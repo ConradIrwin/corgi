@@ -895,6 +895,11 @@ impl Ctx {
         let mut h = hash_dir(&pkg.root())
             .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
         let extras = meta::extra_inputs(pkg);
+        let ws_manifest = Path::new(&self.workspace_root).join("Cargo.toml");
+        if pkg.source.is_none() && ws_manifest.exists() {
+            let wh = crate::store::sha256_file(&ws_manifest)?;
+            h = sha256_hex(format!("{h}|workspace-manifest:{wh}").as_bytes());
+        }
         if !extras.is_empty() {
             let mut acc = h;
             for e in &extras {
@@ -1015,7 +1020,6 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         ctx.rustup_home.clone(),
         ctx.devdir.clone(),
         ctx.store.root.display().to_string(),
-        ctx.workspace_root.clone(),
     ];
     for d in &ctx.darwin_dirs {
         reads.push(d.clone());
@@ -1026,6 +1030,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     for r in reads {
         prof.push_str(&format!("  (subpath \"{r}\")\n"));
     }
+    // the workspace *manifest* is a declared, hashed input of every local
+    // package (proc-macro-crate et al. legitimately read it); the rest of
+    // the workspace is invisible unless declared via extra-inputs
+    prof.push_str(&format!("  (literal \"{}/Cargo.toml\")\n", ctx.workspace_root));
     if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
         for p in extra.split(':').filter(|p| !p.is_empty()) {
             prof.push_str(&format!("  (subpath \"{p}\")\n"));
@@ -1331,7 +1339,13 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     fs::create_dir_all(&outdir)?;
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let mut cmd = sandboxed_command(ctx, &ctx.rustc, &[&pkg_root], &[&outdir, &scratch]);
+    let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
+        .iter()
+        .filter_map(|e| pkg_root.join(e).canonicalize().ok())
+        .collect();
+    let mut reads: Vec<&Path> = vec![&pkg_root];
+    reads.extend(extra_in.iter().map(|p| p.as_path()));
+    let mut cmd = sandboxed_command(ctx, &ctx.rustc, &reads, &[&outdir, &scratch]);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
@@ -1562,6 +1576,12 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
     let outdirs_root = ctx.store.root.join("outdirs");
+    let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
+        .iter()
+        .filter_map(|e| pkg_root.join(e).canonicalize().ok())
+        .collect();
+    let mut reads: Vec<&Path> = vec![&pkg_root];
+    reads.extend(extra_in.iter().map(|p| p.as_path()));
     let mut writes: Vec<&Path> = vec![&stage_parent, &scratch];
     if std::env::var_os("DCARGO_UNSAFE_SHARED_OUTDIRS").is_some() {
         // survey-only: the `scratch` crate (used by cxx) bakes its published
@@ -1569,7 +1589,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         // runtime — cross-action shared mutable state. Needs a real design.
         writes.push(&outdirs_root);
     }
-    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &[&pkg_root], &writes);
+    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
