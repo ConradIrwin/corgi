@@ -1031,6 +1031,23 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
             prof.push_str(&format!("  (subpath \"{p}\")\n"));
         }
     }
+    prof.push_str(")\n");
+    // Align the readable set with the hashed set: the source hash deliberately
+    // excludes .git, build output dirs, and Cargo.lock, so reading them must
+    // be denied or they become unhashed inputs. Later SBPL rules win.
+    prof.push_str("(deny file-read* file-read-metadata\n");
+    let mut deny_roots: Vec<String> = vec![ctx.workspace_root.clone()];
+    for r in extra_reads {
+        deny_roots.push(r.display().to_string());
+    }
+    deny_roots.sort();
+    deny_roots.dedup();
+    for r in &deny_roots {
+        for d in [".git", "target", "dtarget"] {
+            prof.push_str(&format!("  (subpath \"{r}/{d}\")\n"));
+        }
+        prof.push_str(&format!("  (literal \"{r}/Cargo.lock\")\n"));
+    }
     prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
     for d in &ctx.darwin_dirs {
         prof.push_str(&format!("  (subpath \"{d}\")\n"));
