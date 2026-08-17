@@ -1,3 +1,4 @@
+mod audit;
 mod build;
 mod meta;
 mod store;
@@ -23,12 +24,12 @@ fn real_main() -> Result<()> {
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
             "--release" => release = true,
-            "build" if cmd.is_none() => cmd = Some(a),
+            "build" | "audit" if cmd.is_none() => cmd = Some(a),
             _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [--release] [-v])"),
         }
     }
     if let Some(c) = cmd.as_deref() {
-        if c != "build" {
+        if c != "build" && c != "audit" {
             bail!("unknown command `{c}`");
         }
     }
@@ -48,6 +49,9 @@ fn real_main() -> Result<()> {
             PathBuf::from(home).join(".cache/dcargo")
         }
     });
+    if cmd.as_deref() == Some("audit") {
+        return audit::audit(&dir, release, verbose);
+    }
     let store = store::Store::new(store_root)?;
     build::build(store, &dir, verbose, release)
 }

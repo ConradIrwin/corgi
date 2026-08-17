@@ -173,6 +173,17 @@ fn host_triple() -> Result<String> {
 /// The pin is mandatory and must be concrete. No floating channels, no
 /// ambient-rustup fallback: builds are a function of the repo, full stop.
 fn read_toolchain_pin(dir: &Path) -> Result<String> {
+    // the pin may live at the workspace root above the package being built
+    let mut found: Option<PathBuf> = None;
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join("rust-toolchain.toml").exists() || d.join("rust-toolchain").exists() {
+            found = Some(d.to_path_buf());
+            break;
+        }
+        cur = d.parent();
+    }
+    let dir = found.as_deref().unwrap_or(dir);
     let toml_p = dir.join("rust-toolchain.toml");
     let legacy = dir.join("rust-toolchain");
     let channel = if toml_p.exists() {
@@ -300,9 +311,16 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
-    let toolchain_bin = ensure_toolchain(&store, &channel, &host_guess)?;
-    let rustc = toolchain_bin.join("rustc").display().to_string();
-    let cargo_bin = toolchain_bin.join("cargo");
+    ensure_toolchain(&store, &channel, &host_guess)?;
+    // Hand actions only the *logical* toolchain path (via the store alias):
+    // physical per-store paths leak into ld's UUID (it hashes the link
+    // command line, including libstd rlib paths) and into build-script keys.
+    let toolchain_logical = store
+        .logical_root()
+        .join("toolchains")
+        .join(format!("{channel}-{host_guess}"));
+    let rustc = toolchain_logical.join("bin/rustc").display().to_string();
+    let cargo_bin = toolchain_logical.join("bin/cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
     let host = rustc_version
         .lines()
@@ -314,9 +332,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         bail!("host triple mismatch: dcargo resolved {host_guess}, pinned rustc reports {host}");
     }
     let cfg_out = capture(Command::new(&rustc).args(["--print", "cfg"]), "rustc --print cfg")?;
-    let sysroot = capture(Command::new(&rustc).args(["--print", "sysroot"]), "rustc --print sysroot")?
-        .trim()
-        .to_string();
+    // the toolchain dir *is* the sysroot; use the logical spelling so
+    // linker inputs are spelled identically regardless of store location
+    let sysroot = toolchain_logical.display().to_string();
     // Sysroot *content* changes emitted bits even at identical rustc
     // versions: an installed rust-src component devirtualizes std paths in
     // panic locations (observed: 13/14 artifacts differ). Fold it into the
@@ -1100,6 +1118,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         cmd.env("OUT_DIR", ctx.out_dir_logical(&out_key));
     }
 
+    cmd.arg("--sysroot").arg(&ctx.sysroot);
     cmd.arg("--crate-name").arg(&crate_name);
     cmd.arg("--edition").arg(&target.edition);
     cmd.arg(&src_rel);
