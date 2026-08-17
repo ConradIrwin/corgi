@@ -157,6 +157,137 @@ struct RunKey<'a> {
     toolchain: &'a str,
 }
 
+/// Resolve the host triple *without* a rustc: dcargo's own build constants.
+/// Cross-checked later against the pinned rustc's self-reported host.
+/// (Known gap: under Rosetta an x86_64 dcargo resolves x86_64-apple-darwin.)
+fn host_triple() -> Result<String> {
+    let arch = std::env::consts::ARCH;
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu", // TODO: musl detection
+        o => bail!("unsupported host OS {o}"),
+    };
+    Ok(format!("{arch}-{os}"))
+}
+
+/// The pin is mandatory and must be concrete. No floating channels, no
+/// ambient-rustup fallback: builds are a function of the repo, full stop.
+fn read_toolchain_pin(dir: &Path) -> Result<String> {
+    let toml_p = dir.join("rust-toolchain.toml");
+    let legacy = dir.join("rust-toolchain");
+    let channel = if toml_p.exists() {
+        let text = fs::read_to_string(&toml_p)?;
+        let mut ch = None;
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("channel") {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    ch = Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        ch.with_context(|| format!("no `channel` key in {}", toml_p.display()))?
+    } else if legacy.exists() {
+        fs::read_to_string(&legacy)?.trim().to_string()
+    } else {
+        bail!(
+            "dcargo requires a pinned toolchain: create rust-toolchain.toml with \
+             `[toolchain]\nchannel = \"<exact version>\"` (e.g. \"1.94.1\" or \"nightly-2026-03-25\")"
+        );
+    };
+    if !is_concrete_channel(&channel) {
+        bail!(
+            "floating toolchain channel `{channel}` is not allowed; \
+             pin an exact version like \"1.94.1\" or \"nightly-2026-03-25\""
+        );
+    }
+    Ok(channel)
+}
+
+fn is_concrete_channel(c: &str) -> bool {
+    let semver = {
+        let parts: Vec<&str> = c.split('.').collect();
+        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|ch| ch.is_ascii_digit()))
+    };
+    let dated = c
+        .strip_prefix("nightly-")
+        .or_else(|| c.strip_prefix("beta-"))
+        .map(|d| {
+            d.len() == 10
+                && d.chars()
+                    .enumerate()
+                    .all(|(i, ch)| if i == 4 || i == 7 { ch == '-' } else { ch.is_ascii_digit() })
+        })
+        .unwrap_or(false);
+    semver || dated
+}
+
+/// Install rustc + rust-std + cargo from static.rust-lang.org into the
+/// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
+fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
+    let dest = store.root.join("toolchains").join(format!("{channel}-{triple}"));
+    let bin = dest.join("bin");
+    if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
+        return Ok(bin);
+    }
+    eprintln!("dcargo: installing toolchain {channel}-{triple} into {}", dest.display());
+    let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+    } else if let Some(d) = channel.strip_prefix("beta-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+    } else {
+        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+    };
+    let work = store.tmp_path("toolchain");
+    let install = work.join("install");
+    fs::create_dir_all(&install)?;
+    for (comp, payload) in [
+        ("rustc", "rustc".to_string()),
+        ("rust-std", format!("rust-std-{triple}")),
+        ("cargo", "cargo".to_string()),
+    ] {
+        let name = format!("{comp}-{ver}-{triple}");
+        let url = format!("{base}/{name}.tar.xz");
+        let tarball = work.join(format!("{name}.tar.xz"));
+        let st = Command::new("curl")
+            .args(["-sSfL", "-o"])
+            .arg(&tarball)
+            .arg(&url)
+            .status()
+            .context("running curl")?;
+        if !st.success() {
+            bail!("download failed: {url}");
+        }
+        let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "fetching sha256")?;
+        let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+        let actual = crate::store::sha256_file(&tarball)?;
+        if actual != expected {
+            bail!("sha256 mismatch for {name}: expected {expected}, got {actual}");
+        }
+        let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+        if !st.success() {
+            bail!("unpack failed: {name}");
+        }
+        let payload_dir = work.join(&name).join(&payload);
+        let st = Command::new("cp")
+            .arg("-R")
+            .arg(format!("{}/.", payload_dir.display()))
+            .arg(&install)
+            .status()?;
+        if !st.success() {
+            bail!("copying component {comp} failed");
+        }
+        eprintln!("dcargo:   {comp} {ver} verified (sha256 {}…)", &expected[..12]);
+    }
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&install, &dest) {
+        Ok(()) => {}
+        Err(_) if dest.join("bin/rustc").is_file() => {} // concurrent racer won
+        Err(e) => return Err(e).context("publishing toolchain"),
+    }
+    fs::remove_dir_all(&work).ok();
+    Ok(dest.join("bin"))
+}
+
 pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<()> {
     let t0 = Instant::now();
     let dir = dir
@@ -167,7 +298,11 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         bail!("no Cargo.toml in {}", dir.display());
     }
 
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let channel = read_toolchain_pin(&dir)?;
+    let host_guess = host_triple()?;
+    let toolchain_bin = ensure_toolchain(&store, &channel, &host_guess)?;
+    let rustc = toolchain_bin.join("rustc").display().to_string();
+    let cargo_bin = toolchain_bin.join("cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
     let host = rustc_version
         .lines()
@@ -175,6 +310,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         .context("rustc -vV: no host line")?
         .trim()
         .to_string();
+    if host != host_guess {
+        bail!("host triple mismatch: dcargo resolved {host_guess}, pinned rustc reports {host}");
+    }
     let cfg_out = capture(Command::new(&rustc).args(["--print", "cfg"]), "rustc --print cfg")?;
     let sysroot = capture(Command::new(&rustc).args(["--print", "sysroot"]), "rustc --print sysroot")?
         .trim()
@@ -189,11 +327,11 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
 
     eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
     capture(
-        Command::new("cargo").args(["fetch", "--manifest-path"]).arg(&manifest),
+        Command::new(&cargo_bin).args(["fetch", "--manifest-path"]).arg(&manifest),
         "cargo fetch",
     )?;
     let meta_json = capture(
-        Command::new("cargo")
+        Command::new(&cargo_bin)
             .args(["metadata", "--format-version", "1", "--filter-platform", &host, "--manifest-path"])
             .arg(&manifest),
         "cargo metadata",
@@ -280,9 +418,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     } else {
         String::new()
     };
-    let cargo = find_in_path("cargo")
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "cargo".into());
+    let cargo = cargo_bin.display().to_string();
 
     {
         let root_pkg = &meta.packages[pkgs[&root_id]];

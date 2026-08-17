@@ -143,6 +143,15 @@ knob folds into the action key like any other input.
 
 ## Toolchain provenance
 
+Pinning is mandatory and concrete: `rust-toolchain.toml` must name an exact
+version (`1.94.1`, `nightly-2026-03-25`); floating channels and missing pins
+are hard errors, and there is no ambient-rustup fallback. dcargo installs
+rustc + rust-std + cargo from static.rust-lang.org into the store
+(sha256-verified, atomic rename), so a machine needs no Rust installed at
+all. The host triple is resolved from dcargo's own build constants (needed
+before a rustc exists, to pick tarballs) and cross-checked against the
+pinned rustc's self-reported `host:`.
+
 A toolchain can be installed straight into the store from
 static.rust-lang.org (sha256-verified, no rustup) and used via `RUSTC=`;
 sandbox rules, remaps, and keys adapt automatically. Found in the process:
