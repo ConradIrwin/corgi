@@ -100,6 +100,28 @@ writable or every link takes a ~1.5s uncached fallback, and we now resolve
 (which was also an untracked input). Known hole: those darwin cache dirs are
 shared mutable state; Bazel/Nix accept the same tradeoff.
 
+## Canonical OUT_DIR paths (store alias + staging byte-patch)
+
+Seatbelt cannot remount paths (it is allow/deny only; macOS has no per-process
+mount namespaces), so path canonicalization is done with two tricks instead:
+
+1. **Store alias**: a symlink at `/Users/Shared/dcargo` (world-writable,
+   admin-free, same path on every Mac) points at the real store. Actions see
+   OUT_DIR spelled through the alias, so `env!("OUT_DIR")` bakes a
+   machine-independent string no matter where the store physically lives.
+   Upgrade path for path-identity purists: an `/etc/synthetic.conf` firmlink
+   (`/dcargo`, the Nix approach), which survives even `realpath()`.
+2. **Staging byte-patch**: build scripts run with OUT_DIR at
+   `outdirs/<random-64-hex>/out` — the same length as the final
+   `outdirs/<action-key>/out`. Before the atomic publish, generated files are
+   byte-patched `staging-id -> key` (length-preserving, safe for binary
+   files), so paths embedded *during* the run also become canonical, without
+   giving up lock-free publishing.
+
+Verified: a crate whose build.rs bakes OUT_DIR into generated code now
+produces bit-identical binaries from stores at different locations, and the
+embedded path reads `/Users/Shared/dcargo/outdirs/<key>/out` everywhere.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
@@ -80,7 +80,27 @@ pub fn hash_dir(root: &Path) -> Result<String> {
 /// rename, so any number of concurrent builds can share it without locks.
 pub struct Store {
     pub root: PathBuf,
+    /// Canonical machine-independent spelling of the store root, routed
+    /// through a symlink at a path that exists on every machine
+    /// (default /Users/Shared/dcargo). A poor man's bind mount.
+    pub alias: Option<PathBuf>,
     counter: AtomicU64,
+}
+
+fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
+    if let Ok(t) = fs::read_link(alias) {
+        if t == *root {
+            return Ok(());
+        }
+    }
+    if alias.exists() && !fs::symlink_metadata(alias)?.file_type().is_symlink() {
+        return Err(anyhow!("{} exists and is not a symlink", alias.display()));
+    }
+    let tmp = alias.with_file_name(format!(".dcargo-alias-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(root, &tmp)?;
+    fs::rename(&tmp, alias)?; // atomic swap, lock-free like everything else
+    Ok(())
 }
 
 impl Store {
@@ -91,7 +111,25 @@ impl Store {
         // canonicalize so sandbox path rules match kernel-resolved paths
         // (e.g. /tmp/store -> /private/tmp/store)
         let root = root.canonicalize()?;
-        Ok(Store { root, counter: AtomicU64::new(0) })
+        let alias = if std::env::var_os("DCARGO_NO_ALIAS").is_some() {
+            None
+        } else {
+            let alias_path = std::env::var_os("DCARGO_ALIAS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/Users/Shared/dcargo"));
+            match setup_alias(&alias_path, &root) {
+                Ok(()) => Some(alias_path),
+                Err(e) => {
+                    eprintln!("dcargo: warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
+                    None
+                }
+            }
+        };
+        Ok(Store { root, alias, counter: AtomicU64::new(0) })
+    }
+
+    pub fn logical_root(&self) -> &Path {
+        self.alias.as_deref().unwrap_or(&self.root)
     }
 
     pub fn tmp_path(&self, tag: &str) -> PathBuf {
