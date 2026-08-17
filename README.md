@@ -141,6 +141,17 @@ Cargo `[profile.*]` tables and `.cargo/config.toml` (RUSTFLAGS etc.) are not
 read yet — only built-in dev/release profiles exist; when supported, every
 knob folds into the action key like any other input.
 
+## Toolchain provenance
+
+A toolchain can be installed straight into the store from
+static.rust-lang.org (sha256-verified, no rustup) and used via `RUSTC=`;
+sandbox rules, remaps, and keys adapt automatically. Found in the process:
+identical rustc *versions* with different sysroot *content* (rust-src
+installed vs not) emit different bits — 13/14 artifacts — under identical
+keys. Sysroot content identity (rust-src presence) is now folded into every
+action key. Managed toolchains without rust-src are preferable: std paths
+stay in upstream's canonical `/rustc/<commit>/` form on every machine.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);

@@ -179,6 +179,12 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     let sysroot = capture(Command::new(&rustc).args(["--print", "sysroot"]), "rustc --print sysroot")?
         .trim()
         .to_string();
+    // Sysroot *content* changes emitted bits even at identical rustc
+    // versions: an installed rust-src component devirtualizes std paths in
+    // panic locations (observed: 13/14 artifacts differ). Fold it into the
+    // version string so it reaches every action key.
+    let rust_src = Path::new(&sysroot).join("lib/rustlib/src/rust").exists();
+    let rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
     let cfg_env = cargo_cfg_env(&cfg_out);
 
     eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
