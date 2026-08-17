@@ -88,6 +88,9 @@ impl Store {
         for d in ["cas", "actions", "pool", "outdirs", "tmp"] {
             fs::create_dir_all(root.join(d))?;
         }
+        // canonicalize so sandbox path rules match kernel-resolved paths
+        // (e.g. /tmp/store -> /private/tmp/store)
+        let root = root.canonicalize()?;
         Ok(Store { root, counter: AtomicU64::new(0) })
     }
 

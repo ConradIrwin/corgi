@@ -80,6 +80,26 @@ they duplicate some work, they never block or corrupt. (Verified empirically.)
 - two simultaneous cold builds sharing a store: both succeed, cross-pollinate
 - edit + revert: revert is free — the old artifacts are still in the CAS
 
+## Sandboxing (always on, macOS)
+
+Every rustc invocation and build-script run executes under a deny-by-default
+seatbelt profile (`sandbox-exec`): reads limited to system dirs, the
+toolchain, the store, and the package being built; writes limited to the
+action's own out/scratch dirs; no network. Children (cc, ld, rustc probes)
+inherit the sandbox, and since proc-macros run *inside* the sandboxed rustc,
+they are confined too. Undeclared inputs turn from silent impurities into
+loud `PermissionDenied` build errors.
+
+Measured overhead (M-series MBP): +4.5ms per process spawn, ~3% on a pure
+compile, ~1% on a full cold build — so it is enabled unconditionally
+(`DCARGO_NO_SANDBOX=1` exists as a debugging kill-switch only). Two macOS
+gotchas cost the initial integration 4x: xcrun's SDK lookup needs the
+*canonical* darwin per-user temp/cache dirs (`/private/var/folders/...`)
+writable or every link takes a ~1.5s uncached fallback, and we now resolve
+`SDKROOT` once up front instead of letting each link shell out to xcrun
+(which was also an untracked input). Known hole: those darwin cache dirs are
+shared mutable state; Bazel/Nix accept the same tradeoff.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);

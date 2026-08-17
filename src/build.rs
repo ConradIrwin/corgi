@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.3";
+const TOOL_VERSION: &str = "dcargo/0.4";
 
 /// One fixed profile for the PoC (~debug, but debuginfo off so we do not
 /// have to deal with split-debuginfo path determinism yet).
@@ -93,6 +93,11 @@ pub struct Ctx {
     base_env: Vec<(String, String)>,
     workspace_root: String,
     sysroot: String,
+    rustup_home: String,
+    devdir: String,
+    sandbox: bool,
+    darwin_dirs: Vec<String>,
+    sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     dylib_suffix: &'static str,
 }
@@ -196,6 +201,37 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
             base_env.push((k.to_string(), v));
         }
     }
+    let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
+    let devdir = capture(Command::new("/usr/bin/xcode-select").arg("-p"), "xcode-select -p")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
+    let sandbox = host.contains("apple")
+        && Path::new("/usr/bin/sandbox-exec").is_file()
+        && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
+    if sandbox {
+        eprintln!("dcargo: hermetic sandbox enabled (seatbelt)");
+    }
+    // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
+    // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
+    let mut darwin_dirs = Vec::new();
+    for key in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
+        if let Ok(d) = capture(Command::new("/usr/bin/getconf").arg(key), "getconf") {
+            let d = d.trim().trim_end_matches('/').to_string();
+            if !d.is_empty() {
+                let canon = if d.starts_with("/var/") { format!("/private{d}") } else { d };
+                darwin_dirs.push(canon);
+            }
+        }
+    }
+    // resolve the SDK once, outside the sandbox, instead of letting every
+    // rustc link shell out to xcrun (slow and an untracked probe)
+    let sdkroot = if host.contains("apple") {
+        capture(Command::new("/usr/bin/xcrun").arg("--show-sdk-path"), "xcrun --show-sdk-path")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let cargo = find_in_path("cargo")
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cargo".into());
@@ -235,6 +271,11 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
         base_env,
         workspace_root,
         sysroot,
+        rustup_home,
+        devdir,
+        sandbox,
+        darwin_dirs,
+        sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         dylib_suffix,
     };
@@ -515,6 +556,59 @@ impl Ctx {
     }
 }
 
+/// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
+/// system dirs + toolchain + store + this package, writes limited to the
+/// action's own output/scratch dirs, no network. Children inherit it.
+fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
+    if !ctx.sandbox {
+        return Command::new(program);
+    }
+    let mut prof = String::from(concat!(
+        "(version 1)\n",
+        "(deny default)\n",
+        "(allow process-fork)\n",
+        "(allow process-exec*)\n",
+        "(allow process-info*)\n",
+        "(allow file-map-executable)\n",
+        "(allow signal (target same-sandbox))\n",
+        "(allow sysctl-read)\n",
+        "(allow mach-lookup)\n",
+        "(allow file-read-metadata)\n",
+    ));
+    prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
+    for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot"] {
+        prof.push_str(&format!("  (subpath \"{p}\")\n"));
+    }
+    let mut reads: Vec<String> = vec![
+        ctx.sysroot.clone(),
+        ctx.cargo_home.clone(),
+        ctx.rustup_home.clone(),
+        ctx.devdir.clone(),
+        ctx.store.root.display().to_string(),
+        ctx.workspace_root.clone(),
+    ];
+    for d in &ctx.darwin_dirs {
+        reads.push(d.clone());
+    }
+    for r in extra_reads {
+        reads.push(r.display().to_string());
+    }
+    for r in reads {
+        prof.push_str(&format!("  (subpath \"{r}\")\n"));
+    }
+    prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
+    for d in &ctx.darwin_dirs {
+        prof.push_str(&format!("  (subpath \"{d}\")\n"));
+    }
+    for w in writes {
+        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
+    }
+    prof.push_str(")\n");
+    let mut c = Command::new("/usr/bin/sandbox-exec");
+    c.arg("-p").arg(prof).arg(program);
+    c
+}
+
 fn describe(ctx: &Ctx, idx: usize) -> String {
     let u = &ctx.units[idx];
     let p = &ctx.meta.packages[u.pkg];
@@ -762,7 +856,9 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
 
     let outdir = ctx.store.tmp_path("rustc");
     fs::create_dir_all(&outdir)?;
-    let mut cmd = Command::new(&ctx.rustc);
+    let scratch = ctx.store.tmp_path("scratch");
+    fs::create_dir_all(&scratch)?;
+    let mut cmd = sandboxed_command(ctx, &ctx.rustc, &[&pkg_root], &[&outdir, &scratch]);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     for (k, v) in &ctx.base_env {
@@ -833,6 +929,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         eprintln!("dcargo: exec {cmd:?}");
     }
     let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
+    fs::remove_dir_all(&scratch).ok();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
         fs::remove_dir_all(&outdir).ok();
@@ -939,7 +1036,9 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let out_tmp = ctx.store.tmp_path("out");
     fs::create_dir_all(&out_tmp)?;
     let script_path = ctx.pool.join(&script.name);
-    let mut cmd = Command::new(&script_path);
+    let scratch = ctx.store.tmp_path("scratch");
+    fs::create_dir_all(&scratch)?;
+    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &[&pkg_root], &[&out_tmp, &scratch]);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     for (k, v) in &ctx.base_env {
@@ -958,6 +1057,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         eprintln!("dcargo: exec {cmd:?}");
     }
     let out = cmd.output().with_context(|| format!("running build script for {}", pkg.name))?;
+    fs::remove_dir_all(&scratch).ok();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
