@@ -117,6 +117,11 @@ impl Store {
             let alias_path = std::env::var_os("DCARGO_ALIAS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/Users/Shared/dcargo"));
+            if root == alias_path {
+                // the store already lives at the canonical path: no alias,
+                // no symlink, nothing for realpath() to see through
+                return Ok(Store { root, alias: None, counter: AtomicU64::new(0) });
+            }
             match setup_alias(&alias_path, &root) {
                 Ok(()) => Some(alias_path),
                 Err(e) => {

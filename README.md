@@ -105,12 +105,16 @@ shared mutable state; Bazel/Nix accept the same tradeoff.
 Seatbelt cannot remount paths (it is allow/deny only; macOS has no per-process
 mount namespaces), so path canonicalization is done with two tricks instead:
 
-1. **Store alias**: a symlink at `/Users/Shared/dcargo` (world-writable,
-   admin-free, same path on every Mac) points at the real store. Actions see
-   OUT_DIR spelled through the alias, so `env!("OUT_DIR")` bakes a
-   machine-independent string no matter where the store physically lives.
-   Upgrade path for path-identity purists: an `/etc/synthetic.conf` firmlink
-   (`/dcargo`, the Nix approach), which survives even `realpath()`.
+1. **Canonical store location**: the store lives directly at
+   `/Users/Shared/dcargo` (world-writable, admin-free, same path on every
+   Mac), so embedded OUT_DIR strings are machine-independent with no
+   indirection at all — nothing for `realpath()` to see through. Relocating
+   the store (`DCARGO_STORE=...`) falls back to a symlink alias at the
+   canonical path, and the two modes produce bit-identical artifacts.
+   Upgrade path: an `/etc/synthetic.conf` firmlink (`/dcargo`, the Nix
+   approach) for a root-level name. Note `/Users/Shared` is world-writable:
+   fine for a single-dev machine, but a genuinely multi-user store wants a
+   root-owned location plus a daemon (the Nix model).
 2. **Staging byte-patch**: build scripts run with OUT_DIR at
    `outdirs/<random-64-hex>/out` — the same length as the final
    `outdirs/<action-key>/out`. Before the atomic publish, generated files are

@@ -34,9 +34,17 @@ fn real_main() -> Result<()> {
         Some(d) => d,
         None => std::env::current_dir()?,
     };
+    // Default: the store lives *directly at* the canonical machine-wide
+    // path, so embedded OUT_DIR paths are canonical with no indirection.
+    // DCARGO_STORE relocates it (a symlink alias then preserves the
+    // canonical spelling).
     let store_root = std::env::var_os("DCARGO_STORE").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").expect("HOME not set");
-        PathBuf::from(home).join(".cache/dcargo")
+        if cfg!(target_os = "macos") {
+            PathBuf::from("/Users/Shared/dcargo")
+        } else {
+            let home = std::env::var_os("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".cache/dcargo")
+        }
     });
     let store = store::Store::new(store_root)?;
     build::build(store, &dir, verbose)
