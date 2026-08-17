@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.2";
+const TOOL_VERSION: &str = "dcargo/0.3";
 
 /// One fixed profile for the PoC (~debug, but debuginfo off so we do not
 /// have to deal with split-debuginfo path determinism yet).
@@ -92,6 +92,7 @@ pub struct Ctx {
     cargo_home: String,
     base_env: Vec<(String, String)>,
     workspace_root: String,
+    sysroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     dylib_suffix: &'static str,
 }
@@ -153,6 +154,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
         .trim()
         .to_string();
     let cfg_out = capture(Command::new(&rustc).args(["--print", "cfg"]), "rustc --print cfg")?;
+    let sysroot = capture(Command::new(&rustc).args(["--print", "sysroot"]), "rustc --print sysroot")?
+        .trim()
+        .to_string();
     let cfg_env = cargo_cfg_env(&cfg_out);
 
     eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
@@ -230,6 +234,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
         cargo_home,
         base_env,
         workspace_root,
+        sysroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         dylib_suffix,
     };
@@ -818,6 +823,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     if cap_lints {
         cmd.arg("--cap-lints").arg("allow");
     }
+    cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/sysroot", ctx.sysroot));
     cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/cargo-home", ctx.cargo_home));
     cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/ws", ctx.workspace_root));
     cmd.arg("--remap-path-prefix")
