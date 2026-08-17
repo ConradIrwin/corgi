@@ -161,6 +161,18 @@ keys. Sysroot content identity (rust-src presence) is now folded into every
 action key. Managed toolchains without rust-src are preferable: std paths
 stay in upstream's canonical `/rustc/<commit>/` form on every machine.
 
+## Input containment (include!/mod coverage)
+
+Everything a compile can read is either hashed or refused. In-package reads
+(`mod`, `include!`, `include_str!`, `include_bytes!`) are covered by the
+whole-package content hash; `OUT_DIR` reads are keyed transitively via the
+build-script action key; `env!` reads are keyed because the env is explicit
+(an undeclared var fails the compile). rustc's dep-info is then checked
+after every compile: any file read outside the package / OUT_DIR / sysroot
+is a hard "hermeticity violation" error naming the file, because it would
+not be part of the action key. Build-script *file* reads have no dep-info
+equivalent — they are bounded by the sandbox and the package hash instead.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);

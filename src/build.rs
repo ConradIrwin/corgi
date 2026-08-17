@@ -1104,7 +1104,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     cmd.arg("--edition").arg(&target.edition);
     cmd.arg(&src_rel);
     cmd.arg("--crate-type").arg(crate_type);
-    cmd.arg("--emit=link");
+    cmd.arg("--emit=link,dep-info");
     for f in ctx.profile_flags {
         cmd.arg(f);
     }
@@ -1159,6 +1159,22 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     }
     if !stderr.trim().is_empty() {
         eprint!("{stderr}");
+    }
+
+    // Enforce input containment: rustc's dep-info lists every file it read
+    // for this crate (mod files, include!/include_str!/include_bytes!).
+    // All of them must lie inside the hashed package dir or a keyed
+    // location (OUT_DIR in the store, sysroot) — otherwise the action key
+    // is missing an input and we refuse to cache a lie.
+    let dep_file = outdir.join(format!("{crate_name}-{k16}.d"));
+    if let Ok(d) = fs::read_to_string(&dep_file) {
+        let store_root = ctx.store.root.clone();
+        let logical = ctx.store.logical_root().to_path_buf();
+        let sys = PathBuf::from(&ctx.sysroot);
+        validate_dep_info(&d, &pkg_root, &[&store_root, &logical, &sys]).with_context(|| {
+            format!("hermeticity violation compiling {} v{}", pkg.name, pkg.version)
+        })?;
+        fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
     }
 
     let mut outputs = Vec::new();
@@ -1365,6 +1381,32 @@ fn patch_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<()> {
                     }
                 }
                 fs::write(&p, patched)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[&PathBuf]) -> Result<()> {
+    for line in dep.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once(':') else { continue };
+        for tok in rest.split_whitespace() {
+            // NOTE(poc): no handling of backslash-escaped spaces in paths
+            let p = Path::new(tok);
+            if p.is_absolute() {
+                if !(p.starts_with(pkg_root) || allowed_abs.iter().any(|a| p.starts_with(a))) {
+                    bail!(
+                        "undeclared input read during compilation: {tok}\n\
+                         this file is outside the package and OUT_DIR, so it is not part of\n\
+                         the action key; caching it would be unsound"
+                    );
+                }
+            } else if tok.starts_with("..") {
+                bail!("undeclared input outside the package: {tok}");
             }
         }
     }
