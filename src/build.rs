@@ -115,6 +115,7 @@ pub struct Ctx {
     toolchain: String,
     tool_envs: Vec<(String, String)>,
     tools_id: String,
+    env_inputs: Vec<(String, String, Vec<String>)>,
 }
 
 #[derive(Serialize)]
@@ -172,9 +173,18 @@ struct ToolSpec {
     env: String,
 }
 
-/// Declarative tool pins (dcargo-tools.toml): url + sha256 + bin + env.
+#[derive(Default)]
+struct EnvInput {
+    name: String,
+    command: String,
+    packages: Vec<String>,
+}
+
+/// Declarative tool pins (dcargo-tools.toml): url + sha256 + bin + env,
+/// plus [env-inputs.*]: plan-time commands whose output is injected as env
+/// and hashed into the scoped packages' build-script keys.
 /// The whole manifest hash keys every build-script action.
-fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
+fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<EnvInput>)>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
     while let Some(d) = cur {
@@ -188,6 +198,13 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
     let Some(p) = found else { return Ok(None) };
     let text = fs::read_to_string(&p)?;
     let mut specs: Vec<ToolSpec> = Vec::new();
+    let mut env_inputs: Vec<EnvInput> = Vec::new();
+    enum Cur {
+        None,
+        Tool,
+        EnvInput,
+    }
+    let mut cur = Cur::None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -195,17 +212,42 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
         }
         if let Some(rest) = line.strip_prefix("[tools.") {
             specs.push(ToolSpec { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
+            cur = Cur::Tool;
+        } else if let Some(rest) = line.strip_prefix("[env-inputs.") {
+            env_inputs.push(EnvInput { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
+            cur = Cur::EnvInput;
         } else if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim().trim_matches('"').to_string();
-            let Some(t) = specs.last_mut() else { continue };
-            match k.trim() {
-                "version" => t.version = v,
-                "url" => t.url = v,
-                "sha256" => t.sha256 = v,
-                "bin" => t.bin = v,
-                "path" => t.path = v,
-                "env" => t.env = v,
-                _ => {}
+            let raw = v.trim();
+            let v = raw.trim_matches('"').to_string();
+            match cur {
+                Cur::Tool => {
+                    let Some(t) = specs.last_mut() else { continue };
+                    match k.trim() {
+                        "version" => t.version = v,
+                        "url" => t.url = v,
+                        "sha256" => t.sha256 = v,
+                        "bin" => t.bin = v,
+                        "path" => t.path = v,
+                        "env" => t.env = v,
+                        _ => {}
+                    }
+                }
+                Cur::EnvInput => {
+                    let Some(e) = env_inputs.last_mut() else { continue };
+                    match k.trim() {
+                        "command" => e.command = v,
+                        "packages" => {
+                            e.packages = raw
+                                .trim_matches(['[', ']'])
+                                .split(',')
+                                .map(|x| x.trim().trim_matches('"').to_string())
+                                .filter(|x| !x.is_empty())
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+                Cur::None => {}
             }
         }
     }
@@ -219,7 +261,7 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
             );
         }
     }
-    Ok(Some((text, specs)))
+    Ok(Some((text, specs, env_inputs)))
 }
 
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
@@ -538,7 +580,8 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     let cargo = cargo_bin.display().to_string();
     let mut tool_envs: Vec<(String, String)> = Vec::new();
     let mut tools_id = String::new();
-    if let Some((manifest_text, specs)) = read_tools_manifest(&dir)? {
+    let mut env_inputs: Vec<(String, String, Vec<String>)> = Vec::new();
+    if let Some((manifest_text, specs, inputs)) = read_tools_manifest(&dir)? {
         tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
         for t in &specs {
             ensure_tool(&store, t)?;
@@ -550,6 +593,21 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
                 .join(exported);
             eprintln!("dcargo: tool {} {} -> ${}", t.name, t.version, t.env);
             tool_envs.push((t.env.clone(), logical.display().to_string()));
+        }
+        // plan-time resolution: ambient reads happen HERE, outside the
+        // sandbox, and are frozen into keyed values
+        for ei in &inputs {
+            let parts: Vec<&str> = ei.command.split_whitespace().collect();
+            if parts.is_empty() {
+                bail!("env-input {} has an empty command", ei.name);
+            }
+            let out = capture(
+                Command::new(parts[0]).args(&parts[1..]).current_dir(&dir),
+                &format!("env-input {}", ei.name),
+            )?;
+            let val = out.trim().to_string();
+            eprintln!("dcargo: env-input {}={} (scoped to {:?})", ei.name, val, ei.packages);
+            env_inputs.push((ei.name.clone(), val, ei.packages.clone()));
         }
     }
     // Actions never see the ambient PATH: they get [tool shims:]/usr/bin:/bin.
@@ -564,7 +622,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         if !shims.exists() {
             let tmp = store.tmp_path("shims");
             fs::create_dir_all(&tmp)?;
-            if let Some((_, specs)) = read_tools_manifest(&dir)? {
+            if let Some((_, specs, _)) = read_tools_manifest(&dir)? {
                 for t in &specs {
                     if t.bin.is_empty() {
                         continue; // dir/file exports are env-only, not PATH shims
@@ -639,6 +697,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         toolchain,
         tool_envs,
         tools_id,
+        env_inputs,
     };
 
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
@@ -1521,6 +1580,11 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     }
     for (k, v) in &ctx.tool_envs {
         env.push((k.clone(), v.clone()));
+    }
+    for (name, value, pkgs) in &ctx.env_inputs {
+        if pkgs.is_empty() || pkgs.iter().any(|p| p == &pkg.name) {
+            env.push((name.clone(), value.clone())); // keyed via the env vec
+        }
     }
     for (k, v) in &ctx.cfg_env {
         env.push((k.clone(), v.clone()));
