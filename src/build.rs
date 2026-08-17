@@ -168,6 +168,7 @@ struct ToolSpec {
     url: String,
     sha256: String,
     bin: String,
+    path: String,
     env: String,
 }
 
@@ -202,14 +203,20 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
                 "url" => t.url = v,
                 "sha256" => t.sha256 = v,
                 "bin" => t.bin = v,
+                "path" => t.path = v,
                 "env" => t.env = v,
                 _ => {}
             }
         }
     }
     for t in &specs {
-        if t.version.is_empty() || t.url.is_empty() || t.sha256.is_empty() || t.bin.is_empty() || t.env.is_empty() {
-            bail!("tool `{}` in {} needs version, url, sha256, bin, env", t.name, p.display());
+        let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
+        if t.version.is_empty() || t.url.is_empty() || t.sha256.is_empty() || exported.is_empty() || t.env.is_empty() {
+            bail!(
+                "tool `{}` in {} needs version, url, sha256, env, and `bin` (executable) or `path` (file/dir)",
+                t.name,
+                p.display()
+            );
         }
     }
     Ok(Some((text, specs)))
@@ -217,9 +224,10 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
 
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
 fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
+    let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
     let dest = store.root.join("tools").join(format!("{}-{}", t.name, t.version));
-    if dest.join(&t.bin).is_file() {
-        return Ok(dest.join(&t.bin));
+    if dest.join(exported).exists() {
+        return Ok(dest.join(exported));
     }
     eprintln!("dcargo: installing tool {} {} (sha256-pinned)", t.name, t.version);
     let work = store.tmp_path("tool");
@@ -238,17 +246,17 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     if !st.success() {
         bail!("unpack failed for tool {}", t.name);
     }
-    if !unpack.join(&t.bin).is_file() {
-        bail!("tool {}: `{}` not found inside the archive", t.name, t.bin);
+    if !unpack.join(exported).exists() {
+        bail!("tool {}: `{exported}` not found inside the archive", t.name);
     }
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&unpack, &dest) {
         Ok(()) => {}
-        Err(_) if dest.join(&t.bin).is_file() => {}
+        Err(_) if dest.join(exported).exists() => {}
         Err(e) => return Err(e).context("publishing tool"),
     }
     fs::remove_dir_all(&work).ok();
-    Ok(dest.join(&t.bin))
+    Ok(dest.join(exported))
 }
 
 /// Resolve the host triple *without* a rustc: dcargo's own build constants.
@@ -534,11 +542,12 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
         for t in &specs {
             ensure_tool(&store, t)?;
+            let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
             let logical = store
                 .logical_root()
                 .join("tools")
                 .join(format!("{}-{}", t.name, t.version))
-                .join(&t.bin);
+                .join(exported);
             eprintln!("dcargo: tool {} {} -> ${}", t.name, t.version, t.env);
             tool_envs.push((t.env.clone(), logical.display().to_string()));
         }
@@ -554,6 +563,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
             fs::create_dir_all(&tmp)?;
             if let Some((_, specs)) = read_tools_manifest(&dir)? {
                 for t in &specs {
+                    if t.bin.is_empty() {
+                        continue; // dir/file exports are env-only, not PATH shims
+                    }
                     let target = store
                         .root
                         .join("tools")
