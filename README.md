@@ -126,6 +126,21 @@ Verified: a crate whose build.rs bakes OUT_DIR into generated code now
 produces bit-identical binaries from stores at different locations, and the
 embedded path reads `/Users/Shared/dcargo/outdirs/<key>/out` everywhere.
 
+## Exec allowlist = the cache key (toolchain identity)
+
+The sandbox only permits executing binaries that are either **dispatchers**
+(`/usr/bin/cc`, the rustup shim — they pick a tool but do not shape output)
+or **keyed tools**: rustc (via `rustc -vV`), build-script binaries (via
+content hash), and the Xcode clang/ld + SDK (via `cc --version`, `ld -v`,
+`xcrun --show-sdk-version`, hashed into linking and build-script action
+keys). Anything else is `EPERM`. `xcrun` no longer runs during builds at all
+(SDKROOT is resolved once up front). Verified: the allowlisted build
+produces bit-identical artifacts to an unrestricted one.
+
+Cargo `[profile.*]` tables and `.cargo/config.toml` (RUSTFLAGS etc.) are not
+read yet — only built-in dev/release profiles exist; when supported, every
+knob folds into the action key like any other input.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);

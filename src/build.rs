@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.5";
+const TOOL_VERSION: &str = "dcargo/0.6";
 
 /// Profiles (debuginfo stays off in both for now: split-debuginfo path
 /// determinism is future work). Flags are part of every action key, and the
@@ -112,6 +112,7 @@ pub struct Ctx {
     profile_name: &'static str,
     profile_flags: &'static [&'static str],
     opt_level: &'static str,
+    toolchain: String,
 }
 
 #[derive(Serialize)]
@@ -137,6 +138,8 @@ struct CompileKey<'a> {
     profile: &'a [&'a str],
     env: &'a [(String, String)],
     cap_lints: bool,
+    /// linker-chain identity; only linking crate types depend on it
+    toolchain: &'a str,
 }
 
 #[derive(Serialize)]
@@ -150,6 +153,8 @@ struct RunKey<'a> {
     script: [&'a str; 2],
     env: &'a [(String, String)],
     dep_env: &'a [(String, String)],
+    /// build scripts may invoke cc themselves
+    toolchain: &'a str,
 }
 
 pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<()> {
@@ -217,6 +222,31 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     let devdir = capture(Command::new("/usr/bin/xcode-select").arg("-p"), "xcode-select -p")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
+    // toolchain identity beyond rustc: the linker chain shapes final bits
+    let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
+        .ok()
+        .and_then(|o| o.lines().next().map(str::to_string))
+        .unwrap_or_default();
+    let ld_v = Command::new("ld")
+        .arg("-v")
+        .output()
+        .map(|o| {
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            all.lines().next().unwrap_or("").to_string()
+        })
+        .unwrap_or_default();
+    let sdk_v = if host.contains("apple") {
+        capture(Command::new("/usr/bin/xcrun").arg("--show-sdk-version"), "xcrun --show-sdk-version")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}");
     let sandbox = host.contains("apple")
         && Path::new("/usr/bin/sandbox-exec").is_file()
         && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
@@ -293,6 +323,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         profile_name: if release { "release" } else { "debug" },
         profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
         opt_level: if release { "3" } else { "0" },
+        toolchain,
     };
 
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
@@ -590,7 +621,6 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         "(version 1)\n",
         "(deny default)\n",
         "(allow process-fork)\n",
-        "(allow process-exec*)\n",
         "(allow process-info*)\n",
         "(allow file-map-executable)\n",
         "(allow signal (target same-sandbox))\n",
@@ -598,6 +628,28 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         "(allow mach-lookup)\n",
         "(allow file-read-metadata)\n",
     ));
+    // exec allowlist: the *only* runnable binaries are dispatchers
+    // (/usr/bin/cc, the rustup shim) and tools whose identity is part of
+    // the action key (rustc, clang/ld via the toolchain hash, build
+    // scripts via their content hash)
+    prof.push_str("(allow process-exec*\n");
+    prof.push_str("  (literal \"/usr/bin/cc\")\n");
+    let mut exec_lits = vec![
+        format!("{}/bin/rustc", ctx.cargo_home),
+        format!("{}/bin/rustc", ctx.sysroot),
+    ];
+    if let Some(r) = find_in_path(&ctx.rustc) {
+        exec_lits.push(r.display().to_string());
+    }
+    for p in exec_lits {
+        // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
+        // to rustup, so resolve before emitting the rule
+        let canon = fs::canonicalize(&p).map(|c| c.display().to_string()).unwrap_or(p);
+        prof.push_str(&format!("  (literal \"{canon}\")\n"));
+    }
+    prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
+    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
+    prof.push_str(")\n");
     prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
     for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot"] {
         prof.push_str(&format!("  (subpath \"{p}\")\n"));
@@ -866,6 +918,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         profile: ctx.profile_flags,
         env: &env,
         cap_lints,
+        toolchain: if crate_type == "lib" { "" } else { &ctx.toolchain },
     })?;
     let key = sha256_hex(key_json.as_bytes());
     let k16: String = key[..16].to_string();
@@ -1053,6 +1106,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         script: [&script.name, &script.hash],
         env: &env,
         dep_env: &dep_env,
+        toolchain: &ctx.toolchain,
     })?;
     let key = sha256_hex(key_json.as_bytes());
 
