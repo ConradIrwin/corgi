@@ -113,6 +113,8 @@ pub struct Ctx {
     profile_flags: &'static [&'static str],
     opt_level: &'static str,
     toolchain: String,
+    tool_envs: Vec<(String, String)>,
+    tools_id: String,
 }
 
 #[derive(Serialize)]
@@ -155,6 +157,98 @@ struct RunKey<'a> {
     dep_env: &'a [(String, String)],
     /// build scripts may invoke cc themselves
     toolchain: &'a str,
+    /// hash of the declarative tools manifest (dcargo-tools.toml)
+    tools: &'a str,
+}
+
+#[derive(Default)]
+struct ToolSpec {
+    name: String,
+    version: String,
+    url: String,
+    sha256: String,
+    bin: String,
+    env: String,
+}
+
+/// Declarative tool pins (dcargo-tools.toml): url + sha256 + bin + env.
+/// The whole manifest hash keys every build-script action.
+fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>)>> {
+    let mut found: Option<PathBuf> = None;
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let p = d.join("dcargo-tools.toml");
+        if p.exists() {
+            found = Some(p);
+            break;
+        }
+        cur = d.parent();
+    }
+    let Some(p) = found else { return Ok(None) };
+    let text = fs::read_to_string(&p)?;
+    let mut specs: Vec<ToolSpec> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[tools.") {
+            specs.push(ToolSpec { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
+        } else if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim().trim_matches('"').to_string();
+            let Some(t) = specs.last_mut() else { continue };
+            match k.trim() {
+                "version" => t.version = v,
+                "url" => t.url = v,
+                "sha256" => t.sha256 = v,
+                "bin" => t.bin = v,
+                "env" => t.env = v,
+                _ => {}
+            }
+        }
+    }
+    for t in &specs {
+        if t.version.is_empty() || t.url.is_empty() || t.sha256.is_empty() || t.bin.is_empty() || t.env.is_empty() {
+            bail!("tool `{}` in {} needs version, url, sha256, bin, env", t.name, p.display());
+        }
+    }
+    Ok(Some((text, specs)))
+}
+
+/// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
+fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
+    let dest = store.root.join("tools").join(format!("{}-{}", t.name, t.version));
+    if dest.join(&t.bin).is_file() {
+        return Ok(dest.join(&t.bin));
+    }
+    eprintln!("dcargo: installing tool {} {} (sha256-pinned)", t.name, t.version);
+    let work = store.tmp_path("tool");
+    let unpack = work.join("unpack");
+    fs::create_dir_all(&unpack)?;
+    let archive = work.join("archive");
+    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&archive).arg(&t.url).status()?;
+    if !st.success() {
+        bail!("download failed: {}", t.url);
+    }
+    let actual = crate::store::sha256_file(&archive)?;
+    if actual != t.sha256 {
+        bail!("sha256 mismatch for tool {}: manifest pins {}, archive is {actual}", t.name, t.sha256);
+    }
+    let st = Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&unpack).status()?;
+    if !st.success() {
+        bail!("unpack failed for tool {}", t.name);
+    }
+    if !unpack.join(&t.bin).is_file() {
+        bail!("tool {}: `{}` not found inside the archive", t.name, t.bin);
+    }
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&unpack, &dest) {
+        Ok(()) => {}
+        Err(_) if dest.join(&t.bin).is_file() => {}
+        Err(e) => return Err(e).context("publishing tool"),
+    }
+    fs::remove_dir_all(&work).ok();
+    Ok(dest.join(&t.bin))
 }
 
 /// Resolve the host triple *without* a rustc: dcargo's own build constants.
@@ -374,12 +468,6 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{home}/.cargo"));
-    let mut base_env = Vec::new();
-    for k in ["PATH", "HOME"] {
-        if let Ok(v) = std::env::var(k) {
-            base_env.push((k.to_string(), v));
-        }
-    }
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
     let devdir = capture(Command::new("/usr/bin/xcode-select").arg("-p"), "xcode-select -p")
         .map(|s| s.trim().to_string())
@@ -440,6 +528,53 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         String::new()
     };
     let cargo = cargo_bin.display().to_string();
+    let mut tool_envs: Vec<(String, String)> = Vec::new();
+    let mut tools_id = String::new();
+    if let Some((manifest_text, specs)) = read_tools_manifest(&dir)? {
+        tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
+        for t in &specs {
+            ensure_tool(&store, t)?;
+            let logical = store
+                .logical_root()
+                .join("tools")
+                .join(format!("{}-{}", t.name, t.version))
+                .join(&t.bin);
+            eprintln!("dcargo: tool {} {} -> ${}", t.name, t.version, t.env);
+            tool_envs.push((t.env.clone(), logical.display().to_string()));
+        }
+    }
+    // Actions never see the ambient PATH: they get [tool shims:]/usr/bin:/bin.
+    // The shim dir contains symlinks to the pinned tools, so bare-name
+    // spawns (`Command::new("cmake")`) resolve to keyed content.
+    let mut action_path = "/usr/bin:/bin".to_string();
+    if !tool_envs.is_empty() {
+        let shims = store.root.join("toolsets").join(&tools_id[..16]);
+        if !shims.exists() {
+            let tmp = store.tmp_path("shims");
+            fs::create_dir_all(&tmp)?;
+            if let Some((_, specs)) = read_tools_manifest(&dir)? {
+                for t in &specs {
+                    let target = store
+                        .root
+                        .join("tools")
+                        .join(format!("{}-{}", t.name, t.version))
+                        .join(&t.bin);
+                    std::os::unix::fs::symlink(&target, tmp.join(&t.name)).ok();
+                }
+            }
+            fs::create_dir_all(shims.parent().unwrap())?;
+            match fs::rename(&tmp, &shims) {
+                Ok(()) => {}
+                Err(_) if shims.exists() => {}
+                Err(e) => return Err(e).context("publishing tool shims"),
+            }
+        }
+        action_path = format!("{}:{action_path}", shims.display());
+    }
+    let mut base_env = vec![("PATH".to_string(), action_path)];
+    if let Ok(v) = std::env::var("HOME") {
+        base_env.push(("HOME".to_string(), v));
+    }
 
     {
         let root_pkg = &meta.packages[pkgs[&root_id]];
@@ -487,6 +622,8 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
         opt_level: if release { "3" } else { "0" },
         toolchain,
+        tool_envs,
+        tools_id,
     };
 
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
@@ -817,6 +954,7 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
+    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.store.root.join("tools").display()));
     // survey escape hatch: DCARGO_UNSAFE_EXEC=path1:path2 — deliberately
     // unhermetic, used to enumerate a project's ambient tool dependencies
     if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
@@ -1305,6 +1443,9 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     if let Some(links) = &pkg.links {
         env.push(("CARGO_MANIFEST_LINKS".into(), links.clone()));
     }
+    for (k, v) in &ctx.tool_envs {
+        env.push((k.clone(), v.clone()));
+    }
     for (k, v) in &ctx.cfg_env {
         env.push((k.clone(), v.clone()));
     }
@@ -1328,6 +1469,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         env: &env,
         dep_env: &dep_env,
         toolchain: &ctx.toolchain,
+        tools: &ctx.tools_id,
     })?;
     let key = sha256_hex(key_json.as_bytes());
 
@@ -1357,7 +1499,15 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let script_path = ctx.pool.join(&script.name);
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &[&pkg_root], &[&stage_parent, &scratch]);
+    let outdirs_root = ctx.store.root.join("outdirs");
+    let mut writes: Vec<&Path> = vec![&stage_parent, &scratch];
+    if std::env::var_os("DCARGO_UNSAFE_SHARED_OUTDIRS").is_some() {
+        // survey-only: the `scratch` crate (used by cxx) bakes its published
+        // OUT_DIR into its rlib and other build scripts write there at
+        // runtime — cross-action shared mutable state. Needs a real design.
+        writes.push(&outdirs_root);
+    }
+    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &[&pkg_root], &writes);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
