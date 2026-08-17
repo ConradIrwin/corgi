@@ -1,4 +1,4 @@
-use crate::meta::{self, DepKindInfo, Metadata, Package, Target};
+use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{hash_dir, sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,9 @@ const RELEASE_FLAGS: &[&str] = &[
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Lib,
-    Bsc,      // compile build.rs
-    Bsr,      // run build.rs
-    Bin(usize), // index into pkg.targets
+    Bsc, // compile build.rs
+    Bsr, // run build.rs
+    Bin,
 }
 
 struct UnitDep {
@@ -46,8 +46,13 @@ struct UnitDep {
 
 struct Unit {
     pkg: usize,
-    node: usize,
     kind: Kind,
+    /// compiled for the host triple (proc-macros, build scripts, their deps);
+    /// false = compiled for --target
+    host: bool,
+    is_root: bool,
+    target: Target,
+    features: Vec<String>,
     deps: Vec<UnitDep>,
 }
 
@@ -116,6 +121,8 @@ pub struct Ctx {
     tool_envs: Vec<(String, String)>,
     tools_id: String,
     env_inputs: Vec<(String, String, Vec<String>)>,
+    target: Option<String>,
+    cfg_env_target: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -143,6 +150,8 @@ struct CompileKey<'a> {
     cap_lints: bool,
     /// linker-chain identity; only linking crate types depend on it
     toolchain: &'a str,
+    /// cross-compilation target triple ("" = host)
+    tgt: &'a str,
 }
 
 #[derive(Serialize)]
@@ -443,7 +452,58 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
     Ok(dest.join("bin"))
 }
 
-pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<()> {
+/// Additively install rust-std for a cross target into the toolchain dir.
+/// Copies are idempotent (same verified content), marker written last.
+fn ensure_target_std(store: &Store, channel: &str, host: &str, target: &str) -> Result<()> {
+    let tc = store.root.join("toolchains").join(format!("{channel}-{host}"));
+    let marker = tc.join(format!(".std-{target}-ok"));
+    if marker.exists() {
+        return Ok(());
+    }
+    if !tc.join("lib/rustlib").join(target).join("lib").exists() {
+        eprintln!("dcargo: installing rust-std for {target} (sha256-pinned)");
+        let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+            (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+        } else if let Some(d) = channel.strip_prefix("beta-") {
+            (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+        } else {
+            ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+        };
+        let name = format!("rust-std-{ver}-{target}");
+        let work = store.tmp_path("std");
+        fs::create_dir_all(&work)?;
+        let tarball = work.join("t.tar.xz");
+        let url = format!("{base}/{name}.tar.xz");
+        let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+        if !st.success() {
+            bail!("download failed: {url}");
+        }
+        let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+        let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+        let actual = crate::store::sha256_file(&tarball)?;
+        if actual != expected {
+            bail!("sha256 mismatch for {name}");
+        }
+        let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+        if !st.success() {
+            bail!("unpack failed: {name}");
+        }
+        let payload = work.join(&name).join(format!("rust-std-{target}"));
+        let st = Command::new("cp")
+            .arg("-R")
+            .arg(format!("{}/.", payload.display()))
+            .arg(&tc)
+            .status()?;
+        if !st.success() {
+            bail!("copying rust-std for {target} failed");
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+    store.write_atomic(&marker, b"ok")?;
+    Ok(())
+}
+
+pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Option<String>) -> Result<()> {
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -486,18 +546,30 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     let rust_src = Path::new(&sysroot).join("lib/rustlib/src/rust").exists();
     let rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
     let cfg_env = cargo_cfg_env(&cfg_out);
+    if let Some(t) = &target {
+        ensure_target_std(&store, &channel, &host_guess, t)?;
+    }
+    let cfg_env_target = if let Some(t) = &target {
+        let o = capture(
+            Command::new(&rustc).args(["--print", "cfg", "--target", t]),
+            "rustc --print cfg --target",
+        )?;
+        cargo_cfg_env(&o)
+    } else {
+        cfg_env.clone()
+    };
 
     eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
     capture(
         Command::new(&cargo_bin).args(["fetch", "--manifest-path"]).arg(&manifest),
         "cargo fetch",
     )?;
-    let meta_json = capture(
-        Command::new(&cargo_bin)
-            .args(["metadata", "--format-version", "1", "--filter-platform", &host, "--manifest-path"])
-            .arg(&manifest),
-        "cargo metadata",
-    )?;
+    // metadata for package details only (paths, links, metadata tables);
+    // the actual per-unit resolution comes from cargo's unit-graph below
+    let mut meta_cmd = Command::new(&cargo_bin);
+    meta_cmd.args(["metadata", "--format-version", "1"]);
+    meta_cmd.arg("--manifest-path").arg(&manifest);
+    let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
     let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
 
     let root_id = meta
@@ -509,12 +581,20 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let mut nodes_map = HashMap::new();
-    for (i, n) in meta.resolve.nodes.iter().enumerate() {
-        nodes_map.insert(n.id.clone(), i);
-    }
 
-    let units = build_units(&meta, &pkgs, &nodes_map, &root_id)?;
+    let mut ug_cmd = Command::new(&cargo_bin);
+    ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
+    ug_cmd.args(["build", "--unit-graph", "-Zunstable-options"]);
+    if release {
+        ug_cmd.arg("--release");
+    }
+    if let Some(t) = &target {
+        ug_cmd.args(["--target", t]);
+    }
+    ug_cmd.arg("--manifest-path").arg(&manifest);
+    let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
+    let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
+    let units = translate_unit_graph(&ug, &pkgs)?;
 
     let home = std::env::var("HOME").unwrap_or_default();
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{home}/.cargo"));
@@ -546,7 +626,16 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     } else {
         String::new()
     };
-    let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}");
+    // one Xcode identity pin covers the whole Apple tool group
+    // (ar, ranlib, clang, ld, metal, xcrun) — they ship together
+    let xcode_v = if host.contains("apple") {
+        capture(Command::new("/usr/bin/xcodebuild").arg("-version"), "xcodebuild -version")
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}");
     let sandbox = host.contains("apple")
         && Path::new("/usr/bin/sandbox-exec").is_file()
         && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
@@ -698,19 +787,34 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         tool_envs,
         tools_id,
         env_inputs,
+        target,
+        cfg_env_target,
     };
 
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let (executed, cached) = schedule(&ctx, &results)?;
 
     for (i, u) in ctx.units.iter().enumerate() {
-        if let Kind::Bin(ti) = u.kind {
-            let t = &ctx.meta.packages[u.pkg].targets[ti];
+        if matches!(u.kind, Kind::Bin) && u.is_root {
+            let t = &u.target;
             let r = results[i].get().context("bin not built")?;
             let m = r.main.as_ref().context("bin artifact missing")?;
             let dest = dir.join("dtarget").join(ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
             eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
+        }
+        if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
+            if let (Some(tgt), Some(r)) = (ctx.target.as_deref(), results[i].get()) {
+                let k16 = &r.key[..16];
+                for o in &r.res.outputs {
+                    if o.name.ends_with(".wasm") || o.name.ends_with(".dylib") || o.name.ends_with(".so") {
+                        let clean = o.name.replace(&format!("-{k16}"), "");
+                        let dest = dir.join("dtarget").join(tgt).join(ctx.profile_name).join(&clean);
+                        ctx.store.export(&o.hash, &dest, true)?;
+                        eprintln!("dcargo:   cdylib {}  (sha256 {}…)", dest.display(), &o.hash[..12]);
+                    }
+                }
+            }
         }
     }
     eprintln!(
@@ -762,149 +866,61 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn is_normal_dep(kinds: &[DepKindInfo]) -> bool {
-    kinds.is_empty() || kinds.iter().any(|k| k.kind.is_none())
-}
-
-fn is_build_dep(kinds: &[DepKindInfo]) -> bool {
-    kinds.iter().any(|k| k.kind.as_deref() == Some("build"))
-}
-
-fn build_units(
-    meta: &Metadata,
-    pkgs: &HashMap<String, usize>,
-    nodes_map: &HashMap<String, usize>,
-    root_id: &str,
-) -> Result<Vec<Unit>> {
-    let mut units: Vec<Unit> = Vec::new();
-    let mut lib_of: HashMap<usize, usize> = HashMap::new();
-    let mut bsc_of: HashMap<usize, usize> = HashMap::new();
-    let mut bsr_of: HashMap<usize, usize> = HashMap::new();
-
-    let mut node_ids: Vec<&str> = meta.resolve.nodes.iter().map(|n| n.id.as_str()).collect();
-    node_ids.sort();
-
-    for id in &node_ids {
-        let ni = nodes_map[*id];
-        let pi = *pkgs.get(*id).with_context(|| format!("package {id} missing"))?;
-        let pkg = &meta.packages[pi];
-        if meta::build_script_target(pkg).is_some() {
-            bsc_of.insert(pi, units.len());
-            units.push(Unit { pkg: pi, node: ni, kind: Kind::Bsc, deps: vec![] });
-            bsr_of.insert(pi, units.len());
-            units.push(Unit { pkg: pi, node: ni, kind: Kind::Bsr, deps: vec![] });
-        }
-        if meta::lib_target(pkg).is_some() {
-            lib_of.insert(pi, units.len());
-            units.push(Unit { pkg: pi, node: ni, kind: Kind::Lib, deps: vec![] });
-        }
-        if pkg.id == root_id {
-            let node = &meta.resolve.nodes[ni];
-            for (ti, t) in pkg.targets.iter().enumerate() {
-                if t.kind.iter().any(|k| k == "bin") {
-                    // cargo semantics: bins with unmet required-features are skipped
-                    if !t.required_features.iter().all(|f| node.features.contains(f)) {
-                        continue;
-                    }
-                    units.push(Unit { pkg: pi, node: ni, kind: Kind::Bin(ti), deps: vec![] });
-                }
-            }
-        }
+/// Translate cargo's unit-graph into dcargo units. Cargo did the real
+/// resolution (per-platform features, cfg-gated deps, host/target split);
+/// we only re-shape it.
+fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>) -> Result<Vec<Unit>> {
+    let mut units: Vec<Unit> = Vec::with_capacity(g.units.len());
+    for u in &g.units {
+        let pi = *pkgs
+            .get(&u.pkg_id)
+            .with_context(|| format!("unit-graph package {} missing from metadata", u.pkg_id))?;
+        let is_bs_target = u.target.kind.iter().any(|k| k == "custom-build");
+        let kind = if u.mode == "run-custom-build" {
+            Kind::Bsr
+        } else if is_bs_target {
+            Kind::Bsc
+        } else if u.target.kind.iter().any(|k| k == "bin") {
+            Kind::Bin
+        } else {
+            Kind::Lib
+        };
+        units.push(Unit {
+            pkg: pi,
+            kind,
+            host: u.platform.is_none(),
+            is_root: false,
+            target: u.target.clone(),
+            features: u.features.clone(),
+            deps: vec![],
+        });
     }
-
-    for i in 0..units.len() {
-        let (kind, pi, ni) = (units[i].kind, units[i].pkg, units[i].node);
-        let node = &meta.resolve.nodes[ni];
-        let mut deps: Vec<UnitDep> = Vec::new();
-        match kind {
-            Kind::Lib | Kind::Bin(_) => {
-                for d in &node.deps {
-                    if !is_normal_dep(&d.dep_kinds) {
-                        continue;
-                    }
-                    if let Some(&dpi) = pkgs.get(&d.pkg) {
-                        if let Some(&lu) = lib_of.get(&dpi) {
-                            deps.push(UnitDep { unit: lu, extern_name: Some(d.name.clone()) });
-                        }
-                    }
-                }
-                if let Some(&b) = bsr_of.get(&pi) {
-                    deps.push(UnitDep { unit: b, extern_name: None });
-                }
-                if matches!(kind, Kind::Bin(_)) {
-                    if let Some(&l) = lib_of.get(&pi) {
-                        let t = meta::lib_target(&meta.packages[pi]).unwrap();
-                        deps.push(UnitDep { unit: l, extern_name: Some(t.name.replace('-', "_")) });
-                    }
-                }
-            }
-            Kind::Bsc => {
-                for d in &node.deps {
-                    if !is_build_dep(&d.dep_kinds) {
-                        continue;
-                    }
-                    if let Some(&dpi) = pkgs.get(&d.pkg) {
-                        if let Some(&lu) = lib_of.get(&dpi) {
-                            deps.push(UnitDep { unit: lu, extern_name: Some(d.name.clone()) });
-                        }
-                    }
-                }
-            }
-            Kind::Bsr => {
-                deps.push(UnitDep { unit: bsc_of[&pi], extern_name: None });
-                // build scripts of `links` deps feed DEP_<links>_<key> env
-                for d in &node.deps {
-                    if !is_normal_dep(&d.dep_kinds) {
-                        continue;
-                    }
-                    if let Some(&dpi) = pkgs.get(&d.pkg) {
-                        if meta.packages[dpi].links.is_some() {
-                            if let Some(&b) = bsr_of.get(&dpi) {
-                                deps.push(UnitDep { unit: b, extern_name: None });
-                            }
-                        }
-                    }
-                }
-            }
+    let kinds: Vec<Kind> = units.iter().map(|u| u.kind).collect();
+    for (i, u) in g.units.iter().enumerate() {
+        let mut deps = Vec::new();
+        for d in &u.dependencies {
+            let extern_name = if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
+                Some(d.extern_crate_name.clone())
+            } else {
+                None
+            };
+            deps.push(UnitDep { unit: d.index, extern_name });
         }
         units[i].deps = deps;
     }
-
-    // keep only units reachable from the root package (drops dev-only subgraphs)
-    let root_pi = pkgs[root_id];
-    let mut keep = vec![false; units.len()];
-    let mut stack: Vec<usize> = units
-        .iter()
-        .enumerate()
-        .filter(|(_, u)| u.pkg == root_pi && matches!(u.kind, Kind::Bin(_) | Kind::Lib))
-        .map(|(i, _)| i)
-        .collect();
-    while let Some(i) = stack.pop() {
-        if keep[i] {
-            continue;
-        }
-        keep[i] = true;
-        for d in &units[i].deps {
-            stack.push(d.unit);
-        }
-    }
-    let mut map = vec![usize::MAX; units.len()];
-    let mut kept: Vec<Unit> = Vec::new();
+    // build-script run units sometimes carry no feature list; inherit from
+    // the script's compile unit so CARGO_FEATURE_* stays correct
     for i in 0..units.len() {
-        if keep[i] {
-            map[i] = kept.len();
-            kept.push(std::mem::replace(
-                &mut units[i],
-                Unit { pkg: 0, node: 0, kind: Kind::Lib, deps: vec![] },
-            ));
+        if matches!(units[i].kind, Kind::Bsr) && units[i].features.is_empty() {
+            if let Some(b) = units[i].deps.iter().find(|d| matches!(kinds[d.unit], Kind::Bsc)) {
+                units[i].features = units[b.unit].features.clone();
+            }
         }
     }
-    for u in &mut kept {
-        for d in &mut u.deps {
-            d.unit = map[d.unit];
-        }
+    for &r in &g.roots {
+        units[r].is_root = true;
     }
-    Ok(kept)
+    Ok(units)
 }
 
 impl Ctx {
@@ -1046,6 +1062,11 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     if let Ok(canon) = fs::canonicalize(&toolchain_bin) {
         prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
     }
+    // rust-lld & friends live under lib/rustlib/<triple>/bin — also keyed
+    let rustlib = Path::new(&ctx.sysroot).join("lib/rustlib");
+    if let Ok(canon) = fs::canonicalize(&rustlib) {
+        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
+    }
     for p in exec_lits {
         // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
         // to rustup, so resolve before emitting the rule
@@ -1053,6 +1074,19 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
+    // the Apple tool group, keyed collectively via the Xcode identity in
+    // the toolchain hash
+    for p in [
+        "/usr/bin/ar",
+        "/usr/bin/ranlib",
+        "/usr/bin/xcrun",
+        "/usr/bin/xcodebuild",
+        "/usr/bin/xcode-select",
+        "/bin/sh",
+    ] {
+        prof.push_str(&format!("  (literal \"{p}\")\n"));
+    }
+    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
     prof.push_str(&format!("  (subpath \"{}\")\n", ctx.store.root.join("tools").display()));
     // survey escape hatch: DCARGO_UNSAFE_EXEC=path1:path2 — deliberately
     // unhermetic, used to enumerate a project's ambient tool dependencies
@@ -1070,7 +1104,7 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
     prof.push_str(")\n");
     prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
-    for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot"] {
+    for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot", "/private/var/run/com.apple.security.cryptexd"] {
         prof.push_str(&format!("  (subpath \"{p}\")\n"));
     }
     let mut reads: Vec<String> = vec![
@@ -1137,9 +1171,14 @@ fn describe(ctx: &Ctx, idx: usize) -> String {
         }
         Kind::Bsc => "build.rs compile".to_string(),
         Kind::Bsr => "build.rs run".to_string(),
-        Kind::Bin(ti) => format!("bin \"{}\"", p.targets[ti].name),
+        Kind::Bin => format!("bin \"{}\"", u.target.name),
     };
-    format!("{} v{} ({what})", p.name, p.version)
+    let plat = if !u.host {
+        ctx.target.as_deref().map(|t| format!(" → {t}")).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!("{} v{} ({what}{plat})", p.name, p.version)
 }
 
 struct SchedState {
@@ -1259,10 +1298,12 @@ fn finish_compile(
     cached: bool,
     res: ActionResult,
 ) -> Result<UnitResult> {
-    let main_name = match crate_type {
-        "lib" => format!("lib{crate_name}-{k16}.rlib"),
-        "proc-macro" => format!("lib{crate_name}-{k16}{dylib_suffix}"),
-        _ => format!("{crate_name}-{k16}"),
+    let main_name = if crate_type == "proc-macro" {
+        format!("lib{crate_name}-{k16}{dylib_suffix}")
+    } else if crate_type == "lib" || crate_type.split(',').any(|c| c == "rlib" || c == "lib") {
+        format!("lib{crate_name}-{k16}.rlib")
+    } else {
+        format!("{crate_name}-{k16}")
     };
     let main = res
         .outputs
@@ -1281,22 +1322,25 @@ fn finish_compile(
 fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
-    let node = &ctx.meta.resolve.nodes[unit.node];
     let pkg_root = pkg.root();
 
-    let (target, crate_name, crate_type): (&Target, String, &str) = match unit.kind {
+    let target: &Target = &unit.target;
+    let (crate_name, crate_type): (String, String) = match unit.kind {
         Kind::Lib => {
-            let t = meta::lib_target(pkg).context("no lib target")?;
-            let ct = if t.kind.iter().any(|k| k == "proc-macro") { "proc-macro" } else { "lib" };
-            (t, t.name.replace('-', "_"), ct)
+            let ct = if target.kind.iter().any(|k| k == "proc-macro") {
+                "proc-macro".to_string()
+            } else if unit.is_root && target.crate_types.iter().any(|c| c == "cdylib") {
+                // the deployable: build with its declared crate types
+                target.crate_types.join(",")
+            } else {
+                "lib".to_string()
+            };
+            (target.name.replace('-', "_"), ct)
         }
-        Kind::Bsc => {
-            let t = meta::build_script_target(pkg).context("no build script target")?;
-            (t, t.name.replace('-', "_"), "bin")
-        }
-        Kind::Bin(ti) => (&pkg.targets[ti], pkg.targets[ti].name.replace('-', "_"), "bin"),
+        Kind::Bsc | Kind::Bin => (target.name.replace('-', "_"), "bin".to_string()),
         Kind::Bsr => unreachable!(),
     };
+    let crate_type = crate_type.as_str();
     // compile with cwd = package root and a *relative* source path: no
     // absolute paths reach rustc for the code itself.
     let src_rel = Path::new(&target.src_path)
@@ -1304,7 +1348,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| target.src_path.clone());
 
-    let mut features: Vec<String> = node.features.clone();
+    let mut features: Vec<String> = unit.features.clone();
     features.sort();
 
     let default_bs = BuildScriptOut::default();
@@ -1327,7 +1371,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
 
     let mut link_search: Vec<String> = bs.link_search.clone();
     let mut link_args: Vec<String> = Vec::new();
-    if matches!(unit.kind, Kind::Bin(_)) {
+    if matches!(unit.kind, Kind::Bin) {
         link_args = bs.link_args.clone();
         // native lib search paths from all transitive build scripts must be
         // visible when linking the final binary
@@ -1354,7 +1398,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     }
 
     let mut env = ctx.pkg_env(pkg);
-    if matches!(unit.kind, Kind::Bin(_)) {
+    if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
     }
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
@@ -1383,6 +1427,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         env: &env,
         cap_lints,
         toolchain: if crate_type == "lib" { "" } else { &ctx.toolchain },
+        tgt: if unit.host { "" } else { ctx.target.as_deref().unwrap_or("") },
     })?;
     let key = sha256_hex(key_json.as_bytes());
     let k16: String = key[..16].to_string();
@@ -1434,6 +1479,11 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     cmd.arg(&src_rel);
     cmd.arg("--crate-type").arg(crate_type);
     cmd.arg("--emit=link,dep-info");
+    if !unit.host {
+        if let Some(t) = &ctx.target {
+            cmd.arg("--target").arg(t);
+        }
+    }
     for f in ctx.profile_flags {
         cmd.arg(f);
     }
@@ -1538,7 +1588,6 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
 fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
-    let node = &ctx.meta.resolve.nodes[unit.node];
     let pkg_root = pkg.root();
 
     let mut script: Option<OutputFile> = None;
@@ -1565,7 +1614,12 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let script = script.context("build script binary missing")?;
 
     let mut env = ctx.pkg_env(pkg);
-    env.push(("TARGET".into(), ctx.host.clone()));
+    let plat_triple = if unit.host {
+        ctx.host.clone()
+    } else {
+        ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
+    };
+    env.push(("TARGET".into(), plat_triple));
     env.push(("HOST".into(), ctx.host.clone()));
     env.push(("PROFILE".into(), ctx.profile_name.into()));
     env.push(("OPT_LEVEL".into(), ctx.opt_level.into()));
@@ -1586,10 +1640,11 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
             env.push((name.clone(), value.clone())); // keyed via the env vec
         }
     }
-    for (k, v) in &ctx.cfg_env {
+    let plat_cfg = if unit.host { &ctx.cfg_env } else { &ctx.cfg_env_target };
+    for (k, v) in plat_cfg {
         env.push((k.clone(), v.clone()));
     }
-    let mut features = node.features.clone();
+    let mut features = unit.features.clone();
     features.sort();
     for f in &features {
         env.push((format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")), "1".into()));

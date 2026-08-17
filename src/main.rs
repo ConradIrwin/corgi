@@ -18,14 +18,16 @@ fn real_main() -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut release = false;
+    let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
             "--release" => release = true,
+            "--target" => target = Some(args.next().context("--target needs a value")?),
             "build" | "audit" if cmd.is_none() => cmd = Some(a),
-            _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [--release] [-v])"),
+            _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [--release] [--target TRIPLE] [-v])"),
         }
     }
     if let Some(c) = cmd.as_deref() {
@@ -53,5 +55,5 @@ fn real_main() -> Result<()> {
         return audit::audit(&dir, release, verbose);
     }
     let store = store::Store::new(store_root)?;
-    build::build(store, &dir, verbose, release)
+    build::build(store, &dir, verbose, release, target)
 }

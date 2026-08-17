@@ -173,6 +173,19 @@ is a hard "hermeticity violation" error naming the file, because it would
 not be part of the action key. Build-script *file* reads have no dep-info
 equivalent — they are bounded by the sandbox and the package hash instead.
 
+## Cross-compilation (--target)
+
+`dcargo build --target wasm32-unknown-unknown` builds cdylib deployables:
+rust-std for the target is fetched/verified into the pinned toolchain,
+units split into host (proc-macros, build scripts + their deps) and target
+platforms, and the target triple joins the action keys. Resolution now
+comes from cargo's own `--unit-graph` (via RUSTC_BOOTSTRAP=1, planning
+only): exact per-platform, per-subtree features and dep edges — replacing
+the hand-rolled graph walk and cfg evaluator. The Apple tool group
+(ar/ranlib/xcrun/xcodebuild/sh + the Metal cryptex) is permanently allowed
+and keyed collectively via one Xcode identity (`xcodebuild -version`) in
+the toolchain hash.
+
 ## Known gaps / future work (PoC scope)
 
 - toolchain identity beyond `rustc -vV` is not hashed (cc/ld versions, PATH);
