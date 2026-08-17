@@ -11,13 +11,22 @@ use std::time::Instant;
 
 const TOOL_VERSION: &str = "dcargo/0.5";
 
-/// One fixed profile for the PoC (~debug, but debuginfo off so we do not
-/// have to deal with split-debuginfo path determinism yet).
-const PROFILE_FLAGS: &[&str] = &[
+/// Profiles (debuginfo stays off in both for now: split-debuginfo path
+/// determinism is future work). Flags are part of every action key, and the
+/// store is append-only, so profiles coexist and never evict each other.
+const DEBUG_FLAGS: &[&str] = &[
     "-Copt-level=0",
     "-Cdebuginfo=0",
     "-Cdebug-assertions=on",
     "-Coverflow-checks=on",
+    "-Cembed-bitcode=no",
+    "-Cstrip=none",
+];
+const RELEASE_FLAGS: &[&str] = &[
+    "-Copt-level=3",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=off",
+    "-Coverflow-checks=off",
     "-Cembed-bitcode=no",
     "-Cstrip=none",
 ];
@@ -100,6 +109,9 @@ pub struct Ctx {
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     dylib_suffix: &'static str,
+    profile_name: &'static str,
+    profile_flags: &'static [&'static str],
+    opt_level: &'static str,
 }
 
 #[derive(Serialize)]
@@ -140,7 +152,7 @@ struct RunKey<'a> {
     dep_env: &'a [(String, String)],
 }
 
-pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
+pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<()> {
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -278,6 +290,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         dylib_suffix,
+        profile_name: if release { "release" } else { "debug" },
+        profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
+        opt_level: if release { "3" } else { "0" },
     };
 
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
@@ -288,7 +303,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool) -> Result<()> {
             let t = &ctx.meta.packages[u.pkg].targets[ti];
             let r = results[i].get().context("bin not built")?;
             let m = r.main.as_ref().context("bin artifact missing")?;
-            let dest = dir.join("dtarget").join("debug").join(&t.name);
+            let dest = dir.join("dtarget").join(ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
             eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
         }
@@ -848,7 +863,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         link_search: &link_search,
         link_args: &link_args,
         out_key: &out_key,
-        profile: PROFILE_FLAGS,
+        profile: ctx.profile_flags,
         env: &env,
         cap_lints,
     })?;
@@ -895,7 +910,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     cmd.arg(&src_rel);
     cmd.arg("--crate-type").arg(crate_type);
     cmd.arg("--emit=link");
-    for f in PROFILE_FLAGS {
+    for f in ctx.profile_flags {
         cmd.arg(f);
     }
     cmd.arg(format!("-Cmetadata={k16}"));
@@ -1005,8 +1020,8 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let mut env = ctx.pkg_env(pkg);
     env.push(("TARGET".into(), ctx.host.clone()));
     env.push(("HOST".into(), ctx.host.clone()));
-    env.push(("PROFILE".into(), "debug".into()));
-    env.push(("OPT_LEVEL".into(), "0".into()));
+    env.push(("PROFILE".into(), ctx.profile_name.into()));
+    env.push(("OPT_LEVEL".into(), ctx.opt_level.into()));
     env.push(("DEBUG".into(), "false".into()));
     env.push(("NUM_JOBS".into(), "4".into()));
     env.push(("RUSTC".into(), ctx.rustc.clone()));

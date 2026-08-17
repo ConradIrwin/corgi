@@ -16,13 +16,15 @@ fn real_main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut release = false;
     let mut cmd: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
+            "--release" => release = true,
             "build" if cmd.is_none() => cmd = Some(a),
-            _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [-v])"),
+            _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [--release] [-v])"),
         }
     }
     if let Some(c) = cmd.as_deref() {
@@ -47,5 +49,5 @@ fn real_main() -> Result<()> {
         }
     });
     let store = store::Store::new(store_root)?;
-    build::build(store, &dir, verbose)
+    build::build(store, &dir, verbose, release)
 }
