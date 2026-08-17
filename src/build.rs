@@ -555,7 +555,10 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
     // Actions never see the ambient PATH: they get [tool shims:]/usr/bin:/bin.
     // The shim dir contains symlinks to the pinned tools, so bare-name
     // spawns (`Command::new("cmake")`) resolve to keyed content.
-    let mut action_path = "/usr/bin:/bin".to_string();
+    // DCARGO_ACTION_PATH: survey knob to substitute the system portion of
+    // the action PATH (e.g. with exec-logging wrapper scripts)
+    let mut action_path =
+        std::env::var("DCARGO_ACTION_PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
     if !tool_envs.is_empty() {
         let shims = store.root.join("toolsets").join(&tools_id[..16]);
         if !shims.exists() {
