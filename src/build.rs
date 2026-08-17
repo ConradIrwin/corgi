@@ -414,6 +414,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool) -> Result<(
         && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
     if sandbox {
         eprintln!("dcargo: hermetic sandbox enabled (seatbelt)");
+        if std::env::var_os("DCARGO_UNSAFE_EXEC").is_some() {
+            eprintln!("dcargo: WARNING: DCARGO_UNSAFE_EXEC set — exec allowlist widened, build is NOT hermetic (survey mode)");
+        }
     }
     // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
     // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
@@ -801,6 +804,12 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     if let Some(r) = find_in_path(&ctx.rustc) {
         exec_lits.push(r.display().to_string());
     }
+    // the whole pinned-toolchain bin dir is keyed content (e.g.
+    // proc-macro-crate spawns `cargo locate-project` at macro expansion)
+    let toolchain_bin = Path::new(&ctx.sysroot).join("bin");
+    if let Ok(canon) = fs::canonicalize(&toolchain_bin) {
+        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
+    }
     for p in exec_lits {
         // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
         // to rustup, so resolve before emitting the rule
@@ -808,6 +817,19 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
+    // survey escape hatch: DCARGO_UNSAFE_EXEC=path1:path2 — deliberately
+    // unhermetic, used to enumerate a project's ambient tool dependencies
+    if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
+        for p in extra.split(':').filter(|p| !p.is_empty()) {
+            prof.push_str(&format!("  (subpath \"{p}\")\n"));
+        }
+    }
+    // actions may execute binaries they just built in their own writable
+    // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
+    // are products of keyed inputs, so this stays hermetic
+    for w in writes {
+        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
+    }
     prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
     prof.push_str(")\n");
     prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
@@ -830,6 +852,11 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     }
     for r in reads {
         prof.push_str(&format!("  (subpath \"{r}\")\n"));
+    }
+    if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
+        for p in extra.split(':').filter(|p| !p.is_empty()) {
+            prof.push_str(&format!("  (subpath \"{p}\")\n"));
+        }
     }
     prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
     for d in &ctx.darwin_dirs {
@@ -862,7 +889,8 @@ struct SchedState {
     ready: Vec<usize>,
     indeg: Vec<usize>,
     done: usize,
-    error: Option<String>,
+    in_flight: usize,
+    errors: Vec<String>,
     executed: usize,
     cached: usize,
 }
@@ -878,7 +906,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         }
     }
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
-    let state = Mutex::new(SchedState { ready, indeg, done: 0, error: None, executed: 0, cached: 0 });
+    let state = Mutex::new(SchedState { ready, indeg, done: 0, in_flight: 0, errors: Vec::new(), executed: 0, cached: 0 });
     let cv = Condvar::new();
     let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n.max(1));
 
@@ -888,17 +916,21 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 let idx = {
                     let mut st = state.lock().unwrap();
                     loop {
-                        if st.error.is_some() || st.done == n {
-                            return;
-                        }
                         if let Some(i) = st.ready.pop() {
+                            st.in_flight += 1;
                             break i;
+                        }
+                        // keep-going: failed units never release dependents,
+                        // so quiescence (nothing running, nothing ready) ends
+                        if st.in_flight == 0 {
+                            return;
                         }
                         st = cv.wait(st).unwrap();
                     }
                 };
                 let res = run_unit(ctx, idx, results);
                 let mut st = state.lock().unwrap();
+                st.in_flight -= 1;
                 match res {
                     Ok(ur) => {
                         let verb = if ur.cached {
@@ -924,9 +956,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         }
                     }
                     Err(e) => {
-                        if st.error.is_none() {
-                            st.error = Some(format!("{e:#}"));
-                        }
+                        eprintln!("   FAILED {} — dependents skipped", describe(ctx, idx));
+                        st.errors.push(format!("[{}] {e:#}", describe(ctx, idx)));
+                        st.done += 1;
                     }
                 }
                 drop(st);
@@ -936,8 +968,20 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     });
 
     let st = state.into_inner().unwrap();
-    if let Some(e) = st.error {
-        bail!("{e}");
+    if !st.errors.is_empty() {
+        eprintln!("\ndcargo: ===== {} units failed =====", st.errors.len());
+        for (i, e) in st.errors.iter().enumerate() {
+            let lines: Vec<&str> = e.lines().collect();
+            let tail = lines.len().saturating_sub(22);
+            let short: String = lines[..2.min(lines.len())]
+                .iter()
+                .chain(lines[tail.max(2.min(lines.len()))..].iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            eprintln!("  {}. {short}\n", i + 1);
+        }
+        bail!("{} units failed (skipped dependents not counted)", st.errors.len());
     }
     Ok((st.executed, st.cached))
 }
