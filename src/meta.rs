@@ -39,6 +39,8 @@ pub struct Package {
     pub readme: Option<String>,
     #[serde(default)]
     pub rust_version: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 impl Package {
@@ -56,6 +58,8 @@ pub struct Target {
     pub crate_types: Vec<String>,
     pub src_path: String,
     pub edition: String,
+    #[serde(rename = "required-features", default)]
+    pub required_features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +92,19 @@ pub struct DepKindInfo {
     pub kind: Option<String>,
     #[serde(default)]
     pub target: Option<String>,
+}
+
+/// `[package.metadata.dcargo] extra-inputs = [...]` — declared
+/// cross-package inputs, hashed into the source hash and allowed by the
+/// containment checker. Cargo ignores metadata tables, so this is inert
+/// under stock cargo.
+pub fn extra_inputs(p: &Package) -> Vec<String> {
+    p.metadata
+        .get("dcargo")
+        .and_then(|d| d.get("extra-inputs"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 pub fn lib_target(p: &Package) -> Option<&Target> {

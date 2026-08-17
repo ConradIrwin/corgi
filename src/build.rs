@@ -737,8 +737,13 @@ fn build_units(
             units.push(Unit { pkg: pi, node: ni, kind: Kind::Lib, deps: vec![] });
         }
         if pkg.id == root_id {
+            let node = &meta.resolve.nodes[ni];
             for (ti, t) in pkg.targets.iter().enumerate() {
                 if t.kind.iter().any(|k| k == "bin") {
+                    // cargo semantics: bins with unmet required-features are skipped
+                    if !t.required_features.iter().all(|f| node.features.contains(f)) {
+                        continue;
+                    }
                     units.push(Unit { pkg: pi, node: ni, kind: Kind::Bin(ti), deps: vec![] });
                 }
             }
@@ -884,8 +889,23 @@ impl Ctx {
             return Ok(h.clone());
         }
         let pkg = &self.meta.packages[pi];
-        let h = hash_dir(&pkg.root())
+        let mut h = hash_dir(&pkg.root())
             .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
+        let extras = meta::extra_inputs(pkg);
+        if !extras.is_empty() {
+            let mut acc = h;
+            for e in &extras {
+                let p = pkg.root().join(e).canonicalize().with_context(|| {
+                    format!("extra-input `{e}` of {} does not exist", pkg.name)
+                })?;
+                if !p.starts_with(Path::new(&self.workspace_root)) {
+                    bail!("extra-input `{e}` of {} escapes the workspace", pkg.name);
+                }
+                let eh = if p.is_dir() { hash_dir(&p)? } else { crate::store::sha256_file(&p)? };
+                acc.push_str(&format!("|{e}\0{eh}"));
+            }
+            h = sha256_hex(acc.as_bytes());
+        }
         self.src_hash_memo.lock().unwrap().insert(pi, h.clone());
         Ok(h)
     }
@@ -1246,7 +1266,10 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         }
     }
 
-    let env = ctx.pkg_env(pkg);
+    let mut env = ctx.pkg_env(pkg);
+    if matches!(unit.kind, Kind::Bin(_)) {
+        env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
+    }
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
     let cap_lints = pkg.source.is_some();
 
@@ -1381,10 +1404,17 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     // is missing an input and we refuse to cache a lie.
     let dep_file = outdir.join(format!("{crate_name}-{k16}.d"));
     if let Ok(d) = fs::read_to_string(&dep_file) {
-        let store_root = ctx.store.root.clone();
-        let logical = ctx.store.logical_root().to_path_buf();
-        let sys = PathBuf::from(&ctx.sysroot);
-        validate_dep_info(&d, &pkg_root, &[&store_root, &logical, &sys]).with_context(|| {
+        let mut allowed: Vec<PathBuf> = vec![
+            ctx.store.root.clone(),
+            ctx.store.logical_root().to_path_buf(),
+            PathBuf::from(&ctx.sysroot),
+        ];
+        for e in meta::extra_inputs(pkg) {
+            if let Ok(p) = pkg_root.join(&e).canonicalize() {
+                allowed.push(p); // declared -> hashed -> allowed
+            }
+        }
+        validate_dep_info(&d, &pkg_root, &allowed).with_context(|| {
             format!("hermeticity violation compiling {} v{}", pkg.name, pkg.version)
         })?;
         fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
@@ -1612,7 +1642,7 @@ fn patch_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[&PathBuf]) -> Result<()> {
+fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[PathBuf]) -> Result<()> {
     for line in dep.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
