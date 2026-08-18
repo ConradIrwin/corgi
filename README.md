@@ -71,6 +71,34 @@ write-to-temp-then-`rename()` (atomic on POSIX):
 Two concurrent cold builds of the same tree both succeed; in the worst case
 they duplicate some work, they never block or corrupt. (Verified empirically.)
 
+### Warm-build fast path (plan cache + stat hints)
+
+A no-op build must feel instant, so the expensive warm-path work is cached
+at two layers:
+
+- **Plan cache**: `cargo fetch` + `cargo metadata` + `cargo build --unit-graph`
+  (~0.8s even when nothing changed) are skipped entirely when nothing that
+  shapes them changed. A pointer keyed on toolchain/target/profile and the
+  build-dir + tools manifests leads to an entry that re-validates the rest by
+  content: every workspace manifest, `Cargo.lock`, `.cargo/config*`, and the
+  member-glob directory listings (so a new `crates/*` subdir invalidates).
+  The cached cargo JSON lives in the CAS; entry paths are workspace-relative
+  and absolute paths inside the JSON are re-rooted on load, so a bit-identical
+  checkout in a different directory shares the plan.
+- **Source-hash hints**: per-package Merkle hashing consults a per-directory
+  hint file (size/mtime/inode per file) and only re-reads files whose stat
+  changed — same digest as a full read, just cheaper. Registry/git package
+  hashes are immutable and cached once, keyed by `source|name|version`.
+
+Lockfile handling never bothers the user: cargo runs with `--locked` (which
+never writes), and if it rejects a missing/stale `Cargo.lock`, dcargo reruns
+once unlocked so cargo brings the lock up to date, then continues — the plan
+fingerprint hashes the lock *after* that step. dcargo itself never writes the
+lock.
+
+Measured no-op: cloud worker (465 units) 1.9s -> **0.20s**; zed (1,678 units)
+3.7s -> **2.0s**.
+
 ## Verified behaviour
 
 - re-saving files without changes (new mtimes/inodes): `0 executed, 17 cached`

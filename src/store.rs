@@ -27,10 +27,24 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
+/// Per-file hint: (size, mtime_ns, inode) -> content hash. Hints only let
+/// us skip re-hashing; any metadata mismatch falls back to hashing bytes,
+/// so mtimes never decide correctness.
+type Hints = std::collections::HashMap<String, (u64, i64, u64, String)>;
+
+fn stat_key(md: &fs::Metadata) -> (u64, i64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (md.size(), md.mtime() * 1_000_000_000 + md.mtime_nsec(), md.ino())
+}
+
 /// Hash a directory tree by *content only*: relative paths + file bytes.
 /// mtimes, inode numbers, absolute paths never enter the hash.
 pub fn hash_dir(root: &Path) -> Result<String> {
-    fn walk(h: &mut Sha256, root: &Path, rel: &Path) -> Result<()> {
+    hash_dir_hinted(root, &Hints::new(), &mut Hints::new())
+}
+
+fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<String> {
+    fn walk(h: &mut Sha256, root: &Path, rel: &Path, hints: &Hints, fresh: &mut Hints) -> Result<()> {
         let dir = root.join(rel);
         let mut names: Vec<std::ffi::OsString> = Vec::new();
         for e in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
@@ -60,19 +74,25 @@ pub fn hash_dir(root: &Path) -> Result<String> {
                 h.update(b"D");
                 h.update(rl.as_bytes());
                 h.update([0]);
-                walk(h, root, &rel_child)?;
+                walk(h, root, &rel_child, hints, fresh)?;
             } else {
+                let key = stat_key(&md);
+                let content = match hints.get(&rl) {
+                    Some((sz, mt, ino, hash)) if (*sz, *mt, *ino) == key => hash.clone(),
+                    _ => sha256_file(&p)?,
+                };
+                fresh.insert(rl.clone(), (key.0, key.1, key.2, content.clone()));
                 h.update(b"F");
                 h.update(rl.as_bytes());
                 h.update([0]);
-                h.update(sha256_file(&p)?.as_bytes());
+                h.update(content.as_bytes());
                 h.update([0]);
             }
         }
         Ok(())
     }
     let mut h = Sha256::new();
-    walk(&mut h, root, Path::new(""))?;
+    walk(&mut h, root, Path::new(""), hints, fresh)?;
     Ok(hex(&h.finalize()))
 }
 
@@ -170,6 +190,16 @@ impl Store {
         Ok(hash)
     }
 
+    /// Insert in-memory bytes into the CAS (used for cached plan JSON).
+    pub fn insert_bytes(&self, data: &[u8]) -> Result<String> {
+        let hash = sha256_hex(data);
+        let dest = self.cas_path(&hash);
+        if !dest.exists() {
+            self.write_atomic(&dest, data)?;
+        }
+        Ok(hash)
+    }
+
     pub fn write_atomic(&self, dest: &Path, data: &[u8]) -> Result<()> {
         fs::create_dir_all(dest.parent().unwrap())?;
         let tmp = self.tmp_path("w");
@@ -210,6 +240,42 @@ impl Store {
             }
         }
         Ok(dest)
+    }
+
+    /// Content hash of a directory with store-persisted caching.
+    /// `immutable_key`: registry/git checkouts never change once extracted,
+    /// so their hash is computed once ever. Mutable trees use per-file
+    /// (size, mtime, inode) hints; changed files are re-hashed by content.
+    pub fn hash_dir_cached(&self, root: &Path, immutable_key: Option<&str>) -> Result<String> {
+        if let Some(k) = immutable_key {
+            let p = self
+                .root
+                .join("srchash")
+                .join(format!("{}.txt", sha256_hex(k.as_bytes())));
+            if let Ok(h) = fs::read_to_string(&p) {
+                let h = h.trim().to_string();
+                if h.len() == 64 {
+                    return Ok(h);
+                }
+            }
+            let h = hash_dir(root)?;
+            self.write_atomic(&p, h.as_bytes())?;
+            return Ok(h);
+        }
+        let hint_path = self
+            .root
+            .join("srchash")
+            .join(format!("{}.json", sha256_hex(root.display().to_string().as_bytes())));
+        let hints: Hints = fs::read(&hint_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mut fresh = Hints::new();
+        let h = hash_dir_hinted(root, &hints, &mut fresh)?;
+        if fresh != hints {
+            self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
+        }
+        Ok(h)
     }
 
     /// Copy a CAS blob out to a destination in the worktree.

@@ -1,8 +1,8 @@
 use crate::meta::{self, Metadata, Package, Target};
-use crate::store::{hash_dir, sha256_hex, Store};
+use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -574,17 +574,110 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         cfg_env.clone()
     };
 
-    eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
-    capture(
-        Command::new(&cargo_bin).args(["fetch", "--manifest-path"]).arg(&manifest),
-        "cargo fetch",
-    )?;
-    // metadata for package details only (paths, links, metadata tables);
-    // the actual per-unit resolution comes from cargo's unit-graph below
-    let mut meta_cmd = Command::new(&cargo_bin);
-    meta_cmd.args(["metadata", "--format-version", "1"]);
-    meta_cmd.arg("--manifest-path").arg(&manifest);
-    let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
+    // ---- plan-phase cache -------------------------------------------------
+    // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
+    // changed. Their outputs are a pure function of: dcargo itself, the
+    // pinned toolchain, target/profile, the tools manifest (feature
+    // universes), every workspace manifest, the lockfile, cargo config, and
+    // the member-glob directory listings. A pointer keyed on the cheap
+    // always-read inputs leads to an entry that re-validates the rest by
+    // content fingerprint. Entry paths are workspace-relative, so a
+    // bit-identical checkout in a different directory still hits.
+    let (tools_text, universes) = match read_tools_manifest(&dir)? {
+        Some((text, _, _, u)) => (text, u),
+        None => (String::new(), Universes::new()),
+    };
+    let plan_ptr = sha256_hex(
+        format!(
+            "plan-ptr\0{TOOL_VERSION}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
+            target.as_deref().unwrap_or(""),
+            sha256_hex(&fs::read(&manifest)?),
+            sha256_hex(tools_text.as_bytes()),
+        )
+        .as_bytes(),
+    );
+    let mut plan: Option<(String, String)> = None; // (metadata json, unit-graph json)
+    if let Some(bytes) = store.load_action(&plan_ptr) {
+        if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
+            if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
+                if plan_fingerprint(&ws_root, &entry.files, &entry.glob_dirs) == entry.fingerprint {
+                    let meta_text =
+                        fs::read(store.cas_path(&entry.meta_cas)).ok().and_then(|b| String::from_utf8(b).ok());
+                    let ug_text =
+                        fs::read(store.cas_path(&entry.ug_cas)).ok().and_then(|b| String::from_utf8(b).ok());
+                    if let (Some(mut m), Some(mut u)) = (meta_text, ug_text) {
+                        // cargo output embeds absolute paths; re-root them so
+                        // bit-identical checkouts elsewhere can share plans
+                        let new_root = ws_root.display().to_string();
+                        if entry.ws_root_abs != new_root {
+                            m = m.replace(&entry.ws_root_abs, &new_root);
+                            u = u.replace(&entry.ws_root_abs, &new_root);
+                        }
+                        plan = Some((m, u));
+                    }
+                }
+            }
+        }
+    }
+    let (meta_json, ug_json) = match plan {
+        Some(cached) => {
+            eprintln!("dcargo: plan unchanged (cached resolve; skipping cargo)");
+            cached
+        }
+        None => {
+            eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
+            // Never bother the user about a stale lockfile: try --locked
+            // first (it never writes), and when cargo rejects it, run once
+            // unlocked so cargo brings Cargo.lock up to date, then continue.
+            // The plan fingerprint hashes the lock *after* this step.
+            if capture(
+                Command::new(&cargo_bin).args(["fetch", "--locked", "--manifest-path"]).arg(&manifest),
+                "cargo fetch --locked",
+            )
+            .is_err()
+            {
+                eprintln!("dcargo: Cargo.lock is missing or stale; letting cargo update it");
+                capture(
+                    Command::new(&cargo_bin).args(["fetch", "--manifest-path"]).arg(&manifest),
+                    "cargo fetch",
+                )?;
+            }
+            // metadata for package details only (paths, links, metadata tables);
+            // the actual per-unit resolution comes from cargo's unit-graph below
+            let mut meta_cmd = Command::new(&cargo_bin);
+            meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
+            meta_cmd.arg("--manifest-path").arg(&manifest);
+            let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
+            let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+            // Feature unification over a FIXED universe (whole workspace, or the
+            // declared member set for cross targets) — never scoped to the requested
+            // package, so a dep's features don't depend on what you're building.
+            let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
+            let mut ug_cmd = Command::new(&cargo_bin);
+            ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
+            ug_cmd.args(["build", "--unit-graph", "-Zunstable-options", "--locked"]);
+            if release {
+                ug_cmd.arg("--release");
+            }
+            if let Some(t) = &target {
+                ug_cmd.args(["--target", t]);
+            }
+            match target.as_ref().and_then(|t| universes.iter().find(|(k, _)| k == t)) {
+                Some((_, members)) => {
+                    for m in members {
+                        ug_cmd.args(["-p", m]);
+                    }
+                }
+                None => {
+                    ug_cmd.arg("--workspace");
+                }
+            }
+            ug_cmd.arg("--manifest-path").arg(&ws_manifest);
+            let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
+            save_plan(&store, &plan_ptr, &dir, &meta, &meta_json, &ug_json)?;
+            (meta_json, ug_json)
+        }
+    };
     let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
 
     let root_id = meta
@@ -596,33 +689,6 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-
-    // Feature unification over a FIXED universe (whole workspace, or the
-    // declared member set for cross targets) — never scoped to the requested
-    // package, so a dep's features don't depend on what you're building.
-    let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
-    let universes: Universes = read_tools_manifest(&dir)?.map(|(_, _, _, u)| u).unwrap_or_default();
-    let mut ug_cmd = Command::new(&cargo_bin);
-    ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
-    ug_cmd.args(["build", "--unit-graph", "-Zunstable-options"]);
-    if release {
-        ug_cmd.arg("--release");
-    }
-    if let Some(t) = &target {
-        ug_cmd.args(["--target", t]);
-    }
-    match target.as_ref().and_then(|t| universes.iter().find(|(k, _)| k == t)) {
-        Some((_, members)) => {
-            for m in members {
-                ug_cmd.args(["-p", m]);
-            }
-        }
-        None => {
-            ug_cmd.arg("--workspace");
-        }
-    }
-    ug_cmd.arg("--manifest-path").arg(&ws_manifest);
-    let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
 
@@ -848,6 +914,142 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     Ok(())
 }
 
+/// What the plan cache stores: CAS pointers to the cargo metadata and
+/// unit-graph JSON, plus everything needed to prove they are still valid.
+#[derive(Serialize, Deserialize)]
+struct PlanEntry {
+    /// Build dir -> workspace root, relative (validates from any checkout).
+    ws_root_rel: String,
+    /// Workspace root as cargo spelled it at save time; cached JSON embeds
+    /// this prefix in absolute paths, so loads from a different checkout
+    /// re-root by string replacement.
+    ws_root_abs: String,
+    /// Workspace-root-relative files whose content shapes the plan.
+    files: Vec<String>,
+    /// Workspace-root-relative dirs whose set of crate subdirs shapes the
+    /// plan (member globs like `crates/*` pick up new directories).
+    glob_dirs: Vec<String>,
+    fingerprint: String,
+    meta_cas: String,
+    ug_cas: String,
+}
+
+/// Hash every plan input: file contents, plus (for glob dirs) the sorted
+/// child directory names that contain a Cargo.toml. Missing files hash as
+/// absent, so their later appearance invalidates too.
+fn plan_fingerprint(ws_root: &Path, files: &[String], glob_dirs: &[String]) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    for f in files {
+        buf.extend_from_slice(f.as_bytes());
+        buf.push(0);
+        if let Ok(b) = fs::read(plan_abs(ws_root, f)) {
+            buf.extend_from_slice(&b);
+        } else {
+            buf.extend_from_slice(b"<absent>");
+        }
+        buf.push(0xff);
+    }
+    for d in glob_dirs {
+        buf.extend_from_slice(d.as_bytes());
+        buf.push(0);
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(rd) = fs::read_dir(plan_abs(ws_root, d)) {
+            for e in rd.flatten() {
+                if e.path().join("Cargo.toml").is_file() {
+                    names.push(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        for n in &names {
+            buf.extend_from_slice(n.as_bytes());
+            buf.push(0);
+        }
+        buf.push(0xff);
+    }
+    sha256_hex(&buf)
+}
+
+fn plan_abs(ws_root: &Path, rel: &str) -> PathBuf {
+    if rel.starts_with('/') {
+        PathBuf::from(rel)
+    } else {
+        ws_root.join(rel)
+    }
+}
+
+/// `to` expressed relative to `from` (both absolute).
+fn rel_path(from: &Path, to: &Path) -> String {
+    let from_parts: Vec<_> = from.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+    let mut common = 0;
+    while common < from_parts.len() && common < to_parts.len() && from_parts[common] == to_parts[common]
+    {
+        common += 1;
+    }
+    let mut parts: Vec<String> = vec!["..".to_string(); from_parts.len() - common];
+    for c in &to_parts[common..] {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// Record the resolve outputs so an unchanged workspace skips cargo
+/// entirely next time.
+fn save_plan(
+    store: &Store,
+    plan_ptr: &str,
+    dir: &Path,
+    meta: &Metadata,
+    meta_json: &str,
+    ug_json: &str,
+) -> Result<()> {
+    let ws_root = Path::new(&meta.workspace_root)
+        .canonicalize()
+        .context("canonicalizing workspace root")?;
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    files.insert("Cargo.toml".to_string());
+    files.insert("Cargo.lock".to_string());
+    // cargo config can reshape resolution (source replacement, patches);
+    // track the workspace-root and build-dir spellings. (Configs in dirs
+    // above the workspace are not tracked.)
+    for name in [".cargo/config.toml", ".cargo/config"] {
+        files.insert(name.to_string());
+        files.insert(rel_path(&ws_root, &dir.join(name)));
+    }
+    let mut glob_dirs: BTreeSet<String> = BTreeSet::new();
+    for p in &meta.packages {
+        if p.source.is_some() {
+            continue; // registry/git packages are pinned by the lockfile
+        }
+        let mp = Path::new(&p.manifest_path);
+        files.insert(rel_path(&ws_root, mp));
+        // the dir *containing* crate dirs: a new subdir with a Cargo.toml
+        // may enter a `crates/*` members glob
+        if let Some(container) = mp.parent().and_then(Path::parent) {
+            if container.starts_with(&ws_root) {
+                glob_dirs.insert(rel_path(&ws_root, container));
+            }
+        }
+    }
+    let files: Vec<String> = files.into_iter().collect();
+    let glob_dirs: Vec<String> = glob_dirs.into_iter().collect();
+    let entry = PlanEntry {
+        ws_root_rel: rel_path(dir, &ws_root),
+        ws_root_abs: meta.workspace_root.clone(),
+        fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs),
+        files,
+        glob_dirs,
+        meta_cas: store.insert_bytes(meta_json.as_bytes())?,
+        ug_cas: store.insert_bytes(ug_json.as_bytes())?,
+    };
+    store.save_action(plan_ptr, serde_json::to_string(&entry)?.as_bytes())
+}
+
 fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd.output().with_context(|| format!("running {what}"))?;
     if !out.status.success() {
@@ -1020,7 +1222,13 @@ impl Ctx {
             return Ok(h.clone());
         }
         let pkg = &self.meta.packages[pi];
-        let mut h = hash_dir(&pkg.root())
+        let immutable = pkg
+            .source
+            .as_ref()
+            .map(|src| format!("{src}|{}|{}", pkg.name, pkg.version));
+        let mut h = self
+            .store
+            .hash_dir_cached(&pkg.root(), immutable.as_deref())
             .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
         let extras = meta::extra_inputs(pkg);
         let ws_manifest = Path::new(&self.workspace_root).join("Cargo.toml");
@@ -1037,7 +1245,11 @@ impl Ctx {
                 if !p.starts_with(Path::new(&self.workspace_root)) {
                     bail!("extra-input `{e}` of {} escapes the workspace", pkg.name);
                 }
-                let eh = if p.is_dir() { hash_dir(&p)? } else { crate::store::sha256_file(&p)? };
+                let eh = if p.is_dir() {
+                    self.store.hash_dir_cached(&p, None)?
+                } else {
+                    crate::store::sha256_file(&p)?
+                };
                 acc.push_str(&format!("|{e}\0{eh}"));
             }
             h = sha256_hex(acc.as_bytes());
