@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.6";
+const TOOL_VERSION: &str = "dcargo/0.7";
 
 /// Profiles (debuginfo stays off in both for now: split-debuginfo path
 /// determinism is future work). Flags are part of every action key, and the
@@ -1212,8 +1212,12 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root
 
 impl Ctx {
     /// Real filesystem location of a published OUT_DIR.
-    fn out_dir_real(&self, key: &str) -> PathBuf {
-        self.store.root.join("outdirs").join(key).join("out")
+    /// The sentinel is written (atomically) only after a build script
+    /// finished and its directives were recorded: it is the sole on-disk
+    /// fact meaning "this OUT_DIR is complete". A dir without it is a
+    /// crash leftover and gets wiped by the next lock holder.
+    fn out_dir_ok(&self, key: &str) -> bool {
+        self.store.root.join("outdirs").join(key).join(".ok").exists()
     }
 
     /// Machine-independent spelling of the same path (via the store alias).
@@ -1242,7 +1246,7 @@ impl Ctx {
                 return Ok(None); // self-heal: treat as miss
             }
         }
-        if res.bs.is_some() && !self.out_dir_real(key).exists() {
+        if res.bs.is_some() && !self.out_dir_ok(key) {
             return Ok(None);
         }
         self.materialize(&res)?;
@@ -2040,25 +2044,29 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         return Ok(UnitResult { key, cached: true, res, main: None });
     }
 
-    // Stage OUT_DIR under a random id with the *same length* as the final
-    // action key, spelled through the canonical alias. Anything the script
-    // embeds can then be byte-patched (length-preserving, binary-safe) to
-    // the canonical location before publishing.
-    let staging = sha256_hex(
-        format!(
-            "{}-{}-{key}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-        .as_bytes(),
-    );
-    let stage_parent = ctx.store.root.join("outdirs").join(&staging);
-    let stage_out = stage_parent.join("out");
+    // The script runs *in place* at outdirs/<key>/out, so every path a tool
+    // embeds -- literally or derived (cc names objects by a hash of their
+    // input path, which no byte-patch can rewrite) -- is the canonical
+    // location on every machine. Atomicity comes from a sentinel written
+    // last; mutual exclusion from flock, which the kernel releases on any
+    // process death. The lock is per-action: it is only ever contended by a
+    // concurrent build doing this exact work, and the loser wakes to a
+    // finished sentinel.
+    let final_parent = ctx.store.root.join("outdirs").join(&key);
+    fs::create_dir_all(ctx.store.root.join("outdirs"))?;
+    let lock_file = fs::File::create(ctx.store.root.join("outdirs").join(format!("{key}.lock")))?;
+    lock_file.lock().with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
+    // While we waited: a concurrent winner may have finished the work.
+    if let Some(res) = ctx.try_cache_hit(&key)? {
+        return Ok(UnitResult { key, cached: true, res, main: None });
+    }
+    if final_parent.exists() {
+        // No sentinel (the cache probe above would have hit): crash leftover.
+        fs::remove_dir_all(&final_parent).context("clearing partial OUT_DIR")?;
+    }
+    let stage_out = final_parent.join("out");
     fs::create_dir_all(&stage_out)?;
-    let stage_logical = ctx.out_dir_logical(&staging);
+    let stage_logical = ctx.out_dir_logical(&key);
     let script_path = ctx.pool.join(&script.name);
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
@@ -2069,7 +2077,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         .collect();
     let mut reads: Vec<&Path> = vec![&pkg_root];
     reads.extend(extra_in.iter().map(|p| p.as_path()));
-    let mut writes: Vec<&Path> = vec![&stage_parent, &scratch];
+    let mut writes: Vec<&Path> = vec![&final_parent, &scratch];
     if std::env::var_os("DCARGO_UNSAFE_SHARED_OUTDIRS").is_some() {
         // survey-only: the `scratch` crate (used by cxx) bakes its published
         // OUT_DIR into its rlib and other build scripts write there at
@@ -2103,7 +2111,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
-        fs::remove_dir_all(&stage_parent).ok();
+        fs::remove_dir_all(&final_parent).ok();
         bail!(
             "build script failed for {} v{}:\n--- stdout\n{}--- stderr\n{}",
             pkg.name,
@@ -2113,60 +2121,19 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         );
     }
 
-    // canonicalize embedded paths: staging id -> action key (same length)
-    patch_tree(&stage_out, staging.as_bytes(), key.as_bytes())?;
-
-    // publish OUT_DIR at its stable content-keyed location (atomic; races benign)
-    let final_parent = ctx.store.root.join("outdirs").join(&key);
-    match fs::rename(&stage_parent, &final_parent) {
-        Ok(()) => {}
-        Err(_) if final_parent.exists() => {
-            fs::remove_dir_all(&stage_parent).ok();
-        }
-        Err(e) => return Err(e).context("publishing OUT_DIR"),
-    }
-
-    let stdout_fixed = stdout.replace(&staging, &key);
     let mut warnings = Vec::new();
-    let bs = parse_directives(&stdout_fixed, &mut warnings)?;
+    let bs = parse_directives(&stdout, &mut warnings)?;
     for w in warnings {
         eprintln!("dcargo: warning ({} build script): {w}", pkg.name);
     }
 
     let res = ActionResult { outputs: vec![], stderr, bs: Some(bs) };
+    // Commit order: sentinel (OUT_DIR complete), then the action record.
+    // A crash between the two leaves a probe-miss either way; the next
+    // builder re-acquires the lock and redoes the work.
+    ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     Ok(UnitResult { key, cached: false, res, main: None })
-}
-
-/// Replace `from` with `to` (same length) in every file under `dir`.
-/// Length-preserving, so offset-sensitive binary files stay valid.
-fn patch_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<()> {
-    assert_eq!(from.len(), to.len());
-    for e in fs::read_dir(dir)? {
-        let e = e?;
-        let p = e.path();
-        let ft = e.file_type()?;
-        if ft.is_dir() {
-            patch_tree(&p, from, to)?;
-        } else if ft.is_file() {
-            let data = fs::read(&p)?;
-            if data.windows(from.len()).any(|w| w == from) {
-                let mut patched = Vec::with_capacity(data.len());
-                let mut i = 0;
-                while i < data.len() {
-                    if data[i..].starts_with(from) {
-                        patched.extend_from_slice(to);
-                        i += from.len();
-                    } else {
-                        patched.push(data[i]);
-                        i += 1;
-                    }
-                }
-                fs::write(&p, patched)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[PathBuf]) -> Result<()> {
