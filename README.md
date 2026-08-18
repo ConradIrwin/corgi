@@ -96,8 +96,12 @@ once unlocked so cargo brings the lock up to date, then continues — the plan
 fingerprint hashes the lock *after* that step. dcargo itself never writes the
 lock.
 
-Measured no-op: cloud worker (465 units) 1.9s -> **0.20s**; zed (1,678 units)
-3.7s -> **2.0s**.
+- **Export hints**: exported artifacts (the ~1 GiB zed binary) are verified
+  by a stat hint instead of a full content re-read; tampered or deleted
+  outputs are still detected and repaired from the CAS.
+
+Measured no-op: cloud worker (465 units) 1.9s -> **0.11s**; zed (1,678 units)
+3.7s -> **0.15s**. `DCARGO_TIMING=1` prints a phase/hash-work breakdown.
 
 ## Verified behaviour
 

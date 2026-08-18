@@ -113,6 +113,7 @@ pub struct Ctx {
     darwin_dirs: Vec<String>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
+    src_hash_nanos: std::sync::atomic::AtomicU64,
     file_names_memo: Mutex<HashMap<(String, bool), Vec<String>>>,
     profile_name: &'static str,
     profile_flags: &'static [&'static str],
@@ -574,6 +575,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         cfg_env.clone()
     };
 
+    let t_setup_done = Instant::now();
     // ---- plan-phase cache -------------------------------------------------
     // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
     // changed. Their outputs are a pure function of: dcargo itself, the
@@ -691,6 +693,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     }
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
+    let t_plan_done = Instant::now();
 
     let home = std::env::var("HOME").unwrap_or_default();
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{home}/.cargo"));
@@ -869,6 +872,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         darwin_dirs,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
+        src_hash_nanos: std::sync::atomic::AtomicU64::new(0),
         file_names_memo,
         profile_name: if release { "release" } else { "debug" },
         profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
@@ -881,8 +885,10 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         cfg_env_target,
     };
 
+    let t_ctx_done = Instant::now();
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let (executed, cached) = schedule(&ctx, &results)?;
+    let t_sched_done = Instant::now();
 
     for (i, u) in ctx.units.iter().enumerate() {
         if matches!(u.kind, Kind::Bin) && u.is_root {
@@ -906,6 +912,26 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
                 }
             }
         }
+    }
+    if std::env::var_os("DCARGO_TIMING").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "dcargo-timing: setup {:.3}s | plan {:.3}s | identity+tools {:.3}s | schedule {:.3}s (src-hash sum {:.3}s across workers) | export {:.3}s",
+            (t_setup_done - t0).as_secs_f64(),
+            (t_plan_done - t_setup_done).as_secs_f64(),
+            (t_ctx_done - t_plan_done).as_secs_f64(),
+            (t_sched_done - t_ctx_done).as_secs_f64(),
+            ctx.src_hash_nanos.load(Relaxed) as f64 / 1e9,
+            t_sched_done.elapsed().as_secs_f64(),
+        );
+        eprintln!(
+            "dcargo-timing: hinted dirs {}, files statted {}, files content-rehashed {}, immutable src-hash hits {}, export-check bytes hashed {}",
+            crate::store::HINTED_DIRS.load(Relaxed),
+            crate::store::STAT_FILES.load(Relaxed),
+            crate::store::REHASHED_FILES.load(Relaxed),
+            crate::store::IMMUTABLE_HITS.load(Relaxed),
+            crate::store::EXPORT_CHECK_BYTES.load(Relaxed),
+        );
     }
     eprintln!(
         "dcargo: finished in {:.2}s — {executed} executed, {cached} cached",
@@ -1218,6 +1244,14 @@ impl Ctx {
     }
 
     fn pkg_src_hash(&self, pi: usize) -> Result<String> {
+        let started = Instant::now();
+        let result = self.pkg_src_hash_inner(pi);
+        self.src_hash_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
+
+    fn pkg_src_hash_inner(&self, pi: usize) -> Result<String> {
         if let Some(h) = self.src_hash_memo.lock().unwrap().get(&pi) {
             return Ok(h.clone());
         }

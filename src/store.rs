@@ -5,6 +5,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Hash-work counters for `DCARGO_TIMING=1` reports (relaxed: stats only).
+pub static STAT_FILES: AtomicU64 = AtomicU64::new(0);
+pub static REHASHED_FILES: AtomicU64 = AtomicU64::new(0);
+pub static HINTED_DIRS: AtomicU64 = AtomicU64::new(0);
+pub static IMMUTABLE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static EXPORT_CHECK_BYTES: AtomicU64 = AtomicU64::new(0);
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -77,9 +84,13 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
                 walk(h, root, &rel_child, hints, fresh)?;
             } else {
                 let key = stat_key(&md);
+                STAT_FILES.fetch_add(1, Ordering::Relaxed);
                 let content = match hints.get(&rl) {
                     Some((sz, mt, ino, hash)) if (*sz, *mt, *ino) == key => hash.clone(),
-                    _ => sha256_file(&p)?,
+                    _ => {
+                        REHASHED_FILES.fetch_add(1, Ordering::Relaxed);
+                        sha256_file(&p)?
+                    }
                 };
                 fresh.insert(rl.clone(), (key.0, key.1, key.2, content.clone()));
                 h.update(b"F");
@@ -255,6 +266,7 @@ impl Store {
             if let Ok(h) = fs::read_to_string(&p) {
                 let h = h.trim().to_string();
                 if h.len() == 64 {
+                    IMMUTABLE_HITS.fetch_add(1, Ordering::Relaxed);
                     return Ok(h);
                 }
             }
@@ -271,6 +283,7 @@ impl Store {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         let mut fresh = Hints::new();
+        HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
         let h = hash_dir_hinted(root, &hints, &mut fresh)?;
         if fresh != hints {
             self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
@@ -281,9 +294,28 @@ impl Store {
     /// Copy a CAS blob out to a destination in the worktree.
     /// Skips the write when the destination already has identical content.
     pub fn export(&self, hash: &str, dest: &Path, executable: bool) -> Result<bool> {
-        if let Ok(existing) = sha256_file(dest) {
-            if existing == hash {
-                return Ok(false);
+        // A stat hint (size/mtime/inode -> content hash) makes the unchanged
+        // case free: re-reading a ~1 GiB binary to decide "already correct"
+        // dominated warm zed builds (1.85s of a 2.0s no-op).
+        let hint_path = self
+            .root
+            .join("srchash")
+            .join(format!("{}.json", sha256_hex(format!("export:{}", dest.display()).as_bytes())));
+        if let Ok(md) = fs::metadata(dest) {
+            let key = stat_key(&md);
+            let hinted: Option<(u64, i64, u64, String)> =
+                fs::read(&hint_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            if let Some((size, mtime, inode, hinted_hash)) = hinted {
+                if (size, mtime, inode) == key && hinted_hash == hash {
+                    return Ok(false);
+                }
+            }
+            EXPORT_CHECK_BYTES.fetch_add(md.len(), Ordering::Relaxed);
+            if let Ok(existing) = sha256_file(dest) {
+                if existing == hash {
+                    self.write_export_hint(&hint_path, dest, hash);
+                    return Ok(false);
+                }
             }
         }
         fs::create_dir_all(dest.parent().unwrap())?;
@@ -299,6 +331,17 @@ impl Store {
             fs::set_permissions(&tmp, perms)?;
         }
         fs::rename(&tmp, dest)?;
+        self.write_export_hint(&hint_path, dest, hash);
         Ok(true)
+    }
+
+    /// Best-effort: record the just-verified/just-written destination stat.
+    fn write_export_hint(&self, hint_path: &Path, dest: &Path, hash: &str) {
+        if let Ok(md) = fs::metadata(dest) {
+            let key = stat_key(&md);
+            if let Ok(bytes) = serde_json::to_vec(&(key.0, key.1, key.2, hash)) {
+                self.write_atomic(hint_path, &bytes).ok();
+            }
+        }
     }
 }
