@@ -1179,9 +1179,6 @@ pub fn build(
         && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
     if sandbox {
         eprintln!("dcargo: hermetic sandbox enabled (seatbelt)");
-        if std::env::var_os("DCARGO_UNSAFE_EXEC").is_some() {
-            eprintln!("dcargo: WARNING: DCARGO_UNSAFE_EXEC set — exec allowlist widened, build is NOT hermetic (survey mode)");
-        }
     }
     // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
     // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
@@ -1893,13 +1890,6 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     }
     prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
     prof.push_str(&format!("  (subpath \"{}\")\n", ctx.store.root.join("tools").display()));
-    // survey escape hatch: DCARGO_UNSAFE_EXEC=path1:path2 — deliberately
-    // unhermetic, used to enumerate a project's ambient tool dependencies
-    if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
-        for p in extra.split(':').filter(|p| !p.is_empty()) {
-            prof.push_str(&format!("  (subpath \"{p}\")\n"));
-        }
-    }
     // actions may execute binaries they just built in their own writable
     // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
     // are products of keyed inputs, so this stays hermetic
@@ -1932,11 +1922,6 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     // package (proc-macro-crate et al. legitimately read it); the rest of
     // the workspace is invisible unless declared via extra-inputs
     prof.push_str(&format!("  (literal \"{}/Cargo.toml\")\n", ctx.workspace_root));
-    if let Ok(extra) = std::env::var("DCARGO_UNSAFE_EXEC") {
-        for p in extra.split(':').filter(|p| !p.is_empty()) {
-            prof.push_str(&format!("  (subpath \"{p}\")\n"));
-        }
-    }
     prof.push_str(")\n");
     // Align the readable set with the hashed set: the source hash deliberately
     // excludes .git, build output dirs, and Cargo.lock, so reading them must
