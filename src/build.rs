@@ -193,7 +193,9 @@ struct EnvInput {
 /// plus [env-inputs.*]: plan-time commands whose output is injected as env
 /// and hashed into the scoped packages' build-script keys.
 /// The whole manifest hash keys every build-script action.
-fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<EnvInput>)>> {
+type Universes = Vec<(String, Vec<String>)>;
+
+fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<EnvInput>, Universes)>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
     while let Some(d) = cur {
@@ -208,10 +210,12 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<
     let text = fs::read_to_string(&p)?;
     let mut specs: Vec<ToolSpec> = Vec::new();
     let mut env_inputs: Vec<EnvInput> = Vec::new();
+    let mut universes: Vec<(String, Vec<String>)> = Vec::new();
     enum Cur {
         None,
         Tool,
         EnvInput,
+        Universe,
     }
     let mut cur = Cur::None;
     for line in text.lines() {
@@ -225,6 +229,8 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<
         } else if let Some(rest) = line.strip_prefix("[env-inputs.") {
             env_inputs.push(EnvInput { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
             cur = Cur::EnvInput;
+        } else if line == "[feature-universe]" {
+            cur = Cur::Universe;
         } else if let Some((k, v)) = line.split_once('=') {
             let raw = v.trim();
             let v = raw.trim_matches('"').to_string();
@@ -256,6 +262,15 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<
                         _ => {}
                     }
                 }
+                Cur::Universe => {
+                    let members: Vec<String> = raw
+                        .trim_matches(['[', ']'])
+                        .split(',')
+                        .map(|x| x.trim().trim_matches('"').to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                    universes.push((k.trim().to_string(), members));
+                }
                 Cur::None => {}
             }
         }
@@ -270,7 +285,7 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<
             );
         }
     }
-    Ok(Some((text, specs, env_inputs)))
+    Ok(Some((text, specs, env_inputs, universes)))
 }
 
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
@@ -582,6 +597,11 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         pkgs.insert(p.id.clone(), i);
     }
 
+    // Feature unification over a FIXED universe (whole workspace, or the
+    // declared member set for cross targets) — never scoped to the requested
+    // package, so a dep's features don't depend on what you're building.
+    let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
+    let universes: Universes = read_tools_manifest(&dir)?.map(|(_, _, _, u)| u).unwrap_or_default();
     let mut ug_cmd = Command::new(&cargo_bin);
     ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
     ug_cmd.args(["build", "--unit-graph", "-Zunstable-options"]);
@@ -591,10 +611,20 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     if let Some(t) = &target {
         ug_cmd.args(["--target", t]);
     }
-    ug_cmd.arg("--manifest-path").arg(&manifest);
+    match target.as_ref().and_then(|t| universes.iter().find(|(k, _)| k == t)) {
+        Some((_, members)) => {
+            for m in members {
+                ug_cmd.args(["-p", m]);
+            }
+        }
+        None => {
+            ug_cmd.arg("--workspace");
+        }
+    }
+    ug_cmd.arg("--manifest-path").arg(&ws_manifest);
     let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
-    let units = translate_unit_graph(&ug, &pkgs)?;
+    let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
 
     let home = std::env::var("HOME").unwrap_or_default();
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{home}/.cargo"));
@@ -670,7 +700,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     let mut tool_envs: Vec<(String, String)> = Vec::new();
     let mut tools_id = String::new();
     let mut env_inputs: Vec<(String, String, Vec<String>)> = Vec::new();
-    if let Some((manifest_text, specs, inputs)) = read_tools_manifest(&dir)? {
+    let mut universes: Universes = Vec::new();
+    if let Some((manifest_text, specs, inputs, unis)) = read_tools_manifest(&dir)? {
+        universes = unis;
         tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
         for t in &specs {
             ensure_tool(&store, t)?;
@@ -711,7 +743,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         if !shims.exists() {
             let tmp = store.tmp_path("shims");
             fs::create_dir_all(&tmp)?;
-            if let Some((_, specs, _)) = read_tools_manifest(&dir)? {
+            if let Some((_, specs, _, _)) = read_tools_manifest(&dir)? {
                 for t in &specs {
                     if t.bin.is_empty() {
                         continue; // dir/file exports are env-only, not PATH shims
@@ -869,7 +901,7 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
 /// Translate cargo's unit-graph into dcargo units. Cargo did the real
 /// resolution (per-platform features, cfg-gated deps, host/target split);
 /// we only re-shape it.
-fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>) -> Result<Vec<Unit>> {
+fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root_pi: usize) -> Result<Vec<Unit>> {
     let mut units: Vec<Unit> = Vec::with_capacity(g.units.len());
     for u in &g.units {
         let pi = *pkgs
@@ -917,10 +949,39 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>) -> R
             }
         }
     }
-    for &r in &g.roots {
+    // the graph covers the whole universe; build only the requested
+    // package's subgraph (with universe-unified features)
+    let mut stack: Vec<usize> = g.roots.iter().copied().filter(|&r| units[r].pkg == root_pi).collect();
+    if stack.is_empty() {
+        bail!("requested package has no buildable roots in the unit graph");
+    }
+    for &r in &stack {
         units[r].is_root = true;
     }
-    Ok(units)
+    let mut keep = vec![false; units.len()];
+    while let Some(i) = stack.pop() {
+        if keep[i] {
+            continue;
+        }
+        keep[i] = true;
+        for d in &units[i].deps {
+            stack.push(d.unit);
+        }
+    }
+    let mut map = vec![usize::MAX; units.len()];
+    let mut kept: Vec<Unit> = Vec::new();
+    for (i, u) in units.into_iter().enumerate() {
+        if keep[i] {
+            map[i] = kept.len();
+            kept.push(u);
+        }
+    }
+    for u in &mut kept {
+        for d in &mut u.deps {
+            d.unit = map[d.unit];
+        }
+    }
+    Ok(kept)
 }
 
 impl Ctx {
