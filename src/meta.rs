@@ -95,6 +95,89 @@ pub struct UgUnit {
     pub features: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<UgDep>,
+    #[serde(default)]
+    pub profile: UgProfile,
+}
+
+/// Cargo's per-unit resolved profile from the unit graph: inheritance,
+/// build-override, per-package overrides, and platform defaults are all
+/// already applied by cargo — never re-derive any of it from Cargo.toml.
+#[derive(Deserialize, Clone, Default)]
+pub struct UgProfile {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub opt_level: String,
+    /// number (0/1/2) or string ("line-tables-only", ...) depending on
+    /// the manifest spelling; passed to rustc verbatim either way.
+    #[serde(default)]
+    pub debuginfo: serde_json::Value,
+    #[serde(default)]
+    pub codegen_units: Option<u64>,
+    #[serde(default)]
+    pub debug_assertions: bool,
+    #[serde(default)]
+    pub overflow_checks: bool,
+    #[serde(default)]
+    pub panic: String,
+    #[serde(default)]
+    pub lto: String,
+    #[serde(default)]
+    pub split_debuginfo: Option<String>,
+    /// {"deferred": "None"} / {"resolved": "Debuginfo"} / plain string.
+    #[serde(default)]
+    pub strip: serde_json::Value,
+    #[serde(default)]
+    pub rpath: bool,
+}
+
+impl UgProfile {
+    /// The -Cdebuginfo value, verbatim.
+    pub fn debuginfo_flag(&self) -> String {
+        match &self.debuginfo {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => "0".to_string(),
+        }
+    }
+
+    /// The -Cstrip value ("none" unless the profile asks otherwise).
+    pub fn strip_flag(&self) -> &'static str {
+        let v = match &self.strip {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Object(m) => {
+                m.values().next().and_then(|v| v.as_str()).unwrap_or("None")
+            }
+            _ => "None",
+        };
+        match v {
+            "Debuginfo" | "debuginfo" => "debuginfo",
+            "Symbols" | "symbols" => "symbols",
+            _ => "none",
+        }
+    }
+
+    pub fn lto_enabled(&self) -> bool {
+        !matches!(self.lto.as_str(), "" | "false" | "off" | "none")
+    }
+
+    /// Cargo's PROFILE env value for build scripts.
+    pub fn env_name(&self) -> &'static str {
+        if matches!(self.name.as_str(), "release" | "bench") {
+            "release"
+        } else {
+            "debug"
+        }
+    }
+
+    /// The target/<dir> layout name (cargo maps dev/test to "debug").
+    pub fn dir_name(&self) -> String {
+        match self.name.as_str() {
+            "dev" | "test" | "" => "debug".to_string(),
+            "bench" => "release".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 #[derive(Deserialize)]

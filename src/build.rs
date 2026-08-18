@@ -9,28 +9,18 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.10";
+const TOOL_VERSION: &str = "dcargo/0.11";
 
-/// Profiles (hardcoded until [profile.*] support). Debug info is decided
-/// per unit: target-side units get full debug info under dev; host-side
-/// units (build scripts, proc-macros, their exclusive deps) stay at zero
-/// like cargo's build-override default, which also keeps their dylibs
-/// free of debug-map stabs. Flags are part of every action key, and the
-/// store is append-only, so profiles coexist and never evict each other.
-const DEBUG_FLAGS: &[&str] = &[
-    "-Copt-level=0",
-    "-Cdebug-assertions=on",
-    "-Coverflow-checks=on",
-    "-Cembed-bitcode=no",
-    "-Cstrip=none",
-];
-const RELEASE_FLAGS: &[&str] = &[
-    "-Copt-level=3",
-    "-Cdebug-assertions=off",
-    "-Coverflow-checks=off",
-    "-Cembed-bitcode=no",
-    "-Cstrip=none",
-];
+// Profiles come per unit from cargo's unit graph — inheritance,
+// build-override, per-package overrides, and platform defaults already
+// resolved by cargo (see meta::UgProfile). The resolved flags are part
+// of every action key, and the store is append-only, so profiles
+// coexist and never evict each other. Deliberate divergences:
+// - lto is not supported yet (warned once, built without);
+// - darwin linking units always get split-debuginfo=unpacked with
+//   -oso_prefix, whatever the profile says: determinism requires it
+//   (staging paths would otherwise leak into debug-map stabs);
+// - incremental and rpath are ignored.
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -63,6 +53,7 @@ struct Unit {
     target: Target,
     features: Vec<String>,
     deps: Vec<UnitDep>,
+    profile: meta::UgProfile,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -183,9 +174,9 @@ pub struct Ctx {
     src_hash_memo: Mutex<HashMap<usize, String>>,
     src_hash_nanos: std::sync::atomic::AtomicU64,
     file_names_memo: Mutex<HashMap<(String, bool), Vec<String>>>,
-    profile_name: &'static str,
-    profile_flags: &'static [&'static str],
-    opt_level: &'static str,
+    /// target/<dir> layout name from the root units' resolved profile
+    /// (cargo maps dev/test to "debug").
+    profile_name: String,
     toolchain: String,
     tool_envs: Vec<(String, String)>,
     tools_id: String,
@@ -193,10 +184,6 @@ pub struct Ctx {
     target: Option<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
-    /// True for target-side units: reachable from the roots without
-    /// crossing an execution boundary (build script, proc-macro). Only
-    /// these carry debug info under dev.
-    debug_side: Vec<bool>,
     /// Logical path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
@@ -224,8 +211,7 @@ struct CompileKey<'a> {
     link_search: &'a [String],
     link_args: &'a [String],
     out_key: &'a str,
-    profile: &'a [&'a str],
-    debuginfo: u32,
+    profile: &'a [String],
     /// debug-map prefix recorded relative to the workspace root ("" = none)
     oso: &'a str,
     env: &'a [(String, String)],
@@ -1103,6 +1089,26 @@ pub fn build(
     }
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
+    let profile_name = units
+        .iter()
+        .find(|u| u.is_root)
+        .map(|u| u.profile.dir_name())
+        .unwrap_or_else(|| if release { "release".into() } else { "debug".into() });
+    // One-shot warnings for profile settings we deliberately don't honor.
+    if units.iter().any(|u| u.profile.lto_enabled()) {
+        eprintln!("dcargo: warning: profile requests lto; not supported yet, building without");
+    }
+    if units.iter().any(|u| u.profile.rpath) {
+        eprintln!("dcargo: warning: profile requests rpath; ignored");
+    }
+    if units.iter().any(|u| {
+        u.profile.debuginfo_flag() != "0"
+            && matches!(u.profile.split_debuginfo.as_deref(), Some("packed") | Some("off"))
+    }) {
+        eprintln!(
+            "dcargo: warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (determinism requires it)"
+        );
+    }
     // Under check, everything needed for *execution* (build scripts, their
     // runs, proc-macros) and their transitive closures still fully
     // compiles; the rest emits metadata only.
@@ -1126,30 +1132,6 @@ pub fn build(
             }
         }
         check_mode = (0..units.len()).map(|i| !codegen[i]).collect();
-    }
-    // Target-side units: reachable from the roots without crossing an
-    // execution boundary (build scripts, proc-macros). Only these get
-    // debug info; the rest mirrors cargo's build-override default of
-    // zero, which also keeps proc-macro dylibs free of debug-map stabs.
-    let mut debug_side = vec![false; units.len()];
-    {
-        let mut stack: Vec<usize> = (0..units.len()).filter(|&i| units[i].is_root).collect();
-        let mut seen = vec![false; units.len()];
-        while let Some(i) = stack.pop() {
-            if seen[i] {
-                continue;
-            }
-            seen[i] = true;
-            if matches!(units[i].kind, Kind::Bsc | Kind::Bsr)
-                || unit_crate_type(&units[i]) == "proc-macro"
-            {
-                continue;
-            }
-            debug_side[i] = true;
-            for d in &units[i].deps {
-                stack.push(d.unit);
-            }
-        }
     }
     let t_plan_done = Instant::now();
 
@@ -1333,16 +1315,13 @@ pub fn build(
         src_hash_memo: Mutex::new(HashMap::new()),
         src_hash_nanos: std::sync::atomic::AtomicU64::new(0),
         file_names_memo,
-        profile_name: if release { "release" } else { "debug" },
-        profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
-        opt_level: if release { "3" } else { "0" },
+        profile_name,
         toolchain,
         tool_envs,
         tools_id,
         env_inputs,
         target,
         check_mode,
-        debug_side,
         target_std_libdir,
         cfg_env_target,
     };
@@ -1372,11 +1351,11 @@ pub fn build(
             // before running, so even a failing test leaves a debuggable
             // binary behind: `lldb target/<profile>/deps/<name>` from the
             // workspace root needs no configuration.
-            let dest = dtarget.join(ctx.profile_name).join("deps").join(&m.name);
+            let dest = dtarget.join(&ctx.profile_name).join("deps").join(&m.name);
             ctx.store.export(&m.hash, &dest, true)?;
             for o in &r.res.outputs {
                 if o.name.ends_with(".rcgu.o") {
-                    let odest = dtarget.join(ctx.profile_name).join(&o.name);
+                    let odest = dtarget.join(&ctx.profile_name).join(&o.name);
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
@@ -1406,14 +1385,14 @@ pub fn build(
             let t = &u.target;
             let r = results[i].get().context("bin not built")?;
             let m = r.main.as_ref().context("bin artifact missing")?;
-            let dest = dtarget.join(ctx.profile_name).join(&t.name);
+            let dest = dtarget.join(&ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
             eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
             for o in &r.res.outputs {
                 if o.name.ends_with(".rcgu.o") {
                     // The binary's debug map references these objects
                     // relative to the workspace root.
-                    let odest = dtarget.join(ctx.profile_name).join(&o.name);
+                    let odest = dtarget.join(&ctx.profile_name).join(&o.name);
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
@@ -1424,7 +1403,7 @@ pub fn build(
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm") || o.name.ends_with(".dylib") || o.name.ends_with(".so") {
                         let clean = o.name.replace(&format!("-{k16}"), "");
-                        let dest = dtarget.join(tgt).join(ctx.profile_name).join(&clean);
+                        let dest = dtarget.join(tgt).join(&ctx.profile_name).join(&clean);
                         ctx.store.export(&o.hash, &dest, true)?;
                         eprintln!("dcargo:   cdylib {}  (sha256 {}…)", dest.display(), &o.hash[..12]);
                     }
@@ -1667,6 +1646,7 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root
             target: u.target.clone(),
             features: u.features.clone(),
             deps: vec![],
+            profile: u.profile.clone(),
         });
     }
     let kinds: Vec<Kind> = units.iter().map(|u| u.kind).collect();
@@ -2450,26 +2430,36 @@ fn compile(
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
     let cap_lints = pkg.source.is_some();
 
-    // Hardcoded dev/release debug levels until [profile.*] support: full
-    // debug info for target-side units, none for host-side or checked
-    // ones. Darwin linking units keep their CGU objects (split-debuginfo
-    // unpacked) and record them in the debug map relative to the
-    // workspace root via -oso_prefix, so the objects can ship next to
-    // the exported binary and lldb finds them from the workspace root.
-    let debuginfo: u32 = if ctx.profile_name == "release"
-        || self_checked
-        || !ctx.debug_side.get(uidx).copied().unwrap_or(false)
-    {
-        0
-    } else {
-        2
-    };
+    // Per-unit resolved profile straight from cargo's unit graph.
+    // Checked units skip debug info: they emit metadata only.
+    let prof = &unit.profile;
+    let debuginfo = if self_checked { "0".to_string() } else { prof.debuginfo_flag() };
+    let mut pflags: Vec<String> = vec![
+        format!(
+            "-Copt-level={}",
+            if prof.opt_level.is_empty() { "0" } else { prof.opt_level.as_str() }
+        ),
+        format!("-Cdebug-assertions={}", if prof.debug_assertions { "on" } else { "off" }),
+        format!("-Coverflow-checks={}", if prof.overflow_checks { "on" } else { "off" }),
+        format!("-Cdebuginfo={debuginfo}"),
+        format!("-Cstrip={}", prof.strip_flag()),
+        "-Cembed-bitcode=no".to_string(),
+    ];
+    if let Some(n) = prof.codegen_units {
+        pflags.push(format!("-Ccodegen-units={n}"));
+    }
+    if !prof.panic.is_empty() && prof.panic != "unwind" && !matches!(unit.kind, Kind::Test) {
+        pflags.push(format!("-Cpanic={}", prof.panic));
+    }
     let unit_platform = if unit.host {
         ctx.host.as_str()
     } else {
         ctx.target.as_deref().unwrap_or(ctx.host.as_str())
     };
-    let oso_split = debuginfo > 0 && is_linking(ctx, uidx) && unit_platform.contains("apple");
+    // Determinism forces the darwin debug-map treatment on every linking
+    // unit with debug info, whatever split-debuginfo the profile asked
+    // for: without -oso_prefix the staging path would leak into stabs.
+    let oso_split = debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
     let oso_rel = if oso_split { format!("target/{}/", ctx.profile_name) } else { String::new() };
 
     let key_json = serde_json::to_string(&CompileKey {
@@ -2498,8 +2488,7 @@ fn compile(
         link_search: &link_search,
         link_args: &link_args,
         out_key: &out_key,
-        profile: ctx.profile_flags,
-        debuginfo,
+        profile: &pflags,
         oso: &oso_rel,
         env: &env,
         cap_lints,
@@ -2586,10 +2575,9 @@ fn compile(
             }
         }
     }
-    for f in ctx.profile_flags {
+    for f in &pflags {
         cmd.arg(f);
     }
-    cmd.arg(format!("-Cdebuginfo={debuginfo}"));
     if oso_split {
         cmd.arg("-Csplit-debuginfo=unpacked");
         cmd.arg(format!("-Clink-arg=-Wl,-oso_prefix,{}/", stage_root.display()));
@@ -2744,8 +2732,17 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     };
     env.push(("TARGET".into(), plat_triple));
     env.push(("HOST".into(), ctx.host.clone()));
-    env.push(("PROFILE".into(), ctx.profile_name.into()));
-    env.push(("OPT_LEVEL".into(), ctx.opt_level.into()));
+    env.push(("PROFILE".into(), unit.profile.env_name().into()));
+    env.push((
+        "OPT_LEVEL".into(),
+        if unit.profile.opt_level.is_empty() {
+            "0".into()
+        } else {
+            unit.profile.opt_level.clone()
+        },
+    ));
+    // Deliberately not the profile's value: C compiled with -g embeds its
+    // machine-local build dir. C debug info needs its own treatment later.
     env.push(("DEBUG".into(), "false".into()));
     env.push(("NUM_JOBS".into(), "4".into()));
     env.push(("RUSTC".into(), ctx.rustc.clone()));

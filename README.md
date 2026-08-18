@@ -266,7 +266,13 @@ the toolchain hash.
   the whole package dir — but a hostile script could read outside it);
   `rerun-if-changed` narrowing is intentionally ignored (content hashing
   supersedes it, conservatively)
-- hardcoded dev/release profiles (`[profile.*]` tables are ignored so far)
+- `[profile.*]` honored per unit straight from cargo's unit graph
+  (inheritance, `build-override`, per-package overrides, and platform
+  defaults are cargo-resolved — dcargo never re-derives them from
+  Cargo.toml). Not yet honored: `lto` (warned, built without), `rpath`,
+  `incremental`; darwin linking units always use split-debuginfo=unpacked
+  with `-oso_prefix` (determinism requires it); build scripts always see
+  `DEBUG=false` (C compiled with -g would embed machine-local paths)
 - no target-platform cfg evaluation beyond `--filter-platform`, no dev-deps /
   tests / cdylibs, single rustc invocation per crate (no pipelining), warnings
   from cached dep actions are not replayed
