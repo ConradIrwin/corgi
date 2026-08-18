@@ -1174,9 +1174,11 @@ pub fn build(
         String::new()
     };
     let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}");
-    let sandbox = host.contains("apple")
-        && Path::new("/usr/bin/sandbox-exec").is_file()
-        && std::env::var_os("DCARGO_NO_SANDBOX").is_none();
+    // Unconditional where the platform supports it: there is exactly one
+    // mode, and it fails hard. Errors name the missing input (denied exec,
+    // undeclared read), and the fix is a pinned tool or extra-inputs
+    // stanza — loop until green.
+    let sandbox = host.contains("apple") && Path::new("/usr/bin/sandbox-exec").is_file();
     if sandbox {
         eprintln!("dcargo: hermetic sandbox enabled (seatbelt)");
     }

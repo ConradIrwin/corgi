@@ -151,7 +151,7 @@ loud `PermissionDenied` build errors.
 
 Measured overhead (M-series MBP): +4.5ms per process spawn, ~3% on a pure
 compile, ~1% on a full cold build — so it is enabled unconditionally
-(`DCARGO_NO_SANDBOX=1` exists as a debugging kill-switch only). Two macOS
+(no opt-out: one mode, hard errors). Two macOS
 gotchas cost the initial integration 4x: xcrun's SDK lookup needs the
 *canonical* darwin per-user temp/cache dirs (`/private/var/folders/...`)
 writable or every link takes a ~1.5s uncached fallback, and we now resolve
