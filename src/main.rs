@@ -26,15 +26,11 @@ fn real_main() -> Result<()> {
             "-v" | "--verbose" => verbose = true,
             "--release" => release = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
-            "build" | "audit" if cmd.is_none() => cmd = Some(a),
-            _ => bail!("unknown argument `{a}` (usage: dcargo build [--dir DIR] [--release] [--target TRIPLE] [-v])"),
+            "build" | "check" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
+            _ => bail!("unknown argument `{a}` (usage: dcargo build|check|test|gc [--dir DIR] [--release] [--target TRIPLE] [-v])"),
         }
     }
-    if let Some(c) = cmd.as_deref() {
-        if c != "build" && c != "audit" {
-            bail!("unknown command `{c}`");
-        }
-    }
+
     let dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
@@ -55,5 +51,13 @@ fn real_main() -> Result<()> {
         return audit::audit(&dir, release, verbose, target.as_deref());
     }
     let store = store::Store::new(store_root)?;
-    build::build(store, &dir, verbose, release, target)
+    if cmd.as_deref() == Some("gc") {
+        return build::gc(&store);
+    }
+    let mode = match cmd.as_deref() {
+        Some("check") => build::Mode::Check,
+        Some("test") => build::Mode::Test,
+        _ => build::Mode::Build,
+    };
+    build::build(store, &dir, verbose, release, target, mode)
 }

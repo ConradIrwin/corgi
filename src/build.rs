@@ -31,12 +31,20 @@ const RELEASE_FLAGS: &[&str] = &[
     "-Cstrip=none",
 ];
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Build,
+    Check,
+    Test,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Lib,
     Bsc, // compile build.rs
     Bsr, // run build.rs
     Bin,
+    Test, // test harness executable (rustc --test)
 }
 
 struct UnitDep {
@@ -105,7 +113,7 @@ fn unit_crate_type(unit: &Unit) -> String {
                 "lib".to_string()
             }
         }
-        Kind::Bsc | Kind::Bin => "bin".to_string(),
+        Kind::Bsc | Kind::Bin | Kind::Test => "bin".to_string(),
         Kind::Bsr => String::new(),
     }
 }
@@ -120,10 +128,24 @@ fn unit_pipelined(unit: &Unit) -> bool {
 /// need dependency *metadata*.
 fn unit_links(unit: &Unit) -> bool {
     match unit.kind {
-        Kind::Bin | Kind::Bsc => true,
+        Kind::Bin | Kind::Bsc | Kind::Test => true,
         Kind::Lib => unit_crate_type(unit) != "lib",
         Kind::Bsr => false,
     }
+}
+
+/// Under `check`, units outside every execution closure (build scripts,
+/// proc-macros) emit metadata only: they neither link nor produce rlibs.
+fn is_checked(ctx: &Ctx, idx: usize) -> bool {
+    ctx.check_mode.get(idx).copied().unwrap_or(false)
+}
+
+fn is_pipelined(ctx: &Ctx, idx: usize) -> bool {
+    unit_pipelined(&ctx.units[idx]) || is_checked(ctx, idx)
+}
+
+fn is_linking(ctx: &Ctx, idx: usize) -> bool {
+    unit_links(&ctx.units[idx]) && !is_checked(ctx, idx)
 }
 
 struct UnitResult {
@@ -168,6 +190,8 @@ pub struct Ctx {
     tools_id: String,
     env_inputs: Vec<(String, String, Vec<String>)>,
     target: Option<String>,
+    /// Under check: true for units that emit metadata only.
+    check_mode: Vec<bool>,
     /// Logical path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
@@ -343,6 +367,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
     let dest = store.root.join("tools").join(format!("{}-{}", t.name, t.version));
     if dest.join(exported).exists() {
+        touch_tool_marker(&dest);
         return Ok(dest.join(exported));
     }
     eprintln!("dcargo: installing tool {} {} (sha256-pinned)", t.name, t.version);
@@ -371,6 +396,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
         Err(_) if dest.join(exported).exists() => {}
         Err(e) => return Err(e).context("publishing tool"),
     }
+    touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
 }
@@ -450,12 +476,159 @@ fn is_concrete_channel(c: &str) -> bool {
     semver || dated
 }
 
+/// Go-style cache expiry: every file is judged by its own mtime, which
+/// use-sites keep fresh with throttled touches. No reference counting —
+/// blobs are touched whenever a referencing action is used, so a stale
+/// blob implies only stale actions point at it. Deleting something in
+/// use is benign: probes self-heal by rebuilding.
+pub fn gc(store: &Store) -> Result<()> {
+    let days: u64 = std::env::var("DCARGO_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let (files, dirs, bytes) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600))?;
+    eprintln!(
+        "dcargo: gc removed {files} files and {dirs} dirs ({:.1} MB) older than {days} days",
+        bytes as f64 / 1e6
+    );
+    Ok(())
+}
+
+/// Auto-trim after builds, at most once per day (Go's trim.txt scheme).
+fn maybe_auto_gc(store: &Store) {
+    let marker = store.root.join("cache").join("trim.txt");
+    if let Ok(md) = fs::metadata(&marker) {
+        if let Ok(age) = md.modified().and_then(|m| m.elapsed().map_err(|e| std::io::Error::other(e))) {
+            if age < std::time::Duration::from_secs(24 * 3600) {
+                return;
+            }
+        } else {
+            return; // clock skew: fine, skip
+        }
+    }
+    let days: u64 = std::env::var("DCARGO_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    if let Err(e) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600)) {
+        eprintln!("dcargo: warning: gc trim failed: {e:#}");
+    }
+    let _ = store.write_atomic(&marker, b"trimmed\n");
+}
+
+fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
+    let now = std::time::SystemTime::now();
+    let cutoff = now.checked_sub(ttl).context("ttl too large")?;
+    let stale = |p: &Path| -> bool {
+        fs::metadata(p).and_then(|m| m.modified()).map(|m| m < cutoff).unwrap_or(false)
+    };
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    let mut bytes = 0u64;
+    // cache/<xx>/* : blobs and action records, each by its own mtime
+    for shard in read_dir_paths(&store.root.join("cache"))? {
+        if !shard.is_dir() {
+            continue;
+        }
+        for f in read_dir_paths(&shard)? {
+            if stale(&f) {
+                bytes += fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+                if fs::remove_file(&f).is_ok() {
+                    files += 1;
+                }
+            }
+        }
+    }
+    // pool/* : hardlinks share the blob's inode (and mtime) — same verdict
+    for f in read_dir_paths(&store.root.join("pool"))? {
+        if stale(&f) && fs::remove_file(&f).is_ok() {
+            files += 1;
+        }
+    }
+    // outdirs/: entries judged by their sentinel; sentinel-less dirs are
+    // crash leftovers; lock files go only once their entry is gone
+    for p in read_dir_paths(&store.root.join("outdirs"))? {
+        if p.extension().is_some_and(|e| e == "lock") {
+            let entry = p.with_extension("");
+            if !entry.exists() && stale(&p) && fs::remove_file(&p).is_ok() {
+                files += 1;
+            }
+            continue;
+        }
+        if !p.is_dir() {
+            continue;
+        }
+        let ok = p.join(".ok");
+        let verdict = if ok.exists() { stale(&ok) } else { stale(&p) };
+        if verdict && fs::remove_dir_all(&p).is_ok() {
+            dirs += 1;
+        }
+    }
+    // hints/: pure accelerators
+    if store.root.join("hints").exists() {
+        for f in read_dir_paths(&store.root.join("hints"))? {
+            if stale(&f) && fs::remove_file(&f).is_ok() {
+                files += 1;
+            }
+        }
+    }
+    // tools/: judged by the .dcargo-used marker every build refreshes
+    for p in read_dir_paths(&store.root.join("tools"))? {
+        if !p.is_dir() {
+            continue;
+        }
+        let marker = p.join(".dcargo-used");
+        if !marker.exists() {
+            // Seed a marker rather than judging by dir mtime: tarball-derived
+            // dirs keep the archive's embedded (often ancient) timestamps.
+            let _ = fs::write(&marker, b"used\n");
+            continue;
+        }
+        if stale(&marker) && fs::remove_dir_all(&p).is_ok() {
+            dirs += 1;
+        }
+    }
+    // tmp/: anything older than a day is orphaned staging
+    let day = now.checked_sub(std::time::Duration::from_secs(24 * 3600)).unwrap_or(cutoff);
+    for p in read_dir_paths(&store.root.join("tmp"))? {
+        let old = fs::metadata(&p).and_then(|m| m.modified()).map(|m| m < day).unwrap_or(false);
+        if old {
+            if p.is_dir() {
+                if fs::remove_dir_all(&p).is_ok() {
+                    dirs += 1;
+                }
+            } else if fs::remove_file(&p).is_ok() {
+                files += 1;
+            }
+        }
+    }
+    Ok((files, dirs, bytes))
+}
+
+fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(rd) => {
+            for e in rd {
+                out.push(e?.path());
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(out)
+}
+
+/// Refresh a tool/toolchain dir's use marker (throttled like all touches).
+fn touch_tool_marker(dir: &Path) {
+    let marker = dir.join(".dcargo-used");
+    if !marker.exists() {
+        let _ = fs::write(&marker, b"used\n");
+        return;
+    }
+    Store::touch_used(&marker);
+}
+
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
 /// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
 fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
     let dest = store.root.join("tools").join(format!("rust-{channel}-{triple}"));
     let bin = dest.join("bin");
     if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
+        touch_tool_marker(&dest);
         return Ok(bin);
     }
     eprintln!("dcargo: installing toolchain {channel}-{triple} into {}", dest.display());
@@ -513,6 +686,7 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
         Err(_) if dest.join("bin/rustc").is_file() => {} // concurrent racer won
         Err(e) => return Err(e).context("publishing toolchain"),
     }
+    touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join("bin"))
 }
@@ -525,6 +699,7 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
 fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
     let dest = store.root.join("tools").join(format!("rust-std-{channel}-{target}"));
     if dest.join("lib/rustlib").join(target).join("lib").exists() {
+        touch_tool_marker(&dest);
         return Ok(());
     }
     eprintln!("dcargo: installing rust-std for {target} (sha256-pinned)");
@@ -561,11 +736,19 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
         Err(_) if dest.join("lib/rustlib").join(target).join("lib").exists() => {}
         Err(e) => return Err(e).context("publishing rust-std"),
     }
+    touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(())
 }
 
-pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Option<String>) -> Result<()> {
+pub fn build(
+    store: Store,
+    dir: &Path,
+    verbose: bool,
+    release: bool,
+    target: Option<String>,
+    mode: Mode,
+) -> Result<()> {
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -649,9 +832,11 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         Some((text, _, _, u)) => (text, u),
         None => (String::new(), Universes::new()),
     };
+    // check shares build's plan; test resolves a different unit graph
+    let plan_kind = if matches!(mode, Mode::Test) { "test" } else { "build" };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             sha256_hex(tools_text.as_bytes()),
@@ -718,6 +903,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
             let mut ug_cmd = Command::new(&cargo_bin);
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
             ug_cmd.args(["build", "--unit-graph", "-Zunstable-options", "--locked"]);
+            if matches!(mode, Mode::Test) {
+                ug_cmd.arg("--tests");
+            }
             if release {
                 ug_cmd.arg("--release");
             }
@@ -753,6 +941,30 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     }
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
+    // Under check, everything needed for *execution* (build scripts, their
+    // runs, proc-macros) and their transitive closures still fully
+    // compiles; the rest emits metadata only.
+    let mut check_mode: Vec<bool> = Vec::new();
+    if matches!(mode, Mode::Check) {
+        let mut codegen = vec![false; units.len()];
+        let mut stack: Vec<usize> = (0..units.len())
+            .filter(|&i| {
+                matches!(units[i].kind, Kind::Bsc | Kind::Bsr)
+                    || (matches!(units[i].kind, Kind::Lib)
+                        && unit_crate_type(&units[i]) == "proc-macro")
+            })
+            .collect();
+        while let Some(i) = stack.pop() {
+            if codegen[i] {
+                continue;
+            }
+            codegen[i] = true;
+            for d in &units[i].deps {
+                stack.push(d.unit);
+            }
+        }
+        check_mode = (0..units.len()).map(|i| !codegen[i]).collect();
+    }
     let t_plan_done = Instant::now();
 
     let home = std::env::var("HOME").unwrap_or_default();
@@ -944,6 +1156,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         tools_id,
         env_inputs,
         target,
+        check_mode,
         target_std_libdir,
         cfg_env_target,
     };
@@ -957,7 +1170,40 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     // building any member from any directory lands artifacts in one place.
     let dtarget = Path::new(&ctx.workspace_root).join("target");
 
+    // Test harnesses run fresh every time (results deliberately uncached
+    // for now, so cargo-vs-dcargo comparisons stay honest). Unsandboxed,
+    // ambient env, cwd = the package root -- cargo's semantics.
+    if matches!(mode, Mode::Test) {
+        let mut failures: Vec<String> = Vec::new();
+        for (i, u) in ctx.units.iter().enumerate() {
+            if !matches!(u.kind, Kind::Test) || !u.is_root {
+                continue;
+            }
+            let r = results[i].get().context("test harness not built")?;
+            let m = r.main.as_ref().context("test artifact missing")?;
+            let pkg = &ctx.meta.packages[u.pkg];
+            eprintln!("dcargo: running tests: {} ({})", u.target.name, m.name);
+            let mut c = Command::new(ctx.pool.join(&m.name));
+            c.current_dir(pkg.root());
+            for (k, v) in ctx.pkg_env(pkg) {
+                c.env(k, v);
+            }
+            c.env("CARGO_MANIFEST_DIR", pkg.root());
+            let st = c.status().with_context(|| format!("running test {}", u.target.name))?;
+            if !st.success() {
+                failures.push(u.target.name.clone());
+            }
+        }
+        if !failures.is_empty() {
+            eprintln!("dcargo: finished in {:.2}s", t0.elapsed().as_secs_f64());
+            bail!("{} test target(s) failed: {}", failures.len(), failures.join(", "));
+        }
+    }
+
     for (i, u) in ctx.units.iter().enumerate() {
+        if !matches!(mode, Mode::Build) {
+            break;
+        }
         if matches!(u.kind, Kind::Bin) && u.is_root {
             let t = &u.target;
             let r = results[i].get().context("bin not built")?;
@@ -1004,6 +1250,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         "dcargo: finished in {:.2}s — {executed} executed, {cached} cached",
         t0.elapsed().as_secs_f64()
     );
+    maybe_auto_gc(&ctx.store);
     Ok(())
 }
 
@@ -1199,6 +1446,8 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root
             Kind::Bsr
         } else if is_bs_target {
             Kind::Bsc
+        } else if u.mode == "test" {
+            Kind::Test
         } else if u.target.kind.iter().any(|k| k == "bin") {
             Kind::Bin
         } else {
@@ -1272,15 +1521,6 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root
 }
 
 impl Ctx {
-    /// Real filesystem location of a published OUT_DIR.
-    /// The sentinel is written (atomically) only after a build script
-    /// finished and its directives were recorded: it is the sole on-disk
-    /// fact meaning "this OUT_DIR is complete". A dir without it is a
-    /// crash leftover and gets wiped by the next lock holder.
-    fn out_dir_ok(&self, key: &str) -> bool {
-        self.store.root.join("outdirs").join(key).join(".ok").exists()
-    }
-
     /// Machine-independent spelling of the same path (via the store alias).
     /// This is what actions see, so any OUT_DIR string they embed in
     /// artifacts is identical on every machine.
@@ -1303,12 +1543,18 @@ impl Ctx {
             return Ok(None);
         };
         for o in &res.outputs {
-            if !self.store.cache_path(&o.hash).exists() {
+            let p = self.store.cache_path(&o.hash);
+            if !p.exists() {
                 return Ok(None); // self-heal: treat as miss
             }
+            Store::touch_used(&p);
         }
-        if res.bs.is_some() && !self.out_dir_ok(key) {
-            return Ok(None);
+        if res.bs.is_some() {
+            let ok = self.store.root.join("outdirs").join(key).join(".ok");
+            if !ok.exists() {
+                return Ok(None);
+            }
+            Store::touch_used(&ok);
         }
         self.materialize(&res)?;
         Ok(Some(res))
@@ -1545,6 +1791,7 @@ fn describe(ctx: &Ctx, idx: usize) -> String {
         Kind::Bsc => "build.rs compile".to_string(),
         Kind::Bsr => "build.rs run".to_string(),
         Kind::Bin => format!("bin \"{}\"", u.target.name),
+        Kind::Test => format!("test \"{}\"", u.target.name),
     };
     let plat = if !u.host {
         ctx.target.as_deref().map(|t| format!(" → {t}")).unwrap_or_default()
@@ -1575,13 +1822,14 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let mut indeg = vec![0usize; n];
     for (i, u) in ctx.units.iter().enumerate() {
         let mut required: std::collections::HashSet<(usize, bool)> = std::collections::HashSet::new();
-        let self_meta_ok = !unit_links(u);
+        let self_meta_ok = !is_linking(ctx, i);
         for d in &u.deps {
             let meta_edge =
-                self_meta_ok && d.extern_name.is_some() && unit_pipelined(&ctx.units[d.unit]);
+                self_meta_ok && d.extern_name.is_some() && is_pipelined(ctx, d.unit);
             required.insert((d.unit, !meta_edge));
         }
-        if unit_links(u) {
+        let _ = u;
+        if is_linking(ctx, i) {
             // full transitive closure: every reachable unit fully done
             let mut stack: Vec<usize> = u.deps.iter().map(|d| d.unit).collect();
             let mut seen = vec![false; n];
@@ -1894,7 +2142,7 @@ fn compile(
             };
             (target.name.replace('-', "_"), ct)
         }
-        Kind::Bsc | Kind::Bin => (target.name.replace('-', "_"), "bin".to_string()),
+        Kind::Bsc | Kind::Bin | Kind::Test => (target.name.replace('-', "_"), "bin".to_string()),
         Kind::Bsr => unreachable!(),
     };
     let crate_type = crate_type.as_str();
@@ -1908,14 +2156,15 @@ fn compile(
     let mut features: Vec<String> = unit.features.clone();
     features.sort();
 
-    let self_pipelined = unit_pipelined(unit);
+    let self_checked = is_checked(ctx, uidx);
+    let self_pipelined = is_pipelined(ctx, uidx);
     let default_bs = BuildScriptOut::default();
     let mut bs: &BuildScriptOut = &default_bs;
     let mut out_key = String::new();
     let mut externs: Vec<(String, String, String)> = Vec::new();
     for d in &unit.deps {
         if let Some(name) = &d.extern_name {
-            if self_pipelined && unit_pipelined(&ctx.units[d.unit]) {
+            if self_pipelined && is_pipelined(ctx, d.unit) {
                 // pipelined edge: compile against the dep's rmeta, keyed by
                 // the rmeta's bytes (what this action actually consumes)
                 let m = metas[d.unit].get().context("dependency rmeta missing")?;
@@ -1939,7 +2188,7 @@ fn compile(
     // artifacts into the key (the interface chain is cut by rmeta keying,
     // so implementations must be pinned flat, at the link).
     let mut link_closure: Vec<(String, String)> = Vec::new();
-    if unit_links(unit) {
+    if is_linking(ctx, uidx) {
         let mut seen = vec![false; ctx.units.len()];
         let mut stack: Vec<usize> = unit.deps.iter().map(|d| d.unit).collect();
         while let Some(i) = stack.pop() {
@@ -1996,7 +2245,13 @@ fn compile(
     let cap_lints = pkg.source.is_some();
 
     let key_json = serde_json::to_string(&CompileKey {
-        kind: "compile",
+        kind: if self_checked {
+            "check"
+        } else if matches!(unit.kind, Kind::Test) {
+            "compile-test"
+        } else {
+            "compile"
+        },
         tool: TOOL_VERSION,
         rustc: &ctx.rustc_version,
         host: &ctx.host,
@@ -2018,7 +2273,7 @@ fn compile(
         profile: ctx.profile_flags,
         env: &env,
         cap_lints,
-        toolchain: if crate_type == "lib" { "" } else { &ctx.toolchain },
+        toolchain: if crate_type == "lib" || self_checked { "" } else { &ctx.toolchain },
         tgt: if unit.host { "" } else { ctx.target.as_deref().unwrap_or("") },
     })?;
     let key = sha256_hex(key_json.as_bytes());
@@ -2028,7 +2283,11 @@ fn compile(
         if !res.stderr.is_empty() && pkg.source.is_none() {
             eprint!("{}", res.stderr);
         }
-        let expected = expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?;
+        let expected = if self_checked {
+            res.outputs.iter().map(|o| o.name.clone()).collect()
+        } else {
+            expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
+        };
         return finish_compile(&expected, key, true, res);
     }
 
@@ -2071,12 +2330,19 @@ fn compile(
     cmd.arg("--edition").arg(&target.edition);
     cmd.arg(&src_rel);
     cmd.arg("--crate-type").arg(crate_type);
-    if self_pipelined {
+    if self_checked {
+        cmd.arg("--emit=metadata,dep-info");
+        cmd.arg("--error-format=json");
+        cmd.arg("--json=artifacts");
+    } else if self_pipelined {
         cmd.arg("--emit=metadata,link,dep-info");
         cmd.arg("--error-format=json");
         cmd.arg("--json=artifacts");
     } else {
         cmd.arg("--emit=link,dep-info");
+    }
+    if matches!(unit.kind, Kind::Test) {
+        cmd.arg("--test");
     }
     if !unit.host {
         if let Some(t) = &ctx.target {
@@ -2188,7 +2454,11 @@ fn compile(
     let res = ActionResult { outputs, stderr, bs: None };
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     ctx.materialize(&res)?;
-    let expected = expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?;
+    let expected = if self_checked {
+        res.outputs.iter().map(|o| o.name.clone()).collect()
+    } else {
+        expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
+    };
     finish_compile(&expected, key, false, res)
 }
 

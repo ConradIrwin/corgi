@@ -164,6 +164,23 @@ impl Store {
         Ok(Store { root, alias, counter: AtomicU64::new(0) })
     }
 
+    /// Throttled use-marker for GC (Go's scheme): refresh a file's mtime on
+    /// use, at most ~hourly. Purely advisory — a missed touch costs at
+    /// worst a premature eviction, which self-heals as a cache miss.
+    pub fn touch_used(path: &Path) {
+        let Ok(md) = fs::metadata(path) else { return };
+        if let Ok(modified) = md.modified() {
+            if let Ok(age) = modified.elapsed() {
+                if age < std::time::Duration::from_secs(3600) {
+                    return;
+                }
+            }
+        }
+        if let Ok(f) = fs::File::options().append(true).open(path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
+
     pub fn logical_root(&self) -> &Path {
         self.alias.as_deref().unwrap_or(&self.root)
     }
@@ -224,7 +241,10 @@ impl Store {
     }
 
     pub fn load_action(&self, key: &str) -> Option<Vec<u8>> {
-        fs::read(self.action_path(key)).ok()
+        let p = self.action_path(key);
+        let data = fs::read(&p).ok()?;
+        Store::touch_used(&p);
+        Some(data)
     }
 
     pub fn save_action(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -267,6 +287,7 @@ impl Store {
                 let h = h.trim().to_string();
                 if h.len() == 64 {
                     IMMUTABLE_HITS.fetch_add(1, Ordering::Relaxed);
+                    Store::touch_used(&p);
                     return Ok(h);
                 }
             }
@@ -282,6 +303,7 @@ impl Store {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        Store::touch_used(&hint_path);
         let mut fresh = Hints::new();
         HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
         let h = hash_dir_hinted(root, &hints, &mut fresh)?;
