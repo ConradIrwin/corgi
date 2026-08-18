@@ -1140,6 +1140,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     for p in [
         "/usr/bin/ar",
         "/usr/bin/ranlib",
+        "/usr/bin/clang",
+        "/usr/bin/clang++",
+        "/usr/bin/c++",
         "/usr/bin/xcrun",
         "/usr/bin/xcodebuild",
         "/usr/bin/xcode-select",
