@@ -64,40 +64,9 @@ pub struct Target {
 
 #[derive(Deserialize)]
 pub struct Resolve {
-    pub nodes: Vec<Node>,
     pub root: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct Node {
-    pub id: String,
-    #[serde(default)]
-    pub deps: Vec<NodeDep>,
-    #[serde(default)]
-    pub features: Vec<String>,
-}
-
-#[derive(Deserialize)]
-pub struct NodeDep {
-    pub name: String,
-    pub pkg: String,
-    #[serde(default)]
-    pub dep_kinds: Vec<DepKindInfo>,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-pub struct DepKindInfo {
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub target: Option<String>,
-}
-
-/// `[package.metadata.dcargo] extra-inputs = [...]` — declared
-/// cross-package inputs, hashed into the source hash and allowed by the
-/// containment checker. Cargo ignores metadata tables, so this is inert
-/// under stock cargo.
 pub fn extra_inputs(p: &Package) -> Vec<String> {
     p.metadata
         .get("dcargo")
@@ -138,10 +107,6 @@ pub fn lib_target(p: &Package) -> Option<&Target> {
     p.targets
         .iter()
         .find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib" || k == "proc-macro"))
-}
-
-pub fn build_script_target(p: &Package) -> Option<&Target> {
-    p.targets.iter().find(|t| t.kind.iter().any(|k| k == "custom-build"))
 }
 
 pub fn is_proc_macro(p: &Package) -> bool {

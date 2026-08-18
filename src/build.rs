@@ -113,7 +113,7 @@ pub struct Ctx {
     darwin_dirs: Vec<String>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
-    dylib_suffix: &'static str,
+    file_names_memo: Mutex<HashMap<(String, bool), Vec<String>>>,
     profile_name: &'static str,
     profile_flags: &'static [&'static str],
     opt_level: &'static str,
@@ -700,9 +700,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     let mut tool_envs: Vec<(String, String)> = Vec::new();
     let mut tools_id = String::new();
     let mut env_inputs: Vec<(String, String, Vec<String>)> = Vec::new();
-    let mut universes: Universes = Vec::new();
-    if let Some((manifest_text, specs, inputs, unis)) = read_tools_manifest(&dir)? {
-        universes = unis;
+    if let Some((manifest_text, specs, inputs, _)) = read_tools_manifest(&dir)? {
         tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
         for t in &specs {
             ensure_tool(&store, t)?;
@@ -782,13 +780,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     }
 
     let pool = store.root.join("pool");
-    let dylib_suffix = if host.contains("apple") {
-        ".dylib"
-    } else if host.contains("windows") {
-        ".dll"
-    } else {
-        ".so"
-    };
+    let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
     let ctx = Ctx {
         store,
@@ -811,7 +803,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         darwin_dirs,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
-        dylib_suffix,
+        file_names_memo,
         profile_name: if release { "release" } else { "debug" },
         profile_flags: if release { RELEASE_FLAGS } else { DEBUG_FLAGS },
         opt_level: if release { "3" } else { "0" },
@@ -1353,35 +1345,73 @@ fn run_unit(ctx: &Ctx, idx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     }
 }
 
-fn finish_compile(
+/// Authoritative output names for a compile: rustc itself reports them
+/// (`--print file-names`), memoized per (crate-types, platform).
+fn expected_outputs(
+    ctx: &Ctx,
     crate_name: &str,
-    crate_type: &str,
     k16: &str,
-    dylib_suffix: &str,
-    key: String,
-    cached: bool,
-    res: ActionResult,
-) -> Result<UnitResult> {
-    // artifact preference: rlib (dependency consumption) > dylib
-    // (proc-macro, native cdylib) > wasm cdylib > bare binary
-    let _ = crate_type;
-    let candidates = [
-        format!("lib{crate_name}-{k16}.rlib"),
-        format!("lib{crate_name}-{k16}{dylib_suffix}"),
-        format!("{crate_name}-{k16}.wasm"),
-        format!("{crate_name}-{k16}"),
-    ];
-    let main = candidates
+    crate_types: &str,
+    host: bool,
+) -> Result<Vec<String>> {
+    let memo_key = (crate_types.to_string(), host);
+    let pattern = {
+        let cached = ctx.file_names_memo.lock().unwrap().get(&memo_key).cloned();
+        match cached {
+            Some(p) => p,
+            None => {
+                let mut cmd = Command::new(&ctx.rustc);
+                cmd.args([
+                    "--print",
+                    "file-names",
+                    "--crate-name",
+                    "dcargoprobe",
+                    "--crate-type",
+                    crate_types,
+                    "-Cextra-filename=-XDCARGOX",
+                ]);
+                if !host {
+                    if let Some(t) = &ctx.target {
+                        cmd.args(["--target", t]);
+                    }
+                }
+                cmd.arg("-");
+                cmd.stdin(std::process::Stdio::null());
+                let names = capture(&mut cmd, "rustc --print file-names")?;
+                let p: Vec<String> = names.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                if p.is_empty() {
+                    bail!("rustc --print file-names reported nothing for {crate_types}");
+                }
+                ctx.file_names_memo.lock().unwrap().insert(memo_key, p.clone());
+                p
+            }
+        }
+    };
+    Ok(pattern
         .iter()
-        .find_map(|c| res.outputs.iter().find(|o| &o.name == c))
-        .cloned()
-        .with_context(|| {
-            format!(
-                "no main artifact among {:?}",
+        .map(|n| n.replace("dcargoprobe", crate_name).replace("-XDCARGOX", &format!("-{k16}")))
+        .collect())
+}
+
+fn finish_compile(expected: &[String], key: String, cached: bool, res: ActionResult) -> Result<UnitResult> {
+    // every rustc-reported output must exist: catches emission surprises
+    for e in expected {
+        if !res.outputs.iter().any(|o| &o.name == e) {
+            bail!(
+                "rustc-reported output {e} missing (got {:?})",
                 res.outputs.iter().map(|o| &o.name).collect::<Vec<_>>()
-            )
-        })?;
-    Ok(UnitResult { key, cached, res, main: Some(main) })
+            );
+        }
+    }
+    // the dependency-linking artifact: the rlib when one is emitted,
+    // otherwise the sole reported output (dylib/wasm/executable)
+    let main_name = expected
+        .iter()
+        .find(|e| e.ends_with(".rlib"))
+        .or_else(|| expected.first())
+        .context("no expected outputs")?;
+    let main = res.outputs.iter().find(|o| &o.name == main_name).cloned();
+    Ok(UnitResult { key, cached, res, main })
 }
 
 fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
@@ -1501,7 +1531,8 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         if !res.stderr.is_empty() && pkg.source.is_none() {
             eprint!("{}", res.stderr);
         }
-        return finish_compile(&crate_name, crate_type, &k16, ctx.dylib_suffix, key, true, res);
+        let expected = expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?;
+        return finish_compile(&expected, key, true, res);
     }
 
     let outdir = ctx.store.tmp_path("rustc");
@@ -1647,7 +1678,8 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     let res = ActionResult { outputs, stderr, bs: None };
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     ctx.materialize(&res)?;
-    finish_compile(&crate_name, crate_type, &k16, ctx.dylib_suffix, key, false, res)
+    let expected = expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?;
+    finish_compile(&expected, key, false, res)
 }
 
 fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
