@@ -136,7 +136,7 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
 
 impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
-        for d in ["cas", "pool", "outdirs", "tmp"] {
+        for d in ["cache", "pool", "outdirs", "tmp"] {
             fs::create_dir_all(root.join(d))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
@@ -177,15 +177,15 @@ impl Store {
         self.root.join("tmp").join(format!("{tag}-{}-{t}-{n}", std::process::id()))
     }
 
-    pub fn cas_path(&self, hash: &str) -> PathBuf {
-        self.root.join("cas").join(&hash[..2]).join(hash)
+    pub fn cache_path(&self, hash: &str) -> PathBuf {
+        self.root.join("cache").join(&hash[..2]).join(hash)
     }
 
     /// Move a file into the CAS. Concurrent inserts of the same content
     /// race benignly: rename over an identical file is fine.
     pub fn insert_file(&self, path: &Path) -> Result<String> {
         let hash = sha256_file(path)?;
-        let dest = self.cas_path(&hash);
+        let dest = self.cache_path(&hash);
         if dest.exists() {
             fs::remove_file(path).ok();
             return Ok(hash);
@@ -204,7 +204,7 @@ impl Store {
     /// Insert in-memory bytes into the CAS (used for cached plan JSON).
     pub fn insert_bytes(&self, data: &[u8]) -> Result<String> {
         let hash = sha256_hex(data);
-        let dest = self.cas_path(&hash);
+        let dest = self.cache_path(&hash);
         if !dest.exists() {
             self.write_atomic(&dest, data)?;
         }
@@ -220,7 +220,7 @@ impl Store {
     }
 
     pub fn action_path(&self, key: &str) -> PathBuf {
-        self.root.join("cas").join(&key[..2]).join(format!("{key}.json"))
+        self.root.join("cache").join(&key[..2]).join(format!("{key}.json"))
     }
 
     pub fn load_action(&self, key: &str) -> Option<Vec<u8>> {
@@ -237,7 +237,7 @@ impl Store {
     pub fn materialize_pool(&self, hash: &str, file_name: &str, executable: bool) -> Result<PathBuf> {
         let dest = self.root.join("pool").join(file_name);
         if !dest.exists() {
-            let src = self.cas_path(hash);
+            let src = self.cache_path(hash);
             if executable {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = fs::metadata(&src)?.permissions();
@@ -323,7 +323,7 @@ impl Store {
             .parent()
             .unwrap()
             .join(format!(".dcargo-tmp-{}", std::process::id()));
-        fs::copy(self.cas_path(hash), &tmp)?;
+        fs::copy(self.cache_path(hash), &tmp)?;
         if executable {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&tmp)?.permissions();

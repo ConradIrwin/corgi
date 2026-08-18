@@ -31,10 +31,10 @@ Results live in a machine-wide store:
 
 ```
 /Users/Shared/dcargo/
-  cas/<xx>/<sha256>     content-addressed artifacts (rlibs, dylibs, bins)
-  cas/<xx>/<key>.json   action records in the same tree, Go-style: name is the
+  cache/<xx>/<sha256>   content-addressed artifacts (rlibs, dylibs, bins)
+  cache/<xx>/<key>.json action records in the same tree, Go-style: name is the
                         INPUT key, content is the answer (outputs, directives)
-  pool/lib<name>-<key16>.rlib   hardlinks into cas, named for rustc -L/--extern
+  pool/lib<name>-<key16>.rlib   hardlinks into cache, named for rustc -L/--extern
   outdirs/<key>/out     build.rs OUT_DIRs, built in place; .ok sentinel = done
   tools/<name>-<ver>/   every pinned immutable component: [tools] downloads,
                         rust toolchains (rust-<ver>-<host>), and per-target

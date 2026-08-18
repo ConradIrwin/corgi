@@ -622,9 +622,9 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
             if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
                 if plan_fingerprint(&ws_root, &entry.files, &entry.glob_dirs) == entry.fingerprint {
                     let meta_text =
-                        fs::read(store.cas_path(&entry.meta_cas)).ok().and_then(|b| String::from_utf8(b).ok());
+                        fs::read(store.cache_path(&entry.meta_blob)).ok().and_then(|b| String::from_utf8(b).ok());
                     let ug_text =
-                        fs::read(store.cas_path(&entry.ug_cas)).ok().and_then(|b| String::from_utf8(b).ok());
+                        fs::read(store.cache_path(&entry.ug_blob)).ok().and_then(|b| String::from_utf8(b).ok());
                     if let (Some(mut m), Some(mut u)) = (meta_text, ug_text) {
                         // cargo output embeds absolute paths; re-root them so
                         // bit-identical checkouts elsewhere can share plans
@@ -977,8 +977,8 @@ struct PlanEntry {
     /// plan (member globs like `crates/*` pick up new directories).
     glob_dirs: Vec<String>,
     fingerprint: String,
-    meta_cas: String,
-    ug_cas: String,
+    meta_blob: String,
+    ug_blob: String,
 }
 
 /// Hash every plan input: file contents, plus (for glob dirs) the sorted
@@ -1091,8 +1091,8 @@ fn save_plan(
         fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs),
         files,
         glob_dirs,
-        meta_cas: store.insert_bytes(meta_json.as_bytes())?,
-        ug_cas: store.insert_bytes(ug_json.as_bytes())?,
+        meta_blob: store.insert_bytes(meta_json.as_bytes())?,
+        ug_blob: store.insert_bytes(ug_json.as_bytes())?,
     };
     store.save_action(plan_ptr, serde_json::to_string(&entry)?.as_bytes())
 }
@@ -1257,7 +1257,7 @@ impl Ctx {
             return Ok(None);
         };
         for o in &res.outputs {
-            if !self.store.cas_path(&o.hash).exists() {
+            if !self.store.cache_path(&o.hash).exists() {
                 return Ok(None); // self-heal: treat as miss
             }
         }
