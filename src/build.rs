@@ -1313,8 +1313,20 @@ pub fn build(
             let r = results[i].get().context("test harness not built")?;
             let m = r.main.as_ref().context("test artifact missing")?;
             let pkg = &ctx.meta.packages[u.pkg];
-            eprintln!("dcargo: running tests: {} ({})", u.target.name, m.name);
-            let mut c = Command::new(ctx.pool.join(&m.name));
+            // Export the harness and its CGU objects (debug-map targets)
+            // before running, so even a failing test leaves a debuggable
+            // binary behind: `lldb target/<profile>/deps/<name>` from the
+            // workspace root needs no configuration.
+            let dest = dtarget.join(ctx.profile_name).join("deps").join(&m.name);
+            ctx.store.export(&m.hash, &dest, true)?;
+            for o in &r.res.outputs {
+                if o.name.ends_with(".rcgu.o") {
+                    let odest = dtarget.join(ctx.profile_name).join(&o.name);
+                    ctx.store.export(&o.hash, &odest, false)?;
+                }
+            }
+            eprintln!("dcargo: running tests: {} ({})", u.target.name, dest.display());
+            let mut c = Command::new(&dest);
             c.current_dir(pkg.root());
             for (k, v) in ctx.pkg_env(pkg) {
                 c.env(k, v);
