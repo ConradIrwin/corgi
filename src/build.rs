@@ -1346,7 +1346,9 @@ fn run_unit(ctx: &Ctx, idx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
 }
 
 /// Authoritative output names for a compile: rustc itself reports them
-/// (`--print file-names`), memoized per (crate-types, platform).
+/// (`--print file-names`). Two cache layers keep this at zero spawns on
+/// warm builds: an in-process memo, and a store entry keyed by
+/// (tool, rustc -vV, triple, crate-types).
 fn expected_outputs(
     ctx: &Ctx,
     crate_name: &str,
@@ -1355,36 +1357,53 @@ fn expected_outputs(
     host: bool,
 ) -> Result<Vec<String>> {
     let memo_key = (crate_types.to_string(), host);
-    let pattern = {
-        let cached = ctx.file_names_memo.lock().unwrap().get(&memo_key).cloned();
-        match cached {
-            Some(p) => p,
-            None => {
-                let mut cmd = Command::new(&ctx.rustc);
-                cmd.args([
-                    "--print",
-                    "file-names",
-                    "--crate-name",
-                    "dcargoprobe",
-                    "--crate-type",
-                    crate_types,
-                    "-Cextra-filename=-XDCARGOX",
-                ]);
-                if !host {
-                    if let Some(t) = &ctx.target {
-                        cmd.args(["--target", t]);
+    let cached = ctx.file_names_memo.lock().unwrap().get(&memo_key).cloned();
+    let pattern = match cached {
+        Some(p) => p,
+        None => {
+            let plat = if host { ctx.host.as_str() } else { ctx.target.as_deref().unwrap_or(ctx.host.as_str()) };
+            let probe_key = sha256_hex(
+                format!("probe-file-names\0{TOOL_VERSION}\0{}\0{plat}\0{crate_types}", ctx.rustc_version).as_bytes(),
+            );
+            let from_store = ctx
+                .store
+                .load_action(&probe_key)
+                .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok());
+            let p = match from_store {
+                Some(p) => p,
+                None => {
+                    let mut cmd = Command::new(&ctx.rustc);
+                    cmd.args([
+                        "--print",
+                        "file-names",
+                        "--crate-name",
+                        "dcargoprobe",
+                        "--crate-type",
+                        crate_types,
+                        "-Cextra-filename=-XDCARGOX",
+                    ]);
+                    if !host {
+                        if let Some(t) = &ctx.target {
+                            cmd.args(["--target", t]);
+                        }
                     }
+                    cmd.arg("-");
+                    cmd.stdin(std::process::Stdio::null());
+                    let names = capture(&mut cmd, "rustc --print file-names")?;
+                    let p: Vec<String> = names
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    if p.is_empty() {
+                        bail!("rustc --print file-names reported nothing for {crate_types}");
+                    }
+                    ctx.store.save_action(&probe_key, &serde_json::to_vec(&p)?)?;
+                    p
                 }
-                cmd.arg("-");
-                cmd.stdin(std::process::Stdio::null());
-                let names = capture(&mut cmd, "rustc --print file-names")?;
-                let p: Vec<String> = names.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-                if p.is_empty() {
-                    bail!("rustc --print file-names reported nothing for {crate_types}");
-                }
-                ctx.file_names_memo.lock().unwrap().insert(memo_key, p.clone());
-                p
-            }
+            };
+            ctx.file_names_memo.lock().unwrap().insert(memo_key, p.clone());
+            p
         }
     };
     Ok(pattern
