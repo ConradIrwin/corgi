@@ -744,6 +744,56 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
     Ok(dest.join("bin"))
 }
 
+/// Install the rust-src component as its OWN tools/ entry — never inside
+/// the sysroot: rustc devirtualizes std paths when it sees sources there,
+/// which would flip every action key. These sources serve debuggers only:
+/// one lldb source-map line from the toolchain's /rustc/<commit> prefix to
+/// this directory gives complete std source display (see README).
+fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
+    let dest = store.root.join("tools").join(format!("rust-src-{channel}"));
+    if dest.join("lib/rustlib/src/rust/library").exists() {
+        touch_tool_marker(&dest);
+        return Ok(());
+    }
+    eprintln!("dcargo: installing rust-src {channel} (sha256-pinned)");
+    let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+    } else if let Some(d) = channel.strip_prefix("beta-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+    } else {
+        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+    };
+    let name = format!("rust-src-{ver}");
+    let work = store.tmp_path("rust-src");
+    fs::create_dir_all(&work)?;
+    let tarball = work.join("t.tar.xz");
+    let url = format!("{base}/{name}.tar.xz");
+    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    if !st.success() {
+        bail!("download failed: {url}");
+    }
+    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+    let actual = crate::store::sha256_file(&tarball)?;
+    if actual != expected {
+        bail!("sha256 mismatch for {name}");
+    }
+    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    if !st.success() {
+        bail!("unpack failed: {name}");
+    }
+    let payload = work.join(&name).join("rust-src");
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&payload, &dest) {
+        Ok(()) => {}
+        Err(_) if dest.join("lib/rustlib/src/rust/library").exists() => {}
+        Err(e) => return Err(e).context("publishing rust-src component"),
+    }
+    touch_tool_marker(&dest);
+    fs::remove_dir_all(&work).ok();
+    Ok(())
+}
+
 /// Install rust-std for a cross target as its OWN immutable tools/ entry
 /// (never mutating the toolchain dir). Compiles reach it via a bare `-L`:
 /// rustc's crate loader resolves sysroot crates (std, core, ...) from -L
@@ -814,6 +864,11 @@ pub fn build(
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
     ensure_toolchain(&store, &channel, &host_guess)?;
+    // Debugger convenience, deliberately outside the sysroot (see
+    // ensure_rust_src). Failure is non-fatal: builds don't need sources.
+    if let Err(e) = ensure_rust_src(&store, &channel) {
+        eprintln!("dcargo: warning: rust-src install failed ({e}); std source display in debuggers unavailable");
+    }
     // Hand actions only the *logical* toolchain path (via the store alias):
     // physical per-store paths leak into ld's UUID (it hashes the link
     // command line, including libstd rlib paths) and into build-script keys.

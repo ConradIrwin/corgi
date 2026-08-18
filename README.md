@@ -70,6 +70,16 @@ Results live in a machine-wide store:
   are recorded relative to the workspace root; the CGU objects export next
   to the binary (`target/debug/*.rcgu.o`, cargo's own convention). Modern
   ld records zero OSO timestamps, so gc's use-touching never stales them
+- std sources install as a side-car (`tools/rust-src-<ver>`, never inside
+  the sysroot — rustc would devirtualize std paths and flip every key).
+  Everything you write and depend on debugs with zero configuration; for
+  source display *inside* std add the one optional line (editors can
+  inject it automatically):
+
+  ```
+  settings set target.source-map /rustc/$(rustc -vV | sed -n 's/commit-hash: //p') \
+      /Users/Shared/dcargo/tools/rust-src-<ver>/lib/rustlib/src/rust
+  ```
 - on macOS the proc-macro dylib install name is pinned
   (`-Wl,-install_name,/dc/...`) — ld64 otherwise embeds the temp output path
 - verified: two cold builds in different directories with different store
