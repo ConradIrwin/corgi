@@ -110,5 +110,5 @@ pub fn lib_target(p: &Package) -> Option<&Target> {
 }
 
 pub fn is_proc_macro(p: &Package) -> bool {
-    lib_target(p).map_or(false, |t| t.kind.iter().any(|k| k == "proc-macro"))
+    lib_target(p).is_some_and(|t| t.kind.iter().any(|k| k == "proc-macro"))
 }

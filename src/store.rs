@@ -176,7 +176,13 @@ impl Store {
                 }
             }
         }
-        if let Ok(f) = fs::File::options().append(true).open(path) {
+        // Directories (e.g. source checkouts) can't be opened for
+        // append; fall back to a read-only handle, which futimens accepts.
+        let opened = fs::File::options()
+            .append(true)
+            .open(path)
+            .or_else(|_| fs::File::open(path));
+        if let Ok(f) = opened {
             let _ = f.set_modified(std::time::SystemTime::now());
         }
     }

@@ -55,11 +55,21 @@ Results live in a machine-wide store:
 
 ### Determinism details
 
-- compiles run with `cwd = package root` and a *relative* source path, plus
-  `--remap-path-prefix` for cargo-home/workspace/package roots
+- compiles run with `cwd = package root` and a *relative* source path; the
+  workspace root is remapped to `.`, so debug info carries workspace-relative
+  paths (lldb run from the workspace root needs no source-map)
+- dependency sources live in the store itself (`cargo-home/` under the
+  canonical store path): their real paths are machine-independent, so they
+  need no remapping and debuggers step into deps with no configuration
 - `-Cmetadata`/`-Cextra-filename` derive from the action key (stable symbol
   hashes, unique artifact file names — no collisions in the shared pool)
-- `-Cdebuginfo=0` for now (dodges macOS .dSYM/OSO path issues)
+- full debug info on target-side units under dev; host-side units (build
+  scripts, proc-macros, their exclusive deps) stay at zero like cargo's
+  build-override default. Darwin linking units compile with
+  `-Csplit-debuginfo=unpacked` and `-Wl,-oso_prefix` so debug-map entries
+  are recorded relative to the workspace root; the CGU objects export next
+  to the binary (`target/debug/*.rcgu.o`, cargo's own convention). Modern
+  ld records zero OSO timestamps, so gc's use-touching never stales them
 - on macOS the proc-macro dylib install name is pinned
   (`-Wl,-install_name,/dc/...`) — ld64 otherwise embeds the temp output path
 - verified: two cold builds in different directories with different store
@@ -246,7 +256,7 @@ the toolchain hash.
   the whole package dir — but a hostile script could read outside it);
   `rerun-if-changed` narrowing is intentionally ignored (content hashing
   supersedes it, conservatively)
-- one fixed profile (opt-level=0, no debuginfo); no `--release` flag yet
+- hardcoded dev/release profiles (`[profile.*]` tables are ignored so far)
 - no target-platform cfg evaluation beyond `--filter-platform`, no dev-deps /
   tests / cdylibs, single rustc invocation per crate (no pipelining), warnings
   from cached dep actions are not replayed

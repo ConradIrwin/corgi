@@ -9,14 +9,16 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.9";
+const TOOL_VERSION: &str = "dcargo/0.10";
 
-/// Profiles (debuginfo stays off in both for now: split-debuginfo path
-/// determinism is future work). Flags are part of every action key, and the
+/// Profiles (hardcoded until [profile.*] support). Debug info is decided
+/// per unit: target-side units get full debug info under dev; host-side
+/// units (build scripts, proc-macros, their exclusive deps) stay at zero
+/// like cargo's build-override default, which also keeps their dylibs
+/// free of debug-map stabs. Flags are part of every action key, and the
 /// store is append-only, so profiles coexist and never evict each other.
 const DEBUG_FLAGS: &[&str] = &[
     "-Copt-level=0",
-    "-Cdebuginfo=0",
     "-Cdebug-assertions=on",
     "-Coverflow-checks=on",
     "-Cembed-bitcode=no",
@@ -24,7 +26,6 @@ const DEBUG_FLAGS: &[&str] = &[
 ];
 const RELEASE_FLAGS: &[&str] = &[
     "-Copt-level=3",
-    "-Cdebuginfo=0",
     "-Cdebug-assertions=off",
     "-Coverflow-checks=off",
     "-Cembed-bitcode=no",
@@ -192,6 +193,10 @@ pub struct Ctx {
     target: Option<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
+    /// True for target-side units: reachable from the roots without
+    /// crossing an execution boundary (build script, proc-macro). Only
+    /// these carry debug info under dev.
+    debug_side: Vec<bool>,
     /// Logical path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
@@ -220,6 +225,9 @@ struct CompileKey<'a> {
     link_args: &'a [String],
     out_key: &'a str,
     profile: &'a [&'a str],
+    debuginfo: u32,
+    /// debug-map prefix recorded relative to the workspace root ("" = none)
+    oso: &'a str,
     env: &'a [(String, String)],
     cap_lints: bool,
     /// linker-chain identity; only linking crate types depend on it
@@ -268,8 +276,10 @@ struct EnvInput {
 /// and hashed into the scoped packages' build-script keys.
 /// The whole manifest hash keys every build-script action.
 type Universes = Vec<(String, Vec<String>)>;
+/// (manifest text, tool specs, env inputs, feature universes).
+type ToolsManifest = (String, Vec<ToolSpec>, Vec<EnvInput>, Universes);
 
-fn read_tools_manifest(dir: &Path) -> Result<Option<(String, Vec<ToolSpec>, Vec<EnvInput>, Universes)>> {
+fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
     while let Some(d) = cur {
@@ -495,7 +505,7 @@ pub fn gc(store: &Store) -> Result<()> {
 fn maybe_auto_gc(store: &Store) {
     let marker = store.root.join("cache").join("trim.txt");
     if let Ok(md) = fs::metadata(&marker) {
-        if let Ok(age) = md.modified().and_then(|m| m.elapsed().map_err(|e| std::io::Error::other(e))) {
+        if let Ok(age) = md.modified().and_then(|m| m.elapsed().map_err(std::io::Error::other)) {
             if age < std::time::Duration::from_secs(24 * 3600) {
                 return;
             }
@@ -582,6 +592,52 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
             dirs += 1;
         }
     }
+    // cargo-home/: dependency sources are re-fetchable. Registry
+    // extractions and git checkouts are judged by their use-touched
+    // .cargo-ok (fallback: the dir itself); crate tarballs and git dbs
+    // by plain mtime. The sparse index is left alone (small, and cargo
+    // refreshes it itself).
+    let cargo_home = store.root.join("cargo-home");
+    for index_dir in read_dir_paths(&cargo_home.join("registry/src"))? {
+        for pkg_dir in read_dir_paths(&index_dir)? {
+            if !pkg_dir.is_dir() {
+                continue;
+            }
+            let ok = pkg_dir.join(".cargo-ok");
+            let verdict = if ok.exists() { stale(&ok) } else { stale(&pkg_dir) };
+            if verdict && fs::remove_dir_all(&pkg_dir).is_ok() {
+                dirs += 1;
+            }
+        }
+    }
+    for index_dir in read_dir_paths(&cargo_home.join("registry/cache"))? {
+        for f in read_dir_paths(&index_dir)? {
+            if f.is_file() && stale(&f) {
+                let n = fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+                if fs::remove_file(&f).is_ok() {
+                    files += 1;
+                    bytes += n;
+                }
+            }
+        }
+    }
+    for repo_dir in read_dir_paths(&cargo_home.join("git/checkouts"))? {
+        for checkout_dir in read_dir_paths(&repo_dir)? {
+            if !checkout_dir.is_dir() {
+                continue;
+            }
+            let ok = checkout_dir.join(".cargo-ok");
+            let verdict = if ok.exists() { stale(&ok) } else { stale(&checkout_dir) };
+            if verdict && fs::remove_dir_all(&checkout_dir).is_ok() {
+                dirs += 1;
+            }
+        }
+    }
+    for db_dir in read_dir_paths(&cargo_home.join("git/db"))? {
+        if db_dir.is_dir() && stale(&db_dir) && fs::remove_dir_all(&db_dir).is_ok() {
+            dirs += 1;
+        }
+    }
     // tmp/: anything older than a day is orphaned staging
     let day = now.checked_sub(std::time::Duration::from_secs(24 * 3600)).unwrap_or(cutoff);
     for p in read_dir_paths(&store.root.join("tmp"))? {
@@ -601,13 +657,10 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
 
 fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    match fs::read_dir(dir) {
-        Ok(rd) => {
-            for e in rd {
-                out.push(e?.path());
-            }
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd {
+            out.push(e?.path());
         }
-        Err(_) => {}
     }
     Ok(out)
 }
@@ -818,6 +871,15 @@ pub fn build(
         cfg_env.clone()
     };
 
+    // Dependency sources live in the store: cargo (fetch/metadata/
+    // unit-graph) runs with CARGO_HOME at the canonical store path, so
+    // registry and git checkouts land at machine-independent locations
+    // that exist wherever a dcargo store does. Debug info referencing dep
+    // sources therefore needs no remapping and no debugger fixups. Side
+    // effect (deliberate): the user's ~/.cargo/config.toml no longer
+    // silently shapes hermetic builds.
+    let cargo_home = store.logical_root().join("cargo-home").display().to_string();
+
     let t_setup_done = Instant::now();
     // ---- plan-phase cache -------------------------------------------------
     // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
@@ -866,26 +928,28 @@ pub fn build(
             }
         }
     }
-    let (meta_json, ug_json) = match plan {
-        Some(cached) => {
-            eprintln!("dcargo: plan unchanged (cached resolve; skipping cargo)");
-            cached
-        }
-        None => {
+    let resolve_now = || -> Result<(String, String)> {
+        {
             eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
             // Never bother the user about a stale lockfile: try --locked
             // first (it never writes), and when cargo rejects it, run once
             // unlocked so cargo brings Cargo.lock up to date, then continue.
             // The plan fingerprint hashes the lock *after* this step.
             if capture(
-                Command::new(&cargo_bin).args(["fetch", "--locked", "--manifest-path"]).arg(&manifest),
+                Command::new(&cargo_bin)
+                    .args(["fetch", "--locked", "--manifest-path"])
+                    .arg(&manifest)
+                    .env("CARGO_HOME", &cargo_home),
                 "cargo fetch --locked",
             )
             .is_err()
             {
                 eprintln!("dcargo: Cargo.lock is missing or stale; letting cargo update it");
                 capture(
-                    Command::new(&cargo_bin).args(["fetch", "--manifest-path"]).arg(&manifest),
+                    Command::new(&cargo_bin)
+                        .args(["fetch", "--manifest-path"])
+                        .arg(&manifest)
+                        .env("CARGO_HOME", &cargo_home),
                     "cargo fetch",
                 )?;
             }
@@ -893,6 +957,7 @@ pub fn build(
             // the actual per-unit resolution comes from cargo's unit-graph below
             let mut meta_cmd = Command::new(&cargo_bin);
             meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
+            meta_cmd.env("CARGO_HOME", &cargo_home);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
             let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
@@ -902,6 +967,7 @@ pub fn build(
             let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
             let mut ug_cmd = Command::new(&cargo_bin);
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
+            ug_cmd.env("CARGO_HOME", &cargo_home);
             ug_cmd.args(["build", "--unit-graph", "-Zunstable-options", "--locked"]);
             if matches!(mode, Mode::Test) {
                 ug_cmd.arg("--tests");
@@ -925,10 +991,51 @@ pub fn build(
             ug_cmd.arg("--manifest-path").arg(&ws_manifest);
             let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
             save_plan(&store, &plan_ptr, &dir, &meta, &meta_json, &ug_json)?;
-            (meta_json, ug_json)
+            Ok((meta_json, ug_json))
         }
     };
-    let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+    let from_cache = plan.is_some();
+    let (mut meta_json, mut ug_json) = match plan {
+        Some(cached) => {
+            eprintln!("dcargo: plan unchanged (cached resolve; skipping cargo)");
+            cached
+        }
+        None => resolve_now()?,
+    };
+    let mut meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+    // A cached plan says nothing about dependency sources still being
+    // extracted in the store (gc may have trimmed them); verify cheaply
+    // and re-resolve once if anything is missing.
+    if from_cache && meta.packages.iter().any(|p| p.source.is_some() && !p.root().exists()) {
+        eprintln!("dcargo: dependency sources missing from the store; re-fetching");
+        let (m, u) = resolve_now()?;
+        meta_json = m;
+        ug_json = u;
+        meta = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+    }
+    // GC use-marker: dependency sources referenced by this plan stay
+    // live. Git checkouts keep their marker at the checkout root, which
+    // can be an ancestor of the package root.
+    for pkg in &meta.packages {
+        if pkg.source.is_none() {
+            continue;
+        }
+        let root = pkg.root();
+        let mut marker: Option<PathBuf> = None;
+        let mut cursor: Option<&Path> = Some(root.as_path());
+        while let Some(c) = cursor {
+            if !c.starts_with(&cargo_home) {
+                break;
+            }
+            let ok = c.join(".cargo-ok");
+            if ok.exists() {
+                marker = Some(ok);
+                break;
+            }
+            cursor = c.parent();
+        }
+        Store::touch_used(marker.as_deref().unwrap_or(root.as_path()));
+    }
 
     let root_id = meta
         .resolve
@@ -965,10 +1072,33 @@ pub fn build(
         }
         check_mode = (0..units.len()).map(|i| !codegen[i]).collect();
     }
+    // Target-side units: reachable from the roots without crossing an
+    // execution boundary (build scripts, proc-macros). Only these get
+    // debug info; the rest mirrors cargo's build-override default of
+    // zero, which also keeps proc-macro dylibs free of debug-map stabs.
+    let mut debug_side = vec![false; units.len()];
+    {
+        let mut stack: Vec<usize> = (0..units.len()).filter(|&i| units[i].is_root).collect();
+        let mut seen = vec![false; units.len()];
+        while let Some(i) = stack.pop() {
+            if seen[i] {
+                continue;
+            }
+            seen[i] = true;
+            if matches!(units[i].kind, Kind::Bsc | Kind::Bsr)
+                || unit_crate_type(&units[i]) == "proc-macro"
+            {
+                continue;
+            }
+            debug_side[i] = true;
+            for d in &units[i].deps {
+                stack.push(d.unit);
+            }
+        }
+    }
     let t_plan_done = Instant::now();
 
     let home = std::env::var("HOME").unwrap_or_default();
-    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{home}/.cargo"));
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
     let devdir = capture(Command::new("/usr/bin/xcode-select").arg("-p"), "xcode-select -p")
         .map(|s| s.trim().to_string())
@@ -1157,6 +1287,7 @@ pub fn build(
         env_inputs,
         target,
         check_mode,
+        debug_side,
         target_std_libdir,
         cfg_env_target,
     };
@@ -1211,6 +1342,14 @@ pub fn build(
             let dest = dtarget.join(ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
             eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
+            for o in &r.res.outputs {
+                if o.name.ends_with(".rcgu.o") {
+                    // The binary's debug map references these objects
+                    // relative to the workspace root.
+                    let odest = dtarget.join(ctx.profile_name).join(&o.name);
+                    ctx.store.export(&o.hash, &odest, false)?;
+                }
+            }
         }
         if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
             if let (Some(tgt), Some(r)) = (ctx.target.as_deref(), results[i].get()) {
@@ -2244,6 +2383,28 @@ fn compile(
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
     let cap_lints = pkg.source.is_some();
 
+    // Hardcoded dev/release debug levels until [profile.*] support: full
+    // debug info for target-side units, none for host-side or checked
+    // ones. Darwin linking units keep their CGU objects (split-debuginfo
+    // unpacked) and record them in the debug map relative to the
+    // workspace root via -oso_prefix, so the objects can ship next to
+    // the exported binary and lldb finds them from the workspace root.
+    let debuginfo: u32 = if ctx.profile_name == "release"
+        || self_checked
+        || !ctx.debug_side.get(uidx).copied().unwrap_or(false)
+    {
+        0
+    } else {
+        2
+    };
+    let unit_platform = if unit.host {
+        ctx.host.as_str()
+    } else {
+        ctx.target.as_deref().unwrap_or(ctx.host.as_str())
+    };
+    let oso_split = debuginfo > 0 && is_linking(ctx, uidx) && unit_platform.contains("apple");
+    let oso_rel = if oso_split { format!("target/{}/", ctx.profile_name) } else { String::new() };
+
     let key_json = serde_json::to_string(&CompileKey {
         kind: if self_checked {
             "check"
@@ -2271,6 +2432,8 @@ fn compile(
         link_args: &link_args,
         out_key: &out_key,
         profile: ctx.profile_flags,
+        debuginfo,
+        oso: &oso_rel,
         env: &env,
         cap_lints,
         toolchain: if crate_type == "lib" || self_checked { "" } else { &ctx.toolchain },
@@ -2291,7 +2454,11 @@ fn compile(
         return finish_compile(&expected, key, true, res);
     }
 
-    let outdir = ctx.store.tmp_path("rustc");
+    let stage_root = ctx.store.tmp_path("rustc");
+    // With -oso_prefix stripping the stage root, recorded debug-map paths
+    // read `target/<profile>/<cgu>.o` — exactly where the objects are
+    // exported relative to the workspace root.
+    let outdir = if oso_split { stage_root.join(&oso_rel) } else { stage_root.clone() };
     fs::create_dir_all(&outdir)?;
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
@@ -2355,6 +2522,11 @@ fn compile(
     for f in ctx.profile_flags {
         cmd.arg(f);
     }
+    cmd.arg(format!("-Cdebuginfo={debuginfo}"));
+    if oso_split {
+        cmd.arg("-Csplit-debuginfo=unpacked");
+        cmd.arg(format!("-Clink-arg=-Wl,-oso_prefix,{}/", stage_root.display()));
+    }
     cmd.arg(format!("-Cmetadata={k16}"));
     cmd.arg(format!("-Cextra-filename=-{k16}"));
     cmd.arg("--out-dir").arg(&outdir);
@@ -2389,10 +2561,17 @@ fn compile(
         cmd.arg("--cap-lints").arg("allow");
     }
     cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/sysroot", ctx.sysroot));
-    cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/cargo-home", ctx.cargo_home));
-    cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/ws", ctx.workspace_root));
-    cmd.arg("--remap-path-prefix")
-        .arg(format!("{}=/dc/pkg/{}-{}", pkg_root.display(), pkg.name, pkg.version));
+    // Workspace paths become relative: debuggers resolve them against
+    // their own cwd, so lldb run from the workspace root needs no
+    // source-map. Dependency sources need no remap at all — their real
+    // cargo-home is the canonical store path. Packages rooted anywhere
+    // else (path deps outside the workspace) keep a stable token so
+    // their machine-local location never leaks into artifacts.
+    cmd.arg("--remap-path-prefix").arg(format!("{}=.", ctx.workspace_root));
+    if !pkg_root.starts_with(&ctx.workspace_root) && !pkg_root.starts_with(&ctx.cargo_home) {
+        cmd.arg("--remap-path-prefix")
+            .arg(format!("{}=/dc/pkg/{}-{}", pkg_root.display(), pkg.name, pkg.version));
+    }
 
     if ctx.verbose {
         eprintln!("dcargo: exec {cmd:?}");
@@ -2405,7 +2584,7 @@ fn compile(
     };
     fs::remove_dir_all(&scratch).ok();
     if !success {
-        fs::remove_dir_all(&outdir).ok();
+        fs::remove_dir_all(&stage_root).ok();
         bail!("rustc failed for {} v{} ({}):\n{}", pkg.name, pkg.version, crate_name, stderr);
     }
     if !stderr.trim().is_empty() {
@@ -2449,7 +2628,7 @@ fn compile(
         let hash = ctx.store.insert_file(&p)?;
         outputs.push(OutputFile { name, hash, exe });
     }
-    fs::remove_dir_all(&outdir).ok();
+    fs::remove_dir_all(&stage_root).ok();
 
     let res = ActionResult { outputs, stderr, bs: None };
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
