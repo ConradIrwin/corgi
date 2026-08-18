@@ -911,12 +911,16 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     let (executed, cached) = schedule(&ctx, &results)?;
     let t_sched_done = Instant::now();
 
+    // Exports anchor at the WORKSPACE root (cargo's target/ convention):
+    // building any member from any directory lands artifacts in one place.
+    let dtarget = Path::new(&ctx.workspace_root).join("dtarget");
+
     for (i, u) in ctx.units.iter().enumerate() {
         if matches!(u.kind, Kind::Bin) && u.is_root {
             let t = &u.target;
             let r = results[i].get().context("bin not built")?;
             let m = r.main.as_ref().context("bin artifact missing")?;
-            let dest = dir.join("dtarget").join(ctx.profile_name).join(&t.name);
+            let dest = dtarget.join(ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
             eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
         }
@@ -926,7 +930,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm") || o.name.ends_with(".dylib") || o.name.ends_with(".so") {
                         let clean = o.name.replace(&format!("-{k16}"), "");
-                        let dest = dir.join("dtarget").join(tgt).join(ctx.profile_name).join(&clean);
+                        let dest = dtarget.join(tgt).join(ctx.profile_name).join(&clean);
                         ctx.store.export(&o.hash, &dest, true)?;
                         eprintln!("dcargo:   cdylib {}  (sha256 {}…)", dest.display(), &o.hash[..12]);
                     }
