@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.7";
+const TOOL_VERSION: &str = "dcargo/0.8";
 
 /// Profiles (debuginfo stays off in both for now: split-debuginfo path
 /// determinism is future work). Flags are part of every action key, and the
@@ -127,6 +127,9 @@ pub struct Ctx {
     tools_id: String,
     env_inputs: Vec<(String, String, Vec<String>)>,
     target: Option<String>,
+    /// Logical path of the cross target's std lib dir (immutable tools/
+    /// entry); handed to rustc as a bare `-L`.
+    target_std_libdir: Option<String>,
     cfg_env_target: Vec<(String, String)>,
 }
 
@@ -408,7 +411,7 @@ fn is_concrete_channel(c: &str) -> bool {
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
 /// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
 fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
-    let dest = store.root.join("toolchains").join(format!("{channel}-{triple}"));
+    let dest = store.root.join("tools").join(format!("rust-{channel}-{triple}"));
     let bin = dest.join("bin");
     if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
         return Ok(bin);
@@ -472,54 +475,51 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
     Ok(dest.join("bin"))
 }
 
-/// Additively install rust-std for a cross target into the toolchain dir.
-/// Copies are idempotent (same verified content), marker written last.
-fn ensure_target_std(store: &Store, channel: &str, host: &str, target: &str) -> Result<()> {
-    let tc = store.root.join("toolchains").join(format!("{channel}-{host}"));
-    let marker = tc.join(format!(".std-{target}-ok"));
-    if marker.exists() {
+/// Install rust-std for a cross target as its OWN immutable tools/ entry
+/// (never mutating the toolchain dir). Compiles reach it via a bare `-L`:
+/// rustc's crate loader resolves sysroot crates (std, core, ...) from -L
+/// paths of kind "all", and the output is bit-identical to std-in-sysroot
+/// (verified). Atomic unpack+rename; presence of the dir = complete.
+fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
+    let dest = store.root.join("tools").join(format!("rust-std-{channel}-{target}"));
+    if dest.join("lib/rustlib").join(target).join("lib").exists() {
         return Ok(());
     }
-    if !tc.join("lib/rustlib").join(target).join("lib").exists() {
-        eprintln!("dcargo: installing rust-std for {target} (sha256-pinned)");
-        let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
-            (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
-        } else if let Some(d) = channel.strip_prefix("beta-") {
-            (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
-        } else {
-            ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
-        };
-        let name = format!("rust-std-{ver}-{target}");
-        let work = store.tmp_path("std");
-        fs::create_dir_all(&work)?;
-        let tarball = work.join("t.tar.xz");
-        let url = format!("{base}/{name}.tar.xz");
-        let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
-        if !st.success() {
-            bail!("download failed: {url}");
-        }
-        let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
-        let expected = expected.split_whitespace().next().unwrap_or("").to_string();
-        let actual = crate::store::sha256_file(&tarball)?;
-        if actual != expected {
-            bail!("sha256 mismatch for {name}");
-        }
-        let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
-        if !st.success() {
-            bail!("unpack failed: {name}");
-        }
-        let payload = work.join(&name).join(format!("rust-std-{target}"));
-        let st = Command::new("cp")
-            .arg("-R")
-            .arg(format!("{}/.", payload.display()))
-            .arg(&tc)
-            .status()?;
-        if !st.success() {
-            bail!("copying rust-std for {target} failed");
-        }
-        fs::remove_dir_all(&work).ok();
+    eprintln!("dcargo: installing rust-std for {target} (sha256-pinned)");
+    let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+    } else if let Some(d) = channel.strip_prefix("beta-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+    } else {
+        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+    };
+    let name = format!("rust-std-{ver}-{target}");
+    let work = store.tmp_path("std");
+    fs::create_dir_all(&work)?;
+    let tarball = work.join("t.tar.xz");
+    let url = format!("{base}/{name}.tar.xz");
+    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    if !st.success() {
+        bail!("download failed: {url}");
     }
-    store.write_atomic(&marker, b"ok")?;
+    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+    let actual = crate::store::sha256_file(&tarball)?;
+    if actual != expected {
+        bail!("sha256 mismatch for {name}");
+    }
+    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    if !st.success() {
+        bail!("unpack failed: {name}");
+    }
+    let payload = work.join(&name).join(format!("rust-std-{target}"));
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&payload, &dest) {
+        Ok(()) => {}
+        Err(_) if dest.join("lib/rustlib").join(target).join("lib").exists() => {}
+        Err(e) => return Err(e).context("publishing rust-std"),
+    }
+    fs::remove_dir_all(&work).ok();
     Ok(())
 }
 
@@ -541,8 +541,8 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     // command line, including libstd rlib paths) and into build-script keys.
     let toolchain_logical = store
         .logical_root()
-        .join("toolchains")
-        .join(format!("{channel}-{host_guess}"));
+        .join("tools")
+        .join(format!("rust-{channel}-{host_guess}"));
     let rustc = toolchain_logical.join("bin/rustc").display().to_string();
     let cargo_bin = toolchain_logical.join("bin/cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
@@ -566,8 +566,22 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     let rust_src = Path::new(&sysroot).join("lib/rustlib/src/rust").exists();
     let rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
     let cfg_env = cargo_cfg_env(&cfg_out);
+    let mut target_std_libdir: Option<String> = None;
     if let Some(t) = &target {
-        ensure_target_std(&store, &channel, &host_guess, t)?;
+        if t != &host_guess {
+            ensure_target_std(&store, &channel, t)?;
+            target_std_libdir = Some(
+                store
+                    .logical_root()
+                    .join("tools")
+                    .join(format!("rust-std-{channel}-{t}"))
+                    .join("lib/rustlib")
+                    .join(t)
+                    .join("lib")
+                    .display()
+                    .to_string(),
+            );
+        }
     }
     let cfg_env_target = if let Some(t) = &target {
         let o = capture(
@@ -888,6 +902,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         tools_id,
         env_inputs,
         target,
+        target_std_libdir,
         cfg_env_target,
     };
 
@@ -1853,6 +1868,9 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
+            if let Some(libdir) = &ctx.target_std_libdir {
+                cmd.arg("-L").arg(libdir);
+            }
         }
     }
     for f in ctx.profile_flags {

@@ -136,7 +136,7 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
 
 impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
-        for d in ["cas", "actions", "pool", "outdirs", "tmp"] {
+        for d in ["cas", "pool", "outdirs", "tmp"] {
             fs::create_dir_all(root.join(d))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
@@ -220,7 +220,7 @@ impl Store {
     }
 
     pub fn action_path(&self, key: &str) -> PathBuf {
-        self.root.join("actions").join(&key[..2]).join(format!("{key}.json"))
+        self.root.join("cas").join(&key[..2]).join(format!("{key}.json"))
     }
 
     pub fn load_action(&self, key: &str) -> Option<Vec<u8>> {
@@ -261,7 +261,7 @@ impl Store {
         if let Some(k) = immutable_key {
             let p = self
                 .root
-                .join("srchash")
+                .join("hints")
                 .join(format!("{}.txt", sha256_hex(k.as_bytes())));
             if let Ok(h) = fs::read_to_string(&p) {
                 let h = h.trim().to_string();
@@ -276,7 +276,7 @@ impl Store {
         }
         let hint_path = self
             .root
-            .join("srchash")
+            .join("hints")
             .join(format!("{}.json", sha256_hex(root.display().to_string().as_bytes())));
         let hints: Hints = fs::read(&hint_path)
             .ok()
@@ -299,7 +299,7 @@ impl Store {
         // dominated warm zed builds (1.85s of a 2.0s no-op).
         let hint_path = self
             .root
-            .join("srchash")
+            .join("hints")
             .join(format!("{}.json", sha256_hex(format!("export:{}", dest.display()).as_bytes())));
         if let Ok(md) = fs::metadata(dest) {
             let key = stat_key(&md);

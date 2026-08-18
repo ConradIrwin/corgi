@@ -30,11 +30,18 @@ an **action** keyed by a SHA-256 over a canonical JSON of every input:
 Results live in a machine-wide store:
 
 ```
-~/.cache/dcargo/
-  cas/<sha256>          content-addressed artifacts (rlibs, dylibs, bins)
-  actions/<key>.json    action key -> output hashes + build-script directives
+/Users/Shared/dcargo/
+  cas/<xx>/<sha256>     content-addressed artifacts (rlibs, dylibs, bins)
+  cas/<xx>/<key>.json   action records in the same tree, Go-style: name is the
+                        INPUT key, content is the answer (outputs, directives)
   pool/lib<name>-<key16>.rlib   hardlinks into cas, named for rustc -L/--extern
-  outdirs/<key>/out     published build.rs OUT_DIRs at stable paths
+  outdirs/<key>/out     build.rs OUT_DIRs, built in place; .ok sentinel = done
+  tools/<name>-<ver>/   every pinned immutable component: [tools] downloads,
+                        rust toolchains (rust-<ver>-<host>), and per-target
+                        std (rust-std-<ver>-<target>, reached via bare -L --
+                        never mutating the toolchain dir)
+  hints/                stat-hint memo files (source/export); pure
+                        accelerators, freely deletable, never affect keys
   tmp/                  scratch; everything is published by atomic rename
 ```
 
