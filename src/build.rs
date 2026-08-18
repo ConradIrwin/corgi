@@ -913,7 +913,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
 
     // Exports anchor at the WORKSPACE root (cargo's target/ convention):
     // building any member from any directory lands artifacts in one place.
-    let dtarget = Path::new(&ctx.workspace_root).join("dtarget");
+    let dtarget = Path::new(&ctx.workspace_root).join("target");
 
     for (i, u) in ctx.units.iter().enumerate() {
         if matches!(u.kind, Kind::Bin) && u.is_root {
