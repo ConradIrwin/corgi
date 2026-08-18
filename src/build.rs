@@ -1362,21 +1362,22 @@ fn finish_compile(
     cached: bool,
     res: ActionResult,
 ) -> Result<UnitResult> {
-    let main_name = if crate_type == "proc-macro" {
-        format!("lib{crate_name}-{k16}{dylib_suffix}")
-    } else if crate_type == "lib" || crate_type.split(',').any(|c| c == "rlib" || c == "lib") {
-        format!("lib{crate_name}-{k16}.rlib")
-    } else {
-        format!("{crate_name}-{k16}")
-    };
-    let main = res
-        .outputs
+    // artifact preference: rlib (dependency consumption) > dylib
+    // (proc-macro, native cdylib) > wasm cdylib > bare binary
+    let _ = crate_type;
+    let candidates = [
+        format!("lib{crate_name}-{k16}.rlib"),
+        format!("lib{crate_name}-{k16}{dylib_suffix}"),
+        format!("{crate_name}-{k16}.wasm"),
+        format!("{crate_name}-{k16}"),
+    ];
+    let main = candidates
         .iter()
-        .find(|o| o.name == main_name)
+        .find_map(|c| res.outputs.iter().find(|o| &o.name == c))
         .cloned()
         .with_context(|| {
             format!(
-                "expected output {main_name} missing (got {:?})",
+                "no main artifact among {:?}",
                 res.outputs.iter().map(|o| &o.name).collect::<Vec<_>>()
             )
         })?;
