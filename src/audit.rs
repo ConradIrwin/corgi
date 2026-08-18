@@ -14,10 +14,25 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
     // for cache reuse, and $TMPDIR can be session-scoped.
     let base = PathBuf::from("/tmp/dcargo-audit");
     fs::create_dir_all(&base)?;
-    let alias = PathBuf::from("/Users/Shared/dcargo-audit");
+    // Each build's store physically occupies the SAME canonical path -- a
+    // real directory, no symlink alias -- exactly like production stores on
+    // two different machines. An alias would be dishonest here: tools that
+    // realpath() their inputs (the Metal compiler resolves the include path
+    // it embeds in line tables) would record per-store physical paths and
+    // report nondeterminism that production never exhibits. Stores are
+    // parked aside between runs so warm re-audits stay cheap.
+    let canonical = PathBuf::from("/Users/Shared/dcargo-audit");
+    if canonical.symlink_metadata().is_ok() {
+        // leftover alias symlink from an old dcargo, or a dir from a
+        // crashed audit whose slot we cannot know: discard it
+        fs::remove_file(&canonical).or_else(|_| fs::remove_dir_all(&canonical)).ok();
+    }
     let stores = [base.join("store-a"), base.join("store-b")];
     for (i, s) in stores.iter().enumerate() {
         eprintln!("dcargo-audit: ===== build {}/2 (store {}) =====", i + 1, s.display());
+        if s.exists() {
+            fs::rename(s, &canonical).context("unparking audit store")?;
+        }
         let mut c = Command::new(&exe);
         c.arg("build").arg("--dir").arg(dir);
         if release {
@@ -29,9 +44,11 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
         if let Some(t) = target {
             c.args(["--target", t]);
         }
-        c.env("DCARGO_STORE", s);
-        c.env("DCARGO_ALIAS", &alias);
+        c.env("DCARGO_STORE", &canonical);
+        c.env_remove("DCARGO_ALIAS");
         let st = c.status().context("spawning audit build")?;
+        // park even on failure so the state stays inspectable
+        fs::rename(&canonical, s).context("parking audit store")?;
         if !st.success() {
             bail!("audit build {}/2 failed (see errors above)", i + 1);
         }
