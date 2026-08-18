@@ -2088,20 +2088,13 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let script_path = ctx.pool.join(&script.name);
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let outdirs_root = ctx.store.root.join("outdirs");
     let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
         .iter()
         .filter_map(|e| pkg_root.join(e).canonicalize().ok())
         .collect();
     let mut reads: Vec<&Path> = vec![&pkg_root];
     reads.extend(extra_in.iter().map(|p| p.as_path()));
-    let mut writes: Vec<&Path> = vec![&final_parent, &scratch];
-    if std::env::var_os("DCARGO_UNSAFE_SHARED_OUTDIRS").is_some() {
-        // survey-only: the `scratch` crate (used by cxx) bakes its published
-        // OUT_DIR into its rlib and other build scripts write there at
-        // runtime — cross-action shared mutable state. Needs a real design.
-        writes.push(&outdirs_root);
-    }
+    let writes: Vec<&Path> = vec![&final_parent, &scratch];
     let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
