@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.8";
+const TOOL_VERSION: &str = "dcargo/0.9";
 
 /// Profiles (debuginfo stays off in both for now: split-debuginfo path
 /// determinism is future work). Flags are part of every action key, and the
@@ -85,6 +85,47 @@ struct ActionResult {
 }
 
 #[derive(Clone)]
+/// Early (meta-ready) result of a pipelined lib compile: published the
+/// moment rustc reports the rmeta written, while its codegen continues.
+/// Enough for dependent compiles to key themselves and start.
+struct MetaOut {
+    file: String,
+    hash: String,
+}
+
+/// The crate type a unit compiles as (mirrors the logic in `compile`).
+fn unit_crate_type(unit: &Unit) -> String {
+    match unit.kind {
+        Kind::Lib => {
+            if unit.target.kind.iter().any(|k| k == "proc-macro") {
+                "proc-macro".to_string()
+            } else if unit.is_root && unit.target.crate_types.iter().any(|c| c == "cdylib") {
+                unit.target.crate_types.join(",")
+            } else {
+                "lib".to_string()
+            }
+        }
+        Kind::Bsc | Kind::Bin => "bin".to_string(),
+        Kind::Bsr => String::new(),
+    }
+}
+
+/// Pipelined producers: pure-rlib libs, which emit an rmeta early.
+fn unit_pipelined(unit: &Unit) -> bool {
+    matches!(unit.kind, Kind::Lib) && unit_crate_type(unit) == "lib"
+}
+
+/// Linking consumers hand every transitive rlib to the linker, so they
+/// need full artifacts of their whole closure; pure-rlib compiles only
+/// need dependency *metadata*.
+fn unit_links(unit: &Unit) -> bool {
+    match unit.kind {
+        Kind::Bin | Kind::Bsc => true,
+        Kind::Lib => unit_crate_type(unit) != "lib",
+        Kind::Bsr => false,
+    }
+}
+
 struct UnitResult {
     key: String,
     cached: bool,
@@ -147,6 +188,7 @@ struct CompileKey<'a> {
     src_rel: &'a str,
     features: &'a [String],
     externs: &'a [(String, String, String)],
+    link_closure: &'a [(String, String)],
     cfgs: &'a [String],
     renvs: &'a [(String, String)],
     link_libs: &'a [String],
@@ -1524,17 +1566,67 @@ struct SchedState {
 
 fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize)> {
     let n = ctx.units.len();
+    // Typed dependency events: a pure-rlib compile can start as soon as its
+    // lib deps have *metadata* (rmeta, published mid-codegen); anything that
+    // links waits for full artifacts of its entire transitive closure (the
+    // linker consumes every rlib, and closure rlib hashes enter its key).
+    let mut rdeps_meta: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut rdeps_full: Vec<Vec<usize>> = vec![vec![]; n];
     let mut indeg = vec![0usize; n];
-    let mut rdeps: Vec<Vec<usize>> = vec![vec![]; n];
     for (i, u) in ctx.units.iter().enumerate() {
-        indeg[i] = u.deps.len();
+        let mut required: std::collections::HashSet<(usize, bool)> = std::collections::HashSet::new();
+        let self_meta_ok = !unit_links(u);
         for d in &u.deps {
-            rdeps[d.unit].push(i);
+            let meta_edge =
+                self_meta_ok && d.extern_name.is_some() && unit_pipelined(&ctx.units[d.unit]);
+            required.insert((d.unit, !meta_edge));
+        }
+        if unit_links(u) {
+            // full transitive closure: every reachable unit fully done
+            let mut stack: Vec<usize> = u.deps.iter().map(|d| d.unit).collect();
+            let mut seen = vec![false; n];
+            while let Some(j) = stack.pop() {
+                if seen[j] {
+                    continue;
+                }
+                seen[j] = true;
+                required.insert((j, true));
+                for d in &ctx.units[j].deps {
+                    stack.push(d.unit);
+                }
+            }
+        }
+        indeg[i] = required.len();
+        for (j, full) in required {
+            if full {
+                rdeps_full[j].push(i);
+            } else {
+                rdeps_meta[j].push(i);
+            }
         }
     }
+    let metas: Vec<OnceLock<MetaOut>> = (0..n).map(|_| OnceLock::new()).collect();
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
     let state = Mutex::new(SchedState { ready, indeg, done: 0, in_flight: 0, errors: Vec::new(), executed: 0, cached: 0 });
     let cv = Condvar::new();
+    let meta_fired: Vec<std::sync::atomic::AtomicBool> =
+        (0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+    // Called from inside a running rustc the moment its rmeta lands.
+    let fire_meta = |idx: usize, m: MetaOut| {
+        let _ = metas[idx].set(m);
+        if meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let mut st = state.lock().unwrap();
+        for &j in &rdeps_meta[idx] {
+            st.indeg[j] -= 1;
+            if st.indeg[j] == 0 {
+                st.ready.push(j);
+            }
+        }
+        drop(st);
+        cv.notify_all();
+    };
     let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n.max(1));
 
     std::thread::scope(|scope| {
@@ -1555,7 +1647,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         st = cv.wait(st).unwrap();
                     }
                 };
-                let res = run_unit(ctx, idx, results);
+                let res = run_unit(ctx, idx, results, &metas, &fire_meta);
                 let mut st = state.lock().unwrap();
                 st.in_flight -= 1;
                 match res {
@@ -1573,9 +1665,21 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         } else {
                             st.executed += 1;
                         }
+                        // late meta (cache hit, or non-streamed path): fire now
+                        if !meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            if let Some(rm) = ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta")) {
+                                let _ = metas[idx].set(MetaOut { file: rm.name.clone(), hash: rm.hash.clone() });
+                            }
+                            for &j in &rdeps_meta[idx] {
+                                st.indeg[j] -= 1;
+                                if st.indeg[j] == 0 {
+                                    st.ready.push(j);
+                                }
+                            }
+                        }
                         let _ = results[idx].set(ur);
                         st.done += 1;
-                        for &j in &rdeps[idx] {
+                        for &j in &rdeps_full[idx] {
                             st.indeg[j] -= 1;
                             if st.indeg[j] == 0 {
                                 st.ready.push(j);
@@ -1613,10 +1717,16 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     Ok((st.executed, st.cached))
 }
 
-fn run_unit(ctx: &Ctx, idx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
+fn run_unit(
+    ctx: &Ctx,
+    idx: usize,
+    results: &[OnceLock<UnitResult>],
+    metas: &[OnceLock<MetaOut>],
+    fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+) -> Result<UnitResult> {
     match ctx.units[idx].kind {
         Kind::Bsr => run_build_script(ctx, idx, results),
-        _ => compile(ctx, idx, results),
+        _ => compile(ctx, idx, results, metas, fire_meta),
     }
 }
 
@@ -1681,10 +1791,62 @@ fn expected_outputs(
             p
         }
     };
-    Ok(pattern
+    let mut out: Vec<String> = pattern
         .iter()
         .map(|n| n.replace("dcargoprobe", crate_name).replace("-XDCARGOX", &format!("-{k16}")))
-        .collect())
+        .collect();
+    // pipelined pure-rlib compiles emit metadata alongside the rlib
+    if crate_types == "lib" {
+        out.push(format!("lib{crate_name}-{k16}.rmeta"));
+    }
+    Ok(out)
+}
+
+/// Run a pipelined rustc, streaming its JSON stderr: the moment the rmeta
+/// artifact is reported, hash it into the cache, hard-link it into the
+/// pool, and wake dependents — while this same rustc continues codegen.
+fn run_rustc_streaming(
+    ctx: &Ctx,
+    cmd: &mut Command,
+    uidx: usize,
+    pkg_name: &str,
+    fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+) -> Result<(bool, String)> {
+    use std::io::BufRead;
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning rustc for {pkg_name}"))?;
+    let mut rendered = String::new();
+    let reader = std::io::BufReader::new(child.stderr.take().unwrap());
+    for line in reader.lines() {
+        let line = line?;
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => {
+                let artifact = v.get("artifact").and_then(|a| a.as_str());
+                let emit = v.get("emit").and_then(|e| e.as_str());
+                if let (Some(path), Some("metadata")) = (artifact, emit) {
+                    let bytes = fs::read(path).with_context(|| format!("reading rmeta {path}"))?;
+                    let hash = ctx.store.insert_bytes(&bytes)?;
+                    let file = Path::new(path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ctx.store.materialize_pool(&hash, &file, false)?;
+                    fire_meta(uidx, MetaOut { file, hash });
+                } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
+                    rendered.push_str(r);
+                }
+            }
+            Err(_) => {
+                rendered.push_str(&line);
+                rendered.push('\n');
+            }
+        }
+    }
+    let status = child.wait()?;
+    Ok((status.success(), rendered))
 }
 
 fn finish_compile(expected: &[String], key: String, cached: bool, res: ActionResult) -> Result<UnitResult> {
@@ -1708,7 +1870,13 @@ fn finish_compile(expected: &[String], key: String, cached: bool, res: ActionRes
     Ok(UnitResult { key, cached, res, main })
 }
 
-fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
+fn compile(
+    ctx: &Ctx,
+    uidx: usize,
+    results: &[OnceLock<UnitResult>],
+    metas: &[OnceLock<MetaOut>],
+    fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
@@ -1740,16 +1908,25 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     let mut features: Vec<String> = unit.features.clone();
     features.sort();
 
+    let self_pipelined = unit_pipelined(unit);
     let default_bs = BuildScriptOut::default();
     let mut bs: &BuildScriptOut = &default_bs;
     let mut out_key = String::new();
     let mut externs: Vec<(String, String, String)> = Vec::new();
     for d in &unit.deps {
-        let r = results[d.unit].get().context("dependency result missing")?;
         if let Some(name) = &d.extern_name {
-            let m = r.main.as_ref().context("dependency artifact missing")?;
-            externs.push((name.clone(), m.name.clone(), m.hash.clone()));
+            if self_pipelined && unit_pipelined(&ctx.units[d.unit]) {
+                // pipelined edge: compile against the dep's rmeta, keyed by
+                // the rmeta's bytes (what this action actually consumes)
+                let m = metas[d.unit].get().context("dependency rmeta missing")?;
+                externs.push((name.clone(), m.file.clone(), m.hash.clone()));
+            } else {
+                let r = results[d.unit].get().context("dependency result missing")?;
+                let m = r.main.as_ref().context("dependency artifact missing")?;
+                externs.push((name.clone(), m.name.clone(), m.hash.clone()));
+            }
         } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
+            let r = results[d.unit].get().context("dependency result missing")?;
             if let Some(b) = &r.res.bs {
                 bs = b;
                 out_key = r.key.clone();
@@ -1757,6 +1934,31 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         }
     }
     externs.sort();
+
+    // Linking units consume every transitive rlib: enumerate the closure's
+    // artifacts into the key (the interface chain is cut by rmeta keying,
+    // so implementations must be pinned flat, at the link).
+    let mut link_closure: Vec<(String, String)> = Vec::new();
+    if unit_links(unit) {
+        let mut seen = vec![false; ctx.units.len()];
+        let mut stack: Vec<usize> = unit.deps.iter().map(|d| d.unit).collect();
+        while let Some(i) = stack.pop() {
+            if seen[i] {
+                continue;
+            }
+            seen[i] = true;
+            if let Some(r) = results[i].get() {
+                if let Some(m) = &r.main {
+                    link_closure.push((m.name.clone(), m.hash.clone()));
+                }
+            }
+            for d in &ctx.units[i].deps {
+                stack.push(d.unit);
+            }
+        }
+        link_closure.sort();
+        link_closure.dedup();
+    }
 
     let mut link_search: Vec<String> = bs.link_search.clone();
     let mut link_args: Vec<String> = Vec::new();
@@ -1806,6 +2008,7 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
         src_rel: &src_rel,
         features: &features,
         externs: &externs,
+        link_closure: &link_closure,
         cfgs: &bs.cfgs,
         renvs: &bs.envs,
         link_libs: &bs.link_libs,
@@ -1868,7 +2071,13 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     cmd.arg("--edition").arg(&target.edition);
     cmd.arg(&src_rel);
     cmd.arg("--crate-type").arg(crate_type);
-    cmd.arg("--emit=link,dep-info");
+    if self_pipelined {
+        cmd.arg("--emit=metadata,link,dep-info");
+        cmd.arg("--error-format=json");
+        cmd.arg("--json=artifacts");
+    } else {
+        cmd.arg("--emit=link,dep-info");
+    }
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
@@ -1922,10 +2131,14 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     if ctx.verbose {
         eprintln!("dcargo: exec {cmd:?}");
     }
-    let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
+    let (success, stderr) = if self_pipelined {
+        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, fire_meta)?
+    } else {
+        let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
     fs::remove_dir_all(&scratch).ok();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if !out.status.success() {
+    if !success {
         fs::remove_dir_all(&outdir).ok();
         bail!("rustc failed for {} v{} ({}):\n{}", pkg.name, pkg.version, crate_name, stderr);
     }
