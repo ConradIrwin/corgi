@@ -8,7 +8,7 @@ use std::process::Command;
 /// stores (different physical paths, same canonical alias), then demand
 /// bit-identical artifacts under identical action keys. Every leak this
 /// project has found would have been caught by this check.
-pub fn audit(dir: &Path, release: bool, verbose: bool) -> Result<()> {
+pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> Result<()> {
     let exe = std::env::current_exe()?;
     // NOT env::temp_dir(): audit stores must survive across invocations
     // for cache reuse, and $TMPDIR can be session-scoped.
@@ -25,6 +25,9 @@ pub fn audit(dir: &Path, release: bool, verbose: bool) -> Result<()> {
         }
         if verbose {
             c.arg("-v");
+        }
+        if let Some(t) = target {
+            c.args(["--target", t]);
         }
         c.env("DCARGO_STORE", s);
         c.env("DCARGO_ALIAS", &alias);

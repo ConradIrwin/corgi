@@ -52,7 +52,7 @@ fn real_main() -> Result<()> {
         }
     });
     if cmd.as_deref() == Some("audit") {
-        return audit::audit(&dir, release, verbose);
+        return audit::audit(&dir, release, verbose, target.as_deref());
     }
     let store = store::Store::new(store_root)?;
     build::build(store, &dir, verbose, release, target)

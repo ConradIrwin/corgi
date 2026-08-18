@@ -102,6 +102,10 @@ pub struct Ctx {
     meta: Metadata,
     units: Vec<Unit>,
     pool: PathBuf,
+    /// Pool as spelled on rustc command lines: the *logical* store path.
+    /// Physical per-store paths leak into linked artifacts (debug-info OSO
+    /// references to C objects inside dep rlibs record the archive path).
+    pool_logical: PathBuf,
     cargo: String,
     cargo_home: String,
     base_env: Vec<(String, String)>,
@@ -849,6 +853,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
     }
 
     let pool = store.root.join("pool");
+    let pool_logical = store.logical_root().join("pool");
     let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
     let ctx = Ctx {
@@ -861,6 +866,7 @@ pub fn build(store: Store, dir: &Path, verbose: bool, release: bool, target: Opt
         meta,
         units,
         pool,
+        pool_logical,
         cargo,
         cargo_home,
         base_env,
@@ -1851,9 +1857,9 @@ fn compile(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<U
     cmd.arg(format!("-Cmetadata={k16}"));
     cmd.arg(format!("-Cextra-filename=-{k16}"));
     cmd.arg("--out-dir").arg(&outdir);
-    cmd.arg("-L").arg(format!("dependency={}", ctx.pool.display()));
+    cmd.arg("-L").arg(format!("dependency={}", ctx.pool_logical.display()));
     for (name, file, _) in &externs {
-        cmd.arg("--extern").arg(format!("{name}={}", ctx.pool.join(file).display()));
+        cmd.arg("--extern").arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
     }
     if crate_type == "proc-macro" {
         cmd.arg("--extern").arg("proc_macro");
