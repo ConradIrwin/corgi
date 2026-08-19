@@ -1854,11 +1854,6 @@ impl Ctx {
             .hash_dir_cached(&pkg.root(), immutable.as_deref())
             .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
         let extras = meta::extra_inputs(pkg);
-        let ws_manifest = Path::new(&self.workspace_root).join("Cargo.toml");
-        if pkg.source.is_none() && ws_manifest.exists() {
-            let wh = crate::store::sha256_file(&ws_manifest)?;
-            h = sha256_hex(format!("{h}|workspace-manifest:{wh}").as_bytes());
-        }
         if !extras.is_empty() {
             let mut acc = h;
             for e in &extras {
@@ -2007,10 +2002,6 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     for r in reads {
         prof.push_str(&format!("  (subpath \"{r}\")\n"));
     }
-    // the workspace *manifest* is a declared, hashed input of every local
-    // package (proc-macro-crate et al. legitimately read it); the rest of
-    // the workspace is invisible unless declared via extra-inputs
-    prof.push_str(&format!("  (literal \"{}/Cargo.toml\")\n", ctx.workspace_root));
     prof.push_str(")\n");
     // Align the readable set with the hashed set: the source hash deliberately
     // excludes .git, build output dirs, and Cargo.lock, so reading them must

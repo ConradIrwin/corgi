@@ -263,6 +263,20 @@ spawns (`Command::new("cmake")`) resolve through a per-subset shim dir on
 the action PATH. Per-crate settings live elsewhere, in each crate's own
 manifest: `[package.metadata.dcargo] extra-inputs = [...]`.
 
+## Root-manifest blast radius (readable = keyed, by construction)
+
+Actions cannot read the workspace root Cargo.toml at all, and it is hashed
+into nothing. Every section reaches builds only through cargo's *resolved*
+outputs — metadata, lockfile, per-unit profiles in the unit graph — which
+key exactly the units they affect. Measured on zed (1135-line root
+manifest, 1678 units): a comment edit or a `[workspace.metadata.*]` tweak
+rebuilds **nothing**; `[profile.dev.package.zed] codegen-units = 8`
+re-executes exactly the zed package's 3 units. A crate that genuinely
+needs the raw manifest bytes fails hard (sandbox deny + dep-info
+validation) and declares them via `extra-inputs`, which hashes the file
+into exactly that crate. Probed empirically: zero such readers in zed or
+cloud today.
+
 ## Input containment (include!/mod coverage)
 
 Everything a compile can read is either hashed or refused. In-package reads
