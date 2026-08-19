@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.17";
+const TOOL_VERSION: &str = "dcargo/0.18";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -1404,7 +1404,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 format!(
                     "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
                     TOOL_VERSION,
-                    meta.packages[u.pkg].id,
+                    ws_relative_pkg_id(&meta.packages[u.pkg].id, &meta.workspace_root),
                     u.target.name,
                     u.target.kind,
                     u.host,
@@ -2821,6 +2821,46 @@ fn run_rustc_streaming(
     }
     let status = child.wait()?;
     Ok((status.success(), rendered))
+}
+
+/// A location-independent spelling of cargo's package id. Path packages
+/// carry a `file://` URL of their absolute directory, which would make
+/// unit identities (and so -Cmetadata, symbols, and every action key)
+/// specific to one checkout; identical worktrees must share all of them.
+/// Path packages outside the workspace keep their absolute identity —
+/// they really are machine-local.
+fn ws_relative_pkg_id(id: &str, workspace_root: &str) -> String {
+    if let Some(rest) = id.strip_prefix("path+file://") {
+        let (dir, suffix) = rest.split_once('#').unwrap_or((rest, ""));
+        if let Ok(rel) = Path::new(dir).strip_prefix(workspace_root) {
+            return format!("path+{}#{suffix}", rel.display());
+        }
+    }
+    id.to_string()
+}
+
+#[cfg(test)]
+mod ident_tests {
+    use super::ws_relative_pkg_id;
+
+    #[test]
+    fn path_package_ids_are_workspace_relative() {
+        // Two checkouts of the same repo must produce one identity.
+        let a = ws_relative_pkg_id("path+file:///w/one/crates/editor#0.1.0", "/w/one");
+        let b = ws_relative_pkg_id("path+file:///w/two/crates/editor#0.1.0", "/w/two");
+        assert_eq!(a, "path+crates/editor#0.1.0");
+        assert_eq!(a, b);
+        // Name-carrying suffixes survive.
+        assert_eq!(
+            ws_relative_pkg_id("path+file:///w/crates/foo#bar@1.2.3", "/w"),
+            "path+crates/foo#bar@1.2.3"
+        );
+        // Registry ids and out-of-workspace path deps are untouched.
+        let registry = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0";
+        assert_eq!(ws_relative_pkg_id(registry, "/w"), registry);
+        let outside = "path+file:///elsewhere/dep#0.1.0";
+        assert_eq!(ws_relative_pkg_id(outside, "/w"), outside);
+    }
 }
 
 fn finish_compile(
