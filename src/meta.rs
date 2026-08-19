@@ -69,15 +69,6 @@ pub struct Resolve {
     pub root: Option<String>,
 }
 
-pub fn extra_inputs(p: &Package) -> Vec<String> {
-    p.metadata
-        .get("dcargo")
-        .and_then(|d| d.get("extra-inputs"))
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .unwrap_or_default()
-}
-
 /// `cargo build --unit-graph` output: cargo's own per-unit resolution
 /// (platform, features, exact dep edges). Requires RUSTC_BOOTSTRAP=1 on
 /// stable — used for planning only.

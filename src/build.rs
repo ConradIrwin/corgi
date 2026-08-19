@@ -251,6 +251,15 @@ pub struct Ctx {
     host_rustflags: Vec<String>,
     /// Resolved [env] entries, sorted; applied and keyed on every action.
     config_env: Vec<(String, String)>,
+    /// dcargo.toml [extra-inputs]: package -> package-root-relative reads
+    /// outside the package, granted to its actions and hashed as inputs.
+    extra_inputs: ExtraInputs,
+}
+
+impl Ctx {
+    fn extra_inputs_for(&self, pkg: &Package) -> &[String] {
+        self.extra_inputs.get(&pkg.name).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 #[derive(Serialize)]
@@ -366,10 +375,17 @@ struct DcargoToml {
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
     universe: std::collections::BTreeMap<String, UniverseDef>,
+    /// Reads outside a package's root that its actions may perform:
+    /// package name -> package-root-relative paths, granted and hashed as
+    /// inputs. Lives here rather than in package manifests so dependency
+    /// packages can be covered too and crate manifests stay untouched.
+    #[serde(default, rename = "extra-inputs")]
+    extra_inputs: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 type Universes = Vec<(String, Vec<String>)>;
-type DcargoManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes);
+type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
+type DcargoManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes, ExtraInputs);
 
 fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
     let mut found: Option<PathBuf> = None;
@@ -407,7 +423,7 @@ fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
         probes.push(e);
     }
     let universes: Universes = parsed.universe.into_iter().map(|(k, v)| (k, v.packages)).collect();
-    Ok(Some((specs, probes, universes)))
+    Ok(Some((specs, probes, universes, parsed.extra_inputs)))
 }
 
 /// Resolved lint flags for one workspace member. Lints are inputs like
@@ -1219,9 +1235,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let universes = match read_dcargo_toml(&dir)? {
-        Some((_, _, u)) => u,
-        None => Universes::new(),
+    let (universes, extra_inputs) = match read_dcargo_toml(&dir)? {
+        Some((_, _, u, x)) => (u, x),
+        None => (Universes::new(), ExtraInputs::new()),
     };
     // Only the universes shape the plan (they pick the feature-unification
     // member set); tools and env probes don't, so their edits — or any
@@ -1558,7 +1574,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    if let Some((specs, probes, _)) = read_dcargo_toml(&dir)? {
+    if let Some((specs, probes, _, _)) = read_dcargo_toml(&dir)? {
         for t in &specs {
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
@@ -1708,6 +1724,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         target_rustflags,
         host_rustflags,
         config_env,
+        extra_inputs,
     };
 
     let t_ctx_done = Instant::now();
@@ -2150,10 +2167,10 @@ impl Ctx {
             .store
             .hash_dir_cached(&pkg.root(), immutable.as_deref())
             .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
-        let extras = meta::extra_inputs(pkg);
+        let extras = self.extra_inputs_for(pkg);
         if !extras.is_empty() {
             let mut acc = h;
-            for e in &extras {
+            for e in extras {
                 let p = pkg.root().join(e).canonicalize().with_context(|| {
                     format!("extra-input `{e}` of {} does not exist", pkg.name)
                 })?;
@@ -3209,7 +3226,8 @@ fn compile(
     fs::create_dir_all(&outdir)?;
     let scratch = if let Some(d) = &incr_dir { d.join("tmp") } else { ctx.store.tmp_path("scratch") };
     fs::create_dir_all(&scratch)?;
-    let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
+    let extra_in: Vec<PathBuf> = ctx
+        .extra_inputs_for(pkg)
         .iter()
         .filter_map(|e| pkg_root.join(e).canonicalize().ok())
         .collect();
@@ -3410,7 +3428,7 @@ fn compile(
                 allowed.push(conf.clone());
             }
         }
-        for e in meta::extra_inputs(pkg) {
+        for e in ctx.extra_inputs_for(pkg) {
             if let Ok(p) = pkg_root.join(&e).canonicalize() {
                 allowed.push(p); // declared -> hashed -> allowed
             }
@@ -3620,7 +3638,8 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let script_path = ctx.pool.join(&script.name);
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
+    let extra_in: Vec<PathBuf> = ctx
+        .extra_inputs_for(pkg)
         .iter()
         .filter_map(|e| pkg_root.join(e).canonicalize().ok())
         .collect();
