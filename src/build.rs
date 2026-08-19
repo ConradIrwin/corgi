@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.16";
+const TOOL_VERSION: &str = "dcargo/0.17";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -245,6 +245,12 @@ pub struct Ctx {
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
     cfg_env_target: Vec<(String, String)>,
+    /// Resolved .cargo/config.toml rustflags for target-platform units.
+    target_rustflags: Vec<String>,
+    /// Same for host units (empty when an explicit --target is set).
+    host_rustflags: Vec<String>,
+    /// Resolved [env] entries, sorted; applied and keyed on every action.
+    config_env: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -282,6 +288,8 @@ struct CompileKey<'a> {
     oso: &'a str,
     env: &'a [(String, String)],
     cap_lints: bool,
+    /// Resolved .cargo/config.toml rustflags applied to this unit.
+    rustflags: &'a [String],
     /// linker-chain identity; only linking crate types depend on it
     toolchain: &'a str,
     /// cross-compilation target triple ("" = host)
@@ -1104,6 +1112,15 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         bail!("no Cargo.toml in {}", dir.display());
     }
 
+    // Env-injected compiler flags are invisible inputs; the config file
+    // is the one honored channel.
+    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            bail!("{var} is set; dcargo only honors rustflags from .cargo/config.toml");
+        }
+    }
+    let (cargo_config, config_dir) = crate::config::discover(&dir)?;
+
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
     ensure_toolchain(&store, &channel, &host_guess)?;
@@ -1131,7 +1148,21 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     if host != host_guess {
         bail!("host triple mismatch: dcargo resolved {host_guess}, pinned rustc reports {host}");
     }
-    let cfg_out = capture(Command::new(&rustc).args(["--print", "cfg"]), "rustc --print cfg")?;
+    // Rustflags resolve against the platform a unit compiles for; host
+    // units (build scripts, proc-macros) only get them when no explicit
+    // --target splits the platforms — cargo's rule, load-bearing for
+    // cfg-gated code in build scripts.
+    let target_rustflags =
+        cargo_config.rustflags_for(target.as_deref().unwrap_or(&host_guess))?;
+    let host_rustflags: Vec<String> =
+        if target.is_some() { Vec::new() } else { target_rustflags.clone() };
+    let config_env = cargo_config.env;
+    // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
+    // probes rustc with the applicable rustflags so --cfg flags show up.
+    let mut cfg_probe = Command::new(&rustc);
+    cfg_probe.args(["--print", "cfg"]);
+    cfg_probe.args(&host_rustflags);
+    let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
     // the toolchain dir *is* the sysroot; use the logical spelling so
     // linker inputs are spelled identically regardless of store location
     let sysroot = toolchain_logical.display().to_string();
@@ -1160,10 +1191,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         }
     }
     let cfg_env_target = if let Some(t) = &target {
-        let o = capture(
-            Command::new(&rustc).args(["--print", "cfg", "--target", t]),
-            "rustc --print cfg --target",
-        )?;
+        let mut probe = Command::new(&rustc);
+        probe.args(["--print", "cfg", "--target", t]);
+        probe.args(&target_rustflags);
+        let o = capture(&mut probe, "rustc --print cfg --target")?;
         cargo_cfg_env(&o)
     } else {
         cfg_env.clone()
@@ -1621,6 +1652,15 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let pool_logical = store.logical_root().join("pool");
     let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
+    if let Some(config_location) = &config_dir {
+        if config_location != Path::new(&workspace_root) {
+            bail!(
+                ".cargo/config found at {} but the workspace root is {}; dcargo only honors the workspace's own config",
+                config_location.display(),
+                workspace_root
+            );
+        }
+    }
     let ctx = Ctx {
         store,
         verbose,
@@ -1665,6 +1705,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         clippy_conf,
         target_std_libdir,
         cfg_env_target,
+        target_rustflags,
+        host_rustflags,
+        config_env,
     };
 
     let t_ctx_done = Instant::now();
@@ -2927,9 +2970,12 @@ fn compile(
     }
 
     let mut env = ctx.pkg_env(pkg);
+    env.extend(ctx.config_env.iter().cloned());
     if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
     }
+    let unit_rustflags: &[String] =
+        if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags };
     let t_phase = Instant::now();
     let mut phases = Phases::default();
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
@@ -3019,6 +3065,7 @@ fn compile(
         oso: &oso_rel,
         env: &env,
         cap_lints,
+        rustflags: unit_rustflags,
         toolchain: if crate_type == "lib" || self_checked { "" } else { &ctx.toolchain },
         tgt: if unit.host { "" } else { ctx.target.as_deref().unwrap_or("") },
     })?;
@@ -3035,15 +3082,24 @@ fn compile(
     let hit = ctx.try_cache_hit(&key)?;
     phases.cache_ns = t_cache.elapsed().as_nanos() as u64;
     if let Some(res) = hit {
-        if !res.stderr.is_empty() && pkg.source.is_none() {
-            eprint!("{}", res.stderr);
-        }
-        let expected = if self_checked {
+        let expected: Vec<String> = if self_checked {
             res.outputs.iter().map(|o| o.name.clone()).collect()
         } else {
             expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
         };
-        return finish_compile(&expected, key, true, res, phases);
+        if expected.iter().all(|e| res.outputs.iter().any(|o| &o.name == e)) {
+            if !res.stderr.is_empty() && pkg.source.is_none() {
+                eprint!("{}", res.stderr);
+            }
+            return finish_compile(&expected, key, true, res, phases);
+        }
+        // A record that does not cover the expected outputs was written by
+        // a buggy or interrupted run: heal by dropping it and re-executing.
+        eprintln!(
+            "dcargo: discarding corrupt action record for {} ({crate_name})",
+            pkg.name
+        );
+        fs::remove_file(ctx.store.action_path(&key)).ok();
     }
 
     // Incremental state: store-managed, scoped per (checkout, crate,
@@ -3068,7 +3124,7 @@ fn compile(
         };
         let identity = sha256_hex(
             format!(
-                "incr\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "incr\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 ctx.workspace_root,
                 pkg.name,
                 crate_name,
@@ -3076,7 +3132,12 @@ fn compile(
                 kind_tag,
                 mode_tag,
                 unit_platform,
-                ctx.profile_name
+                ctx.profile_name,
+                // The unit identity separates same-name units (a lib
+                // compiled for the target and again as a host-side
+                // dependency of a proc-macro): each needs its own state
+                // and, above all, its own pinned output directory.
+                ctx.idents[uidx]
             )
             .as_bytes(),
         );
@@ -3248,6 +3309,11 @@ fn compile(
         cmd.arg("--remap-path-prefix")
             .arg(format!("{}=/dc/pkg/{}-{}", pkg_root.display(), pkg.name, pkg.version));
     }
+    // Config rustflags go last, as cargo appends them: later flags win, so
+    // the config can override anything tool-chosen.
+    for flag in unit_rustflags {
+        cmd.arg(flag);
+    }
 
     if ctx.verbose {
         eprintln!("dcargo: exec {cmd:?}");
@@ -3266,7 +3332,6 @@ fn compile(
     };
     phases.rustc_ns = t_rustc.elapsed().as_nanos() as u64;
     drop(job_token); // compiler exited; hashing/ingestion is not codegen
-    incr_lock.take(); // compiler exited; release the incremental state
     fs::remove_dir_all(&scratch).ok();
     if !success {
         fs::remove_dir_all(&stage_root).ok();
@@ -3326,16 +3391,29 @@ fn compile(
     }
     phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
     fs::remove_dir_all(&stage_root).ok();
+    // The pinned output dir has been read and removed; only now may
+    // another action of this unit wipe and reuse it.
+    incr_lock.take();
 
     let t_finish = Instant::now();
     let res = ActionResult { outputs, stderr, bs: None };
-    ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    ctx.materialize(&res)?;
-    let expected = if self_checked {
+    let expected: Vec<String> = if self_checked {
         res.outputs.iter().map(|o| o.name.clone()).collect()
     } else {
         expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
     };
+    // Never record an action whose outputs are incomplete: a poisoned
+    // record would replay the failure from cache on every future run.
+    for e in &expected {
+        if !res.outputs.iter().any(|o| &o.name == e) {
+            bail!(
+                "rustc-reported output {e} missing (got {:?})",
+                res.outputs.iter().map(|o| &o.name).collect::<Vec<_>>()
+            );
+        }
+    }
+    ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
+    ctx.materialize(&res)?;
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
     finish_compile(&expected, key, false, res, phases)
 }
@@ -3392,7 +3470,13 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    env.push(("CARGO_ENCODED_RUSTFLAGS".into(), String::new()));
+    // Cargo hands build scripts the rustflags of the unit they configure,
+    // joined with the 0x1f separator.
+    env.push((
+        "CARGO_ENCODED_RUSTFLAGS".into(),
+        (if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags }).join("\x1f"),
+    ));
+    env.extend(ctx.config_env.iter().cloned());
     if let Some(links) = &pkg.links {
         env.push(("CARGO_MANIFEST_LINKS".into(), links.clone()));
     }

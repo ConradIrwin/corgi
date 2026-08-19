@@ -1,5 +1,6 @@
 mod audit;
 mod build;
+mod config;
 mod meta;
 mod store;
 
