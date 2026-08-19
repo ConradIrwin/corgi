@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.11";
+const TOOL_VERSION: &str = "dcargo/0.12";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -140,6 +140,19 @@ fn is_linking(ctx: &Ctx, idx: usize) -> bool {
     unit_links(&ctx.units[idx]) && !is_checked(ctx, idx)
 }
 
+/// A pinned tool ready for scoped injection into build-script runs.
+struct ToolRt {
+    name: String,
+    version: String,
+    env: String,
+    value: String,
+    /// Identity of the *setting*: hash of the pin itself. Scoped actions
+    /// key on this, nothing else does.
+    id: String,
+    bin: String,
+    packages: Vec<String>,
+}
+
 struct UnitResult {
     key: String,
     cached: bool,
@@ -178,9 +191,11 @@ pub struct Ctx {
     /// (cargo maps dev/test to "debug").
     profile_name: String,
     toolchain: String,
-    tool_envs: Vec<(String, String)>,
-    tools_id: String,
-    env_inputs: Vec<(String, String, Vec<String>)>,
+    /// Pinned tools resolved for injection: env var, logical path,
+    /// identity hash, shim name/bin, and package scope (empty = all).
+    tools: Vec<ToolRt>,
+    /// Plan-time probe results: (name, value, packages, profiles).
+    env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
@@ -235,8 +250,8 @@ struct RunKey<'a> {
     dep_env: &'a [(String, String)],
     /// build scripts may invoke cc themselves
     toolchain: &'a str,
-    /// hash of the declarative tools manifest (dcargo-tools.toml)
-    tools: &'a str,
+    /// identity hashes of the tools scoped to this package (sorted)
+    tools: &'a [String],
 }
 
 #[derive(Default)]
@@ -248,28 +263,42 @@ struct ToolSpec {
     bin: String,
     path: String,
     env: String,
-}
-
-#[derive(Default)]
-struct EnvInput {
-    name: String,
-    command: String,
+    /// Packages whose actions see and key on this tool; empty = every
+    /// build script (right for graph-wide tools like a wasm C compiler).
     packages: Vec<String>,
 }
 
-/// Declarative tool pins (dcargo-tools.toml): url + sha256 + bin + env,
-/// plus [env-inputs.*]: plan-time commands whose output is injected as env
-/// and hashed into the scoped packages' build-script keys.
-/// The whole manifest hash keys every build-script action.
-type Universes = Vec<(String, Vec<String>)>;
-/// (manifest text, tool specs, env inputs, feature universes).
-type ToolsManifest = (String, Vec<ToolSpec>, Vec<EnvInput>, Universes);
+#[derive(Default)]
+struct EnvProbe {
+    name: String,
+    command: String,
+    /// Required: the packages whose build scripts receive the value.
+    packages: Vec<String>,
+    /// Profile names this applies to; empty = all profiles.
+    profiles: Vec<String>,
+}
 
-fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
+/// Workspace dcargo.toml: sha256-pinned tools, plan-time env probes, and
+/// feature universes. Every setting names the packages it applies to, and
+/// only those actions key on it — the file itself is never hashed into
+/// keys, so comment or command-text edits rebuild nothing.
+type Universes = Vec<(String, Vec<String>)>;
+/// (manifest text, tool specs, env probes, feature universes).
+type DcargoManifest = (String, Vec<ToolSpec>, Vec<EnvProbe>, Universes);
+
+fn parse_string_array(raw: &str) -> Vec<String> {
+    raw.trim_matches(['[', ']'])
+        .split(',')
+        .map(|x| x.trim().trim_matches('"').to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
     while let Some(d) = cur {
-        let p = d.join("dcargo-tools.toml");
+        let p = d.join("dcargo.toml");
         if p.exists() {
             found = Some(p);
             break;
@@ -279,12 +308,12 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
     let Some(p) = found else { return Ok(None) };
     let text = fs::read_to_string(&p)?;
     let mut specs: Vec<ToolSpec> = Vec::new();
-    let mut env_inputs: Vec<EnvInput> = Vec::new();
+    let mut probes: Vec<EnvProbe> = Vec::new();
     let mut universes: Vec<(String, Vec<String>)> = Vec::new();
     enum Cur {
         None,
         Tool,
-        EnvInput,
+        Env,
         Universe,
     }
     let mut cur = Cur::None;
@@ -296,11 +325,14 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
         if let Some(rest) = line.strip_prefix("[tools.") {
             specs.push(ToolSpec { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
             cur = Cur::Tool;
-        } else if let Some(rest) = line.strip_prefix("[env-inputs.") {
-            env_inputs.push(EnvInput { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
-            cur = Cur::EnvInput;
-        } else if line == "[feature-universe]" {
+        } else if let Some(rest) = line.strip_prefix("[env.") {
+            probes.push(EnvProbe { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
+            cur = Cur::Env;
+        } else if let Some(rest) = line.strip_prefix("[universe.") {
+            universes.push((rest.trim_end_matches(']').to_string(), Vec::new()));
             cur = Cur::Universe;
+        } else if line.starts_with('[') {
+            bail!("unknown section {line} in {}", p.display());
         } else if let Some((k, v)) = line.split_once('=') {
             let raw = v.trim();
             let v = raw.trim_matches('"').to_string();
@@ -314,34 +346,27 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
                         "bin" => t.bin = v,
                         "path" => t.path = v,
                         "env" => t.env = v,
-                        _ => {}
+                        "packages" => t.packages = parse_string_array(raw),
+                        other => bail!("unknown tool key `{other}` in {}", p.display()),
                     }
                 }
-                Cur::EnvInput => {
-                    let Some(e) = env_inputs.last_mut() else { continue };
+                Cur::Env => {
+                    let Some(e) = probes.last_mut() else { continue };
                     match k.trim() {
                         "command" => e.command = v,
-                        "packages" => {
-                            e.packages = raw
-                                .trim_matches(['[', ']'])
-                                .split(',')
-                                .map(|x| x.trim().trim_matches('"').to_string())
-                                .filter(|x| !x.is_empty())
-                                .collect();
-                        }
-                        _ => {}
+                        "packages" => e.packages = parse_string_array(raw),
+                        "profiles" => e.profiles = parse_string_array(raw),
+                        other => bail!("unknown env key `{other}` in {}", p.display()),
                     }
                 }
                 Cur::Universe => {
-                    let members: Vec<String> = raw
-                        .trim_matches(['[', ']'])
-                        .split(',')
-                        .map(|x| x.trim().trim_matches('"').to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect();
-                    universes.push((k.trim().to_string(), members));
+                    let Some(u) = universes.last_mut() else { continue };
+                    match k.trim() {
+                        "packages" => u.1 = parse_string_array(raw),
+                        other => bail!("unknown universe key `{other}` in {}", p.display()),
+                    }
                 }
-                Cur::None => {}
+                Cur::None => bail!("stray key `{}` outside any section in {}", k.trim(), p.display()),
             }
         }
     }
@@ -355,7 +380,50 @@ fn read_tools_manifest(dir: &Path) -> Result<Option<ToolsManifest>> {
             );
         }
     }
-    Ok(Some((text, specs, env_inputs, universes)))
+    for e in &probes {
+        if e.command.is_empty() || e.packages.is_empty() {
+            bail!("env `{}` in {} needs a command and a non-empty packages list", e.name, p.display());
+        }
+    }
+    Ok(Some((text, specs, probes, universes)))
+}
+
+/// Bare-name spawns (`Command::new("cmake")`) resolve through a shim dir
+/// of symlinks to exactly the tools visible to this action. One dir per
+/// distinct subset, named by the subset's identity hash; contents derive
+/// from keyed tool ids, so PATH itself never needs keying.
+fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>> {
+    let with_bin: Vec<&&ToolRt> = tools.iter().filter(|t| !t.bin.is_empty()).collect();
+    if with_bin.is_empty() {
+        return Ok(None);
+    }
+    let mut ids: Vec<&str> = with_bin.iter().map(|t| t.id.as_str()).collect();
+    ids.sort();
+    let subset = crate::store::sha256_hex(ids.join("\n").as_bytes());
+    let dir = store.root.join("toolsets").join(&subset[..16]);
+    if dir.exists() {
+        Store::touch_used(&dir);
+        return Ok(Some(dir));
+    }
+    let tmp = store.tmp_path("shims");
+    fs::create_dir_all(&tmp)?;
+    for t in &with_bin {
+        let target = store
+            .root
+            .join("tools")
+            .join(format!("{}-{}", t.name, t.version))
+            .join(&t.bin);
+        std::os::unix::fs::symlink(&target, tmp.join(&t.name)).ok();
+    }
+    fs::create_dir_all(dir.parent().unwrap())?;
+    match fs::rename(&tmp, &dir) {
+        Ok(()) => {}
+        Err(_) if dir.exists() => {
+            fs::remove_dir_all(&tmp).ok();
+        }
+        Err(e) => return Err(e).context("publishing tool shims"),
+    }
+    Ok(Some(dir))
 }
 
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
@@ -575,6 +643,12 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
             continue;
         }
         if stale(&marker) && fs::remove_dir_all(&p).is_ok() {
+            dirs += 1;
+        }
+    }
+    // toolsets/: shim dirs, cheap to rebuild; judged by use-touched mtime.
+    for p in read_dir_paths(&store.root.join("toolsets"))? {
+        if p.is_dir() && stale(&p) && fs::remove_dir_all(&p).is_ok() {
             dirs += 1;
         }
     }
@@ -931,10 +1005,14 @@ pub fn build(
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let (tools_text, universes) = match read_tools_manifest(&dir)? {
-        Some((text, _, _, u)) => (text, u),
-        None => (String::new(), Universes::new()),
+    let universes = match read_dcargo_toml(&dir)? {
+        Some((_, _, _, u)) => u,
+        None => Universes::new(),
     };
+    // Only the universes shape the plan (they pick the feature-unification
+    // member set); tools and env probes don't, so their edits — or any
+    // comment — must not even cost a replan.
+    let universe_id = sha256_hex(format!("{universes:?}").as_bytes());
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) { "test" } else { "build" };
     let plan_ptr = sha256_hex(
@@ -942,7 +1020,7 @@ pub fn build(
             "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
-            sha256_hex(tools_text.as_bytes()),
+            universe_id,
         )
         .as_bytes(),
     );
@@ -1204,11 +1282,9 @@ pub fn build(
         String::new()
     };
     let cargo = cargo_bin.display().to_string();
-    let mut tool_envs: Vec<(String, String)> = Vec::new();
-    let mut tools_id = String::new();
-    let mut env_inputs: Vec<(String, String, Vec<String>)> = Vec::new();
-    if let Some((manifest_text, specs, inputs, _)) = read_tools_manifest(&dir)? {
-        tools_id = crate::store::sha256_hex(manifest_text.as_bytes());
+    let mut tools_rt: Vec<ToolRt> = Vec::new();
+    let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
+    if let Some((_, specs, probes, _)) = read_dcargo_toml(&dir)? {
         for t in &specs {
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
@@ -1217,60 +1293,72 @@ pub fn build(
                 .join("tools")
                 .join(format!("{}-{}", t.name, t.version))
                 .join(exported);
-            eprintln!("dcargo: tool {} {} -> ${}", t.name, t.version, t.env);
-            tool_envs.push((t.env.clone(), logical.display().to_string()));
+            let scope = if t.packages.is_empty() {
+                String::new()
+            } else {
+                format!(" (packages {:?})", t.packages)
+            };
+            eprintln!("dcargo: tool {} {} -> ${}{scope}", t.name, t.version, t.env);
+            // The setting's own identity: exactly the scoped actions key
+            // on it, so a pin edit has exactly the declared blast radius.
+            let id = sha256_hex(
+                format!(
+                    "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                    t.name, t.version, t.url, t.sha256, t.bin, t.path, t.env
+                )
+                .as_bytes(),
+            );
+            tools_rt.push(ToolRt {
+                name: t.name.clone(),
+                version: t.version.clone(),
+                env: t.env.clone(),
+                value: logical.display().to_string(),
+                id,
+                bin: t.bin.clone(),
+                packages: t.packages.clone(),
+            });
         }
-        // plan-time resolution: ambient reads happen HERE, outside the
-        // sandbox, and are frozen into keyed values
-        for ei in &inputs {
-            let parts: Vec<&str> = ei.command.split_whitespace().collect();
+        // Plan-time probes: ambient reads happen HERE, outside the
+        // sandbox, frozen into keyed values. A probe only runs when some
+        // scoped package builds under a scoped profile — dev builds never
+        // execute (or key on) a release-only probe.
+        for probe in &probes {
+            let active = units.iter().any(|u| {
+                let pkg_name = &meta.packages[u.pkg].name;
+                probe.packages.iter().any(|p| p == pkg_name)
+                    && (probe.profiles.is_empty()
+                        || probe.profiles.iter().any(|pr| pr == &u.profile.name))
+            });
+            if !active {
+                continue;
+            }
+            let parts: Vec<&str> = probe.command.split_whitespace().collect();
             if parts.is_empty() {
-                bail!("env-input {} has an empty command", ei.name);
+                bail!("env {} has an empty command", probe.name);
             }
             let out = capture(
-                Command::new(parts[0]).args(&parts[1..]).current_dir(&dir),
-                &format!("env-input {}", ei.name),
+                Command::new(parts[0]).args(&parts[1..]).current_dir(Path::new(&meta.workspace_root)),
+                &format!("env probe {}", probe.name),
             )?;
             let val = out.trim().to_string();
-            eprintln!("dcargo: env-input {}={} (scoped to {:?})", ei.name, val, ei.packages);
-            env_inputs.push((ei.name.clone(), val, ei.packages.clone()));
-        }
-    }
-    // Actions never see the ambient PATH: they get [tool shims:]/usr/bin:/bin.
-    // The shim dir contains symlinks to the pinned tools, so bare-name
-    // spawns (`Command::new("cmake")`) resolve to keyed content.
-    // DCARGO_ACTION_PATH: survey knob to substitute the system portion of
-    // the action PATH (e.g. with exec-logging wrapper scripts)
-    let mut action_path =
-        std::env::var("DCARGO_ACTION_PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
-    if !tool_envs.is_empty() {
-        let shims = store.root.join("toolsets").join(&tools_id[..16]);
-        if !shims.exists() {
-            let tmp = store.tmp_path("shims");
-            fs::create_dir_all(&tmp)?;
-            if let Some((_, specs, _, _)) = read_tools_manifest(&dir)? {
-                for t in &specs {
-                    if t.bin.is_empty() {
-                        continue; // dir/file exports are env-only, not PATH shims
-                    }
-                    let target = store
-                        .root
-                        .join("tools")
-                        .join(format!("{}-{}", t.name, t.version))
-                        .join(&t.bin);
-                    std::os::unix::fs::symlink(&target, tmp.join(&t.name)).ok();
+            eprintln!(
+                "dcargo: env {}={} (packages {:?}{})",
+                probe.name,
+                val,
+                probe.packages,
+                if probe.profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!(", profiles {:?}", probe.profiles)
                 }
-            }
-            fs::create_dir_all(shims.parent().unwrap())?;
-            match fs::rename(&tmp, &shims) {
-                Ok(()) => {}
-                Err(_) if shims.exists() => {}
-                Err(e) => return Err(e).context("publishing tool shims"),
-            }
+            );
+            env_probes.push((probe.name.clone(), val, probe.packages.clone(), probe.profiles.clone()));
         }
-        action_path = format!("{}:{action_path}", shims.display());
     }
-    let mut base_env = vec![("PATH".to_string(), action_path)];
+    // Actions never see the ambient PATH: they get [shims:]/usr/bin:/bin,
+    // where the shim dir (built per visible tool subset in
+    // run_build_script) resolves bare-name spawns to keyed content.
+    let mut base_env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
     if let Ok(v) = std::env::var("HOME") {
         base_env.push(("HOME".to_string(), v));
     }
@@ -1316,9 +1404,8 @@ pub fn build(
         file_names_memo,
         profile_name,
         toolchain,
-        tool_envs,
-        tools_id,
-        env_inputs,
+        tools: tools_rt,
+        env_probes,
         target,
         check_mode,
         target_std_libdir,
@@ -2739,14 +2826,25 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     if let Some(links) = &pkg.links {
         env.push(("CARGO_MANIFEST_LINKS".into(), links.clone()));
     }
-    for (k, v) in &ctx.tool_envs {
-        env.push((k.clone(), v.clone()));
+    // Scoped settings: only the tools and env probes naming this package
+    // reach it, and only their identity hashes enter this action's key.
+    let visible_tools: Vec<&ToolRt> = ctx
+        .tools
+        .iter()
+        .filter(|t| t.packages.is_empty() || t.packages.iter().any(|p| p == &pkg.name))
+        .collect();
+    for t in &visible_tools {
+        env.push((t.env.clone(), t.value.clone()));
     }
-    for (name, value, pkgs) in &ctx.env_inputs {
-        if pkgs.is_empty() || pkgs.iter().any(|p| p == &pkg.name) {
+    for (name, value, pkgs, profiles) in &ctx.env_probes {
+        if pkgs.iter().any(|p| p == &pkg.name)
+            && (profiles.is_empty() || profiles.iter().any(|pr| pr == &unit.profile.name))
+        {
             env.push((name.clone(), value.clone())); // keyed via the env vec
         }
     }
+    let mut tool_ids: Vec<String> = visible_tools.iter().map(|t| t.id.clone()).collect();
+    tool_ids.sort();
     let plat_cfg = if unit.host { &ctx.cfg_env } else { &ctx.cfg_env_target };
     for (k, v) in plat_cfg {
         env.push((k.clone(), v.clone()));
@@ -2771,7 +2869,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         env: &env,
         dep_env: &dep_env,
         toolchain: &ctx.toolchain,
-        tools: &ctx.tools_id,
+        tools: &tool_ids,
     })?;
     let key = sha256_hex(key_json.as_bytes());
 
@@ -2821,6 +2919,9 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     }
     for (k, v) in &ctx.base_env {
         cmd.env(k, v);
+    }
+    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
+        cmd.env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
     }
     for (k, v) in &env {
         cmd.env(k, v);

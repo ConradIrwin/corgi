@@ -229,6 +229,40 @@ keys. Sysroot content identity (rust-src presence) is now folded into every
 action key. Managed toolchains without rust-src are preferable: std paths
 stay in upstream's canonical `/rustc/<commit>/` form on every machine.
 
+## Scoped workspace settings (dcargo.toml)
+
+One optional file at the workspace root; every setting names the packages
+it applies to, and **only those packages' actions key on it** — the file
+itself is never hashed into keys, so comments, reordering, or probe
+command-text edits rebuild nothing (and don't even cost a replan; only
+`[universe.*]` shapes the plan).
+
+```toml
+[tools.cmake]              # sha256-pinned, unpacked into the store
+version  = "4.1.2"
+url      = "https://github.com/Kitware/CMake/releases/..."
+sha256   = "3be85f..."
+bin      = "cmake-4.1.2-macos-universal/CMake.app/Contents/bin/cmake"
+env      = "CMAKE"
+packages = ["webrtc-sys", "wasmtime-c-api-impl"]   # omit = every build script
+
+[env.ZED_COMMIT_SHA]       # plan-time probe, run outside the sandbox
+command  = "git rev-parse HEAD"
+packages = ["zed", "cli", "remote_server"]          # required
+profiles = ["release"]                              # omit = all profiles
+
+[universe.wasm32-unknown-unknown]                   # feature unification set
+packages = ["cloud_worker", "github_worker"]
+```
+
+Blast radii by construction: bump a tool pin and exactly the scoped
+packages' build scripts re-run; a probe's *value* keys the scoped actions
+(its command text never does), and a release-scoped probe doesn't run at
+all under dev — so a new git commit can't bust the dev cache. Bare-name
+spawns (`Command::new("cmake")`) resolve through a per-subset shim dir on
+the action PATH. Per-crate settings live elsewhere, in each crate's own
+manifest: `[package.metadata.dcargo] extra-inputs = [...]`.
+
 ## Input containment (include!/mod coverage)
 
 Everything a compile can read is either hashed or refused. In-package reads
