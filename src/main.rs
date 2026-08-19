@@ -26,8 +26,8 @@ fn real_main() -> Result<()> {
             "-v" | "--verbose" => verbose = true,
             "--release" => release = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
-            "build" | "check" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
-            _ => bail!("unknown argument `{a}` (usage: dcargo build|check|test|gc [--dir DIR] [--release] [--target TRIPLE] [-v])"),
+            "build" | "check" | "clippy" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
+            _ => bail!("unknown argument `{a}` (usage: dcargo build|check|clippy|test|gc [--dir DIR] [--release] [--target TRIPLE] [-v])"),
         }
     }
 
@@ -56,6 +56,7 @@ fn real_main() -> Result<()> {
     }
     let mode = match cmd.as_deref() {
         Some("check") => build::Mode::Check,
+        Some("clippy") => build::Mode::Clippy,
         Some("test") => build::Mode::Test,
         _ => build::Mode::Build,
     };

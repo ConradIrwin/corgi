@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 pub struct Metadata {
+    #[serde(default)]
+    pub workspace_members: Vec<String>,
     pub packages: Vec<Package>,
     pub resolve: Resolve,
     pub workspace_root: String,

@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.12";
+const TOOL_VERSION: &str = "dcargo/0.13";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -26,6 +26,10 @@ const TOOL_VERSION: &str = "dcargo/0.12";
 pub enum Mode {
     Build,
     Check,
+    /// Check mode with clippy-driver as the executor for workspace-member
+    /// units (their own key namespace; the dependency layer is shared
+    /// with plain check).
+    Clippy,
     Test,
 }
 
@@ -199,6 +203,15 @@ pub struct Ctx {
     target: Option<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
+    /// Per-package resolved lint flags (empty for non-members).
+    lints: Vec<LintFlags>,
+    /// Clippy mode: member checked units run clippy-driver.
+    clippy: bool,
+    /// clippy-driver path (logical), identity (version + conf hash), and
+    /// the workspace clippy.toml when present.
+    clippy_driver: String,
+    clippy_id: String,
+    clippy_conf: Option<PathBuf>,
     /// Logical path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
@@ -227,6 +240,10 @@ struct CompileKey<'a> {
     link_args: &'a [String],
     out_key: &'a str,
     profile: &'a [String],
+    /// resolved lint-level flags (value-keyed inputs; empty for deps)
+    lints: &'a [String],
+    /// clippy identity (driver version + clippy.toml hash); "" = rustc
+    clippy: &'a str,
     /// debug-map prefix recorded relative to the workspace root ("" = none)
     oso: &'a str,
     env: &'a [(String, String)],
@@ -386,6 +403,156 @@ fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
         }
     }
     Ok(Some((text, specs, probes, universes)))
+}
+
+/// Resolved lint flags for one workspace member. Lints are inputs like
+/// any probe value: dcargo is the producer (cargo exposes no API for
+/// them — checked: unit graph, cargo metadata, and build-plan, which is
+/// removed), the manifests they come from never enter keys, and only
+/// these resolved values do.
+#[derive(Default, Clone)]
+struct LintFlags {
+    /// Lints rustc acts on (rust-tool): keyed into every mode.
+    rustc_only: Vec<String>,
+    /// The full set including clippy:: tool lints: keyed into clippy
+    /// actions only — inert flags must not bust check/build caches.
+    with_clippy: Vec<String>,
+}
+
+/// One resolved entry: (priority, tool, lint, level). Sorted by
+/// (priority, tool, lint) — cargo's documented flag ordering.
+type LintEntry = (i64, String, String, String);
+
+/// Trim a trailing `# comment` from a TOML value we understand (quoted
+/// string or single-line inline table).
+fn strip_line_comment(raw: &str) -> &str {
+    let end = if let Some(rest) = raw.strip_prefix('"') {
+        rest.find('"').map(|i| i + 2)
+    } else if raw.starts_with('{') {
+        raw.find('}').map(|i| i + 1)
+    } else {
+        raw.find('#')
+    };
+    match end {
+        Some(e) => raw[..e].trim_end(),
+        None => raw,
+    }
+}
+
+fn parse_lint_value(raw: &str, ctx_name: &str) -> Result<(String, i64)> {
+    if let Some(inner) = raw.strip_prefix('{') {
+        if raw.contains("check-cfg") {
+            bail!("[lints] `{ctx_name}`: check-cfg configuration is not supported yet");
+        }
+        let inner = inner.trim_end_matches('}');
+        let mut level = String::new();
+        let mut priority = 0i64;
+        for part in inner.split(',') {
+            let Some((k, v)) = part.split_once('=') else { continue };
+            match k.trim() {
+                "level" => level = v.trim().trim_matches('"').to_string(),
+                "priority" => {
+                    priority = v.trim().parse().with_context(|| format!("bad lint priority for {ctx_name}"))?
+                }
+                other => bail!("[lints] `{ctx_name}`: unsupported key `{other}`"),
+            }
+        }
+        Ok((level, priority))
+    } else {
+        Ok((raw.trim_matches('"').to_string(), 0))
+    }
+}
+
+/// Parse `[lints.*]` (member manifests) or `[workspace.lints.*]` (root)
+/// tables. Returns (member says `workspace = true`, entries).
+fn parse_lint_tables(text: &str, root: bool) -> Result<(bool, Vec<LintEntry>)> {
+    let head = if root { "[workspace.lints" } else { "[lints" };
+    let mut tool: Option<String> = None;
+    let mut in_bare_lints = false;
+    let mut uses_workspace = false;
+    let mut entries: Vec<LintEntry> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            tool = None;
+            in_bare_lints = false;
+            if let Some(rest) = line.strip_prefix(head) {
+                if let Some(t) = rest.strip_prefix('.') {
+                    tool = Some(t.trim_end_matches(']').to_string());
+                } else if rest == "]" {
+                    in_bare_lints = true;
+                }
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let (k, raw) = (k.trim(), strip_line_comment(v.trim()));
+            if in_bare_lints {
+                if k == "workspace" && raw == "true" {
+                    uses_workspace = true;
+                } else {
+                    bail!("[lints] key `{k}` not understood (only `workspace = true` or [lints.<tool>] tables)");
+                }
+            } else if let Some(t) = &tool {
+                let (level, priority) = parse_lint_value(raw, k)?;
+                entries.push((priority, t.clone(), k.to_string(), level));
+            }
+        }
+    }
+    Ok((uses_workspace, entries))
+}
+
+fn lint_entries_to_flags(entries: &[LintEntry]) -> Result<LintFlags> {
+    let mut sorted = entries.to_vec();
+    sorted.sort();
+    let mut out = LintFlags::default();
+    for (_, tool, lint, level) in &sorted {
+        if tool == "rustdoc" {
+            continue; // rustdoc lints apply to rustdoc runs only
+        }
+        let name = if tool == "rust" { lint.clone() } else { format!("{tool}::{lint}") };
+        let flag = match level.as_str() {
+            "allow" => format!("-A{name}"),
+            "warn" => format!("-W{name}"),
+            "deny" => format!("-D{name}"),
+            "forbid" => format!("-F{name}"),
+            "force-warn" => format!("--force-warn={name}"),
+            other => bail!("[lints] `{name}`: unknown level `{other}`"),
+        };
+        if tool == "rust" {
+            out.rustc_only.push(flag.clone());
+        }
+        out.with_clippy.push(flag);
+    }
+    Ok(out)
+}
+
+/// Per-package resolved lints (workspace members only; deps are capped
+/// anyway and cargo never applies your lints to them).
+fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
+    let members: std::collections::HashSet<&str> =
+        meta.workspace_members.iter().map(|s| s.as_str()).collect();
+    let ws_text =
+        fs::read_to_string(Path::new(&meta.workspace_root).join("Cargo.toml")).unwrap_or_default();
+    let (_, ws_entries) = parse_lint_tables(&ws_text, true)?;
+    let ws_flags = lint_entries_to_flags(&ws_entries)?;
+    let mut out = vec![LintFlags::default(); meta.packages.len()];
+    for (i, pkg) in meta.packages.iter().enumerate() {
+        if !members.contains(pkg.id.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&pkg.manifest_path)
+            .with_context(|| format!("reading manifest of {}", pkg.name))?;
+        let (uses_workspace, own) = parse_lint_tables(&text, false)?;
+        if uses_workspace && !own.is_empty() {
+            bail!("{}: [lints] mixes `workspace = true` with inline tables", pkg.name);
+        }
+        out[i] = if uses_workspace { ws_flags.clone() } else { lint_entries_to_flags(&own)? };
+    }
+    Ok(out)
 }
 
 /// Bare-name spawns (`Command::new("cmake")`) resolve through a shim dir
@@ -854,6 +1021,51 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
     Ok(())
 }
 
+/// Add the clippy component's driver to an installed toolchain (single
+/// atomic file rename; presence = complete). Only clippy mode pays for it.
+fn ensure_clippy(store: &Store, channel: &str, triple: &str) -> Result<()> {
+    let toolchain = store.root.join("tools").join(format!("rust-{channel}-{triple}"));
+    let driver = toolchain.join("bin/clippy-driver");
+    if driver.is_file() {
+        return Ok(());
+    }
+    eprintln!("dcargo: installing clippy {channel} (sha256-pinned)");
+    let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+    } else if let Some(d) = channel.strip_prefix("beta-") {
+        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+    } else {
+        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+    };
+    let name = format!("clippy-{ver}-{triple}");
+    let work = store.tmp_path("clippy");
+    fs::create_dir_all(&work)?;
+    let tarball = work.join("t.tar.xz");
+    let url = format!("{base}/{name}.tar.xz");
+    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    if !st.success() {
+        bail!("download failed: {url}");
+    }
+    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+    let actual = crate::store::sha256_file(&tarball)?;
+    if actual != expected {
+        bail!("sha256 mismatch for {name}");
+    }
+    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    if !st.success() {
+        bail!("unpack failed: {name}");
+    }
+    let payload = work.join(&name).join("clippy-preview/bin/clippy-driver");
+    match fs::rename(&payload, &driver) {
+        Ok(()) => {}
+        Err(_) if driver.is_file() => {} // concurrent racer won
+        Err(e) => return Err(e).context("publishing clippy-driver"),
+    }
+    fs::remove_dir_all(&work).ok();
+    Ok(())
+}
+
 /// Install rust-std for a cross target as its OWN immutable tools/ entry
 /// (never mutating the toolchain dir). Compiles reach it via a bare `-L`:
 /// rustc's crate loader resolves sysroot crates (std, core, ...) from -L
@@ -1191,7 +1403,7 @@ pub fn build(
     // runs, proc-macros) and their transitive closures still fully
     // compiles; the rest emits metadata only.
     let mut check_mode: Vec<bool> = Vec::new();
-    if matches!(mode, Mode::Check) {
+    if matches!(mode, Mode::Check | Mode::Clippy) {
         let mut codegen = vec![false; units.len()];
         let mut stack: Vec<usize> = (0..units.len())
             .filter(|&i| {
@@ -1282,6 +1494,26 @@ pub fn build(
         String::new()
     };
     let cargo = cargo_bin.display().to_string();
+    // Lints are plan-time-resolved inputs (see resolve_lints).
+    let lints = resolve_lints(&meta)?;
+    let mut clippy_driver = String::new();
+    let mut clippy_id = String::new();
+    let mut clippy_conf: Option<PathBuf> = None;
+    if matches!(mode, Mode::Clippy) {
+        ensure_clippy(&store, &channel, &host_guess)?;
+        clippy_driver = format!("{}/bin/clippy-driver", toolchain_logical.display());
+        let version = capture(Command::new(&clippy_driver).arg("-V"), "clippy-driver -V")?;
+        let mut conf_hash = String::new();
+        for name in ["clippy.toml", ".clippy.toml"] {
+            let candidate = Path::new(&meta.workspace_root).join(name);
+            if candidate.is_file() {
+                conf_hash = crate::store::sha256_file(&candidate)?;
+                clippy_conf = Some(candidate);
+                break;
+            }
+        }
+        clippy_id = format!("{}|{conf_hash}", version.trim());
+    }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
     if let Some((_, specs, probes, _)) = read_dcargo_toml(&dir)? {
@@ -1408,6 +1640,11 @@ pub fn build(
         env_probes,
         target,
         check_mode,
+        lints,
+        clippy: matches!(mode, Mode::Clippy),
+        clippy_driver,
+        clippy_id,
+        clippy_conf,
         target_std_libdir,
         cfg_env_target,
     };
@@ -2516,6 +2753,15 @@ fn compile(
     if !prof.panic.is_empty() && prof.panic != "unwind" && !matches!(unit.kind, Kind::Test) {
         pflags.push(format!("-Cpanic={}", prof.panic));
     }
+    // Lints and (in clippy mode) the executor swap: local packages'
+    // checked units run clippy-driver in their own key namespace; the
+    // dependency layer stays plain-rustc and is shared with check.
+    let clippy_action = ctx.clippy && self_checked && pkg.source.is_none();
+    let lint_flags: &[String] = if clippy_action {
+        &ctx.lints[unit.pkg].with_clippy
+    } else {
+        &ctx.lints[unit.pkg].rustc_only
+    };
     let unit_platform = if unit.host {
         ctx.host.as_str()
     } else {
@@ -2528,7 +2774,9 @@ fn compile(
     let oso_rel = if oso_split { format!("target/{}/", ctx.profile_name) } else { String::new() };
 
     let key_json = serde_json::to_string(&CompileKey {
-        kind: if self_checked {
+        kind: if clippy_action {
+            "clippy"
+        } else if self_checked {
             "check"
         } else if matches!(unit.kind, Kind::Test) {
             "compile-test"
@@ -2554,6 +2802,8 @@ fn compile(
         link_args: &link_args,
         out_key: &out_key,
         profile: &pflags,
+        lints: lint_flags,
+        clippy: if clippy_action { &ctx.clippy_id } else { "" },
         oso: &oso_rel,
         env: &env,
         cap_lints,
@@ -2589,7 +2839,13 @@ fn compile(
         .collect();
     let mut reads: Vec<&Path> = vec![&pkg_root];
     reads.extend(extra_in.iter().map(|p| p.as_path()));
-    let mut cmd = sandboxed_command(ctx, &ctx.rustc, &reads, &[&outdir, &scratch]);
+    if clippy_action {
+        if let Some(conf) = &ctx.clippy_conf {
+            reads.push(conf.as_path());
+        }
+    }
+    let executor = if clippy_action { ctx.clippy_driver.as_str() } else { ctx.rustc.as_str() };
+    let mut cmd = sandboxed_command(ctx, executor, &reads, &[&outdir, &scratch]);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
@@ -2642,6 +2898,15 @@ fn compile(
     }
     for f in &pflags {
         cmd.arg(f);
+    }
+    for f in lint_flags {
+        cmd.arg(f);
+    }
+    if clippy_action {
+        // cfg(clippy) is a documented, code-visible condition — precisely
+        // why clippy artifacts live in their own key namespace.
+        cmd.arg("--cfg").arg("clippy");
+        cmd.env("CLIPPY_CONF_DIR", &ctx.workspace_root);
     }
     if oso_split {
         cmd.arg("-Csplit-debuginfo=unpacked");
@@ -2723,6 +2988,13 @@ fn compile(
             ctx.store.logical_root().to_path_buf(),
             PathBuf::from(&ctx.sysroot),
         ];
+        if clippy_action {
+            // clippy-driver reports its config in dep-info; the content is
+            // already keyed (clippy_id carries the clippy.toml hash).
+            if let Some(conf) = &ctx.clippy_conf {
+                allowed.push(conf.clone());
+            }
+        }
         for e in meta::extra_inputs(pkg) {
             if let Ok(p) = pkg_root.join(&e).canonicalize() {
                 allowed.push(p); // declared -> hashed -> allowed

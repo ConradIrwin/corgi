@@ -263,6 +263,25 @@ spawns (`Command::new("cmake")`) resolve through a per-subset shim dir on
 the action PATH. Per-crate settings live elsewhere, in each crate's own
 manifest: `[package.metadata.dcargo] extra-inputs = [...]`.
 
+## Lints and clippy
+
+`[lints]` / `[workspace.lints]` are resolved by dcargo at plan time
+(cargo exposes them through no API — checked: metadata, unit graph, and
+build-plan, which is removed) and treated as inputs like any probe value:
+the manifests never enter keys, only the resolved flags do, per member.
+Rust-tool lints key every mode; clippy:: lints key clippy actions only —
+they're inert to rustc, so editing them never busts check or build
+caches (cargo can't say the same).
+
+`dcargo clippy` is check mode with clippy-driver as the executor for
+local packages' checked units, in their own key namespace (`--cfg
+clippy` is code-visible, so sharing rmetas with check would be a lie);
+the whole dependency layer shares check's rmetas. clippy.toml is a
+hashed input (clippy-driver reports it in dep-info; verified against the
+hermeticity validator). Diagnostics replay from the store: a warm
+full-workspace `dcargo clippy` on zed is 0.2s, and check/clippy
+alternation is 0-executed in both directions — no fingerprint thrash.
+
 ## Root-manifest blast radius (readable = keyed, by construction)
 
 Actions cannot read the workspace root Cargo.toml at all, and it is hashed
