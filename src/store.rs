@@ -34,6 +34,34 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
+/// Stream-hash a file while checking for a forbidden byte sequence
+/// (needle straddling chunk boundaries included). Returns (hash, found).
+pub fn sha256_file_scan(path: &Path, needle: &[u8]) -> Result<(String, bool)> {
+    let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut h = Sha256::new();
+    let finder = memchr::memmem::Finder::new(needle);
+    let overlap = needle.len().saturating_sub(1);
+    let mut carry: Vec<u8> = Vec::with_capacity(overlap * 2);
+    let mut found = needle.is_empty();
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        if !found {
+            // A match can straddle the boundary: search the carried tail
+            // plus the head of this chunk, then the chunk itself.
+            carry.extend_from_slice(&buf[..n.min(overlap)]);
+            found = finder.find(&carry).is_some() || finder.find(&buf[..n]).is_some();
+            carry.clear();
+            carry.extend_from_slice(&buf[n.saturating_sub(overlap)..n]);
+        }
+    }
+    Ok((hex(&h.finalize()), found))
+}
+
 /// Per-file hint: (size, mtime_ns, inode) -> content hash. Hints only let
 /// us skip re-hashing; any metadata mismatch falls back to hashing bytes,
 /// so mtimes never decide correctness.
@@ -208,6 +236,17 @@ impl Store {
     /// race benignly: rename over an identical file is fine.
     pub fn insert_file(&self, path: &Path) -> Result<String> {
         let hash = sha256_file(path)?;
+        self.insert_hashed(path, hash)
+    }
+
+    /// insert_file, but also reports whether the bytes contain `needle` —
+    /// the location-leak tripwire rides the hashing pass for free.
+    pub fn insert_file_scan(&self, path: &Path, needle: &[u8]) -> Result<(String, bool)> {
+        let (hash, found) = sha256_file_scan(path, needle)?;
+        Ok((self.insert_hashed(path, hash)?, found))
+    }
+
+    fn insert_hashed(&self, path: &Path, hash: String) -> Result<String> {
         let dest = self.cache_path(&hash);
         if dest.exists() {
             fs::remove_file(path).ok();
@@ -383,5 +422,39 @@ impl Store {
                 self.write_atomic(hint_path, &bytes).ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::sha256_file_scan;
+
+    fn scan(content: &[u8], needle: &[u8]) -> bool {
+        let path = std::env::temp_dir().join(format!("dcargo-scan-test-{}", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        let (_, found) = sha256_file_scan(&path, needle).unwrap();
+        std::fs::remove_file(&path).ok();
+        found
+    }
+
+    #[test]
+    fn finds_needle_across_chunk_boundary() {
+        // The hasher reads 64 KiB chunks; plant the needle straddling the
+        // first boundary so half sits in each read.
+        let needle = b"/Users/conrad/worktrees/zed-one";
+        let mut content = vec![b'x'; (1 << 16) - 10];
+        content.extend_from_slice(needle);
+        content.extend_from_slice(&vec![b'y'; 1 << 16]);
+        assert!(scan(&content, needle));
+        // Same content without the needle is clean.
+        let clean = vec![b'x'; (1 << 17) + 21];
+        assert!(!scan(&clean, needle));
+        // Needle at the very start and very end.
+        let mut head = needle.to_vec();
+        head.extend_from_slice(&[b'z'; 100]);
+        assert!(scan(&head, needle));
+        let mut tail = vec![b'z'; (1 << 16) * 2];
+        tail.extend_from_slice(needle);
+        assert!(scan(&tail, needle));
     }
 }

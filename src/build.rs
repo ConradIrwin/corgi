@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.18";
+const TOOL_VERSION: &str = "dcargo/0.19";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -1749,7 +1749,6 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             for (k, v) in ctx.pkg_env(pkg) {
                 c.env(k, v);
             }
-            c.env("CARGO_MANIFEST_DIR", pkg.root());
             let st = c.status().with_context(|| format!("running test {}", u.target.name))?;
             if !st.success() {
                 failures.push(u.target.name.clone());
@@ -3240,8 +3239,19 @@ fn compile(
         cmd.env(k, v);
     }
     cmd.env("CARGO_CRATE_NAME", &crate_name);
-    cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
-    cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
+    // Workspace packages see a relative manifest location: every build-time
+    // reader runs with cwd = the package root (compiles, build scripts,
+    // test binaries), so `.` resolves correctly there — and a checkout
+    // location can never be baked into a shareable artifact. Runtime code
+    // must locate the repo at runtime. Packages outside the workspace
+    // (registry, git) keep their canonical store paths.
+    if pkg_root.starts_with(&ctx.workspace_root) {
+        cmd.env("CARGO_MANIFEST_DIR", ".");
+        cmd.env("CARGO_MANIFEST_PATH", "./Cargo.toml");
+    } else {
+        cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
+        cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
+    }
     cmd.env("CARGO", &ctx.cargo);
     for (k, v) in &bs.envs {
         cmd.env(k, v);
@@ -3426,7 +3436,20 @@ fn compile(
             || name.ends_with(".so")
             || name.ends_with(".dll");
         phases.ingest_bytes += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        let hash = ctx.store.insert_file(&p)?;
+        // Location-leak tripwire: artifacts must be location-free to be
+        // shared across checkouts. Any channel that bakes the workspace
+        // path into an output (env!, proc-macro env reads, cwd
+        // resolution) is caught here, on the bytes, before the action is
+        // recorded.
+        let (hash, leaked) =
+            ctx.store.insert_file_scan(&p, ctx.workspace_root.as_bytes())?;
+        if leaked {
+            bail!(
+                "output {name} embeds the workspace path ({}); artifacts must be \
+location-free — resolve paths at runtime instead of baking them in at build time",
+                ctx.workspace_root
+            );
+        }
         outputs.push(OutputFile { name, hash, exe });
     }
     phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
@@ -3624,8 +3647,16 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         cmd.env(k, v);
     }
     cmd.env("OUT_DIR", &stage_logical);
-    cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
-    cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
+    // Same contract as compiles: cwd is the package root, so workspace
+    // packages get `.` and can never observe the checkout location
+    // through these variables.
+    if pkg_root.starts_with(&ctx.workspace_root) {
+        cmd.env("CARGO_MANIFEST_DIR", ".");
+        cmd.env("CARGO_MANIFEST_PATH", "./Cargo.toml");
+    } else {
+        cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
+        cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
+    }
     ctx.jobserver.configure(&mut cmd);
     let _job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
     if ctx.verbose {
