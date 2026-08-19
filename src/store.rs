@@ -232,15 +232,10 @@ impl Store {
         self.root.join("cache").join(&hash[..2]).join(hash)
     }
 
-    /// Move a file into the CAS. Concurrent inserts of the same content
-    /// race benignly: rename over an identical file is fine.
-    pub fn insert_file(&self, path: &Path) -> Result<String> {
-        let hash = sha256_file(path)?;
-        self.insert_hashed(path, hash)
-    }
-
-    /// insert_file, but also reports whether the bytes contain `needle` —
-    /// the location-leak tripwire rides the hashing pass for free.
+    /// Move a file into the CAS, also reporting whether the bytes contain
+    /// `needle` — the location-leak tripwire rides the hashing pass for
+    /// free. Concurrent inserts of the same content race benignly: rename
+    /// over an identical file is fine.
     pub fn insert_file_scan(&self, path: &Path, needle: &[u8]) -> Result<(String, bool)> {
         let (hash, found) = sha256_file_scan(path, needle)?;
         Ok((self.insert_hashed(path, hash)?, found))
@@ -296,36 +291,51 @@ impl Store {
         self.write_atomic(&self.action_path(key), data)
     }
 
-    /// Hard-link a CAS blob into the pool under its rustc-visible file name
-    /// (lib<name>-<key16>.rlib etc). Clean-namespace names embed the action
-    /// key, so they map to one content forever. Incremental-unit names embed
-    /// the stable unit identity instead and re-map to newer content as the
-    /// source evolves: the pool is a view of the latest ingestion, while
-    /// action records pin exact hashes.
+    /// A pool spelling for a produced file: the producing action's key
+    /// spliced into the name before the extension, so a pool name only ever
+    /// refers to outputs of one action. Incremental units keep one
+    /// -Cextra-filename across edits (rustc's sessions require it), so their
+    /// produced names alone would re-map to new content on every edit — and
+    /// concurrent builds of sibling checkouts would race on one name. The
+    /// splice must be the same for an action's rmeta and rlib: rustc's crate
+    /// locator groups flavor candidates by the file-name remainder after
+    /// lib<name><extra-filename>, and transitive resolution only sees the
+    /// rlib when the pair lands in one group. Clean-namespace units already
+    /// embed the key as their extra-filename; their names pass through
+    /// unchanged.
+    pub fn pool_file_name(name: &str, action_key: &str) -> String {
+        let key16 = &action_key[..16];
+        if name.contains(key16) {
+            return name.to_string();
+        }
+        match name.rsplit_once('.') {
+            Some((stem, extension)) => format!("{stem}-{key16}.{extension}"),
+            None => format!("{name}-{key16}"),
+        }
+    }
+
+    /// Hard-link a CAS blob into the pool under its rustc-visible file name.
+    /// Names embed the producing action's key (pool_file_name), so an
+    /// existing entry with different bytes can only be a nondeterministic
+    /// twin from a concurrent run of the same action: interchangeable, so
+    /// the first writer wins and an existing name is never re-pointed —
+    /// consumers may already hold the path.
     pub fn materialize_pool(&self, hash: &str, file_name: &str, executable: bool) -> Result<PathBuf> {
         let dest = self.root.join("pool").join(file_name);
-        let src = self.cache_path(hash);
-        if let Ok(dest_meta) = fs::symlink_metadata(&dest) {
-            use std::os::unix::fs::MetadataExt;
-            let src_meta = fs::metadata(&src)
-                .with_context(|| format!("pool source blob missing: {}", src.display()))?;
-            if dest_meta.ino() == src_meta.ino() && dest_meta.dev() == src_meta.dev() {
-                return Ok(dest);
-            }
-            fs::remove_file(&dest).with_context(|| format!("refreshing {}", dest.display()))?;
+        if fs::symlink_metadata(&dest).is_ok() {
+            return Ok(dest);
         }
-        {
-            if executable {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&src)?.permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&src, perms)?;
-            }
-            match fs::hard_link(&src, &dest) {
-                Ok(()) => {}
-                Err(_) if dest.exists() => {}
-                Err(e) => return Err(e).with_context(|| format!("materialize {}", dest.display())),
-            }
+        let src = self.cache_path(hash);
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&src)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&src, perms)?;
+        }
+        match fs::hard_link(&src, &dest) {
+            Ok(()) => {}
+            Err(_) if dest.exists() => {}
+            Err(e) => return Err(e).with_context(|| format!("materialize {}", dest.display())),
         }
         Ok(dest)
     }
@@ -422,6 +432,47 @@ impl Store {
                 self.write_atomic(hint_path, &bytes).ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_name_tests {
+    use super::Store;
+
+    #[test]
+    fn action_key_is_spliced_before_the_extension() {
+        let key = "1111222233334444ffffffffffffffff";
+        assert_eq!(
+            Store::pool_file_name("libfoo-aaaabbbbccccdddd.rlib", key),
+            "libfoo-aaaabbbbccccdddd-1111222233334444.rlib"
+        );
+        assert_eq!(
+            Store::pool_file_name("build_script_build-aaaabbbbccccdddd", key),
+            "build_script_build-aaaabbbbccccdddd-1111222233334444"
+        );
+    }
+
+    #[test]
+    fn names_already_embedding_the_key_pass_through() {
+        let key = "aaaabbbbccccddddffffffffffffffff";
+        assert_eq!(
+            Store::pool_file_name("libfoo-aaaabbbbccccdddd.rlib", key),
+            "libfoo-aaaabbbbccccdddd.rlib"
+        );
+    }
+
+    #[test]
+    fn rmeta_and_rlib_of_one_action_share_the_locator_group() {
+        // rustc's crate locator groups flavor candidates by the file-name
+        // remainder after lib<name><extra-filename>; transitive resolution
+        // only sees the rlib when the pair shares that remainder.
+        let key = "1111222233334444ffffffffffffffff";
+        let rmeta = Store::pool_file_name("libfoo-aaaabbbbccccdddd.rmeta", key);
+        let rlib = Store::pool_file_name("libfoo-aaaabbbbccccdddd.rlib", key);
+        assert_eq!(
+            rmeta.strip_suffix(".rmeta").unwrap(),
+            rlib.strip_suffix(".rlib").unwrap()
+        );
     }
 }
 

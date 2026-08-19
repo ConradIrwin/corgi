@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.19";
+const TOOL_VERSION: &str = "dcargo/0.20";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -93,6 +93,7 @@ struct ActionResult {
 /// moment rustc reports the rmeta written, while its codegen continues.
 /// Enough for dependent compiles to key themselves and start.
 struct MetaOut {
+    /// Pool-addressed (key-spliced) file name of the rmeta.
     file: String,
     hash: String,
 }
@@ -2114,9 +2115,10 @@ impl Ctx {
         self.store.logical_root().join("outdirs").join(key).join("out")
     }
 
-    fn materialize(&self, res: &ActionResult) -> Result<()> {
+    fn materialize(&self, action_key: &str, res: &ActionResult) -> Result<()> {
         for o in &res.outputs {
-            self.store.materialize_pool(&o.hash, &o.name, o.exe)?;
+            let pool_name = Store::pool_file_name(&o.name, action_key);
+            self.store.materialize_pool(&o.hash, &pool_name, o.exe)?;
         }
         Ok(())
     }
@@ -2142,7 +2144,7 @@ impl Ctx {
             }
             Store::touch_used(&ok);
         }
-        self.materialize(&res)?;
+        self.materialize(key, &res)?;
         Ok(Some(res))
     }
 
@@ -2495,7 +2497,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         // late meta (cache hit, or non-streamed path): fire now
                         if !meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
                             if let Some(rm) = ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta")) {
-                                let _ = metas[idx].set(MetaOut { file: rm.name.clone(), hash: rm.hash.clone() });
+                                let _ = metas[idx].set(MetaOut {
+                                    file: Store::pool_file_name(&rm.name, &ur.key),
+                                    hash: rm.hash.clone(),
+                                });
                             }
                             for &j in &rdeps_meta[idx] {
                                 st.indeg[j] -= 1;
@@ -2800,6 +2805,7 @@ fn run_rustc_streaming(
     cmd: &mut Command,
     uidx: usize,
     pkg_name: &str,
+    action_key: &str,
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
 ) -> Result<(bool, String)> {
     use std::io::BufRead;
@@ -2823,8 +2829,9 @@ fn run_rustc_streaming(
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    ctx.store.materialize_pool(&hash, &file, false)?;
-                    fire_meta(uidx, MetaOut { file, hash });
+                    let pool_name = Store::pool_file_name(&file, action_key);
+                    ctx.store.materialize_pool(&hash, &pool_name, false)?;
+                    fire_meta(uidx, MetaOut { file: pool_name, hash });
                 } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
                     rendered.push_str(r);
                 }
@@ -2960,7 +2967,7 @@ fn compile(
             } else {
                 let r = results[d.unit].get().context("dependency result missing")?;
                 let m = r.main.as_ref().context("dependency artifact missing")?;
-                externs.push((name.clone(), m.name.clone(), m.hash.clone()));
+                externs.push((name.clone(), Store::pool_file_name(&m.name, &r.key), m.hash.clone()));
             }
         } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
             let r = results[d.unit].get().context("dependency result missing")?;
@@ -3393,7 +3400,7 @@ fn compile(
     let job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
     let t_rustc = Instant::now();
     let (success, stderr) = if self_pipelined {
-        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, fire_meta)?
+        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &key, fire_meta)?
     } else {
         let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
         (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
@@ -3429,7 +3436,7 @@ fn compile(
             }
         }
         for e in ctx.extra_inputs_for(pkg) {
-            if let Ok(p) = pkg_root.join(&e).canonicalize() {
+            if let Ok(p) = pkg_root.join(e).canonicalize() {
                 allowed.push(p); // declared -> hashed -> allowed
             }
         }
@@ -3494,7 +3501,7 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         }
     }
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    ctx.materialize(&res)?;
+    ctx.materialize(&key, &res)?;
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
     finish_compile(&expected, key, false, res, phases)
 }
@@ -3505,11 +3512,15 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let pkg_root = pkg.root();
 
     let mut script: Option<OutputFile> = None;
+    let mut script_key = String::new();
     let mut dep_env: Vec<(String, String)> = Vec::new();
     for d in &unit.deps {
         let r = results[d.unit].get().context("dep result missing")?;
         match ctx.units[d.unit].kind {
-            Kind::Bsc => script = r.main.clone(),
+            Kind::Bsc => {
+                script = r.main.clone();
+                script_key = r.key.clone();
+            }
             Kind::Bsr => {
                 let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
                 if let (Some(links), Some(b)) = (&dpkg.links, &r.res.bs) {
@@ -3635,7 +3646,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let stage_out = final_parent.join("out");
     fs::create_dir_all(&stage_out)?;
     let stage_logical = ctx.out_dir_logical(&key);
-    let script_path = ctx.pool.join(&script.name);
+    let script_path = ctx.pool.join(Store::pool_file_name(&script.name, &script_key));
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
     let extra_in: Vec<PathBuf> = ctx
