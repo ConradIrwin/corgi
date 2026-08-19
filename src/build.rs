@@ -201,6 +201,8 @@ pub struct Ctx {
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
+    /// Emit a per-unit timing report (target/dcargo-timings/).
+    timings: bool,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
     /// Per-package resolved lint flags (empty for non-members).
@@ -1045,6 +1047,7 @@ pub fn build(
     release: bool,
     target: Option<String>,
     mode: Mode,
+    timings: bool,
 ) -> Result<()> {
     let t0 = Instant::now();
     let dir = dir
@@ -1561,6 +1564,7 @@ pub fn build(
         tools: tools_rt,
         env_probes,
         target,
+        timings,
         check_mode,
         lints,
         clippy: matches!(mode, Mode::Clippy),
@@ -2264,6 +2268,14 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         }
     }
     let metas: Vec<OnceLock<MetaOut>> = (0..n).map(|_| OnceLock::new()).collect();
+    // Per-unit wall-clock samples (ns since scheduling began); cheap
+    // enough to collect always, reported only under --timings.
+    let t_sched = Instant::now();
+    use std::sync::atomic::{AtomicBool as TBool, AtomicU64 as TNs, Ordering::Relaxed};
+    let t_start: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
+    let t_meta: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
+    let t_end: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
+    let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
     let state = Mutex::new(SchedState { ready, indeg, done: 0, in_flight: 0, errors: Vec::new(), executed: 0, cached: 0 });
     let cv = Condvar::new();
@@ -2275,6 +2287,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         if meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        t_meta[idx].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
         let mut st = state.lock().unwrap();
         for &j in &rdeps_meta[idx] {
             st.indeg[j] -= 1;
@@ -2305,7 +2318,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         st = cv.wait(st).unwrap();
                     }
                 };
+                t_start[idx].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
                 let res = run_unit(ctx, idx, results, &metas, &fire_meta);
+                t_end[idx].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
                 let mut st = state.lock().unwrap();
                 st.in_flight -= 1;
                 match res {
@@ -2319,6 +2334,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         };
                         eprintln!("{verb:>9} {}", describe(ctx, idx));
                         if ur.cached {
+                            t_cached[idx].store(true, Relaxed);
                             st.cached += 1;
                         } else {
                             st.executed += 1;
@@ -2372,7 +2388,140 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         }
         bail!("{} units failed (skipped dependents not counted)", st.errors.len());
     }
+    if ctx.timings {
+        let wall = t_sched.elapsed();
+        let mut rows: Vec<TimingRow> = Vec::new();
+        for i in 0..n {
+            let end = t_end[i].load(Relaxed);
+            if end == 0 || t_cached[i].load(Relaxed) {
+                continue;
+            }
+            let start = t_start[i].load(Relaxed);
+            let meta = t_meta[i].load(Relaxed);
+            rows.push(TimingRow {
+                label: describe(ctx, i),
+                start_ns: start,
+                meta_ns: if meta > start && meta < end { meta } else { 0 },
+                end_ns: end,
+                linking: is_linking(ctx, i),
+                bsr: matches!(ctx.units[i].kind, Kind::Bsr),
+            });
+        }
+        if let Err(e) = write_timings_report(ctx, &rows, wall, st.executed, st.cached) {
+            eprintln!("dcargo: warning: could not write timings report: {e:#}");
+        }
+    }
     Ok((st.executed, st.cached))
+}
+
+struct TimingRow {
+    label: String,
+    start_ns: u64,
+    /// rmeta publication (pipelined units); 0 = none observed
+    meta_ns: u64,
+    end_ns: u64,
+    linking: bool,
+    bsr: bool,
+}
+
+/// Emit a cargo-timings-style report: a gantt of executed units (front-end
+/// vs codegen split for pipelined compiles) plus a duration-sorted table.
+fn write_timings_report(
+    ctx: &Ctx,
+    rows: &[TimingRow],
+    wall: std::time::Duration,
+    executed: usize,
+    cached: usize,
+) -> Result<()> {
+    let wall_ns = wall.as_nanos().max(1) as u64;
+    let cpu_ns: u64 = rows.iter().map(|r| r.end_ns - r.start_ns).sum();
+    let mut sorted: Vec<&TimingRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.start_ns);
+    let secs = |ns: u64| ns as f64 / 1e9;
+    let mut gantt = String::new();
+    for r in &sorted {
+        let left = r.start_ns as f64 / wall_ns as f64 * 100.0;
+        let width = ((r.end_ns - r.start_ns) as f64 / wall_ns as f64 * 100.0).max(0.05);
+        let class = if r.bsr {
+            "bsr"
+        } else if r.linking {
+            "link"
+        } else {
+            "lib"
+        };
+        let meta_html = if r.meta_ns > 0 {
+            let mw = (r.meta_ns - r.start_ns) as f64 / (r.end_ns - r.start_ns) as f64 * 100.0;
+            format!("<i style=\"width:{mw:.1}%\"></i>")
+        } else {
+            String::new()
+        };
+        let title = if r.meta_ns > 0 {
+            format!(
+                "{} — {:.2}s at {:.2}s (rmeta after {:.2}s)",
+                r.label,
+                secs(r.end_ns - r.start_ns),
+                secs(r.start_ns),
+                secs(r.meta_ns - r.start_ns)
+            )
+        } else {
+            format!("{} — {:.2}s at {:.2}s", r.label, secs(r.end_ns - r.start_ns), secs(r.start_ns))
+        };
+        gantt.push_str(&format!(
+            "<div class=\"row\"><span class=\"lbl\">{}</span><div class=\"bar {class}\" style=\"margin-left:{left:.2}%;width:{width:.2}%\" title=\"{title}\">{meta_html}</div></div>\n",
+            r.label
+        ));
+    }
+    let mut by_dur: Vec<&TimingRow> = rows.iter().collect();
+    by_dur.sort_by_key(|r| std::cmp::Reverse(r.end_ns - r.start_ns));
+    let mut table = String::new();
+    for r in by_dur.iter().take(30) {
+        let fe = if r.meta_ns > 0 {
+            format!("{:.2}s", secs(r.meta_ns - r.start_ns))
+        } else {
+            "—".to_string()
+        };
+        table.push_str(&format!(
+            "<tr><td>{}</td><td>{:.2}s</td><td>{fe}</td><td>{:.2}s</td></tr>\n",
+            r.label,
+            secs(r.end_ns - r.start_ns),
+            secs(r.start_ns)
+        ));
+    }
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><title>dcargo timings</title><style>\
+body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
+.row{{display:flex;align-items:center;height:14px}}\
+.lbl{{width:340px;flex:none;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
+.bar{{height:11px;border-radius:2px;position:relative;min-width:1px}}\
+.bar.lib{{background:#7cb3e8}}.bar.link{{background:#b07ce8}}.bar.bsr{{background:#e8a67c}}\
+.bar i{{display:block;position:absolute;left:0;top:0;bottom:0;background:#2c6cb0;border-radius:2px 0 0 2px}}\
+table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;padding:2px 8px;text-align:left;font-size:12px}}\
+</style>\n<h1>dcargo timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
+<div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>duration</th><th>front-end</th><th>start</th></tr>{table}</table>\n",
+        wall.as_secs_f64(),
+        executed,
+        cached,
+        cpu_ns as f64 / 1e9,
+        cpu_ns as f64 / wall_ns as f64,
+    );
+    let dir = Path::new(&ctx.workspace_root).join("target/dcargo-timings");
+    fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let path = dir.join(format!("dcargo-timing-{stamp}.html"));
+    fs::write(&path, &html)?;
+    fs::write(dir.join("dcargo-timing.html"), &html)?;
+    eprintln!("dcargo:   timings report: {}", path.display());
+    for r in by_dur.iter().take(5) {
+        eprintln!(
+            "dcargo:   slow: {:>7.2}s  {}",
+            (r.end_ns - r.start_ns) as f64 / 1e9,
+            r.label
+        );
+    }
+    Ok(())
 }
 
 fn run_unit(

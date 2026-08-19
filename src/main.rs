@@ -17,6 +17,7 @@ fn real_main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut timings = false;
     let mut release = false;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
@@ -24,6 +25,7 @@ fn real_main() -> Result<()> {
         match a.as_str() {
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
+            "--timings" => timings = true,
             "--release" => release = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
             "build" | "check" | "clippy" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
@@ -60,5 +62,5 @@ fn real_main() -> Result<()> {
         Some("test") => build::Mode::Test,
         _ => build::Mode::Build,
     };
-    build::build(store, &dir, verbose, release, target, mode)
+    build::build(store, &dir, verbose, release, target, mode, timings)
 }
