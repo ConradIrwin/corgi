@@ -34,7 +34,9 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
             fs::rename(s, &canonical).context("unparking audit store")?;
         }
         let mut c = Command::new(&exe);
-        c.arg("build").arg("--dir").arg(dir);
+        // Determinism is only claimed for the clean namespace: audit
+        // builds never touch incremental state.
+        c.arg("build").arg("--no-incremental").arg("--dir").arg(dir);
         if release {
             c.arg("--release");
         }

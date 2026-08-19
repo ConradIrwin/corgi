@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.13";
+const TOOL_VERSION: &str = "dcargo/0.15";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -157,11 +157,24 @@ struct ToolRt {
     packages: Vec<String>,
 }
 
+/// Where an action's wall time went (ns), for the timings report.
+#[derive(Default, Clone, Copy)]
+struct Phases {
+    key_ns: u64,
+    cache_ns: u64,
+    rustc_ns: u64,
+    validate_ns: u64,
+    ingest_ns: u64,
+    ingest_bytes: u64,
+    finish_ns: u64,
+}
+
 struct UnitResult {
     key: String,
     cached: bool,
     res: ActionResult,
     main: Option<OutputFile>,
+    phases: Phases,
 }
 
 pub struct Ctx {
@@ -203,6 +216,20 @@ pub struct Ctx {
     target: Option<String>,
     /// Emit a per-unit timing report (target/dcargo-timings/).
     timings: bool,
+    /// Dev-loop namespace: local units compile with -Cincremental into
+    /// store-managed state. Off under --no-incremental (audit, CI).
+    incremental: bool,
+    /// GNU-make jobserver: caps machine-wide compiler parallelism at
+    /// ~NCPU. rustc gates its LLVM codegen threads on it natively, and
+    /// build scripts inherit it (cc/cmake/make all cooperate) — without
+    /// it, N concurrent rustcs each assume they own every core.
+    jobserver: jobserver::Client,
+    /// Per-unit identity (16 hex chars): pkg, crate, kind, platform,
+    /// profile, features, dep identities — deliberately source-free, so
+    /// -Cmetadata (symbol hashes) is stable across edits and rustc's
+    /// incremental state stays valid. -Cextra-filename keeps the full
+    /// key16, so pool file names remain globally unique.
+    idents: Vec<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
     /// Per-package resolved lint flags (empty for non-members).
@@ -246,6 +273,11 @@ struct CompileKey<'a> {
     lints: &'a [String],
     /// clippy identity (driver version + clippy.toml hash); "" = rustc
     clippy: &'a str,
+    /// Incremental namespace: history-seeded, functionally equivalent but
+    /// not bit-reproducible. Never mixes with the clean namespace.
+    incr: bool,
+    /// -Cmetadata value (source-free unit identity).
+    ident: &'a str,
     /// debug-map prefix recorded relative to the workspace root ("" = none)
     oso: &'a str,
     env: &'a [(String, String)],
@@ -743,6 +775,17 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
             dirs += 1;
         }
     }
+    // incr/: dev-loop incremental state — fat, rebuildable, judged by
+    // dir mtime (rustc session writes refresh it on every use).
+    for p in read_dir_paths(&store.root.join("incr"))? {
+        if p.is_dir() {
+            if stale(&p) && fs::remove_dir_all(&p).is_ok() {
+                dirs += 1;
+            }
+        } else if stale(&p) && fs::remove_file(&p).is_ok() {
+            files += 1;
+        }
+    }
     // cargo-home/: dependency sources are re-fetchable. Registry
     // extractions and git checkouts are judged by their use-touched
     // .cargo-ok (fallback: the dir itself); crate tarballs and git dbs
@@ -1040,15 +1083,18 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn build(
-    store: Store,
-    dir: &Path,
-    verbose: bool,
-    release: bool,
-    target: Option<String>,
-    mode: Mode,
-    timings: bool,
-) -> Result<()> {
+/// Invocation options beyond the store and directory.
+pub struct BuildOpts {
+    pub verbose: bool,
+    pub release: bool,
+    pub target: Option<String>,
+    pub mode: Mode,
+    pub timings: bool,
+    pub no_incremental: bool,
+}
+
+pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
+    let BuildOpts { verbose, release, target, mode, timings, no_incremental } = opts;
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -1309,6 +1355,46 @@ pub fn build(
         .find(|u| u.is_root)
         .map(|u| u.profile.dir_name())
         .unwrap_or_else(|| if release { "release".into() } else { "debug".into() });
+    // Source-free unit identities (memoized DFS over dep edges).
+    let idents: Vec<String> = {
+        let mut memo: Vec<Option<String>> = vec![None; units.len()];
+        fn ident_of(i: usize, units: &[Unit], meta: &Metadata, memo: &mut Vec<Option<String>>) -> String {
+            if let Some(v) = &memo[i] {
+                return v.clone();
+            }
+            let u = &units[i];
+            let mut dep_ids: Vec<String> =
+                u.deps.iter().map(|d| ident_of(d.unit, units, meta, memo)).collect();
+            dep_ids.sort();
+            let mut features = u.features.clone();
+            features.sort();
+            let prof = &u.profile;
+            let ident = sha256_hex(
+                format!(
+                    "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
+                    TOOL_VERSION,
+                    meta.packages[u.pkg].id,
+                    u.target.name,
+                    u.target.kind,
+                    u.host,
+                    prof.name,
+                    prof.opt_level,
+                    prof.debuginfo_flag(),
+                    prof.codegen_units,
+                    prof.panic,
+                    prof.debug_assertions,
+                    prof.overflow_checks,
+                    features,
+                    dep_ids
+                )
+                .as_bytes(),
+            )[..16]
+                .to_string();
+            memo[i] = Some(ident.clone());
+            ident
+        }
+        (0..units.len()).map(|i| ident_of(i, &units, &meta, &mut memo)).collect()
+    };
     // One-shot warnings for profile settings we deliberately don't honor.
     if units.iter().any(|u| u.profile.lto_enabled()) {
         eprintln!("dcargo: warning: profile requests lto; not supported yet, building without");
@@ -1565,6 +1651,12 @@ pub fn build(
         env_probes,
         target,
         timings,
+        incremental: !no_incremental,
+        jobserver: jobserver::Client::new(
+            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+        )
+        .context("creating jobserver")?,
+        idents,
         check_mode,
         lints,
         clippy: matches!(mode, Mode::Clippy),
@@ -2276,6 +2368,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let t_meta: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_end: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
+    let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
     let state = Mutex::new(SchedState { ready, indeg, done: 0, in_flight: 0, errors: Vec::new(), executed: 0, cached: 0 });
     let cv = Condvar::new();
@@ -2325,6 +2418,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 st.in_flight -= 1;
                 match res {
                     Ok(ur) => {
+                        let _ = phase_slots[idx].set(ur.phases);
                         let verb = if ur.cached {
                             "Cached"
                         } else if matches!(ctx.units[idx].kind, Kind::Bsr) {
@@ -2391,9 +2485,13 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     if ctx.timings {
         let wall = t_sched.elapsed();
         let mut rows: Vec<TimingRow> = Vec::new();
+        let mut cached_walk_ns: u64 = 0;
         for i in 0..n {
             let end = t_end[i].load(Relaxed);
             if end == 0 || t_cached[i].load(Relaxed) {
+                if end > 0 {
+                    cached_walk_ns += end - t_start[i].load(Relaxed);
+                }
                 continue;
             }
             let start = t_start[i].load(Relaxed);
@@ -2405,9 +2503,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 end_ns: end,
                 linking: is_linking(ctx, i),
                 bsr: matches!(ctx.units[i].kind, Kind::Bsr),
+                phases: phase_slots[i].get().copied().unwrap_or_default(),
             });
         }
-        if let Err(e) = write_timings_report(ctx, &rows, wall, st.executed, st.cached) {
+        if let Err(e) = write_timings_report(ctx, &rows, wall, st.executed, st.cached, cached_walk_ns) {
             eprintln!("dcargo: warning: could not write timings report: {e:#}");
         }
     }
@@ -2422,6 +2521,7 @@ struct TimingRow {
     end_ns: u64,
     linking: bool,
     bsr: bool,
+    phases: Phases,
 }
 
 /// Emit a cargo-timings-style report: a gantt of executed units (front-end
@@ -2432,6 +2532,7 @@ fn write_timings_report(
     wall: std::time::Duration,
     executed: usize,
     cached: usize,
+    cached_walk_ns: u64,
 ) -> Result<()> {
     let wall_ns = wall.as_nanos().max(1) as u64;
     let cpu_ns: u64 = rows.iter().map(|r| r.end_ns - r.start_ns).sum();
@@ -2480,13 +2581,29 @@ fn write_timings_report(
         } else {
             "—".to_string()
         };
+        let ph = &r.phases;
+        let total = r.end_ns - r.start_ns;
+        let accounted =
+            ph.key_ns + ph.cache_ns + ph.rustc_ns + ph.validate_ns + ph.ingest_ns + ph.finish_ns;
         table.push_str(&format!(
-            "<tr><td>{}</td><td>{:.2}s</td><td>{fe}</td><td>{:.2}s</td></tr>\n",
+            "<tr><td>{}</td><td>{:.2}s</td><td>{:.2}s</td><td>{fe}</td><td>{:.2}s ({:.0} MB)</td><td>{:.0}ms</td><td>{:.0}ms</td><td>{:.0}ms</td><td>{:.0}ms</td><td>{:.2}s</td></tr>\n",
             r.label,
-            secs(r.end_ns - r.start_ns),
-            secs(r.start_ns)
+            secs(total),
+            secs(ph.rustc_ns),
+            secs(ph.ingest_ns),
+            ph.ingest_bytes as f64 / 1e6,
+            ph.key_ns as f64 / 1e6,
+            ph.cache_ns as f64 / 1e6,
+            ph.validate_ns as f64 / 1e6,
+            ph.finish_ns as f64 / 1e6,
+            secs(total.saturating_sub(accounted)),
         ));
     }
+    let sum_rustc: u64 = rows.iter().map(|r| r.phases.rustc_ns).sum();
+    let sum_ingest: u64 = rows.iter().map(|r| r.phases.ingest_ns).sum();
+    let sum_bytes: u64 = rows.iter().map(|r| r.phases.ingest_bytes).sum();
+    let sum_key: u64 = rows.iter().map(|r| r.phases.key_ns).sum();
+    let sum_finish: u64 = rows.iter().map(|r| r.phases.finish_ns).sum();
     let html = format!(
         "<!doctype html><meta charset=utf-8><title>dcargo timings</title><style>\
 body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
@@ -2497,12 +2614,19 @@ body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
 .bar i{{display:block;position:absolute;left:0;top:0;bottom:0;background:#2c6cb0;border-radius:2px 0 0 2px}}\
 table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;padding:2px 8px;text-align:left;font-size:12px}}\
 </style>\n<h1>dcargo timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
-<div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>duration</th><th>front-end</th><th>start</th></tr>{table}</table>\n",
+<div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>total</th><th>rustc</th><th>front-end</th><th>ingest</th><th>key</th><th>cache</th><th>validate</th><th>finish</th><th>other</th></tr>{table}</table>\n\
+<p>phase totals across executed units: rustc {:.1}s · ingest {:.1}s ({:.2} GB hashed) · key {:.1}s · finish {:.1}s · cache-hit walk {:.1}s</p>\n",
         wall.as_secs_f64(),
         executed,
         cached,
         cpu_ns as f64 / 1e9,
         cpu_ns as f64 / wall_ns as f64,
+        sum_rustc as f64 / 1e9,
+        sum_ingest as f64 / 1e9,
+        sum_bytes as f64 / 1e9,
+        sum_key as f64 / 1e9,
+        sum_finish as f64 / 1e9,
+        cached_walk_ns as f64 / 1e9,
     );
     let dir = Path::new(&ctx.workspace_root).join("target/dcargo-timings");
     fs::create_dir_all(&dir)?;
@@ -2656,7 +2780,13 @@ fn run_rustc_streaming(
     Ok((status.success(), rendered))
 }
 
-fn finish_compile(expected: &[String], key: String, cached: bool, res: ActionResult) -> Result<UnitResult> {
+fn finish_compile(
+    expected: &[String],
+    key: String,
+    cached: bool,
+    res: ActionResult,
+    phases: Phases,
+) -> Result<UnitResult> {
     // every rustc-reported output must exist: catches emission surprises
     for e in expected {
         if !res.outputs.iter().any(|o| &o.name == e) {
@@ -2674,7 +2804,7 @@ fn finish_compile(expected: &[String], key: String, cached: bool, res: ActionRes
         .or_else(|| expected.first())
         .context("no expected outputs")?;
     let main = res.outputs.iter().find(|o| &o.name == main_name).cloned();
-    Ok(UnitResult { key, cached, res, main })
+    Ok(UnitResult { key, cached, res, main, phases })
 }
 
 fn compile(
@@ -2800,6 +2930,8 @@ fn compile(
     if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
     }
+    let t_phase = Instant::now();
+    let mut phases = Phases::default();
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
     let cap_lints = pkg.source.is_some();
 
@@ -2841,6 +2973,10 @@ fn compile(
     } else {
         ctx.target.as_deref().unwrap_or(ctx.host.as_str())
     };
+    // Cargo's resolved profile says which units it would compile
+    // incrementally (local packages under dev); we honor exactly that,
+    // in a separate key namespace.
+    let incr_action = ctx.incremental && prof.incremental;
     // Determinism forces the darwin debug-map treatment on every linking
     // unit with debug info, whatever split-debuginfo the profile asked
     // for: without -oso_prefix the staging path would leak into stabs.
@@ -2878,6 +3014,8 @@ fn compile(
         profile: &pflags,
         lints: lint_flags,
         clippy: if clippy_action { &ctx.clippy_id } else { "" },
+        incr: incr_action,
+        ident: &ctx.idents[uidx],
         oso: &oso_rel,
         env: &env,
         cap_lints,
@@ -2886,8 +3024,12 @@ fn compile(
     })?;
     let key = sha256_hex(key_json.as_bytes());
     let k16: String = key[..16].to_string();
+    phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
-    if let Some(res) = ctx.try_cache_hit(&key)? {
+    let t_cache = Instant::now();
+    let hit = ctx.try_cache_hit(&key)?;
+    phases.cache_ns = t_cache.elapsed().as_nanos() as u64;
+    if let Some(res) = hit {
         if !res.stderr.is_empty() && pkg.source.is_none() {
             eprint!("{}", res.stderr);
         }
@@ -2896,9 +3038,52 @@ fn compile(
         } else {
             expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
         };
-        return finish_compile(&expected, key, true, res);
+        return finish_compile(&expected, key, true, res, phases);
     }
 
+    // Incremental state: store-managed, scoped per (checkout, crate,
+    // crate-type, mode, platform, profile) so histories never cross;
+    // flock-guarded for the duration of the compile (rustc tolerates a
+    // stale dir by falling back to a clean session).
+    let mut incr_lock: Option<fs::File> = None;
+    let incr_dir: Option<PathBuf> = if incr_action {
+        let kind_tag = match unit.kind {
+            Kind::Bin => "bin",
+            Kind::Lib => "lib",
+            Kind::Bsc => "bsc",
+            Kind::Bsr => "bsr",
+            Kind::Test => "test",
+        };
+        let mode_tag = if clippy_action {
+            "clippy"
+        } else if self_checked {
+            "check"
+        } else {
+            "full"
+        };
+        let identity = sha256_hex(
+            format!(
+                "incr\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                ctx.workspace_root,
+                pkg.name,
+                crate_name,
+                crate_type,
+                kind_tag,
+                mode_tag,
+                unit_platform,
+                ctx.profile_name
+            )
+            .as_bytes(),
+        );
+        let dir = ctx.store.root.join("incr").join(&identity[..16]);
+        fs::create_dir_all(&dir)?;
+        let lock = fs::File::create(ctx.store.root.join("incr").join(format!("{}.lock", &identity[..16])))?;
+        lock.lock().with_context(|| format!("locking incremental state for {crate_name}"))?;
+        incr_lock = Some(lock);
+        Some(dir)
+    } else {
+        None
+    };
     let stage_root = ctx.store.tmp_path("rustc");
     // With -oso_prefix stripping the stage root, recorded debug-map paths
     // read `target/<profile>/<cgu>.o` — exactly where the objects are
@@ -2919,7 +3104,11 @@ fn compile(
         }
     }
     let executor = if clippy_action { ctx.clippy_driver.as_str() } else { ctx.rustc.as_str() };
-    let mut cmd = sandboxed_command(ctx, executor, &reads, &[&outdir, &scratch]);
+    let mut writes: Vec<&Path> = vec![&outdir, &scratch];
+    if let Some(d) = &incr_dir {
+        writes.push(d.as_path());
+    }
+    let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
@@ -2982,11 +3171,14 @@ fn compile(
         cmd.arg("--cfg").arg("clippy");
         cmd.env("CLIPPY_CONF_DIR", &ctx.workspace_root);
     }
+    if let Some(d) = &incr_dir {
+        cmd.arg(format!("-Cincremental={}", d.display()));
+    }
     if oso_split {
         cmd.arg("-Csplit-debuginfo=unpacked");
         cmd.arg(format!("-Clink-arg=-Wl,-oso_prefix,{}/", stage_root.display()));
     }
-    cmd.arg(format!("-Cmetadata={k16}"));
+    cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
     cmd.arg(format!("-Cextra-filename=-{k16}"));
     cmd.arg("--out-dir").arg(&outdir);
     cmd.arg("-L").arg(format!("dependency={}", ctx.pool_logical.display()));
@@ -3035,12 +3227,21 @@ fn compile(
     if ctx.verbose {
         eprintln!("dcargo: exec {cmd:?}");
     }
+    ctx.jobserver.configure(&mut cmd);
+    // One token per running compiler (its implicit thread); rustc acquires
+    // more from the shared pool for extra codegen threads and releases
+    // them as codegen units finish.
+    let job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
+    let t_rustc = Instant::now();
     let (success, stderr) = if self_pipelined {
         run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, fire_meta)?
     } else {
         let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
         (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
     };
+    phases.rustc_ns = t_rustc.elapsed().as_nanos() as u64;
+    drop(job_token); // compiler exited; hashing/ingestion is not codegen
+    incr_lock.take(); // compiler exited; release the incremental state
     fs::remove_dir_all(&scratch).ok();
     if !success {
         fs::remove_dir_all(&stage_root).ok();
@@ -3074,9 +3275,11 @@ fn compile(
                 allowed.push(p); // declared -> hashed -> allowed
             }
         }
+        let t_val = Instant::now();
         validate_dep_info(&d, &pkg_root, &allowed).with_context(|| {
             format!("hermeticity violation compiling {} v{}", pkg.name, pkg.version)
         })?;
+        phases.validate_ns = t_val.elapsed().as_nanos() as u64;
         fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
     }
 
@@ -3085,17 +3288,21 @@ fn compile(
         .map(|e| e.map(|e| e.path()))
         .collect::<std::io::Result<_>>()?;
     entries.sort();
+    let t_ingest = Instant::now();
     for p in entries {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         let exe = !name.contains('.')
             || name.ends_with(".dylib")
             || name.ends_with(".so")
             || name.ends_with(".dll");
+        phases.ingest_bytes += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         let hash = ctx.store.insert_file(&p)?;
         outputs.push(OutputFile { name, hash, exe });
     }
+    phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
     fs::remove_dir_all(&stage_root).ok();
 
+    let t_finish = Instant::now();
     let res = ActionResult { outputs, stderr, bs: None };
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     ctx.materialize(&res)?;
@@ -3104,7 +3311,8 @@ fn compile(
     } else {
         expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
     };
-    finish_compile(&expected, key, false, res)
+    phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
+    finish_compile(&expected, key, false, res, phases)
 }
 
 fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
@@ -3211,7 +3419,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let key = sha256_hex(key_json.as_bytes());
 
     if let Some(res) = ctx.try_cache_hit(&key)? {
-        return Ok(UnitResult { key, cached: true, res, main: None });
+        return Ok(UnitResult { key, cached: true, res, main: None, phases: Phases::default() });
     }
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
@@ -3228,7 +3436,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     lock_file.lock().with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
     // While we waited: a concurrent winner may have finished the work.
     if let Some(res) = ctx.try_cache_hit(&key)? {
-        return Ok(UnitResult { key, cached: true, res, main: None });
+        return Ok(UnitResult { key, cached: true, res, main: None, phases: Phases::default() });
     }
     if final_parent.exists() {
         // No sentinel (the cache probe above would have hit): crash leftover.
@@ -3269,6 +3477,8 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     cmd.env("OUT_DIR", &stage_logical);
     cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
     cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
+    ctx.jobserver.configure(&mut cmd);
+    let _job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
     if ctx.verbose {
         eprintln!("dcargo: exec {cmd:?}");
     }
@@ -3299,7 +3509,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     // builder re-acquires the lock and redoes the work.
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    Ok(UnitResult { key, cached: false, res, main: None })
+    Ok(UnitResult { key, cached: false, res, main: None, phases: Phases::default() })
 }
 
 fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[PathBuf]) -> Result<()> {

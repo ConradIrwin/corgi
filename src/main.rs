@@ -18,6 +18,7 @@ fn real_main() -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut timings = false;
+    let mut no_incremental = false;
     let mut release = false;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
@@ -26,6 +27,7 @@ fn real_main() -> Result<()> {
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
             "--timings" => timings = true,
+            "--no-incremental" => no_incremental = true,
             "--release" => release = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
             "build" | "check" | "clippy" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
@@ -62,5 +64,9 @@ fn real_main() -> Result<()> {
         Some("test") => build::Mode::Test,
         _ => build::Mode::Build,
     };
-    build::build(store, &dir, verbose, release, target, mode, timings)
+    build::build(
+        store,
+        &dir,
+        build::BuildOpts { verbose, release, target, mode, timings, no_incremental },
+    )
 }

@@ -126,6 +126,10 @@ pub struct UgProfile {
     pub lto: String,
     #[serde(default)]
     pub split_debuginfo: Option<String>,
+    /// Cargo's resolved per-unit incremental decision (members true under
+    /// dev, deps and build scripts false; honors [profile.*] overrides).
+    #[serde(default)]
+    pub incremental: bool,
     /// {"deferred": "None"} / {"resolved": "Debuginfo"} / plain string.
     #[serde(default)]
     pub strip: serde_json::Value,
