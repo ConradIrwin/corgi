@@ -3191,7 +3191,10 @@ fn compile(
     if let Some(d) = &incr_dir {
         cmd.arg(format!("-Cincremental={}", d.display()));
         if std::env::var_os("DCARGO_INCR_INFO").is_some() {
-            // Temporary instrumentation: make rustc report session reuse.
+            // Debug aid: rustc reports session hard-link counts on stderr.
+            // RUSTC_BOOTSTRAP flips the tracked unstable-features option,
+            // so toggling this costs one full-red loop each way and keeps
+            // its own session lineage while set.
             cmd.arg("-Zincremental-info");
             cmd.env("RUSTC_BOOTSTRAP", "1");
         }
