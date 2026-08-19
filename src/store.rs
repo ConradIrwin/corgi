@@ -258,12 +258,24 @@ impl Store {
     }
 
     /// Hard-link a CAS blob into the pool under its rustc-visible file name
-    /// (lib<name>-<key16>.rlib etc). Names embed the action key, so a name
-    /// can only ever map to one content.
+    /// (lib<name>-<key16>.rlib etc). Clean-namespace names embed the action
+    /// key, so they map to one content forever. Incremental-unit names embed
+    /// the stable unit identity instead and re-map to newer content as the
+    /// source evolves: the pool is a view of the latest ingestion, while
+    /// action records pin exact hashes.
     pub fn materialize_pool(&self, hash: &str, file_name: &str, executable: bool) -> Result<PathBuf> {
         let dest = self.root.join("pool").join(file_name);
-        if !dest.exists() {
-            let src = self.cache_path(hash);
+        let src = self.cache_path(hash);
+        if let Ok(dest_meta) = fs::symlink_metadata(&dest) {
+            use std::os::unix::fs::MetadataExt;
+            let src_meta = fs::metadata(&src)
+                .with_context(|| format!("pool source blob missing: {}", src.display()))?;
+            if dest_meta.ino() == src_meta.ino() && dest_meta.dev() == src_meta.dev() {
+                return Ok(dest);
+            }
+            fs::remove_file(&dest).with_context(|| format!("refreshing {}", dest.display()))?;
+        }
+        {
             if executable {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = fs::metadata(&src)?.permissions();

@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.15";
+const TOOL_VERSION: &str = "dcargo/0.16";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -3024,6 +3024,11 @@ fn compile(
     })?;
     let key = sha256_hex(key_json.as_bytes());
     let k16: String = key[..16].to_string();
+    // Incremental units use the identity hash, not the action key, in
+    // -Cextra-filename: rustc's dep graph embeds the output file names,
+    // so a key-derived (source-dependent) value marks every saved session
+    // red on each edit. Clean-namespace units keep the key-unique k16.
+    let ef16: String = if incr_action { ctx.idents[uidx].clone() } else { k16.clone() };
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
     let t_cache = Instant::now();
@@ -3036,7 +3041,7 @@ fn compile(
         let expected = if self_checked {
             res.outputs.iter().map(|o| o.name.clone()).collect()
         } else {
-            expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
+            expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
         };
         return finish_compile(&expected, key, true, res, phases);
     }
@@ -3084,13 +3089,25 @@ fn compile(
     } else {
         None
     };
-    let stage_root = ctx.store.tmp_path("rustc");
+    // Incremental units compile with a pinned output context: rustc's
+    // dep graph embeds the output directory path, so a per-run tmp dir
+    // marks every saved session red. The stable dir is wiped first —
+    // artifacts are re-emitted from session state, and ingestion scans
+    // the whole dir so it must never see stale files. Clean-namespace
+    // units keep per-run tmp dirs.
+    let stage_root = if let Some(d) = &incr_dir {
+        let out = d.join("out");
+        fs::remove_dir_all(&out).ok();
+        out
+    } else {
+        ctx.store.tmp_path("rustc")
+    };
     // With -oso_prefix stripping the stage root, recorded debug-map paths
     // read `target/<profile>/<cgu>.o` — exactly where the objects are
     // exported relative to the workspace root.
     let outdir = if oso_split { stage_root.join(&oso_rel) } else { stage_root.clone() };
     fs::create_dir_all(&outdir)?;
-    let scratch = ctx.store.tmp_path("scratch");
+    let scratch = if let Some(d) = &incr_dir { d.join("tmp") } else { ctx.store.tmp_path("scratch") };
     fs::create_dir_all(&scratch)?;
     let extra_in: Vec<PathBuf> = meta::extra_inputs(pkg)
         .iter()
@@ -3173,13 +3190,18 @@ fn compile(
     }
     if let Some(d) = &incr_dir {
         cmd.arg(format!("-Cincremental={}", d.display()));
+        if std::env::var_os("DCARGO_INCR_INFO").is_some() {
+            // Temporary instrumentation: make rustc report session reuse.
+            cmd.arg("-Zincremental-info");
+            cmd.env("RUSTC_BOOTSTRAP", "1");
+        }
     }
     if oso_split {
         cmd.arg("-Csplit-debuginfo=unpacked");
         cmd.arg(format!("-Clink-arg=-Wl,-oso_prefix,{}/", stage_root.display()));
     }
     cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
-    cmd.arg(format!("-Cextra-filename=-{k16}"));
+    cmd.arg(format!("-Cextra-filename=-{ef16}"));
     cmd.arg("--out-dir").arg(&outdir);
     cmd.arg("-L").arg(format!("dependency={}", ctx.pool_logical.display()));
     for (name, file, _) in &externs {
@@ -3190,7 +3212,7 @@ fn compile(
         if ctx.host.contains("apple") {
             // ld64 defaults the dylib install name to the (temporary) output
             // path; pin it to a deterministic value instead.
-            cmd.arg(format!("-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{k16}.dylib"));
+            cmd.arg(format!("-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"));
         }
     }
     for f in &features {
@@ -3256,7 +3278,7 @@ fn compile(
     // All of them must lie inside the hashed package dir or a keyed
     // location (OUT_DIR in the store, sysroot) — otherwise the action key
     // is missing an input and we refuse to cache a lie.
-    let dep_file = outdir.join(format!("{crate_name}-{k16}.d"));
+    let dep_file = outdir.join(format!("{crate_name}-{ef16}.d"));
     if let Ok(d) = fs::read_to_string(&dep_file) {
         let mut allowed: Vec<PathBuf> = vec![
             ctx.store.root.clone(),
@@ -3309,7 +3331,7 @@ fn compile(
     let expected = if self_checked {
         res.outputs.iter().map(|o| o.name.clone()).collect()
     } else {
-        expected_outputs(ctx, &crate_name, &k16, crate_type, unit.host)?
+        expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
     };
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
     finish_compile(&expected, key, false, res, phases)
