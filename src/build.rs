@@ -271,45 +271,63 @@ struct RunKey<'a> {
     tools: &'a [String],
 }
 
-#[derive(Default)]
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ToolSpec {
+    #[serde(skip)]
     name: String,
     version: String,
     url: String,
     sha256: String,
+    #[serde(default)]
     bin: String,
+    #[serde(default)]
     path: String,
     env: String,
     /// Packages whose actions see and key on this tool; empty = every
     /// build script (right for graph-wide tools like a wasm C compiler).
+    #[serde(default)]
     packages: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EnvProbe {
+    #[serde(skip)]
     name: String,
     command: String,
     /// Required: the packages whose build scripts receive the value.
     packages: Vec<String>,
     /// Profile names this applies to; empty = all profiles.
+    #[serde(default)]
     profiles: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseDef {
+    packages: Vec<String>,
 }
 
 /// Workspace dcargo.toml: sha256-pinned tools, plan-time env probes, and
 /// feature universes. Every setting names the packages it applies to, and
 /// only those actions key on it — the file itself is never hashed into
-/// keys, so comment or command-text edits rebuild nothing.
-type Universes = Vec<(String, Vec<String>)>;
-/// (manifest text, tool specs, env probes, feature universes).
-type DcargoManifest = (String, Vec<ToolSpec>, Vec<EnvProbe>, Universes);
-
-fn parse_string_array(raw: &str) -> Vec<String> {
-    raw.trim_matches(['[', ']'])
-        .split(',')
-        .map(|x| x.trim().trim_matches('"').to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
+/// keys, so comment or command-text edits rebuild nothing. Parsed with
+/// the `toml` crate (the parser cargo itself builds on); unknown sections
+/// or keys are hard errors via deny_unknown_fields.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DcargoToml {
+    #[serde(default)]
+    tools: std::collections::BTreeMap<String, ToolSpec>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, EnvProbe>,
+    #[serde(default)]
+    universe: std::collections::BTreeMap<String, UniverseDef>,
 }
+
+type Universes = Vec<(String, Vec<String>)>;
+type DcargoManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes);
 
 fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
     let mut found: Option<PathBuf> = None;
@@ -324,85 +342,30 @@ fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
     }
     let Some(p) = found else { return Ok(None) };
     let text = fs::read_to_string(&p)?;
+    let parsed: DcargoToml =
+        toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     let mut specs: Vec<ToolSpec> = Vec::new();
-    let mut probes: Vec<EnvProbe> = Vec::new();
-    let mut universes: Vec<(String, Vec<String>)> = Vec::new();
-    enum Cur {
-        None,
-        Tool,
-        Env,
-        Universe,
-    }
-    let mut cur = Cur::None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[tools.") {
-            specs.push(ToolSpec { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
-            cur = Cur::Tool;
-        } else if let Some(rest) = line.strip_prefix("[env.") {
-            probes.push(EnvProbe { name: rest.trim_end_matches(']').to_string(), ..Default::default() });
-            cur = Cur::Env;
-        } else if let Some(rest) = line.strip_prefix("[universe.") {
-            universes.push((rest.trim_end_matches(']').to_string(), Vec::new()));
-            cur = Cur::Universe;
-        } else if line.starts_with('[') {
-            bail!("unknown section {line} in {}", p.display());
-        } else if let Some((k, v)) = line.split_once('=') {
-            let raw = v.trim();
-            let v = raw.trim_matches('"').to_string();
-            match cur {
-                Cur::Tool => {
-                    let Some(t) = specs.last_mut() else { continue };
-                    match k.trim() {
-                        "version" => t.version = v,
-                        "url" => t.url = v,
-                        "sha256" => t.sha256 = v,
-                        "bin" => t.bin = v,
-                        "path" => t.path = v,
-                        "env" => t.env = v,
-                        "packages" => t.packages = parse_string_array(raw),
-                        other => bail!("unknown tool key `{other}` in {}", p.display()),
-                    }
-                }
-                Cur::Env => {
-                    let Some(e) = probes.last_mut() else { continue };
-                    match k.trim() {
-                        "command" => e.command = v,
-                        "packages" => e.packages = parse_string_array(raw),
-                        "profiles" => e.profiles = parse_string_array(raw),
-                        other => bail!("unknown env key `{other}` in {}", p.display()),
-                    }
-                }
-                Cur::Universe => {
-                    let Some(u) = universes.last_mut() else { continue };
-                    match k.trim() {
-                        "packages" => u.1 = parse_string_array(raw),
-                        other => bail!("unknown universe key `{other}` in {}", p.display()),
-                    }
-                }
-                Cur::None => bail!("stray key `{}` outside any section in {}", k.trim(), p.display()),
-            }
-        }
-    }
-    for t in &specs {
-        let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
-        if t.version.is_empty() || t.url.is_empty() || t.sha256.is_empty() || exported.is_empty() || t.env.is_empty() {
+    for (name, mut t) in parsed.tools {
+        t.name = name;
+        if t.bin.is_empty() == t.path.is_empty() {
             bail!(
-                "tool `{}` in {} needs version, url, sha256, env, and `bin` (executable) or `path` (file/dir)",
+                "tool `{}` in {} needs exactly one of `bin` (executable) or `path` (file/dir)",
                 t.name,
                 p.display()
             );
         }
+        specs.push(t);
     }
-    for e in &probes {
+    let mut probes: Vec<EnvProbe> = Vec::new();
+    for (name, mut e) in parsed.env {
+        e.name = name;
         if e.command.is_empty() || e.packages.is_empty() {
             bail!("env `{}` in {} needs a command and a non-empty packages list", e.name, p.display());
         }
+        probes.push(e);
     }
-    Ok(Some((text, specs, probes, universes)))
+    let universes: Universes = parsed.universe.into_iter().map(|(k, v)| (k, v.packages)).collect();
+    Ok(Some((specs, probes, universes)))
 }
 
 /// Resolved lint flags for one workspace member. Lints are inputs like
@@ -423,86 +386,33 @@ struct LintFlags {
 /// (priority, tool, lint) — cargo's documented flag ordering.
 type LintEntry = (i64, String, String, String);
 
-/// Trim a trailing `# comment` from a TOML value we understand (quoted
-/// string or single-line inline table).
-fn strip_line_comment(raw: &str) -> &str {
-    let end = if let Some(rest) = raw.strip_prefix('"') {
-        rest.find('"').map(|i| i + 2)
-    } else if raw.starts_with('{') {
-        raw.find('}').map(|i| i + 1)
-    } else {
-        raw.find('#')
-    };
-    match end {
-        Some(e) => raw[..e].trim_end(),
-        None => raw,
-    }
-}
-
-fn parse_lint_value(raw: &str, ctx_name: &str) -> Result<(String, i64)> {
-    if let Some(inner) = raw.strip_prefix('{') {
-        if raw.contains("check-cfg") {
-            bail!("[lints] `{ctx_name}`: check-cfg configuration is not supported yet");
-        }
-        let inner = inner.trim_end_matches('}');
-        let mut level = String::new();
-        let mut priority = 0i64;
-        for part in inner.split(',') {
-            let Some((k, v)) = part.split_once('=') else { continue };
-            match k.trim() {
-                "level" => level = v.trim().trim_matches('"').to_string(),
-                "priority" => {
-                    priority = v.trim().parse().with_context(|| format!("bad lint priority for {ctx_name}"))?
+/// `{ rust: { lint: "level" | { level, priority } }, clippy: {...} }`.
+fn lint_entries_from_table(table: &toml::Table) -> Result<Vec<LintEntry>> {
+    let mut entries = Vec::new();
+    for (tool, lints) in table {
+        let Some(lints) = lints.as_table() else {
+            bail!("[lints.{tool}] is not a table");
+        };
+        for (lint, value) in lints {
+            let (level, priority) = match value {
+                toml::Value::String(level) => (level.clone(), 0),
+                toml::Value::Table(cfg) => {
+                    if cfg.contains_key("check-cfg") {
+                        bail!("[lints] `{tool}::{lint}`: check-cfg configuration is not supported yet");
+                    }
+                    let level = cfg
+                        .get("level")
+                        .and_then(|v| v.as_str())
+                        .with_context(|| format!("[lints] `{tool}::{lint}` needs a `level`"))?;
+                    let priority = cfg.get("priority").and_then(|v| v.as_integer()).unwrap_or(0);
+                    (level.to_string(), priority)
                 }
-                other => bail!("[lints] `{ctx_name}`: unsupported key `{other}`"),
-            }
-        }
-        Ok((level, priority))
-    } else {
-        Ok((raw.trim_matches('"').to_string(), 0))
-    }
-}
-
-/// Parse `[lints.*]` (member manifests) or `[workspace.lints.*]` (root)
-/// tables. Returns (member says `workspace = true`, entries).
-fn parse_lint_tables(text: &str, root: bool) -> Result<(bool, Vec<LintEntry>)> {
-    let head = if root { "[workspace.lints" } else { "[lints" };
-    let mut tool: Option<String> = None;
-    let mut in_bare_lints = false;
-    let mut uses_workspace = false;
-    let mut entries: Vec<LintEntry> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            tool = None;
-            in_bare_lints = false;
-            if let Some(rest) = line.strip_prefix(head) {
-                if let Some(t) = rest.strip_prefix('.') {
-                    tool = Some(t.trim_end_matches(']').to_string());
-                } else if rest == "]" {
-                    in_bare_lints = true;
-                }
-            }
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let (k, raw) = (k.trim(), strip_line_comment(v.trim()));
-            if in_bare_lints {
-                if k == "workspace" && raw == "true" {
-                    uses_workspace = true;
-                } else {
-                    bail!("[lints] key `{k}` not understood (only `workspace = true` or [lints.<tool>] tables)");
-                }
-            } else if let Some(t) = &tool {
-                let (level, priority) = parse_lint_value(raw, k)?;
-                entries.push((priority, t.clone(), k.to_string(), level));
-            }
+                other => bail!("[lints] `{tool}::{lint}`: unsupported value {other:?}"),
+            };
+            entries.push((priority, tool.clone(), lint.clone(), level));
         }
     }
-    Ok((uses_workspace, entries))
+    Ok(entries)
 }
 
 fn lint_entries_to_flags(entries: &[LintEntry]) -> Result<LintFlags> {
@@ -535,9 +445,14 @@ fn lint_entries_to_flags(entries: &[LintEntry]) -> Result<LintFlags> {
 fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
     let members: std::collections::HashSet<&str> =
         meta.workspace_members.iter().map(|s| s.as_str()).collect();
-    let ws_text =
-        fs::read_to_string(Path::new(&meta.workspace_root).join("Cargo.toml")).unwrap_or_default();
-    let (_, ws_entries) = parse_lint_tables(&ws_text, true)?;
+    let ws_path = Path::new(&meta.workspace_root).join("Cargo.toml");
+    let ws_text = fs::read_to_string(&ws_path).unwrap_or_default();
+    let ws_doc: toml::Table =
+        toml::from_str(&ws_text).with_context(|| format!("parsing {}", ws_path.display()))?;
+    let ws_entries = match ws_doc.get("workspace").and_then(|w| w.get("lints")).and_then(|l| l.as_table()) {
+        Some(t) => lint_entries_from_table(t)?,
+        None => Vec::new(),
+    };
     let ws_flags = lint_entries_to_flags(&ws_entries)?;
     let mut out = vec![LintFlags::default(); meta.packages.len()];
     for (i, pkg) in meta.packages.iter().enumerate() {
@@ -546,11 +461,20 @@ fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
         }
         let text = fs::read_to_string(&pkg.manifest_path)
             .with_context(|| format!("reading manifest of {}", pkg.name))?;
-        let (uses_workspace, own) = parse_lint_tables(&text, false)?;
-        if uses_workspace && !own.is_empty() {
-            bail!("{}: [lints] mixes `workspace = true` with inline tables", pkg.name);
+        let doc: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing manifest of {}", pkg.name))?;
+        let Some(lints) = doc.get("lints").and_then(|l| l.as_table()) else {
+            continue;
+        };
+        let uses_workspace = lints.get("workspace").and_then(|v| v.as_bool()).unwrap_or(false);
+        if uses_workspace {
+            if lints.len() > 1 {
+                bail!("{}: [lints] mixes `workspace = true` with inline tables", pkg.name);
+            }
+            out[i] = ws_flags.clone();
+        } else {
+            out[i] = lint_entries_to_flags(&lint_entries_from_table(lints)?)?;
         }
-        out[i] = if uses_workspace { ws_flags.clone() } else { lint_entries_to_flags(&own)? };
     }
     Ok(out)
 }
@@ -663,15 +587,13 @@ fn read_toolchain_pin(dir: &Path) -> Result<String> {
     let legacy = dir.join("rust-toolchain");
     let channel = if toml_p.exists() {
         let text = fs::read_to_string(&toml_p)?;
-        let mut ch = None;
-        for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("channel") {
-                if let Some(v) = rest.trim_start().strip_prefix('=') {
-                    ch = Some(v.trim().trim_matches('"').to_string());
-                }
-            }
-        }
-        ch.with_context(|| format!("no `channel` key in {}", toml_p.display()))?
+        let doc: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing {}", toml_p.display()))?;
+        doc.get("toolchain")
+            .and_then(|t| t.get("channel"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+            .with_context(|| format!("no `channel` key in {}", toml_p.display()))?
     } else if legacy.exists() {
         fs::read_to_string(&legacy)?.trim().to_string()
     } else {
@@ -1218,7 +1140,7 @@ pub fn build(
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
     let universes = match read_dcargo_toml(&dir)? {
-        Some((_, _, _, u)) => u,
+        Some((_, _, u)) => u,
         None => Universes::new(),
     };
     // Only the universes shape the plan (they pick the feature-unification
@@ -1516,7 +1438,7 @@ pub fn build(
     }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    if let Some((_, specs, probes, _)) = read_dcargo_toml(&dir)? {
+    if let Some((specs, probes, _)) = read_dcargo_toml(&dir)? {
         for t in &specs {
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
@@ -2753,10 +2675,13 @@ fn compile(
     if !prof.panic.is_empty() && prof.panic != "unwind" && !matches!(unit.kind, Kind::Test) {
         pflags.push(format!("-Cpanic={}", prof.panic));
     }
-    // Lints and (in clippy mode) the executor swap: local packages'
-    // checked units run clippy-driver in their own key namespace; the
+    // Lints and (in clippy mode) the executor swap. Like cargo's
+    // workspace wrapper, clippy-driver runs for EVERY unit of local
+    // packages — checked units and the codegen closure (proc-macros,
+    // build scripts), so their own code is linted too. All of it lives
+    // in clippy-keyed actions (--cfg clippy is code-visible); the
     // dependency layer stays plain-rustc and is shared with check.
-    let clippy_action = ctx.clippy && self_checked && pkg.source.is_none();
+    let clippy_action = ctx.clippy && pkg.source.is_none();
     let lint_flags: &[String] = if clippy_action {
         &ctx.lints[unit.pkg].with_clippy
     } else {
@@ -2775,7 +2700,7 @@ fn compile(
 
     let key_json = serde_json::to_string(&CompileKey {
         kind: if clippy_action {
-            "clippy"
+            if self_checked { "clippy" } else { "clippy-compile" }
         } else if self_checked {
             "check"
         } else if matches!(unit.kind, Kind::Test) {
