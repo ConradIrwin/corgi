@@ -263,6 +263,30 @@ spawns (`Command::new("cmake")`) resolve through a per-subset shim dir on
 the action PATH. Per-crate settings live elsewhere, in each crate's own
 manifest: `[package.metadata.dcargo] extra-inputs = [...]`.
 
+## The dev loop: incremental namespace, jobserver, timings
+
+Local units compile with rustc's own -Cincremental against store-managed
+state, in a separate key namespace (incr:true): functionally equivalent,
+not bit-reproducible, never mixed with the clean namespace that audit
+(and CI, via --no-incremental) builds in. This required -Cmetadata to
+become a source-free unit identity (cargo's own scheme) so symbol hashes
+survive edits; -Cextra-filename keeps the full key16 for unique pool
+names, with SVH disambiguating same-identity candidates.
+
+A GNU-make jobserver (rustc participates natively; build scripts inherit
+it, so cc/cmake cooperate) caps machine-wide codegen threads at ~NCPU —
+without it, 18 concurrent rustcs at codegen-units=16 meant ~290 runnable
+threads on 18 cores and ~2x per-unit inflation. Blob hashing uses the
+sha2 crate's hardware intrinsics (~2.6 GB/s measured; 5x over software).
+
+`--timings` writes target/dcargo-timings/dcargo-timing-<ts>.html: a
+gantt of executed units with front-end/codegen splits, per-unit phase
+columns (rustc, ingest bytes+time, key, cache, validate), phase totals,
+and a top-5 stderr summary. Measured editor-edit loop on zed after all
+of the above: 19.4-23.6s vs cargo's 13.0-18.5s (was 27-53s), with the
+edited crate and the final link at or better than cargo's times; the
+residual gap is dependents' codegen reuse, under investigation.
+
 ## Lints and clippy
 
 `[lints]` / `[workspace.lints]` are resolved by dcargo at plan time
