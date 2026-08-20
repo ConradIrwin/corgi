@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.20";
+const TOOL_VERSION: &str = "dcargo/0.21";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -1115,6 +1115,9 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
 pub struct BuildOpts {
     pub verbose: bool,
     pub release: bool,
+    /// Take every workspace member's units as roots instead of the
+    /// package at the build dir (cargo's --workspace).
+    pub workspace: bool,
     pub target: Option<String>,
     pub mode: Mode,
     pub timings: bool,
@@ -1131,6 +1134,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let BuildOpts {
         verbose,
         release,
+        workspace,
         target,
         mode,
         timings,
@@ -1417,17 +1421,20 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         Store::touch_used(marker.as_deref().unwrap_or(root.as_path()));
     }
 
-    let root_id = meta
-        .resolve
-        .root
-        .clone()
-        .context("no root package (virtual workspaces not supported in this PoC)")?;
     let mut pkgs = HashMap::new();
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
+    let root_pi: Option<usize> = if workspace {
+        None
+    } else {
+        let root_id = meta.resolve.root.clone().context(
+            "no root package (build from a member directory, or pass --workspace)",
+        )?;
+        Some(pkgs[&root_id])
+    };
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
-    let units = translate_unit_graph(&ug, &pkgs, pkgs[&root_id])?;
+    let units = translate_unit_graph(&ug, &pkgs, root_pi)?;
     let profile_name = units
         .iter()
         .find(|u| u.is_root)
@@ -1685,11 +1692,15 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
 
     {
-        let root_pkg = &meta.packages[pkgs[&root_id]];
+        let building = match root_pi {
+            Some(pi) => {
+                let root_pkg = &meta.packages[pi];
+                format!("{} v{}", root_pkg.name, root_pkg.version)
+            }
+            None => "workspace".to_string(),
+        };
         eprintln!(
-            "dcargo: building {} v{} — {} units (store {})",
-            root_pkg.name,
-            root_pkg.version,
+            "dcargo: building {building} — {} units (store {})",
             units.len(),
             store.root.display()
         );
@@ -1762,6 +1773,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let (executed, cached) = schedule(&ctx, &results)?;
     let t_sched_done = Instant::now();
+
+    if matches!(mode, Mode::Test) {
+        fs::create_dir_all("/tmp/dcargo/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
+    }
 
     // Exports anchor at the WORKSPACE root (cargo's target/ convention):
     // building any member from any directory lands artifacts in one place.
@@ -2093,7 +2108,11 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
 /// Translate cargo's unit-graph into dcargo units. Cargo did the real
 /// resolution (per-platform features, cfg-gated deps, host/target split);
 /// we only re-shape it.
-fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root_pi: usize) -> Result<Vec<Unit>> {
+fn translate_unit_graph(
+    g: &meta::UnitGraph,
+    pkgs: &HashMap<String, usize>,
+    root_pi: Option<usize>,
+) -> Result<Vec<Unit>> {
     let mut units: Vec<Unit> = Vec::with_capacity(g.units.len());
     for u in &g.units {
         let pi = *pkgs
@@ -2144,9 +2163,15 @@ fn translate_unit_graph(g: &meta::UnitGraph, pkgs: &HashMap<String, usize>, root
             }
         }
     }
-    // the graph covers the whole universe; build only the requested
-    // package's subgraph (with universe-unified features)
-    let mut stack: Vec<usize> = g.roots.iter().copied().filter(|&r| units[r].pkg == root_pi).collect();
+    // The graph covers the whole universe; build only the requested
+    // subgraph (with universe-unified features): one package's roots, or
+    // every root cargo reported when building the whole workspace.
+    let mut stack: Vec<usize> = g
+        .roots
+        .iter()
+        .copied()
+        .filter(|&r| root_pi.is_none_or(|pi| units[r].pkg == pi))
+        .collect();
     if stack.is_empty() {
         bail!("requested package has no buildable roots in the unit graph");
     }
@@ -2371,6 +2396,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
     prof.push_str(")\n");
     prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
+    // Compiles run with cwd = the workspace root (cargo's shape); getcwd
+    // needs the directory node itself, but nothing under it beyond the
+    // explicitly granted package/extra-input subpaths.
+    prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
     for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot", "/private/var/run/com.apple.security.cryptexd"] {
         prof.push_str(&format!("  (subpath \"{p}\")\n"));
     }
@@ -3013,10 +3042,13 @@ fn compile(
         Kind::Bsr => unreachable!(),
     };
     let crate_type = crate_type.as_str();
-    // compile with cwd = package root and a *relative* source path: no
-    // absolute paths reach rustc for the code itself.
+    // Cargo's invocation shape: rustc runs from the workspace root and
+    // workspace sources are spelled relative to it, so Location::file(),
+    // panic messages, and debug info match cargo's byte for byte without
+    // a checkout prefix entering the artifact. Sources outside the
+    // workspace (registry, git) keep their canonical store spelling.
     let src_rel = Path::new(&target.src_path)
-        .strip_prefix(&pkg_root)
+        .strip_prefix(&ctx.workspace_root)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| target.src_path.clone());
 
@@ -3108,6 +3140,15 @@ fn compile(
     env.extend(ctx.config_env.iter().cloned());
     if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
+    }
+    if matches!(unit.kind, Kind::Test) && target.kind.iter().any(|k| k == "test" || k == "bench") {
+        // Cargo sets CARGO_TARGET_TMPDIR only when compiling integration
+        // tests and benches: a scratch directory the harness may use at
+        // runtime, normally baked in via env!. proc-macro-crate keys its
+        // Itself-vs-Name answer off the variable's mere presence. One
+        // fixed machine-global path keeps the baked value identical
+        // everywhere (a workspace path would trip the location tripwire).
+        env.push(("CARGO_TARGET_TMPDIR".to_string(), "/tmp/dcargo/target-tmp".to_string()));
     }
     let unit_rustflags: &[String] =
         if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags };
@@ -3323,7 +3364,7 @@ fn compile(
         writes.push(d.as_path());
     }
     let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
-    cmd.current_dir(&pkg_root);
+    cmd.current_dir(&ctx.workspace_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if !ctx.sdkroot.is_empty() {
@@ -3336,19 +3377,13 @@ fn compile(
         cmd.env(k, v);
     }
     cmd.env("CARGO_CRATE_NAME", &crate_name);
-    // Workspace packages see a relative manifest location: every build-time
-    // reader runs with cwd = the package root (compiles, build scripts,
-    // test binaries), so `.` resolves correctly there — and a checkout
-    // location can never be baked into a shareable artifact. Runtime code
-    // must locate the repo at runtime. Packages outside the workspace
-    // (registry, git) keep their canonical store paths.
-    if pkg_root.starts_with(&ctx.workspace_root) {
-        cmd.env("CARGO_MANIFEST_DIR", ".");
-        cmd.env("CARGO_MANIFEST_PATH", "./Cargo.toml");
-    } else {
-        cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
-        cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
-    }
+    // Cargo-identical manifest env: absolute, and deliberately not part
+    // of any action key. Sharing depends on artifacts being independent
+    // of the checkout location, and the ingest byte-scan proves exactly
+    // that before a record is saved — code that bakes these values into
+    // an output fails the build instead of silently pinning a checkout.
+    cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
+    cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
     cmd.env("CARGO", &ctx.cargo);
     for (k, v) in &bs.envs {
         cmd.env(k, v);
@@ -3418,13 +3453,17 @@ fn compile(
     for (name, file, _) in &externs {
         cmd.arg("--extern").arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
     }
-    if crate_type == "proc-macro" {
+    // A proc-macro target gets the compiler's own `proc_macro` crate in
+    // every mode — including its --test harness, which compiles as a plain
+    // test bin where rustc no longer injects it implicitly. Cargo passes
+    // --extern proc_macro whenever the unit's target is a proc-macro.
+    if crate_type == "proc-macro" || target.kind.iter().any(|k| k == "proc-macro") {
         cmd.arg("--extern").arg("proc_macro");
-        if ctx.host.contains("apple") {
-            // ld64 defaults the dylib install name to the (temporary) output
-            // path; pin it to a deterministic value instead.
-            cmd.arg(format!("-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"));
-        }
+    }
+    if crate_type == "proc-macro" && ctx.host.contains("apple") {
+        // ld64 defaults the dylib install name to the (temporary) output
+        // path; pin it to a deterministic value instead.
+        cmd.arg(format!("-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"));
     }
     for f in &features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
@@ -3513,7 +3552,8 @@ fn compile(
             }
         }
         let t_val = Instant::now();
-        validate_dep_info(&d, &pkg_root, &allowed).with_context(|| {
+        let workspace_relative_pkg = pkg_root.strip_prefix(&ctx.workspace_root).ok();
+        validate_dep_info(&d, &pkg_root, workspace_relative_pkg, &allowed).with_context(|| {
             format!("hermeticity violation compiling {} v{}", pkg.name, pkg.version)
         })?;
         phases.validate_ns = t_val.elapsed().as_nanos() as u64;
@@ -3749,16 +3789,12 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         cmd.env(k, v);
     }
     cmd.env("OUT_DIR", &stage_logical);
-    // Same contract as compiles: cwd is the package root, so workspace
-    // packages get `.` and can never observe the checkout location
-    // through these variables.
-    if pkg_root.starts_with(&ctx.workspace_root) {
-        cmd.env("CARGO_MANIFEST_DIR", ".");
-        cmd.env("CARGO_MANIFEST_PATH", "./Cargo.toml");
-    } else {
-        cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
-        cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
-    }
+    // Cargo-identical manifest env; unkeyed for the same reason as in
+    // compiles. Generated code that embeds it is rejected at the
+    // consuming compile's ingest; data files are covered by the OUT_DIR
+    // scan before this action commits.
+    cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
+    cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
     ctx.jobserver.configure(&mut cmd);
     let _job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
     if ctx.verbose {
@@ -3785,6 +3821,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         eprintln!("dcargo: warning ({} build script): {w}", pkg.name);
     }
 
+    scan_dir_for_workspace_path(&stage_out, &ctx.workspace_root)?;
     let res = ActionResult { outputs: vec![], stderr, bs: Some(bs) };
     // Commit order: sentinel (OUT_DIR complete), then the action record.
     // A crash between the two leaves a probe-miss either way; the next
@@ -3794,7 +3831,36 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     Ok(UnitResult { key, cached: false, res, main: None, phases: Phases::default() })
 }
 
-fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[PathBuf]) -> Result<()> {
+/// Location-leak tripwire for build-script outputs: OUT_DIR is shared at
+/// its canonical store path, so nothing under it may embed the checkout
+/// location. Generated code is also covered at its consumer's ingest;
+/// this catches data files a crate only reads at runtime.
+fn scan_dir_for_workspace_path(dir: &Path, workspace_root: &str) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            scan_dir_for_workspace_path(&path, workspace_root)?;
+        } else if path.is_file() {
+            let (_, leaked) = crate::store::sha256_file_scan(&path, workspace_root.as_bytes())?;
+            if leaked {
+                bail!(
+                    "build script output {} embeds the workspace path ({workspace_root}); \
+                     outputs must be location-free — resolve paths at runtime instead of \
+                     baking them in at build time",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_dep_info(
+    dep: &str,
+    pkg_root: &Path,
+    workspace_relative_pkg: Option<&Path>,
+    allowed_abs: &[PathBuf],
+) -> Result<()> {
     for line in dep.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -3812,8 +3878,13 @@ fn validate_dep_info(dep: &str, pkg_root: &Path, allowed_abs: &[PathBuf]) -> Res
                          the action key; caching it would be unsound"
                     );
                 }
-            } else if tok.starts_with("..") {
-                bail!("undeclared input outside the package: {tok}");
+            } else {
+                // Relative paths resolve against the compile cwd — the
+                // workspace root — and must stay inside this package.
+                match workspace_relative_pkg {
+                    Some(prefix) if p.starts_with(prefix) => {}
+                    _ => bail!("undeclared input outside the package: {tok}"),
+                }
             }
         }
     }

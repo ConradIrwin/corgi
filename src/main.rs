@@ -21,12 +21,13 @@ fn real_main() -> Result<()> {
     let mut timings = false;
     let mut no_incremental = false;
     let mut release = false;
+    let mut workspace = false;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
     const USAGE: &str = "usage: dcargo build|check|clippy|run|test|audit|gc \
-[--dir DIR] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
+[--dir DIR] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => {
@@ -40,6 +41,7 @@ fn real_main() -> Result<()> {
             "--timings" => timings = true,
             "--no-incremental" => no_incremental = true,
             "--release" => release = true,
+            "--workspace" => workspace = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
             "build" | "check" | "clippy" | "run" | "test" | "audit" | "gc" if cmd.is_none() => {
                 cmd = Some(a)
@@ -55,6 +57,9 @@ fn real_main() -> Result<()> {
     }
     if !exec_args.is_empty() && !matches!(cmd.as_deref(), Some("run") | Some("test")) {
         bail!("`--` arguments only apply to `dcargo run` and `dcargo test` ({USAGE})");
+    }
+    if workspace && matches!(cmd.as_deref(), Some("run") | Some("audit")) {
+        bail!("`--workspace` does not apply to `dcargo {}`", cmd.as_deref().unwrap_or(""));
     }
 
     let dir = match dir {
@@ -93,6 +98,7 @@ fn real_main() -> Result<()> {
         build::BuildOpts {
             verbose,
             release,
+            workspace,
             target,
             mode,
             timings,
