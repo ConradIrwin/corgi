@@ -8,6 +8,12 @@ content-addressed store** shared by any number of worktrees.
 corgi build [--dir DIR] [-p PACKAGE] [-v] # store at ~/.cache/corgi, override with $CORGI_STORE
 ```
 
+Installing corgi requires Rust 1.90 or newer:
+
+```
+cargo install corgi-build
+```
+
 ## How it works
 
 Cargo is used only for what it is genuinely good at — resolution (`cargo fetch`
