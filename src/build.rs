@@ -2,14 +2,17 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.21";
+const TOOL_VERSION: &str = "corgi/0.22";
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! status {
     ($label:expr, $($arg:tt)*) => {
@@ -187,6 +190,64 @@ struct UnitResult {
     phases: Phases,
 }
 
+struct TestHarness {
+    name: String,
+    path: PathBuf,
+    cwd: PathBuf,
+    pass_key: String,
+    cached_pass: bool,
+    tests: Vec<String>,
+}
+
+struct TestCase {
+    harness: usize,
+    name: String,
+}
+
+struct TestOutcome {
+    harness: usize,
+    name: String,
+    success: bool,
+    killed: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    elapsed: std::time::Duration,
+}
+
+struct TestCaptureFile {
+    path: PathBuf,
+}
+
+impl TestCaptureFile {
+    fn create(stream: &str) -> Result<(Self, fs::File)> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("corgi-test-{}-{id}-{stream}", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("creating test output capture"),
+            }
+        }
+    }
+
+    fn read(&self) -> Result<Vec<u8>> {
+        fs::read(&self.path).context("reading captured test output")
+    }
+}
+
+impl Drop for TestCaptureFile {
+    fn drop(&mut self) {
+        fs::remove_file(&self.path).ok();
+    }
+}
+
 pub struct Ctx {
     store: Store,
     verbose: bool,
@@ -335,6 +396,19 @@ struct RunKey<'a> {
     tools: &'a [String],
 }
 
+#[derive(Serialize)]
+struct TestPassKey<'a> {
+    kind: &'a str,
+    tool: &'a str,
+    harness_action: &'a str,
+    runtime: &'a str,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TestPass {
+    passed: bool,
+}
+
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct ToolSpec {
@@ -365,7 +439,10 @@ struct ToolSpec {
 struct EnvProbe {
     #[serde(skip)]
     name: String,
-    command: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    inherit: bool,
     /// Required: the packages whose build scripts receive the value.
     packages: Vec<String>,
     /// Profile names this applies to; empty = all profiles.
@@ -436,9 +513,9 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
     let mut probes: Vec<EnvProbe> = Vec::new();
     for (name, mut e) in parsed.env {
         e.name = name;
-        if e.command.is_empty() || e.packages.is_empty() {
+        if e.command.is_some() == e.inherit || e.packages.is_empty() {
             bail!(
-                "env `{}` in {} needs a command and a non-empty packages list",
+                "env `{}` in {} needs exactly one of `command` or `inherit = true` and a non-empty packages list",
                 e.name,
                 p.display()
             );
@@ -1733,7 +1810,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
     let (root_sets, extra_inputs) = match read_corgi_toml(&dir)? {
-        Some((_, _, u, x)) => (u, x),
+        Some((_, _, root_sets, extra_inputs)) => (root_sets, extra_inputs),
         None => (RootSets::new(), ExtraInputs::new()),
     };
     let resolution_roots = match root.as_deref() {
@@ -2206,29 +2283,49 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             if !active {
                 continue;
             }
-            let parts: Vec<&str> = probe.command.split_whitespace().collect();
-            if parts.is_empty() {
-                bail!("env {} has an empty command", probe.name);
-            }
-            let out = capture(
-                Command::new(parts[0])
-                    .args(&parts[1..])
-                    .current_dir(Path::new(&meta.workspace_root)),
-                &format!("env probe {}", probe.name),
-            )?;
-            let val = out.trim().to_string();
-            eprintln!(
-                "{:>12} env {}={} (packages {:?}{})",
-                "Using",
-                probe.name,
-                val,
-                probe.packages,
-                if probe.profiles.is_empty() {
-                    String::new()
-                } else {
-                    format!(", profiles {:?}", probe.profiles)
+            let val = if probe.inherit {
+                let Ok(value) = std::env::var(&probe.name) else {
+                    continue;
+                };
+                status!(
+                    "Using",
+                    "inherited env {} (packages {:?}{})",
+                    probe.name,
+                    probe.packages,
+                    if probe.profiles.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", profiles {:?}", probe.profiles)
+                    }
+                );
+                value
+            } else {
+                let command = probe.command.as_deref().unwrap_or_default();
+                let parts: Vec<&str> = command.split_whitespace().collect();
+                if parts.is_empty() {
+                    bail!("env {} has an empty command", probe.name);
                 }
-            );
+                let out = capture(
+                    Command::new(parts[0])
+                        .args(&parts[1..])
+                        .current_dir(Path::new(&meta.workspace_root)),
+                    &format!("env probe {}", probe.name),
+                )?;
+                let value = out.trim().to_string();
+                status!(
+                    "Using",
+                    "env {}={} (packages {:?}{})",
+                    probe.name,
+                    value,
+                    probe.packages,
+                    if probe.profiles.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", profiles {:?}", probe.profiles)
+                    }
+                );
+                value
+            };
             env_probes.push((
                 probe.name.clone(),
                 val,
@@ -2345,17 +2442,15 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
 
-    // Export every test harness before declaring the build finished. They
-    // run afterward, fresh every time (results deliberately uncached for
-    // now, so cargo-vs-corgi comparisons stay honest).
     if matches!(mode, Mode::Test) {
+        let canonical_run = test_filter.is_none() && exec_args.is_empty();
+        let mut harnesses = Vec::new();
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(u.kind, Kind::Test) || !u.is_root {
                 continue;
             }
             let r = results[i].get().context("test harness not built")?;
             let m = r.main.as_ref().context("test artifact missing")?;
-            let pkg = &ctx.meta.packages[u.pkg];
             // Export the harness and its CGU objects (debug-map targets)
             // before running, so even a failing test leaves a debuggable
             // binary behind: `lldb target/<profile>/deps/<name>` from the
@@ -2368,8 +2463,18 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
-            test_harnesses.push((u.target.name.clone(), pkg.root(), dest));
+            let pass_key = test_pass_key(&r.key)?;
+            let cached_pass = canonical_run && load_test_pass(&ctx.store, &pass_key);
+            harnesses.push(TestHarness {
+                name: u.target.name.clone(),
+                path: dest,
+                cwd: ctx.meta.packages[u.pkg].root(),
+                pass_key,
+                cached_pass,
+                tests: Vec::new(),
+            });
         }
+        test_harnesses = harnesses;
     }
 
     for (i, u) in ctx.units.iter().enumerate() {
@@ -2441,34 +2546,14 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         }
     }
     if matches!(mode, Mode::Test) {
-        // Unsandboxed, exactly as if run by hand: ambient env untouched (no
-        // CARGO_* vars), only cwd = the package root, which the location-free
-        // artifact contract requires (baked-in "." manifest paths resolve
-        // there).
-        let mut failures: Vec<String> = Vec::new();
-        for (name, package_root, dest) in test_harnesses {
-            match dest.strip_prefix(&ctx.workspace_root) {
-                Ok(relative) => status!("Running", "test {}", relative.display()),
-                Err(_) => status!("Running", "test {}", dest.display()),
-            }
-            let mut c = Command::new(&dest);
-            c.current_dir(package_root);
-            if let Some(filter) = &test_filter {
-                c.arg(filter);
-            }
-            c.args(&exec_args);
-            let st = c.status().with_context(|| format!("running test {name}"))?;
-            if !st.success() {
-                failures.push(name);
-            }
-        }
-        if !failures.is_empty() {
-            bail!(
-                "{} test target(s) failed: {}",
-                failures.len(),
-                failures.join(", ")
-            );
-        }
+        let canonical_run = test_filter.is_none() && exec_args.is_empty();
+        run_tests(
+            &ctx,
+            &mut test_harnesses,
+            test_filter.as_deref(),
+            &exec_args,
+            canonical_run,
+        )?;
     }
     maybe_auto_clean(&ctx.store);
     if matches!(mode, Mode::Run) {
@@ -3214,6 +3299,323 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     let mut c = Command::new("/usr/bin/sandbox-exec");
     c.arg("-p").arg(prof).arg(program);
     c
+}
+
+fn test_pass_key(harness_action: &str) -> Result<String> {
+    let key = TestPassKey {
+        kind: "test-pass",
+        tool: TOOL_VERSION,
+        harness_action,
+        runtime: "ambient-env-v1",
+    };
+    Ok(sha256_hex(&serde_json::to_vec(&key)?))
+}
+
+fn load_test_pass(store: &Store, key: &str) -> bool {
+    store
+        .load_action(key)
+        .and_then(|bytes| serde_json::from_slice::<TestPass>(&bytes).ok())
+        .is_some_and(|result| result.passed)
+}
+
+fn save_test_pass(store: &Store, key: &str) -> Result<()> {
+    store.save_action(key, &serde_json::to_vec(&TestPass { passed: true })?)
+}
+
+fn configure_test_command(harness: &TestHarness) -> Command {
+    let mut command = Command::new(&harness.path);
+    command.current_dir(&harness.cwd);
+    command
+}
+
+fn parse_test_list(stdout: &[u8], harness: &str) -> Result<Vec<String>> {
+    let text = std::str::from_utf8(stdout)
+        .with_context(|| format!("test harness {harness} produced a non-UTF-8 test list"))?;
+    let mut tests = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = line
+            .strip_suffix(": test")
+            .or_else(|| line.strip_suffix(": benchmark"))
+        {
+            tests.push(name.to_string());
+        }
+    }
+    tests.sort();
+    tests.dedup();
+    Ok(tests)
+}
+
+fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
+    let mut command = configure_test_command(harness);
+    command.args(["--list", "--format", "terse"]);
+    if ignored {
+        command.arg("--ignored");
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("listing tests in {}", harness.name))?;
+    if !output.status.success() {
+        io::Write::write_all(&mut io::stderr(), &output.stdout).ok();
+        io::Write::write_all(&mut io::stderr(), &output.stderr).ok();
+        bail!("test harness {} failed while listing tests", harness.name);
+    }
+    parse_test_list(&output.stdout, &harness.name)
+}
+
+fn wait_for_test(child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool)> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for test process")? {
+            return Ok((status, false));
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            terminate_test_process(child)?;
+            let status = child.wait().context("waiting for timed-out test process")?;
+            return Ok((status, true));
+        }
+        std::thread::sleep((timeout - elapsed).min(Duration::from_millis(10)));
+    }
+}
+
+fn terminate_test_process(child: &mut Child) -> Result<()> {
+    child.kill().context("terminating timed-out test process")
+}
+
+fn run_test_case(
+    harness: &TestHarness,
+    name: &str,
+    exec_args: &[String],
+    timeout: Duration,
+) -> Result<TestOutcome> {
+    let started = Instant::now();
+    let mut command = configure_test_command(harness);
+    command.args(["--exact", name, "--nocapture"]);
+    command.args(exec_args);
+    let (stdout_capture, stdout_file) = TestCaptureFile::create("stdout")?;
+    let (stderr_capture, stderr_file) = TestCaptureFile::create("stderr")?;
+    command.stdout(Stdio::from(stdout_file));
+    command.stderr(Stdio::from(stderr_file));
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running {} {name}", harness.name))?;
+    let (status, killed) = wait_for_test(&mut child, timeout)?;
+    Ok(TestOutcome {
+        harness: 0,
+        name: name.to_string(),
+        success: status.success(),
+        killed,
+        stdout: stdout_capture.read()?,
+        stderr: stderr_capture.read()?,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn run_tests(
+    ctx: &Ctx,
+    harnesses: &mut [TestHarness],
+    filter: Option<&str>,
+    exec_args: &[String],
+    canonical_run: bool,
+) -> Result<()> {
+    let started = Instant::now();
+    let ignored_only = exec_args.iter().any(|argument| argument == "--ignored");
+    let include_ignored = exec_args
+        .iter()
+        .any(|argument| argument == "--include-ignored");
+    let mut queue = VecDeque::new();
+    let mut cached_harnesses = 0usize;
+    for (harness_index, harness) in harnesses.iter_mut().enumerate() {
+        if harness.cached_pass {
+            cached_harnesses += 1;
+            if ctx.verbose {
+                status!("Cached", "test {}", harness.name);
+            }
+            continue;
+        }
+        let all_tests = list_tests(harness, false)?;
+        let ignored: BTreeSet<String> = list_tests(harness, true)?.into_iter().collect();
+        let candidates: Vec<String> = if ignored_only {
+            ignored.iter().cloned().collect()
+        } else if include_ignored {
+            all_tests
+        } else {
+            all_tests
+                .into_iter()
+                .filter(|test| !ignored.contains(test))
+                .collect()
+        };
+        harness.tests = candidates
+            .into_iter()
+            .filter(|test| filter.is_none_or(|filter| test.contains(filter)))
+            .collect();
+        for name in &harness.tests {
+            queue.push_back(TestCase {
+                harness: harness_index,
+                name: name.clone(),
+            });
+        }
+    }
+    let test_count = queue.len();
+    if cached_harnesses == 0 && test_count == 0 {
+        bail!("no tests found");
+    }
+    status!(
+        "Running",
+        "{test_count} tests ({} harnesses cached)",
+        cached_harnesses,
+    );
+    let queue = Mutex::new(queue);
+    let outcomes = Mutex::new(Vec::<Result<TestOutcome>>::new());
+    let reporter = Mutex::new(());
+    let worker_count = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(test_count.max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let Some(test) = queue.lock().unwrap().pop_front() else {
+                    break;
+                };
+                let token = match ctx.jobserver.acquire().context("acquiring test job token") {
+                    Ok(token) => token,
+                    Err(error) => {
+                        outcomes.lock().unwrap().push(Err(error));
+                        break;
+                    }
+                };
+                let result = run_test_case(
+                    &harnesses[test.harness],
+                    &test.name,
+                    exec_args,
+                    TEST_TIMEOUT,
+                )
+                .map(|mut outcome| {
+                    outcome.harness = test.harness;
+                    outcome
+                });
+                drop(token);
+                if let Ok(outcome) = &result {
+                    if !outcome.success || ctx.verbose {
+                        let _reporter = reporter.lock().unwrap();
+                        if outcome.killed {
+                            status!(
+                                "Killed",
+                                "{} {} after {:.3}s",
+                                harnesses[outcome.harness].name,
+                                outcome.name,
+                                outcome.elapsed.as_secs_f64(),
+                            );
+                        } else {
+                            let status_label = if outcome.success { "Passed" } else { "Failed" };
+                            status!(
+                                status_label,
+                                "{} {} in {:.3}s",
+                                harnesses[outcome.harness].name,
+                                outcome.name,
+                                outcome.elapsed.as_secs_f64(),
+                            );
+                        }
+                        if !outcome.success {
+                            io::Write::write_all(&mut io::stderr(), &outcome.stdout).ok();
+                            io::Write::write_all(&mut io::stderr(), &outcome.stderr).ok();
+                        }
+                    }
+                }
+                outcomes.lock().unwrap().push(result);
+            });
+        }
+    });
+    let mut failures = Vec::new();
+    let mut harness_failed = vec![false; harnesses.len()];
+    for outcome in outcomes.into_inner().unwrap() {
+        let outcome = outcome?;
+        if !outcome.success {
+            harness_failed[outcome.harness] = true;
+            failures.push(format!(
+                "{} {}",
+                harnesses[outcome.harness].name, outcome.name
+            ));
+        }
+    }
+    if canonical_run {
+        for (index, harness) in harnesses.iter().enumerate() {
+            if !harness.cached_pass && !harness_failed[index] {
+                save_test_pass(&ctx.store, &harness.pass_key)?;
+            }
+        }
+    }
+    if failures.is_empty() {
+        status!(
+            "Finished",
+            "{test_count} tests passed, {cached_harnesses} harnesses cached in {:.2}s",
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(())
+    } else {
+        bail!("{} test(s) failed: {}", failures.len(), failures.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod test_runner_tests {
+    use super::{run_test_case, TestHarness};
+    use std::time::Duration;
+
+    #[test]
+    fn test_process_is_killed_after_timeout() {
+        let harness = current_test_harness();
+        let outcome = run_test_case(
+            &harness,
+            "build::test_runner_tests::sleeps_longer_than_timeout",
+            &["--ignored".to_string()],
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        assert!(outcome.killed);
+        assert!(!outcome.success);
+        assert!(outcome.elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn abruptly_terminated_test_is_a_failure() {
+        let harness = current_test_harness();
+        let outcome = run_test_case(
+            &harness,
+            "build::test_runner_tests::aborts",
+            &["--ignored".to_string()],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert!(!outcome.killed);
+        assert!(!outcome.success);
+    }
+
+    #[test]
+    #[ignore]
+    fn sleeps_longer_than_timeout() {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore]
+    fn aborts() {
+        std::process::abort();
+    }
+
+    fn current_test_harness() -> TestHarness {
+        TestHarness {
+            name: "corgi".to_string(),
+            path: std::env::current_exe().unwrap(),
+            cwd: std::env::current_dir().unwrap(),
+            pass_key: String::new(),
+            cached_pass: false,
+            tests: Vec::new(),
+        }
+    }
 }
 
 fn describe(ctx: &Ctx, idx: usize) -> String {
@@ -4267,7 +4669,6 @@ fn compile(
     } else {
         String::new()
     };
-
     let key_json = serde_json::to_string(&CompileKey {
         kind: if clippy_action {
             if self_checked {
@@ -5063,7 +5464,9 @@ fn validate_dep_info(
             // NOTE(poc): no handling of backslash-escaped spaces in paths
             let p = Path::new(tok);
             if p.is_absolute() {
-                if !(p.starts_with(pkg_root) || allowed_abs.iter().any(|a| p.starts_with(a))) {
+                if !(p.starts_with(pkg_root)
+                    || allowed_abs.iter().any(|allowed| p.starts_with(allowed)))
+                {
                     bail!(
                         "undeclared input read during compilation: {tok}\n\
                          this file is outside the package and OUT_DIR, so it is not part of\n\
