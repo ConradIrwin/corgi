@@ -184,7 +184,7 @@ impl Store {
             match setup_alias(&alias_path, &root) {
                 Ok(()) => Some(alias_path),
                 Err(e) => {
-                    eprintln!("corgi: warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
+                    eprintln!("corgi warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
                     None
                 }
             }

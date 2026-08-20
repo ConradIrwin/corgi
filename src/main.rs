@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("corgi: error: {e:#}");
+        eprintln!("corgi error: {e:#}");
         std::process::exit(1);
     }
 }

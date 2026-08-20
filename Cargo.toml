@@ -2,6 +2,7 @@
 name = "corgi-build"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.97"
 description = "PoC: deterministic, content-addressed, lock-free cargo-compatible build tool"
 license = "MIT"
 repository = "https://github.com/ConradIrwin/corgi"
