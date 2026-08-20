@@ -69,7 +69,11 @@ type Hints = std::collections::HashMap<String, (u64, i64, u64, String)>;
 
 fn stat_key(md: &fs::Metadata) -> (u64, i64, u64) {
     use std::os::unix::fs::MetadataExt;
-    (md.size(), md.mtime() * 1_000_000_000 + md.mtime_nsec(), md.ino())
+    (
+        md.size(),
+        md.mtime() * 1_000_000_000 + md.mtime_nsec(),
+        md.ino(),
+    )
 }
 
 /// Hash a directory tree by *content only*: relative paths + file bytes.
@@ -79,7 +83,13 @@ pub fn hash_dir(root: &Path) -> Result<String> {
 }
 
 fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<String> {
-    fn walk(h: &mut Sha256, root: &Path, rel: &Path, hints: &Hints, fresh: &mut Hints) -> Result<()> {
+    fn walk(
+        h: &mut Sha256,
+        root: &Path,
+        rel: &Path,
+        hints: &Hints,
+        fresh: &mut Hints,
+    ) -> Result<()> {
         let dir = root.join(rel);
         let mut names: Vec<std::ffi::OsString> = Vec::new();
         for e in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
@@ -89,7 +99,9 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
         for name in names {
             let l = name.to_string_lossy().into_owned();
             // Never let build outputs or vcs state into the source hash.
-            if rel.as_os_str().is_empty() && matches!(l.as_str(), "target" | "dtarget" | "Cargo.lock") {
+            if rel.as_os_str().is_empty()
+                && matches!(l.as_str(), "target" | "dtarget" | "Cargo.lock")
+            {
                 continue;
             }
             if l == ".git" {
@@ -179,7 +191,11 @@ impl Store {
             if root == alias_path {
                 // the store already lives at the canonical path: no alias,
                 // no symlink, nothing for realpath() to see through
-                return Ok(Store { root, alias: None, counter: AtomicU64::new(0) });
+                return Ok(Store {
+                    root,
+                    alias: None,
+                    counter: AtomicU64::new(0),
+                });
             }
             match setup_alias(&alias_path, &root) {
                 Ok(()) => Some(alias_path),
@@ -189,7 +205,11 @@ impl Store {
                 }
             }
         };
-        Ok(Store { root, alias, counter: AtomicU64::new(0) })
+        Ok(Store {
+            root,
+            alias,
+            counter: AtomicU64::new(0),
+        })
     }
 
     /// Throttled use-marker for GC (Go's scheme): refresh a file's mtime on
@@ -225,7 +245,9 @@ impl Store {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        self.root.join("tmp").join(format!("{tag}-{}-{t}-{n}", std::process::id()))
+        self.root
+            .join("tmp")
+            .join(format!("{tag}-{}-{t}-{n}", std::process::id()))
     }
 
     pub fn cache_path(&self, hash: &str) -> PathBuf {
@@ -277,7 +299,10 @@ impl Store {
     }
 
     pub fn action_path(&self, key: &str) -> PathBuf {
-        self.root.join("cache").join(&key[..2]).join(format!("{key}.json"))
+        self.root
+            .join("cache")
+            .join(&key[..2])
+            .join(format!("{key}.json"))
     }
 
     pub fn load_action(&self, key: &str) -> Option<Vec<u8>> {
@@ -320,7 +345,12 @@ impl Store {
     /// twin from a concurrent run of the same action: interchangeable, so
     /// the first writer wins and an existing name is never re-pointed —
     /// consumers may already hold the path.
-    pub fn materialize_pool(&self, hash: &str, file_name: &str, executable: bool) -> Result<PathBuf> {
+    pub fn materialize_pool(
+        &self,
+        hash: &str,
+        file_name: &str,
+        executable: bool,
+    ) -> Result<PathBuf> {
         let dest = self.root.join("pool").join(file_name);
         if fs::symlink_metadata(&dest).is_ok() {
             return Ok(dest);
@@ -362,10 +392,10 @@ impl Store {
             self.write_atomic(&p, h.as_bytes())?;
             return Ok(h);
         }
-        let hint_path = self
-            .root
-            .join("hints")
-            .join(format!("{}.json", sha256_hex(root.display().to_string().as_bytes())));
+        let hint_path = self.root.join("hints").join(format!(
+            "{}.json",
+            sha256_hex(root.display().to_string().as_bytes())
+        ));
         let hints: Hints = fs::read(&hint_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -386,14 +416,15 @@ impl Store {
         // A stat hint (size/mtime/inode -> content hash) makes the unchanged
         // case free: re-reading a ~1 GiB binary to decide "already correct"
         // dominated warm zed builds (1.85s of a 2.0s no-op).
-        let hint_path = self
-            .root
-            .join("hints")
-            .join(format!("{}.json", sha256_hex(format!("export:{}", dest.display()).as_bytes())));
+        let hint_path = self.root.join("hints").join(format!(
+            "{}.json",
+            sha256_hex(format!("export:{}", dest.display()).as_bytes())
+        ));
         if let Ok(md) = fs::metadata(dest) {
             let key = stat_key(&md);
-            let hinted: Option<(u64, i64, u64, String)> =
-                fs::read(&hint_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            let hinted: Option<(u64, i64, u64, String)> = fs::read(&hint_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
             if let Some((size, mtime, inode, hinted_hash)) = hinted {
                 if (size, mtime, inode) == key && hinted_hash == hash {
                     return Ok(false);

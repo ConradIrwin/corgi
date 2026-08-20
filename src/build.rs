@@ -268,7 +268,10 @@ pub struct Ctx {
 
 impl Ctx {
     fn extra_inputs_for(&self, pkg: &Package) -> &[String] {
-        self.extra_inputs.get(&pkg.name).map(Vec::as_slice).unwrap_or(&[])
+        self.extra_inputs
+            .get(&pkg.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -434,11 +437,19 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
     for (name, mut e) in parsed.env {
         e.name = name;
         if e.command.is_empty() || e.packages.is_empty() {
-            bail!("env `{}` in {} needs a command and a non-empty packages list", e.name, p.display());
+            bail!(
+                "env `{}` in {} needs a command and a non-empty packages list",
+                e.name,
+                p.display()
+            );
         }
         probes.push(e);
     }
-    let universes: Universes = parsed.universe.into_iter().map(|(k, v)| (k, v.packages)).collect();
+    let universes: Universes = parsed
+        .universe
+        .into_iter()
+        .map(|(k, v)| (k, v.packages))
+        .collect();
     Ok(Some((specs, probes, universes, parsed.extra_inputs)))
 }
 
@@ -478,7 +489,10 @@ fn lint_entries_from_table(table: &toml::Table) -> Result<Vec<LintEntry>> {
                         .get("level")
                         .and_then(|v| v.as_str())
                         .with_context(|| format!("[lints] `{tool}::{lint}` needs a `level`"))?;
-                    let priority = cfg.get("priority").and_then(|v| v.as_integer()).unwrap_or(0);
+                    let priority = cfg
+                        .get("priority")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(0);
                     (level.to_string(), priority)
                 }
                 other => bail!("[lints] `{tool}::{lint}`: unsupported value {other:?}"),
@@ -497,7 +511,11 @@ fn lint_entries_to_flags(entries: &[LintEntry]) -> Result<LintFlags> {
         if tool == "rustdoc" {
             continue; // rustdoc lints apply to rustdoc runs only
         }
-        let name = if tool == "rust" { lint.clone() } else { format!("{tool}::{lint}") };
+        let name = if tool == "rust" {
+            lint.clone()
+        } else {
+            format!("{tool}::{lint}")
+        };
         let flag = match level.as_str() {
             "allow" => format!("-A{name}"),
             "warn" => format!("-W{name}"),
@@ -523,7 +541,11 @@ fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
     let ws_text = fs::read_to_string(&ws_path).unwrap_or_default();
     let ws_doc: toml::Table =
         toml::from_str(&ws_text).with_context(|| format!("parsing {}", ws_path.display()))?;
-    let ws_entries = match ws_doc.get("workspace").and_then(|w| w.get("lints")).and_then(|l| l.as_table()) {
+    let ws_entries = match ws_doc
+        .get("workspace")
+        .and_then(|w| w.get("lints"))
+        .and_then(|l| l.as_table())
+    {
         Some(t) => lint_entries_from_table(t)?,
         None => Vec::new(),
     };
@@ -540,10 +562,16 @@ fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
         let Some(lints) = doc.get("lints").and_then(|l| l.as_table()) else {
             continue;
         };
-        let uses_workspace = lints.get("workspace").and_then(|v| v.as_bool()).unwrap_or(false);
+        let uses_workspace = lints
+            .get("workspace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if uses_workspace {
             if lints.len() > 1 {
-                bail!("{}: [lints] mixes `workspace = true` with inline tables", pkg.name);
+                bail!(
+                    "{}: [lints] mixes `workspace = true` with inline tables",
+                    pkg.name
+                );
             }
             out[i] = ws_flags.clone();
         } else {
@@ -594,30 +622,53 @@ fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
 fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
-    let dest = store.root.join("tools").join(format!("{}-{}", t.name, t.version));
+    let dest = store
+        .root
+        .join("tools")
+        .join(format!("{}-{}", t.name, t.version));
     if dest.join(exported).exists() {
         touch_tool_marker(&dest);
         return Ok(dest.join(exported));
     }
-    status!("Installing", "tool {} {} (sha256-pinned)", t.name, t.version);
+    status!(
+        "Installing",
+        "tool {} {} (sha256-pinned)",
+        t.name,
+        t.version
+    );
     let work = store.tmp_path("tool");
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
     let archive = work.join("archive");
     match t.auth.as_str() {
         "" => {
-            let st =
-                Command::new("curl").args(["-sSfL", "-o"]).arg(&archive).arg(&t.url).status()?;
+            let st = Command::new("curl")
+                .args(["-sSfL", "-o"])
+                .arg(&archive)
+                .arg(&t.url)
+                .status()?;
             if !st.success() {
                 bail!("download failed: {}", t.url);
             }
         }
         "github" => {
             let (repo, tag, asset) = parse_github_release_url(&t.url).with_context(|| {
-                format!("tool {}: auth = \"github\" requires a github.com release-asset url", t.name)
+                format!(
+                    "tool {}: auth = \"github\" requires a github.com release-asset url",
+                    t.name
+                )
             })?;
             let st = Command::new("gh")
-                .args(["release", "download", &tag, "-R", &repo, "--pattern", &asset, "--output"])
+                .args([
+                    "release",
+                    "download",
+                    &tag,
+                    "-R",
+                    &repo,
+                    "--pattern",
+                    &asset,
+                    "--output",
+                ])
                 .arg(&archive)
                 .status()
                 .with_context(|| {
@@ -634,13 +685,25 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
                 );
             }
         }
-        other => bail!("tool {}: unknown auth scheme `{other}` (supported: \"github\")", t.name),
+        other => bail!(
+            "tool {}: unknown auth scheme `{other}` (supported: \"github\")",
+            t.name
+        ),
     }
     let actual = crate::store::sha256_file(&archive)?;
     if actual != t.sha256 {
-        bail!("sha256 mismatch for tool {}: manifest pins {}, archive is {actual}", t.name, t.sha256);
+        bail!(
+            "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
+            t.name,
+            t.sha256
+        );
     }
-    let st = Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&unpack).status()?;
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&unpack)
+        .status()?;
     if !st.success() {
         bail!("unpack failed for tool {}", t.name);
     }
@@ -669,7 +732,11 @@ fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
         [owner, repo, "releases", "download", tag, asset]
             if !owner.is_empty() && !repo.is_empty() && !tag.is_empty() && !asset.is_empty() =>
         {
-            Ok((format!("{owner}/{repo}"), tag.to_string(), asset.to_string()))
+            Ok((
+                format!("{owner}/{repo}"),
+                tag.to_string(),
+                asset.to_string(),
+            ))
         }
         _ => bail!("not a release-asset url (expected .../releases/download/<tag>/<asset>): {url}"),
     }
@@ -733,16 +800,23 @@ fn read_toolchain_pin(dir: &Path) -> Result<String> {
 fn is_concrete_channel(c: &str) -> bool {
     let semver = {
         let parts: Vec<&str> = c.split('.').collect();
-        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|ch| ch.is_ascii_digit()))
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|ch| ch.is_ascii_digit()))
     };
     let dated = c
         .strip_prefix("nightly-")
         .or_else(|| c.strip_prefix("beta-"))
         .map(|d| {
             d.len() == 10
-                && d.chars()
-                    .enumerate()
-                    .all(|(i, ch)| if i == 4 || i == 7 { ch == '-' } else { ch.is_ascii_digit() })
+                && d.chars().enumerate().all(|(i, ch)| {
+                    if i == 4 || i == 7 {
+                        ch == '-'
+                    } else {
+                        ch.is_ascii_digit()
+                    }
+                })
         })
         .unwrap_or(false);
     semver || dated
@@ -754,7 +828,10 @@ fn is_concrete_channel(c: &str) -> bool {
 /// blob implies only stale actions point at it. Deleting something in
 /// use is benign: probes self-heal by rebuilding.
 pub fn gc(store: &Store) -> Result<()> {
-    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let (files, dirs, bytes) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600))?;
     eprintln!(
         "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) older than {days} days",
@@ -768,7 +845,10 @@ pub fn gc(store: &Store) -> Result<()> {
 fn maybe_auto_gc(store: &Store) {
     let marker = store.root.join("cache").join("trim.txt");
     if let Ok(md) = fs::metadata(&marker) {
-        if let Ok(age) = md.modified().and_then(|m| m.elapsed().map_err(std::io::Error::other)) {
+        if let Ok(age) = md
+            .modified()
+            .and_then(|m| m.elapsed().map_err(std::io::Error::other))
+        {
             if age < std::time::Duration::from_secs(24 * 3600) {
                 return;
             }
@@ -776,7 +856,10 @@ fn maybe_auto_gc(store: &Store) {
             return; // clock skew: fine, skip
         }
     }
-    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     if let Err(e) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600)) {
         eprintln!("corgi warning: gc trim failed: {e:#}");
     }
@@ -787,7 +870,10 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
     let now = std::time::SystemTime::now();
     let cutoff = now.checked_sub(ttl).context("ttl too large")?;
     let stale = |p: &Path| -> bool {
-        fs::metadata(p).and_then(|m| m.modified()).map(|m| m < cutoff).unwrap_or(false)
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|m| m < cutoff)
+            .unwrap_or(false)
     };
     let mut files = 0u64;
     let mut dirs = 0u64;
@@ -884,7 +970,11 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
                 continue;
             }
             let ok = pkg_dir.join(".cargo-ok");
-            let verdict = if ok.exists() { stale(&ok) } else { stale(&pkg_dir) };
+            let verdict = if ok.exists() {
+                stale(&ok)
+            } else {
+                stale(&pkg_dir)
+            };
             if verdict && fs::remove_dir_all(&pkg_dir).is_ok() {
                 dirs += 1;
             }
@@ -907,7 +997,11 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
                 continue;
             }
             let ok = checkout_dir.join(".cargo-ok");
-            let verdict = if ok.exists() { stale(&ok) } else { stale(&checkout_dir) };
+            let verdict = if ok.exists() {
+                stale(&ok)
+            } else {
+                stale(&checkout_dir)
+            };
             if verdict && fs::remove_dir_all(&checkout_dir).is_ok() {
                 dirs += 1;
             }
@@ -919,9 +1013,14 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
         }
     }
     // tmp/: anything older than a day is orphaned staging
-    let day = now.checked_sub(std::time::Duration::from_secs(24 * 3600)).unwrap_or(cutoff);
+    let day = now
+        .checked_sub(std::time::Duration::from_secs(24 * 3600))
+        .unwrap_or(cutoff);
     for p in read_dir_paths(&store.root.join("tmp"))? {
-        let old = fs::metadata(&p).and_then(|m| m.modified()).map(|m| m < day).unwrap_or(false);
+        let old = fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .map(|m| m < day)
+            .unwrap_or(false);
         if old {
             if p.is_dir() {
                 if fs::remove_dir_all(&p).is_ok() {
@@ -958,19 +1057,35 @@ fn touch_tool_marker(dir: &Path) {
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
 /// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
 fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
-    let dest = store.root.join("tools").join(format!("rust-{channel}-{triple}"));
+    let dest = store
+        .root
+        .join("tools")
+        .join(format!("rust-{channel}-{triple}"));
     let bin = dest.join("bin");
     if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
         touch_tool_marker(&dest);
         return Ok(bin);
     }
-    status!("Installing", "toolchain {channel}-{triple} into {}", dest.display());
+    status!(
+        "Installing",
+        "toolchain {channel}-{triple} into {}",
+        dest.display()
+    );
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "nightly".to_string(),
+        )
     } else if let Some(d) = channel.strip_prefix("beta-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "beta".to_string(),
+        )
     } else {
-        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+        (
+            "https://static.rust-lang.org/dist".to_string(),
+            channel.to_string(),
+        )
     };
     let work = store.tmp_path("toolchain");
     let install = work.join("install");
@@ -992,13 +1107,21 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
         if !st.success() {
             bail!("download failed: {url}");
         }
-        let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "fetching sha256")?;
+        let expected = capture(
+            Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+            "fetching sha256",
+        )?;
         let expected = expected.split_whitespace().next().unwrap_or("").to_string();
         let actual = crate::store::sha256_file(&tarball)?;
         if actual != expected {
             bail!("sha256 mismatch for {name}: expected {expected}, got {actual}");
         }
-        let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+        let st = Command::new("tar")
+            .arg("-xf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&work)
+            .status()?;
         if !st.success() {
             bail!("unpack failed: {name}");
         }
@@ -1037,28 +1160,49 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
     }
     status!("Installing", "rust-src {channel} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "nightly".to_string(),
+        )
     } else if let Some(d) = channel.strip_prefix("beta-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "beta".to_string(),
+        )
     } else {
-        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+        (
+            "https://static.rust-lang.org/dist".to_string(),
+            channel.to_string(),
+        )
     };
     let name = format!("rust-src-{ver}");
     let work = store.tmp_path("rust-src");
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    let st = Command::new("curl")
+        .args(["-sSfL", "-o"])
+        .arg(&tarball)
+        .arg(&url)
+        .status()?;
     if !st.success() {
         bail!("download failed: {url}");
     }
-    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = capture(
+        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        "sha256",
+    )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
     let actual = crate::store::sha256_file(&tarball)?;
     if actual != expected {
         bail!("sha256 mismatch for {name}");
     }
-    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&work)
+        .status()?;
     if !st.success() {
         bail!("unpack failed: {name}");
     }
@@ -1077,35 +1221,59 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
 /// Add the clippy component's driver to an installed toolchain (single
 /// atomic file rename; presence = complete). Only clippy mode pays for it.
 fn ensure_clippy(store: &Store, channel: &str, triple: &str) -> Result<()> {
-    let toolchain = store.root.join("tools").join(format!("rust-{channel}-{triple}"));
+    let toolchain = store
+        .root
+        .join("tools")
+        .join(format!("rust-{channel}-{triple}"));
     let driver = toolchain.join("bin/clippy-driver");
     if driver.is_file() {
         return Ok(());
     }
     status!("Installing", "clippy {channel} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "nightly".to_string(),
+        )
     } else if let Some(d) = channel.strip_prefix("beta-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "beta".to_string(),
+        )
     } else {
-        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+        (
+            "https://static.rust-lang.org/dist".to_string(),
+            channel.to_string(),
+        )
     };
     let name = format!("clippy-{ver}-{triple}");
     let work = store.tmp_path("clippy");
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    let st = Command::new("curl")
+        .args(["-sSfL", "-o"])
+        .arg(&tarball)
+        .arg(&url)
+        .status()?;
     if !st.success() {
         bail!("download failed: {url}");
     }
-    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = capture(
+        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        "sha256",
+    )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
     let actual = crate::store::sha256_file(&tarball)?;
     if actual != expected {
         bail!("sha256 mismatch for {name}");
     }
-    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&work)
+        .status()?;
     if !st.success() {
         bail!("unpack failed: {name}");
     }
@@ -1119,41 +1287,159 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str) -> Result<()> {
     Ok(())
 }
 
+/// Install rustfmt as its own immutable tools/ entry. Formatting edits the
+/// working tree directly, so the component is kept outside the compiler
+/// sysroot and never participates in build action keys.
+fn ensure_rustfmt(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
+    let dest = store
+        .root
+        .join("tools")
+        .join(format!("rustfmt-{channel}-{triple}"));
+    let cargo_fmt = dest.join("bin/cargo-fmt");
+    let rustfmt = dest.join("bin/rustfmt");
+    if cargo_fmt.is_file() && rustfmt.is_file() {
+        ensure_rustfmt_lib_link(&dest, channel, triple)?;
+        touch_tool_marker(&dest);
+        return Ok(dest.join("bin"));
+    }
+    status!("Installing", "rustfmt {channel} (sha256-pinned)");
+    let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "nightly".to_string(),
+        )
+    } else if let Some(d) = channel.strip_prefix("beta-") {
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "beta".to_string(),
+        )
+    } else {
+        (
+            "https://static.rust-lang.org/dist".to_string(),
+            channel.to_string(),
+        )
+    };
+    let name = format!("rustfmt-{ver}-{triple}");
+    let work = store.tmp_path("rustfmt");
+    fs::create_dir_all(&work)?;
+    let tarball = work.join("t.tar.xz");
+    let url = format!("{base}/{name}.tar.xz");
+    let st = Command::new("curl")
+        .args(["-sSfL", "-o"])
+        .arg(&tarball)
+        .arg(&url)
+        .status()?;
+    if !st.success() {
+        bail!("download failed: {url}");
+    }
+    let expected = capture(
+        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        "sha256",
+    )?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_string();
+    let actual = crate::store::sha256_file(&tarball)?;
+    if actual != expected {
+        bail!("sha256 mismatch for {name}: expected {expected}, got {actual}");
+    }
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&work)
+        .status()?;
+    if !st.success() {
+        bail!("unpack failed: {name}");
+    }
+    let payload = work.join(&name).join("rustfmt-preview");
+    ensure_rustfmt_lib_link(&payload, channel, triple)?;
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&payload, &dest) {
+        Ok(()) => {}
+        Err(_) if cargo_fmt.is_file() && rustfmt.is_file() => {} // concurrent racer won
+        Err(e) => return Err(e).context("publishing rustfmt component"),
+    }
+    touch_tool_marker(&dest);
+    fs::remove_dir_all(&work).ok();
+    Ok(dest.join("bin"))
+}
+
+/// rustfmt links against rustc_driver with an @rpath/../lib lookup. Keep the
+/// component separate while exposing the matching pinned compiler libraries
+/// at the relative location rustfmt expects.
+fn ensure_rustfmt_lib_link(dir: &Path, channel: &str, triple: &str) -> Result<()> {
+    let link = dir.join("lib");
+    if fs::symlink_metadata(&link).is_ok() {
+        return Ok(());
+    }
+    let target = PathBuf::from("..")
+        .join(format!("rust-{channel}-{triple}"))
+        .join("lib");
+    match std::os::unix::fs::symlink(target, &link) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).context("linking rustfmt to pinned compiler libraries"),
+    }
+}
+
 /// Install rust-std for a cross target as its OWN immutable tools/ entry
 /// (never mutating the toolchain dir). Compiles reach it via a bare `-L`:
 /// rustc's crate loader resolves sysroot crates (std, core, ...) from -L
 /// paths of kind "all", and the output is bit-identical to std-in-sysroot
 /// (verified). Atomic unpack+rename; presence of the dir = complete.
 fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
-    let dest = store.root.join("tools").join(format!("rust-std-{channel}-{target}"));
+    let dest = store
+        .root
+        .join("tools")
+        .join(format!("rust-std-{channel}-{target}"));
     if dest.join("lib/rustlib").join(target).join("lib").exists() {
         touch_tool_marker(&dest);
         return Ok(());
     }
     status!("Installing", "rust-std for {target} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "nightly".to_string(),
+        )
     } else if let Some(d) = channel.strip_prefix("beta-") {
-        (format!("https://static.rust-lang.org/dist/{d}"), "beta".to_string())
+        (
+            format!("https://static.rust-lang.org/dist/{d}"),
+            "beta".to_string(),
+        )
     } else {
-        ("https://static.rust-lang.org/dist".to_string(), channel.to_string())
+        (
+            "https://static.rust-lang.org/dist".to_string(),
+            channel.to_string(),
+        )
     };
     let name = format!("rust-std-{ver}-{target}");
     let work = store.tmp_path("std");
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&tarball).arg(&url).status()?;
+    let st = Command::new("curl")
+        .args(["-sSfL", "-o"])
+        .arg(&tarball)
+        .arg(&url)
+        .status()?;
     if !st.success() {
         bail!("download failed: {url}");
     }
-    let expected = capture(Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]), "sha256")?;
+    let expected = capture(
+        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        "sha256",
+    )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
     let actual = crate::store::sha256_file(&tarball)?;
     if actual != expected {
         bail!("sha256 mismatch for {name}");
     }
-    let st = Command::new("tar").arg("-xf").arg(&tarball).arg("-C").arg(&work).status()?;
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&work)
+        .status()?;
     if !st.success() {
         bail!("unpack failed: {name}");
     }
@@ -1190,6 +1476,71 @@ pub struct BuildOpts {
     pub exec_args: Vec<String>,
 }
 
+/// Format workspace sources with the exact rustfmt component matching the
+/// project's pinned toolchain. This deliberately bypasses build planning,
+/// sandboxing, and the CAS: formatting discovers Cargo targets and edits the
+/// working tree in place.
+pub fn fmt(
+    store: Store,
+    dir: &Path,
+    workspace: bool,
+    package: Option<&str>,
+    verbose: bool,
+    args: &[String],
+) -> Result<()> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("bad directory {}", dir.display()))?;
+    let manifest = dir.join("Cargo.toml");
+    if !manifest.exists() {
+        bail!("no Cargo.toml in {}", dir.display());
+    }
+
+    let channel = read_toolchain_pin(&dir)?;
+    let host = host_triple()?;
+    let toolchain_bin = ensure_toolchain(&store, &channel, &host)?;
+    let rustfmt_bin = ensure_rustfmt(&store, &channel, &host)?;
+    let cargo = toolchain_bin.join("cargo");
+    let rustc = toolchain_bin.join("rustc");
+    let rustfmt = rustfmt_bin.join("rustfmt");
+
+    let mut paths = vec![rustfmt_bin, toolchain_bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths).context("constructing PATH for rustfmt")?;
+
+    let mut command = Command::new(&cargo);
+    command
+        .arg("fmt")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .current_dir(&dir)
+        .env("CARGO", &cargo)
+        .env("RUSTC", &rustc)
+        .env("RUSTFMT", &rustfmt)
+        .env("PATH", path);
+    if workspace {
+        command.arg("--all");
+    }
+    if let Some(package) = package {
+        command.args(["--package", package]);
+    }
+    if verbose {
+        command.arg("--verbose");
+    }
+    command.args(args);
+    if verbose {
+        status!("Exec", "{command:?}");
+    }
+
+    let status = command.status().context("running pinned cargo fmt")?;
+    if !status.success() {
+        bail!("cargo fmt failed with {status}");
+    }
+    Ok(())
+}
+
 pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let BuildOpts {
         verbose,
@@ -1214,7 +1565,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
 
     // Env-injected compiler flags are invisible inputs; the config file
     // is the one honored channel.
-    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"] {
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+    ] {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
             bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
@@ -1252,10 +1607,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // units (build scripts, proc-macros) only get them when no explicit
     // --target splits the platforms — cargo's rule, load-bearing for
     // cfg-gated code in build scripts.
-    let target_rustflags =
-        cargo_config.rustflags_for(target.as_deref().unwrap_or(&host_guess))?;
-    let host_rustflags: Vec<String> =
-        if target.is_some() { Vec::new() } else { target_rustflags.clone() };
+    let target_rustflags = cargo_config.rustflags_for(target.as_deref().unwrap_or(&host_guess))?;
+    let host_rustflags: Vec<String> = if target.is_some() {
+        Vec::new()
+    } else {
+        target_rustflags.clone()
+    };
     let config_env = cargo_config.env;
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
@@ -1307,7 +1664,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // sources therefore needs no remapping and no debugger fixups. Side
     // effect (deliberate): the user's ~/.cargo/config.toml no longer
     // silently shapes hermetic builds.
-    let cargo_home = store.logical_root().join("cargo-home").display().to_string();
+    let cargo_home = store
+        .logical_root()
+        .join("cargo-home")
+        .display()
+        .to_string();
 
     let t_setup_done = Instant::now();
     // ---- plan-phase cache -------------------------------------------------
@@ -1328,7 +1689,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // comment — must not even cost a replan.
     let universe_id = sha256_hex(format!("{universes:?}").as_bytes());
     // check shares build's plan; test resolves a different unit graph
-    let plan_kind = if matches!(mode, Mode::Test) { "test" } else { "build" };
+    let plan_kind = if matches!(mode, Mode::Test) {
+        "test"
+    } else {
+        "build"
+    };
     let plan_ptr = sha256_hex(
         format!(
             "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
@@ -1343,10 +1708,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
             if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
                 if plan_fingerprint(&ws_root, &entry.files, &entry.glob_dirs) == entry.fingerprint {
-                    let meta_text =
-                        fs::read(store.cache_path(&entry.meta_blob)).ok().and_then(|b| String::from_utf8(b).ok());
-                    let ug_text =
-                        fs::read(store.cache_path(&entry.ug_blob)).ok().and_then(|b| String::from_utf8(b).ok());
+                    let meta_text = fs::read(store.cache_path(&entry.meta_blob))
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok());
+                    let ug_text = fs::read(store.cache_path(&entry.ug_blob))
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok());
                     if let (Some(mut m), Some(mut u)) = (meta_text, ug_text) {
                         // cargo output embeds absolute paths; re-root them so
                         // bit-identical checkouts elsewhere can share plans
@@ -1403,7 +1770,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             meta_cmd.current_dir(&dir);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
-            let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+            let meta: Metadata =
+                serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
             // Feature unification over a FIXED universe (whole workspace, or the
             // declared member set for cross targets) — never scoped to the requested
             // package, so a dep's features don't depend on what you're building.
@@ -1423,7 +1791,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             if let Some(t) = &target {
                 ug_cmd.args(["--target", t]);
             }
-            match target.as_ref().and_then(|t| universes.iter().find(|(k, _)| k == t)) {
+            match target
+                .as_ref()
+                .and_then(|t| universes.iter().find(|(k, _)| k == t))
+            {
                 Some((_, members)) => {
                     for m in members {
                         ug_cmd.args(["-p", m]);
@@ -1451,7 +1822,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // A cached plan says nothing about dependency sources still being
     // extracted in the store (gc may have trimmed them); verify cheaply
     // and re-resolve once if anything is missing.
-    if from_cache && meta.packages.iter().any(|p| p.source.is_some() && !p.root().exists()) {
+    if from_cache
+        && meta
+            .packages
+            .iter()
+            .any(|p| p.source.is_some() && !p.root().exists())
+    {
         status!("Fetching", "dependency sources missing from the store");
         let (m, u) = resolve_now()?;
         meta_json = m;
@@ -1486,24 +1862,38 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let root_pi = select_root_package(&meta, &pkgs, workspace, package.as_deref(), mode)?;
+    let root_packages = select_root_packages(&meta, &pkgs, workspace, package.as_deref(), mode)?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
-    let units = translate_unit_graph(&ug, &pkgs, root_pi)?;
+    let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref())?;
     let profile_name = units
         .iter()
         .find(|u| u.is_root)
         .map(|u| u.profile.dir_name())
-        .unwrap_or_else(|| if release { "release".into() } else { "debug".into() });
+        .unwrap_or_else(|| {
+            if release {
+                "release".into()
+            } else {
+                "debug".into()
+            }
+        });
     // Source-free unit identities (memoized DFS over dep edges).
     let idents: Vec<String> = {
         let mut memo: Vec<Option<String>> = vec![None; units.len()];
-        fn ident_of(i: usize, units: &[Unit], meta: &Metadata, memo: &mut Vec<Option<String>>) -> String {
+        fn ident_of(
+            i: usize,
+            units: &[Unit],
+            meta: &Metadata,
+            memo: &mut Vec<Option<String>>,
+        ) -> String {
             if let Some(v) = &memo[i] {
                 return v.clone();
             }
             let u = &units[i];
-            let mut dep_ids: Vec<String> =
-                u.deps.iter().map(|d| ident_of(d.unit, units, meta, memo)).collect();
+            let mut dep_ids: Vec<String> = u
+                .deps
+                .iter()
+                .map(|d| ident_of(d.unit, units, meta, memo))
+                .collect();
             dep_ids.sort();
             let mut features = u.features.clone();
             features.sort();
@@ -1532,7 +1922,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             memo[i] = Some(ident.clone());
             ident
         }
-        (0..units.len()).map(|i| ident_of(i, &units, &meta, &mut memo)).collect()
+        (0..units.len())
+            .map(|i| ident_of(i, &units, &meta, &mut memo))
+            .collect()
     };
     // One-shot warnings for profile settings we deliberately don't honor.
     if units.iter().any(|u| u.profile.lto_enabled()) {
@@ -1543,7 +1935,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
     if units.iter().any(|u| {
         u.profile.debuginfo_flag() != "0"
-            && matches!(u.profile.split_debuginfo.as_deref(), Some("packed") | Some("off"))
+            && matches!(
+                u.profile.split_debuginfo.as_deref(),
+                Some("packed") | Some("off")
+            )
     }) {
         eprintln!(
             "corgi warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (determinism requires it)"
@@ -1577,9 +1972,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let devdir = capture(Command::new("/usr/bin/xcode-select").arg("-p"), "xcode-select -p")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
+    let devdir = capture(
+        Command::new("/usr/bin/xcode-select").arg("-p"),
+        "xcode-select -p",
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
     // toolchain identity beyond rustc: the linker chain shapes final bits
     let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
         .ok()
@@ -1598,18 +1996,24 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         })
         .unwrap_or_default();
     let sdk_v = if host.contains("apple") {
-        capture(Command::new("/usr/bin/xcrun").arg("--show-sdk-version"), "xcrun --show-sdk-version")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
+        capture(
+            Command::new("/usr/bin/xcrun").arg("--show-sdk-version"),
+            "xcrun --show-sdk-version",
+        )
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
     } else {
         String::new()
     };
     // one Xcode identity pin covers the whole Apple tool group
     // (ar, ranlib, clang, ld, metal, xcrun) — they ship together
     let xcode_v = if host.contains("apple") {
-        capture(Command::new("/usr/bin/xcodebuild").arg("-version"), "xcodebuild -version")
-            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-            .unwrap_or_default()
+        capture(
+            Command::new("/usr/bin/xcodebuild").arg("-version"),
+            "xcodebuild -version",
+        )
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
     } else {
         String::new()
     };
@@ -1629,7 +2033,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         if let Ok(d) = capture(Command::new("/usr/bin/getconf").arg(key), "getconf") {
             let d = d.trim().trim_end_matches('/').to_string();
             if !d.is_empty() {
-                let canon = if d.starts_with("/var/") { format!("/private{d}") } else { d };
+                let canon = if d.starts_with("/var/") {
+                    format!("/private{d}")
+                } else {
+                    d
+                };
                 darwin_dirs.push(canon);
             }
         }
@@ -1637,9 +2045,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // resolve the SDK once, outside the sandbox, instead of letting every
     // rustc link shell out to xcrun (slow and an untracked probe)
     let sdkroot = if host.contains("apple") {
-        capture(Command::new("/usr/bin/xcrun").arg("--show-sdk-path"), "xcrun --show-sdk-path")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
+        capture(
+            Command::new("/usr/bin/xcrun").arg("--show-sdk-path"),
+            "xcrun --show-sdk-path",
+        )
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
     } else {
         String::new()
     };
@@ -1680,7 +2091,13 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             } else {
                 format!(" (packages {:?})", t.packages)
             };
-            status!("Using", "tool {} {} -> ${}{scope}", t.name, t.version, t.env);
+            status!(
+                "Using",
+                "tool {} {} -> ${}{scope}",
+                t.name,
+                t.version,
+                t.env
+            );
             // The setting's own identity: exactly the scoped actions key
             // on it, so a pin edit has exactly the declared blast radius.
             let id = sha256_hex(
@@ -1719,7 +2136,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 bail!("env {} has an empty command", probe.name);
             }
             let out = capture(
-                Command::new(parts[0]).args(&parts[1..]).current_dir(Path::new(&meta.workspace_root)),
+                Command::new(parts[0])
+                    .args(&parts[1..])
+                    .current_dir(Path::new(&meta.workspace_root)),
                 &format!("env probe {}", probe.name),
             )?;
             let val = out.trim().to_string();
@@ -1735,7 +2154,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                     format!(", profiles {:?}", probe.profiles)
                 }
             );
-            env_probes.push((probe.name.clone(), val, probe.packages.clone(), probe.profiles.clone()));
+            env_probes.push((
+                probe.name.clone(),
+                val,
+                probe.packages.clone(),
+                probe.profiles.clone(),
+            ));
         }
     }
     // Actions never see the ambient PATH: they get [shims:]/usr/bin:/bin,
@@ -1747,11 +2171,13 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
 
     {
-        let building = match root_pi {
-            Some(pi) => {
+        let building = match root_packages.as_ref() {
+            Some(packages) if packages.len() == 1 => {
+                let pi = *packages.iter().next().expect("one selected package");
                 let root_pkg = &meta.packages[pi];
                 format!("{} v{}", root_pkg.name, root_pkg.version)
             }
+            Some(_) => "default workspace members".to_string(),
             None => "workspace".to_string(),
         };
         eprintln!(
@@ -1807,7 +2233,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
-            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4),
         )
         .context("creating jobserver")?,
         idents,
@@ -1826,7 +2254,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     };
 
     let t_ctx_done = Instant::now();
-    let results: Vec<OnceLock<UnitResult>> = (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
+    let results: Vec<OnceLock<UnitResult>> =
+        (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let (executed, cached) = schedule(&ctx, &results)?;
     let t_sched_done = Instant::now();
 
@@ -1891,7 +2320,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             if let (Some(tgt), Some(r)) = (ctx.target.as_deref(), results[i].get()) {
                 let k16 = &r.key[..16];
                 for o in &r.res.outputs {
-                    if o.name.ends_with(".wasm") || o.name.ends_with(".dylib") || o.name.ends_with(".so") {
+                    if o.name.ends_with(".wasm")
+                        || o.name.ends_with(".dylib")
+                        || o.name.ends_with(".so")
+                    {
                         let clean = o.name.replace(&format!("-{k16}"), "");
                         let dest = dtarget.join(tgt).join(&ctx.profile_name).join(&clean);
                         ctx.store.export(&o.hash, &dest, true)?;
@@ -1955,7 +2387,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             }
         }
         if !failures.is_empty() {
-            bail!("{} test target(s) failed: {}", failures.len(), failures.join(", "));
+            bail!(
+                "{} test target(s) failed: {}",
+                failures.len(),
+                failures.join(", ")
+            );
         }
     }
     maybe_auto_gc(&ctx.store);
@@ -1973,9 +2409,13 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             .context("selected package has no runnable binary target")?;
         let bin_index = select_run_binary(
             package.default_run.as_deref(),
-            root_bins.iter().map(|&i| (i, ctx.units[i].target.name.as_str())),
+            root_bins
+                .iter()
+                .map(|&i| (i, ctx.units[i].target.name.as_str())),
         )?;
-        let dest = dtarget.join(&ctx.profile_name).join(&ctx.units[bin_index].target.name);
+        let dest = dtarget
+            .join(&ctx.profile_name)
+            .join(&ctx.units[bin_index].target.name);
         status!("Running", "`{}`", dest.display());
         // Exactly a manual run of the exported binary: ambient env, the
         // caller's cwd, inherited stdio; corgi sets nothing (no CARGO_*
@@ -2066,7 +2506,9 @@ fn rel_path(from: &Path, to: &Path) -> String {
     let from_parts: Vec<_> = from.components().collect();
     let to_parts: Vec<_> = to.components().collect();
     let mut common = 0;
-    while common < from_parts.len() && common < to_parts.len() && from_parts[common] == to_parts[common]
+    while common < from_parts.len()
+        && common < to_parts.len()
+        && from_parts[common] == to_parts[common]
     {
         common += 1;
     }
@@ -2172,7 +2614,9 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            map.entry(k.to_string()).or_default().push(v.trim_matches('"').to_string());
+            map.entry(k.to_string())
+                .or_default()
+                .push(v.trim_matches('"').to_string());
         } else {
             map.entry(line.to_string()).or_default();
         }
@@ -2181,24 +2625,30 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
     map.into_iter()
         .map(|(k, mut vs)| {
             vs.sort();
-            (format!("CARGO_CFG_{}", k.to_uppercase().replace('-', "_")), vs.join(","))
+            (
+                format!("CARGO_CFG_{}", k.to_uppercase().replace('-', "_")),
+                vs.join(","),
+            )
         })
         .collect()
 }
 
-fn select_root_package(
+fn select_root_packages(
     metadata: &Metadata,
     package_indices: &HashMap<String, usize>,
     workspace: bool,
     package: Option<&str>,
     mode: Mode,
-) -> Result<Option<usize>> {
+) -> Result<Option<BTreeSet<usize>>> {
     if workspace {
         return Ok(None);
     }
     if let Some(package) = package {
-        let workspace_members: BTreeSet<&str> =
-            metadata.workspace_members.iter().map(String::as_str).collect();
+        let workspace_members: BTreeSet<&str> = metadata
+            .workspace_members
+            .iter()
+            .map(String::as_str)
+            .collect();
         let matches: Vec<usize> = metadata
             .packages
             .iter()
@@ -2209,7 +2659,7 @@ fn select_root_package(
             .map(|(index, _)| index)
             .collect();
         return match matches.as_slice() {
-            [index] => Ok(Some(*index)),
+            [index] => Ok(Some(BTreeSet::from([*index]))),
             [] => bail!("package `{package}` is not a workspace member"),
             _ => bail!("package specification `{package}` is ambiguous"),
         };
@@ -2218,18 +2668,18 @@ fn select_root_package(
         return package_indices
             .get(root_id)
             .copied()
-            .map(Some)
+            .map(|index| Some(BTreeSet::from([index])))
             .with_context(|| format!("root package {root_id} missing from metadata"));
     }
+    let default_members: BTreeSet<usize> = metadata
+        .workspace_default_members
+        .iter()
+        .filter_map(|id| package_indices.get(id).copied())
+        .collect();
     if matches!(mode, Mode::Run) {
-        let default_members: Vec<usize> = metadata
-            .workspace_default_members
-            .iter()
-            .filter_map(|id| package_indices.get(id).copied())
-            .collect();
-        return match default_members.as_slice() {
-            [index] => Ok(Some(*index)),
-            [] => bail!("virtual workspace has no default package; use `-p PACKAGE`"),
+        return match default_members.len() {
+            1 => Ok(Some(default_members)),
+            0 => bail!("virtual workspace has no default package; use `-p PACKAGE`"),
             _ => bail!(
                 "virtual workspace has multiple default packages: [{}]; use `-p PACKAGE`",
                 default_members
@@ -2239,6 +2689,12 @@ fn select_root_package(
                     .join(", ")
             ),
         };
+    }
+    if matches!(mode, Mode::Build | Mode::Test) {
+        if default_members.is_empty() {
+            bail!("virtual workspace has no default packages; use `--workspace` or `-p PACKAGE`");
+        }
+        return Ok(Some(default_members));
     }
     bail!("no root package (build from a member directory, or pass --workspace)")
 }
@@ -2264,7 +2720,11 @@ fn select_run_binary<'a>(
         _ => bail!(
             "`corgi run` could not determine which binary to run; found {}: [{}]",
             binaries.len(),
-            binaries.iter().map(|(_, name)| *name).collect::<Vec<_>>().join(", ")
+            binaries
+                .iter()
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -2275,7 +2735,7 @@ fn select_run_binary<'a>(
 fn translate_unit_graph(
     g: &meta::UnitGraph,
     pkgs: &HashMap<String, usize>,
-    root_pi: Option<usize>,
+    root_packages: Option<&BTreeSet<usize>>,
 ) -> Result<Vec<Unit>> {
     let mut units: Vec<Unit> = Vec::with_capacity(g.units.len());
     for u in &g.units {
@@ -2309,12 +2769,16 @@ fn translate_unit_graph(
     for (i, u) in g.units.iter().enumerate() {
         let mut deps = Vec::new();
         for d in &u.dependencies {
-            let extern_name = if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
-                Some(d.extern_crate_name.clone())
-            } else {
-                None
-            };
-            deps.push(UnitDep { unit: d.index, extern_name });
+            let extern_name =
+                if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
+                    Some(d.extern_crate_name.clone())
+                } else {
+                    None
+                };
+            deps.push(UnitDep {
+                unit: d.index,
+                extern_name,
+            });
         }
         units[i].deps = deps;
     }
@@ -2322,7 +2786,11 @@ fn translate_unit_graph(
     // the script's compile unit so CARGO_FEATURE_* stays correct
     for i in 0..units.len() {
         if matches!(units[i].kind, Kind::Bsr) && units[i].features.is_empty() {
-            if let Some(b) = units[i].deps.iter().find(|d| matches!(kinds[d.unit], Kind::Bsc)) {
+            if let Some(b) = units[i]
+                .deps
+                .iter()
+                .find(|d| matches!(kinds[d.unit], Kind::Bsc))
+            {
                 units[i].features = units[b.unit].features.clone();
             }
         }
@@ -2334,7 +2802,7 @@ fn translate_unit_graph(
         .roots
         .iter()
         .copied()
-        .filter(|&r| root_pi.is_none_or(|pi| units[r].pkg == pi))
+        .filter(|&r| root_packages.is_none_or(|packages| packages.contains(&units[r].pkg)))
         .collect();
     if stack.is_empty() {
         bail!("requested package has no buildable roots in the unit graph");
@@ -2373,7 +2841,11 @@ impl Ctx {
     /// This is what actions see, so any OUT_DIR string they embed in
     /// artifacts is identical on every machine.
     fn out_dir_logical(&self, key: &str) -> PathBuf {
-        self.store.logical_root().join("outdirs").join(key).join("out")
+        self.store
+            .logical_root()
+            .join("outdirs")
+            .join(key)
+            .join("out")
     }
 
     fn materialize(&self, action_key: &str, res: &ActionResult) -> Result<()> {
@@ -2412,8 +2884,10 @@ impl Ctx {
     fn pkg_src_hash(&self, pi: usize) -> Result<String> {
         let started = Instant::now();
         let result = self.pkg_src_hash_inner(pi);
-        self.src_hash_nanos
-            .fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.src_hash_nanos.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         result
     }
 
@@ -2434,9 +2908,10 @@ impl Ctx {
         if !extras.is_empty() {
             let mut acc = h;
             for e in extras {
-                let p = pkg.root().join(e).canonicalize().with_context(|| {
-                    format!("extra-input `{e}` of {} does not exist", pkg.name)
-                })?;
+                let p =
+                    pkg.root().join(e).canonicalize().with_context(|| {
+                        format!("extra-input `{e}` of {} does not exist", pkg.name)
+                    })?;
                 if !p.starts_with(Path::new(&self.workspace_root)) {
                     bail!("extra-input `{e}` of {} escapes the workspace", pkg.name);
                 }
@@ -2472,13 +2947,34 @@ impl Ctx {
             ("CARGO_PKG_VERSION_PATCH".into(), patch.into()),
             ("CARGO_PKG_VERSION_PRE".into(), pre.into()),
             ("CARGO_PKG_AUTHORS".into(), pkg.authors.join(":")),
-            ("CARGO_PKG_DESCRIPTION".into(), pkg.description.clone().unwrap_or_default()),
-            ("CARGO_PKG_HOMEPAGE".into(), pkg.homepage.clone().unwrap_or_default()),
-            ("CARGO_PKG_REPOSITORY".into(), pkg.repository.clone().unwrap_or_default()),
-            ("CARGO_PKG_LICENSE".into(), pkg.license.clone().unwrap_or_default()),
-            ("CARGO_PKG_LICENSE_FILE".into(), pkg.license_file.clone().unwrap_or_default()),
-            ("CARGO_PKG_README".into(), pkg.readme.clone().unwrap_or_default()),
-            ("CARGO_PKG_RUST_VERSION".into(), pkg.rust_version.clone().unwrap_or_default()),
+            (
+                "CARGO_PKG_DESCRIPTION".into(),
+                pkg.description.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_HOMEPAGE".into(),
+                pkg.homepage.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_REPOSITORY".into(),
+                pkg.repository.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_LICENSE".into(),
+                pkg.license.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_LICENSE_FILE".into(),
+                pkg.license_file.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_README".into(),
+                pkg.readme.clone().unwrap_or_default(),
+            ),
+            (
+                "CARGO_PKG_RUST_VERSION".into(),
+                pkg.rust_version.clone().unwrap_or_default(),
+            ),
         ];
         e.sort();
         e
@@ -2530,7 +3026,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     for p in exec_lits {
         // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
         // to rustup, so resolve before emitting the rule
-        let canon = fs::canonicalize(&p).map(|c| c.display().to_string()).unwrap_or(p);
+        let canon = fs::canonicalize(&p)
+            .map(|c| c.display().to_string())
+            .unwrap_or(p);
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
@@ -2550,7 +3048,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  (literal \"{p}\")\n"));
     }
     prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
-    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.store.root.join("tools").display()));
+    prof.push_str(&format!(
+        "  (subpath \"{}\")\n",
+        ctx.store.root.join("tools").display()
+    ));
     // actions may execute binaries they just built in their own writable
     // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
     // are products of keyed inputs, so this stays hermetic
@@ -2564,7 +3065,19 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     // needs the directory node itself, but nothing under it beyond the
     // explicitly granted package/extra-input subpaths.
     prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
-    for p in ["/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt", "/private/etc", "/private/var/db", "/private/preboot", "/private/var/run/com.apple.security.cryptexd"] {
+    for p in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/opt",
+        "/private/etc",
+        "/private/var/db",
+        "/private/preboot",
+        "/private/var/run/com.apple.security.cryptexd",
+    ] {
         prof.push_str(&format!("  (subpath \"{p}\")\n"));
     }
     let mut reads: Vec<String> = vec![
@@ -2617,16 +3130,22 @@ fn describe(ctx: &Ctx, idx: usize) -> String {
     let u = &ctx.units[idx];
     let p = &ctx.meta.packages[u.pkg];
     let what = match u.kind {
-        Kind::Lib => {
-            if meta::is_proc_macro(p) { "proc-macro" } else { "lib" }.to_string()
+        Kind::Lib => if meta::is_proc_macro(p) {
+            "proc-macro"
+        } else {
+            "lib"
         }
+        .to_string(),
         Kind::Bsc => "build.rs compile".to_string(),
         Kind::Bsr => "build.rs run".to_string(),
         Kind::Bin => format!("bin \"{}\"", u.target.name),
         Kind::Test => format!("test \"{}\"", u.target.name),
     };
     let plat = if !u.host {
-        ctx.target.as_deref().map(|t| format!(" → {t}")).unwrap_or_default()
+        ctx.target
+            .as_deref()
+            .map(|t| format!(" → {t}"))
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -2653,11 +3172,11 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let mut rdeps_full: Vec<Vec<usize>> = vec![vec![]; n];
     let mut indeg = vec![0usize; n];
     for (i, u) in ctx.units.iter().enumerate() {
-        let mut required: std::collections::HashSet<(usize, bool)> = std::collections::HashSet::new();
+        let mut required: std::collections::HashSet<(usize, bool)> =
+            std::collections::HashSet::new();
         let self_meta_ok = !is_linking(ctx, i);
         for d in &u.deps {
-            let meta_edge =
-                self_meta_ok && d.extern_name.is_some() && is_pipelined(ctx, d.unit);
+            let meta_edge = self_meta_ok && d.extern_name.is_some() && is_pipelined(ctx, d.unit);
             required.insert((d.unit, !meta_edge));
         }
         let _ = u;
@@ -2696,10 +3215,19 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
-    let state = Mutex::new(SchedState { ready, indeg, done: 0, in_flight: 0, errors: Vec::new(), executed: 0, cached: 0 });
+    let state = Mutex::new(SchedState {
+        ready,
+        indeg,
+        done: 0,
+        in_flight: 0,
+        errors: Vec::new(),
+        executed: 0,
+        cached: 0,
+    });
     let cv = Condvar::new();
-    let meta_fired: Vec<std::sync::atomic::AtomicBool> =
-        (0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+    let meta_fired: Vec<std::sync::atomic::AtomicBool> = (0..n)
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
     // Called from inside a running rustc the moment its rmeta lands.
     let fire_meta = |idx: usize, m: MetaOut| {
         let _ = metas[idx].set(m);
@@ -2717,7 +3245,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         drop(st);
         cv.notify_all();
     };
-    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n.max(1));
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n.max(1));
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -2763,7 +3294,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         }
                         // late meta (cache hit, or non-streamed path): fire now
                         if !meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
-                            if let Some(rm) = ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta")) {
+                            if let Some(rm) =
+                                ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta"))
+                            {
                                 let _ = metas[idx].set(MetaOut {
                                     file: Store::pool_file_name(&rm.name, &ur.key),
                                     hash: rm.hash.clone(),
@@ -2811,7 +3344,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 .join("\n    ");
             eprintln!("  {}. {short}\n", i + 1);
         }
-        bail!("{} units failed (skipped dependents not counted)", st.errors.len());
+        bail!(
+            "{} units failed (skipped dependents not counted)",
+            st.errors.len()
+        );
     }
     if ctx.timings {
         let wall = t_sched.elapsed();
@@ -2837,7 +3373,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 phases: phase_slots[i].get().copied().unwrap_or_default(),
             });
         }
-        if let Err(e) = write_timings_report(ctx, &rows, wall, st.executed, st.cached, cached_walk_ns) {
+        if let Err(e) =
+            write_timings_report(ctx, &rows, wall, st.executed, st.cached, cached_walk_ns)
+        {
             eprintln!("corgi warning: could not write timings report: {e:#}");
         }
     }
@@ -2896,7 +3434,12 @@ fn write_timings_report(
                 secs(r.meta_ns - r.start_ns)
             )
         } else {
-            format!("{} — {:.2}s at {:.2}s", r.label, secs(r.end_ns - r.start_ns), secs(r.start_ns))
+            format!(
+                "{} — {:.2}s at {:.2}s",
+                r.label,
+                secs(r.end_ns - r.start_ns),
+                secs(r.start_ns)
+            )
         };
         gantt.push_str(&format!(
             "<div class=\"row\"><span class=\"lbl\">{}</span><div class=\"bar {class}\" style=\"margin-left:{left:.2}%;width:{width:.2}%\" title=\"{title}\">{meta_html}</div></div>\n",
@@ -3009,9 +3552,17 @@ fn expected_outputs(
     let pattern = match cached {
         Some(p) => p,
         None => {
-            let plat = if host { ctx.host.as_str() } else { ctx.target.as_deref().unwrap_or(ctx.host.as_str()) };
+            let plat = if host {
+                ctx.host.as_str()
+            } else {
+                ctx.target.as_deref().unwrap_or(ctx.host.as_str())
+            };
             let probe_key = sha256_hex(
-                format!("probe-file-names\0{TOOL_VERSION}\0{}\0{plat}\0{crate_types}", ctx.rustc_version).as_bytes(),
+                format!(
+                    "probe-file-names\0{TOOL_VERSION}\0{}\0{plat}\0{crate_types}",
+                    ctx.rustc_version
+                )
+                .as_bytes(),
             );
             let from_store = ctx
                 .store
@@ -3046,17 +3597,24 @@ fn expected_outputs(
                     if p.is_empty() {
                         bail!("rustc --print file-names reported nothing for {crate_types}");
                     }
-                    ctx.store.save_action(&probe_key, &serde_json::to_vec(&p)?)?;
+                    ctx.store
+                        .save_action(&probe_key, &serde_json::to_vec(&p)?)?;
                     p
                 }
             };
-            ctx.file_names_memo.lock().unwrap().insert(memo_key, p.clone());
+            ctx.file_names_memo
+                .lock()
+                .unwrap()
+                .insert(memo_key, p.clone());
             p
         }
     };
     let mut out: Vec<String> = pattern
         .iter()
-        .map(|n| n.replace("corgiprobe", crate_name).replace("-XCORGIX", &format!("-{k16}")))
+        .map(|n| {
+            n.replace("corgiprobe", crate_name)
+                .replace("-XCORGIX", &format!("-{k16}"))
+        })
         .collect();
     // pipelined pure-rlib compiles emit metadata alongside the rlib
     if crate_types == "lib" {
@@ -3099,7 +3657,13 @@ fn run_rustc_streaming(
                         .unwrap_or_default();
                     let pool_name = Store::pool_file_name(&file, action_key);
                     ctx.store.materialize_pool(&hash, &pool_name, false)?;
-                    fire_meta(uidx, MetaOut { file: pool_name, hash });
+                    fire_meta(
+                        uidx,
+                        MetaOut {
+                            file: pool_name,
+                            hash,
+                        },
+                    );
                 } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
                     rendered.push_str(r);
                 }
@@ -3132,7 +3696,7 @@ fn ws_relative_pkg_id(id: &str, workspace_root: &str) -> String {
 
 #[cfg(test)]
 mod run_selection_tests {
-    use super::{select_root_package, select_run_binary, Mode};
+    use super::{select_root_packages, select_run_binary, Mode};
     use crate::meta::Metadata;
     use std::collections::HashMap;
 
@@ -3147,10 +3711,21 @@ mod run_selection_tests {
             .collect::<HashMap<_, _>>();
 
         let selected =
-            select_root_package(&metadata, &package_indices, false, None, Mode::Run).unwrap();
+            select_root_packages(&metadata, &package_indices, false, None, Mode::Run).unwrap();
 
-        assert_eq!(selected, Some(0));
-        assert_eq!(metadata.packages[selected.unwrap()].name, "delta");
+        assert_eq!(
+            selected
+                .as_ref()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            metadata.packages[*selected.unwrap().iter().next().unwrap()].name,
+            "delta"
+        );
     }
 
     #[test]
@@ -3163,18 +3738,49 @@ mod run_selection_tests {
             .map(|(index, package)| (package.id.clone(), index))
             .collect::<HashMap<_, _>>();
 
-        let selected =
-            select_root_package(&metadata, &package_indices, false, Some("helper"), Mode::Run)
-                .unwrap();
+        let selected = select_root_packages(
+            &metadata,
+            &package_indices,
+            false,
+            Some("helper"),
+            Mode::Run,
+        )
+        .unwrap();
 
-        assert_eq!(selected, Some(1));
+        assert_eq!(
+            selected.unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn build_and_test_use_all_workspace_default_members() {
+        let mut metadata = metadata();
+        metadata
+            .workspace_default_members
+            .push(metadata.packages[1].id.clone());
+        let package_indices = metadata
+            .packages
+            .iter()
+            .enumerate()
+            .map(|(index, package)| (package.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+
+        for mode in [Mode::Build, Mode::Test] {
+            let selected =
+                select_root_packages(&metadata, &package_indices, false, None, mode).unwrap();
+
+            assert_eq!(
+                selected.unwrap().iter().copied().collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+        }
     }
 
     #[test]
     fn default_run_selects_among_multiple_binaries() {
         let selected =
-            select_run_binary(Some("delta"), [(4, "delta-cli"), (9, "delta")].into_iter())
-                .unwrap();
+            select_run_binary(Some("delta"), [(4, "delta-cli"), (9, "delta")].into_iter()).unwrap();
 
         assert_eq!(selected, 9);
         assert!(select_run_binary(None, [(4, "delta-cli"), (9, "delta")].into_iter()).is_err());
@@ -3285,7 +3891,13 @@ fn finish_compile(
         .or_else(|| expected.first())
         .context("no expected outputs")?;
     let main = res.outputs.iter().find(|o| &o.name == main_name).cloned();
-    Ok(UnitResult { key, cached, res, main, phases })
+    Ok(UnitResult {
+        key,
+        cached,
+        res,
+        main,
+        phases,
+    })
 }
 
 fn compile(
@@ -3345,7 +3957,11 @@ fn compile(
             } else {
                 let r = results[d.unit].get().context("dependency result missing")?;
                 let m = r.main.as_ref().context("dependency artifact missing")?;
-                externs.push((name.clone(), Store::pool_file_name(&m.name, &r.key), m.hash.clone()));
+                externs.push((
+                    name.clone(),
+                    Store::pool_file_name(&m.name, &r.key),
+                    m.hash.clone(),
+                ));
             }
         } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
             let r = results[d.unit].get().context("dependency result missing")?;
@@ -3422,10 +4038,16 @@ fn compile(
         // Itself-vs-Name answer off the variable's mere presence. One
         // fixed machine-global path keeps the baked value identical
         // everywhere (a workspace path would trip the location tripwire).
-        env.push(("CARGO_TARGET_TMPDIR".to_string(), "/tmp/corgi/target-tmp".to_string()));
+        env.push((
+            "CARGO_TARGET_TMPDIR".to_string(),
+            "/tmp/corgi/target-tmp".to_string(),
+        ));
     }
-    let unit_rustflags: &[String] =
-        if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags };
+    let unit_rustflags: &[String] = if unit.host {
+        &ctx.host_rustflags
+    } else {
+        &ctx.target_rustflags
+    };
     let t_phase = Instant::now();
     let mut phases = Phases::default();
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
@@ -3434,14 +4056,28 @@ fn compile(
     // Per-unit resolved profile straight from cargo's unit graph.
     // Checked units skip debug info: they emit metadata only.
     let prof = &unit.profile;
-    let debuginfo = if self_checked { "0".to_string() } else { prof.debuginfo_flag() };
+    let debuginfo = if self_checked {
+        "0".to_string()
+    } else {
+        prof.debuginfo_flag()
+    };
     let mut pflags: Vec<String> = vec![
         format!(
             "-Copt-level={}",
-            if prof.opt_level.is_empty() { "0" } else { prof.opt_level.as_str() }
+            if prof.opt_level.is_empty() {
+                "0"
+            } else {
+                prof.opt_level.as_str()
+            }
         ),
-        format!("-Cdebug-assertions={}", if prof.debug_assertions { "on" } else { "off" }),
-        format!("-Coverflow-checks={}", if prof.overflow_checks { "on" } else { "off" }),
+        format!(
+            "-Cdebug-assertions={}",
+            if prof.debug_assertions { "on" } else { "off" }
+        ),
+        format!(
+            "-Coverflow-checks={}",
+            if prof.overflow_checks { "on" } else { "off" }
+        ),
         format!("-Cdebuginfo={debuginfo}"),
         format!("-Cstrip={}", prof.strip_flag()),
         "-Cembed-bitcode=no".to_string(),
@@ -3477,11 +4113,19 @@ fn compile(
     // unit with debug info, whatever split-debuginfo the profile asked
     // for: without -oso_prefix the staging path would leak into stabs.
     let oso_split = debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
-    let oso_rel = if oso_split { format!("target/{}/", ctx.profile_name) } else { String::new() };
+    let oso_rel = if oso_split {
+        format!("target/{}/", ctx.profile_name)
+    } else {
+        String::new()
+    };
 
     let key_json = serde_json::to_string(&CompileKey {
         kind: if clippy_action {
-            if self_checked { "clippy" } else { "clippy-compile" }
+            if self_checked {
+                "clippy"
+            } else {
+                "clippy-compile"
+            }
         } else if self_checked {
             "check"
         } else if matches!(unit.kind, Kind::Test) {
@@ -3492,7 +4136,11 @@ fn compile(
         tool: TOOL_VERSION,
         rustc: &ctx.rustc_version,
         host: &ctx.host,
-        pkg: [&pkg.name, &pkg.version, pkg.source.as_deref().unwrap_or("local")],
+        pkg: [
+            &pkg.name,
+            &pkg.version,
+            pkg.source.as_deref().unwrap_or("local"),
+        ],
         src_hash: &src_hash,
         crate_name: &crate_name,
         edition: &target.edition,
@@ -3516,8 +4164,16 @@ fn compile(
         env: &env,
         cap_lints,
         rustflags: unit_rustflags,
-        toolchain: if crate_type == "lib" || self_checked { "" } else { &ctx.toolchain },
-        tgt: if unit.host { "" } else { ctx.target.as_deref().unwrap_or("") },
+        toolchain: if crate_type == "lib" || self_checked {
+            ""
+        } else {
+            &ctx.toolchain
+        },
+        tgt: if unit.host {
+            ""
+        } else {
+            ctx.target.as_deref().unwrap_or("")
+        },
     })?;
     let key = sha256_hex(key_json.as_bytes());
     let k16: String = key[..16].to_string();
@@ -3525,7 +4181,11 @@ fn compile(
     // -Cextra-filename: rustc's dep graph embeds the output file names,
     // so a key-derived (source-dependent) value marks every saved session
     // red on each edit. Clean-namespace units keep the key-unique k16.
-    let ef16: String = if incr_action { ctx.idents[uidx].clone() } else { k16.clone() };
+    let ef16: String = if incr_action {
+        ctx.idents[uidx].clone()
+    } else {
+        k16.clone()
+    };
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
     let t_cache = Instant::now();
@@ -3537,7 +4197,10 @@ fn compile(
         } else {
             expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
         };
-        if expected.iter().all(|e| res.outputs.iter().any(|o| &o.name == e)) {
+        if expected
+            .iter()
+            .all(|e| res.outputs.iter().any(|o| &o.name == e))
+        {
             if !res.stderr.is_empty() && pkg.source.is_none() {
                 eprint!("{}", res.stderr);
             }
@@ -3547,8 +4210,7 @@ fn compile(
         // a buggy or interrupted run: heal by dropping it and re-executing.
         eprintln!(
             "{:>12} corrupt action record for {} ({crate_name})",
-            "Discarding",
-            pkg.name
+            "Discarding", pkg.name
         );
         fs::remove_file(ctx.store.action_path(&key)).ok();
     }
@@ -3594,8 +4256,14 @@ fn compile(
         );
         let dir = ctx.store.root.join("incr").join(&identity[..16]);
         fs::create_dir_all(&dir)?;
-        let lock = fs::File::create(ctx.store.root.join("incr").join(format!("{}.lock", &identity[..16])))?;
-        lock.lock().with_context(|| format!("locking incremental state for {crate_name}"))?;
+        let lock = fs::File::create(
+            ctx.store
+                .root
+                .join("incr")
+                .join(format!("{}.lock", &identity[..16])),
+        )?;
+        lock.lock()
+            .with_context(|| format!("locking incremental state for {crate_name}"))?;
         incr_lock = Some(lock);
         Some(dir)
     } else {
@@ -3617,9 +4285,17 @@ fn compile(
     // With -oso_prefix stripping the stage root, recorded debug-map paths
     // read `target/<profile>/<cgu>.o` — exactly where the objects are
     // exported relative to the workspace root.
-    let outdir = if oso_split { stage_root.join(&oso_rel) } else { stage_root.clone() };
+    let outdir = if oso_split {
+        stage_root.join(&oso_rel)
+    } else {
+        stage_root.clone()
+    };
     fs::create_dir_all(&outdir)?;
-    let scratch = if let Some(d) = &incr_dir { d.join("tmp") } else { ctx.store.tmp_path("scratch") };
+    let scratch = if let Some(d) = &incr_dir {
+        d.join("tmp")
+    } else {
+        ctx.store.tmp_path("scratch")
+    };
     fs::create_dir_all(&scratch)?;
     let extra_in: Vec<PathBuf> = ctx
         .extra_inputs_for(pkg)
@@ -3633,7 +4309,11 @@ fn compile(
             reads.push(conf.as_path());
         }
     }
-    let executor = if clippy_action { ctx.clippy_driver.as_str() } else { ctx.rustc.as_str() };
+    let executor = if clippy_action {
+        ctx.clippy_driver.as_str()
+    } else {
+        ctx.rustc.as_str()
+    };
     let mut writes: Vec<&Path> = vec![&outdir, &scratch];
     if let Some(d) = &incr_dir {
         writes.push(d.as_path());
@@ -3719,14 +4399,19 @@ fn compile(
     }
     if oso_split {
         cmd.arg("-Csplit-debuginfo=unpacked");
-        cmd.arg(format!("-Clink-arg=-Wl,-oso_prefix,{}/", stage_root.display()));
+        cmd.arg(format!(
+            "-Clink-arg=-Wl,-oso_prefix,{}/",
+            stage_root.display()
+        ));
     }
     cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
     cmd.arg(format!("-Cextra-filename=-{ef16}"));
     cmd.arg("--out-dir").arg(&outdir);
-    cmd.arg("-L").arg(format!("dependency={}", ctx.pool_logical.display()));
+    cmd.arg("-L")
+        .arg(format!("dependency={}", ctx.pool_logical.display()));
     for (name, file, _) in &externs {
-        cmd.arg("--extern").arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
+        cmd.arg("--extern")
+            .arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
     }
     // A proc-macro target gets the compiler's own `proc_macro` crate in
     // every mode — including its --test harness, which compiles as a plain
@@ -3738,7 +4423,9 @@ fn compile(
     if crate_type == "proc-macro" && ctx.host.contains("apple") {
         // ld64 defaults the dylib install name to the (temporary) output
         // path; pin it to a deterministic value instead.
-        cmd.arg(format!("-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"));
+        cmd.arg(format!(
+            "-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"
+        ));
     }
     for f in &features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
@@ -3758,17 +4445,23 @@ fn compile(
     if cap_lints {
         cmd.arg("--cap-lints").arg("allow");
     }
-    cmd.arg("--remap-path-prefix").arg(format!("{}=/dc/sysroot", ctx.sysroot));
+    cmd.arg("--remap-path-prefix")
+        .arg(format!("{}=/dc/sysroot", ctx.sysroot));
     // Workspace paths become relative: debuggers resolve them against
     // their own cwd, so lldb run from the workspace root needs no
     // source-map. Dependency sources need no remap at all — their real
     // cargo-home is the canonical store path. Packages rooted anywhere
     // else (path deps outside the workspace) keep a stable token so
     // their machine-local location never leaks into artifacts.
-    cmd.arg("--remap-path-prefix").arg(format!("{}=.", ctx.workspace_root));
+    cmd.arg("--remap-path-prefix")
+        .arg(format!("{}=.", ctx.workspace_root));
     if !pkg_root.starts_with(&ctx.workspace_root) && !pkg_root.starts_with(&ctx.cargo_home) {
-        cmd.arg("--remap-path-prefix")
-            .arg(format!("{}=/dc/pkg/{}-{}", pkg_root.display(), pkg.name, pkg.version));
+        cmd.arg("--remap-path-prefix").arg(format!(
+            "{}=/dc/pkg/{}-{}",
+            pkg_root.display(),
+            pkg.name,
+            pkg.version
+        ));
     }
     // Config rustflags go last, as cargo appends them: later flags win, so
     // the config can override anything tool-chosen.
@@ -3783,20 +4476,34 @@ fn compile(
     // One token per running compiler (its implicit thread); rustc acquires
     // more from the shared pool for extra codegen threads and releases
     // them as codegen units finish.
-    let job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
+    let job_token = ctx
+        .jobserver
+        .acquire()
+        .context("acquiring jobserver token")?;
     let t_rustc = Instant::now();
     let (success, stderr) = if self_pipelined {
         run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &key, fire_meta)?
     } else {
-        let out = cmd.output().with_context(|| format!("spawning rustc for {}", pkg.name))?;
-        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+        let out = cmd
+            .output()
+            .with_context(|| format!("spawning rustc for {}", pkg.name))?;
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
     phases.rustc_ns = t_rustc.elapsed().as_nanos() as u64;
     drop(job_token); // compiler exited; hashing/ingestion is not codegen
     fs::remove_dir_all(&scratch).ok();
     if !success {
         fs::remove_dir_all(&stage_root).ok();
-        bail!("rustc failed for {} v{} ({}):\n{}", pkg.name, pkg.version, crate_name, stderr);
+        bail!(
+            "rustc failed for {} v{} ({}):\n{}",
+            pkg.name,
+            pkg.version,
+            crate_name,
+            stderr
+        );
     }
     if !stderr.trim().is_empty() {
         eprint!("{stderr}");
@@ -3829,7 +4536,10 @@ fn compile(
         let t_val = Instant::now();
         let workspace_relative_pkg = pkg_root.strip_prefix(&ctx.workspace_root).ok();
         validate_dep_info(&d, &pkg_root, workspace_relative_pkg, &allowed).with_context(|| {
-            format!("hermeticity violation compiling {} v{}", pkg.name, pkg.version)
+            format!(
+                "hermeticity violation compiling {} v{}",
+                pkg.name, pkg.version
+            )
         })?;
         phases.validate_ns = t_val.elapsed().as_nanos() as u64;
         fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
@@ -3853,8 +4563,9 @@ fn compile(
         // path into an output (env!, proc-macro env reads, cwd
         // resolution) is caught here, on the bytes, before the action is
         // recorded.
-        let (hash, leaked) =
-            ctx.store.insert_file_scan(&p, ctx.workspace_root.as_bytes())?;
+        let (hash, leaked) = ctx
+            .store
+            .insert_file_scan(&p, ctx.workspace_root.as_bytes())?;
         if leaked {
             bail!(
                 "output {name} embeds the workspace path ({}); artifacts must be \
@@ -3871,7 +4582,11 @@ location-free — resolve paths at runtime instead of baking them in at build ti
     incr_lock.take();
 
     let t_finish = Instant::now();
-    let res = ActionResult { outputs, stderr, bs: None };
+    let res = ActionResult {
+        outputs,
+        stderr,
+        bs: None,
+    };
     let expected: Vec<String> = if self_checked {
         res.outputs.iter().map(|o| o.name.clone()).collect()
     } else {
@@ -3893,7 +4608,11 @@ location-free — resolve paths at runtime instead of baking them in at build ti
     finish_compile(&expected, key, false, res, phases)
 }
 
-fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) -> Result<UnitResult> {
+fn run_build_script(
+    ctx: &Ctx,
+    uidx: usize,
+    results: &[OnceLock<UnitResult>],
+) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
@@ -3953,7 +4672,12 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     // joined with the 0x1f separator.
     env.push((
         "CARGO_ENCODED_RUSTFLAGS".into(),
-        (if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags }).join("\x1f"),
+        (if unit.host {
+            &ctx.host_rustflags
+        } else {
+            &ctx.target_rustflags
+        })
+        .join("\x1f"),
     ));
     env.extend(ctx.config_env.iter().cloned());
     if let Some(links) = &pkg.links {
@@ -3978,14 +4702,21 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     }
     let mut tool_ids: Vec<String> = visible_tools.iter().map(|t| t.id.clone()).collect();
     tool_ids.sort();
-    let plat_cfg = if unit.host { &ctx.cfg_env } else { &ctx.cfg_env_target };
+    let plat_cfg = if unit.host {
+        &ctx.cfg_env
+    } else {
+        &ctx.cfg_env_target
+    };
     for (k, v) in plat_cfg {
         env.push((k.clone(), v.clone()));
     }
     let mut features = unit.features.clone();
     features.sort();
     for f in &features {
-        env.push((format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")), "1".into()));
+        env.push((
+            format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")),
+            "1".into(),
+        ));
     }
     env.sort();
     dep_env.sort();
@@ -3996,7 +4727,11 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
         tool: TOOL_VERSION,
         rustc: &ctx.rustc_version,
         host: &ctx.host,
-        pkg: [&pkg.name, &pkg.version, pkg.source.as_deref().unwrap_or("local")],
+        pkg: [
+            &pkg.name,
+            &pkg.version,
+            pkg.source.as_deref().unwrap_or("local"),
+        ],
         src_hash: &src_hash,
         script: [&script.name, &script.hash],
         env: &env,
@@ -4007,7 +4742,13 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let key = sha256_hex(key_json.as_bytes());
 
     if let Some(res) = ctx.try_cache_hit(&key)? {
-        return Ok(UnitResult { key, cached: true, res, main: None, phases: Phases::default() });
+        return Ok(UnitResult {
+            key,
+            cached: true,
+            res,
+            main: None,
+            phases: Phases::default(),
+        });
     }
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
@@ -4021,10 +4762,18 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let final_parent = ctx.store.root.join("outdirs").join(&key);
     fs::create_dir_all(ctx.store.root.join("outdirs"))?;
     let lock_file = fs::File::create(ctx.store.root.join("outdirs").join(format!("{key}.lock")))?;
-    lock_file.lock().with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
+    lock_file
+        .lock()
+        .with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
     // While we waited: a concurrent winner may have finished the work.
     if let Some(res) = ctx.try_cache_hit(&key)? {
-        return Ok(UnitResult { key, cached: true, res, main: None, phases: Phases::default() });
+        return Ok(UnitResult {
+            key,
+            cached: true,
+            res,
+            main: None,
+            phases: Phases::default(),
+        });
     }
     if final_parent.exists() {
         // No sentinel (the cache probe above would have hit): crash leftover.
@@ -4033,7 +4782,9 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let stage_out = final_parent.join("out");
     fs::create_dir_all(&stage_out)?;
     let stage_logical = ctx.out_dir_logical(&key);
-    let script_path = ctx.pool.join(Store::pool_file_name(&script.name, &script_key));
+    let script_path = ctx
+        .pool
+        .join(Store::pool_file_name(&script.name, &script_key));
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
     let extra_in: Vec<PathBuf> = ctx
@@ -4071,11 +4822,16 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
     cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
     ctx.jobserver.configure(&mut cmd);
-    let _job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
+    let _job_token = ctx
+        .jobserver
+        .acquire()
+        .context("acquiring jobserver token")?;
     if ctx.verbose {
         status!("Exec", "{cmd:?}");
     }
-    let out = cmd.output().with_context(|| format!("running build script for {}", pkg.name))?;
+    let out = cmd
+        .output()
+        .with_context(|| format!("running build script for {}", pkg.name))?;
     fs::remove_dir_all(&scratch).ok();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -4097,13 +4853,23 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     }
 
     scan_dir_for_workspace_path(&stage_out, &ctx.workspace_root)?;
-    let res = ActionResult { outputs: vec![], stderr, bs: Some(bs) };
+    let res = ActionResult {
+        outputs: vec![],
+        stderr,
+        bs: Some(bs),
+    };
     // Commit order: sentinel (OUT_DIR complete), then the action record.
     // A crash between the two leaves a probe-miss either way; the next
     // builder re-acquires the lock and redoes the work.
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    Ok(UnitResult { key, cached: false, res, main: None, phases: Phases::default() })
+    Ok(UnitResult {
+        key,
+        cached: false,
+        res,
+        main: None,
+        phases: Phases::default(),
+    })
 }
 
 /// Location-leak tripwire for build-script outputs: OUT_DIR is shared at
@@ -4141,7 +4907,9 @@ fn validate_dep_info(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((_, rest)) = line.split_once(':') else { continue };
+        let Some((_, rest)) = line.split_once(':') else {
+            continue;
+        };
         for tok in rest.split_whitespace() {
             // NOTE(poc): no handling of backslash-escaped spaces in paths
             let p = Path::new(tok);
@@ -4167,7 +4935,10 @@ fn validate_dep_info(
 }
 
 fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScriptOut> {
-    let mut bs = BuildScriptOut { stdout: stdout.to_string(), ..Default::default() };
+    let mut bs = BuildScriptOut {
+        stdout: stdout.to_string(),
+        ..Default::default()
+    };
     for line in stdout.lines() {
         let line = line.trim();
         let rest = if let Some(r) = line.strip_prefix("cargo::") {
@@ -4177,7 +4948,9 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
         } else {
             continue;
         };
-        let Some((k, v)) = rest.split_once('=') else { continue };
+        let Some((k, v)) = rest.split_once('=') else {
+            continue;
+        };
         match k {
             "rustc-cfg" => bs.cfgs.push(v.to_string()),
             "rustc-env" => {
@@ -4215,7 +4988,10 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
                     bs.metadata.push((mk.to_string(), mv.to_string()));
                 }
             }
-            "rerun-if-changed" | "rerun-if-env-changed" | "rustc-check-cfg" | "rustc-cdylib-link-arg" => {}
+            "rerun-if-changed"
+            | "rerun-if-env-changed"
+            | "rustc-check-cfg"
+            | "rustc-cdylib-link-arg" => {}
             other => bs.metadata.push((other.to_string(), v.to_string())),
         }
     }

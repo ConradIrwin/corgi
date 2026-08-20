@@ -27,13 +27,21 @@ fn real_main() -> Result<()> {
     let mut cmd: Option<String> = None;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
-    const USAGE: &str = "usage: corgi build|check|clippy|run|test|audit|gc \
+    let mut fmt_args: Vec<String> = Vec::new();
+    const USAGE: &str = "usage: corgi build|check|clippy|fmt|run|test|audit|gc \
 [--dir DIR] [-p PACKAGE] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => {
+                if cmd.as_deref() == Some("fmt") {
+                    fmt_args.push("--".to_string());
+                }
                 for rest in args.by_ref() {
-                    exec_args.push(rest);
+                    if cmd.as_deref() == Some("fmt") {
+                        fmt_args.push(rest);
+                    } else {
+                        exec_args.push(rest);
+                    }
                 }
                 break;
             }
@@ -43,19 +51,17 @@ fn real_main() -> Result<()> {
             "--no-incremental" => no_incremental = true,
             "--release" => release = true,
             "--workspace" => workspace = true,
-            "-p" | "--package" => {
-                package = Some(args.next().context("--package needs a value")?)
-            }
+            "-p" | "--package" => package = Some(args.next().context("--package needs a value")?),
             "--target" => target = Some(args.next().context("--target needs a value")?),
-            "build" | "check" | "clippy" | "run" | "test" | "audit" | "gc" if cmd.is_none() => {
+            "build" | "check" | "clippy" | "fmt" | "run" | "test" | "audit" | "gc"
+                if cmd.is_none() =>
+            {
                 cmd = Some(a)
             }
-            _ if cmd.as_deref() == Some("test")
-                && test_filter.is_none()
-                && !a.starts_with('-') =>
-            {
+            _ if cmd.as_deref() == Some("test") && test_filter.is_none() && !a.starts_with('-') => {
                 test_filter = Some(a)
             }
+            _ if cmd.as_deref() == Some("fmt") => fmt_args.push(a),
             _ => bail!("unknown argument `{a}` ({USAGE})"),
         }
     }
@@ -63,13 +69,19 @@ fn real_main() -> Result<()> {
         bail!("`--` arguments only apply to `corgi run` and `corgi test` ({USAGE})");
     }
     if workspace && matches!(cmd.as_deref(), Some("run") | Some("audit")) {
-        bail!("`--workspace` does not apply to `corgi {}`", cmd.as_deref().unwrap_or(""));
+        bail!(
+            "`--workspace` does not apply to `corgi {}`",
+            cmd.as_deref().unwrap_or("")
+        );
     }
     if workspace && package.is_some() {
         bail!("`--workspace` cannot be used with `--package`");
     }
     if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("gc")) {
-        bail!("`--package` does not apply to `corgi {}`", cmd.as_deref().unwrap_or(""));
+        bail!(
+            "`--package` does not apply to `corgi {}`",
+            cmd.as_deref().unwrap_or("")
+        );
     }
 
     let dir = match dir {
@@ -80,20 +92,35 @@ fn real_main() -> Result<()> {
     // path, so embedded OUT_DIR paths are canonical with no indirection.
     // CORGI_STORE relocates it (a symlink alias then preserves the
     // canonical spelling).
-    let store_root = std::env::var_os("CORGI_STORE").map(PathBuf::from).unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            PathBuf::from("/Users/Shared/corgi")
-        } else {
-            let home = std::env::var_os("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".cache/corgi")
-        }
-    });
+    let store_root = std::env::var_os("CORGI_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                PathBuf::from("/Users/Shared/corgi")
+            } else {
+                let home = std::env::var_os("HOME").expect("HOME not set");
+                PathBuf::from(home).join(".cache/corgi")
+            }
+        });
     if cmd.as_deref() == Some("audit") {
         return audit::audit(&dir, release, verbose, target.as_deref());
     }
     let store = store::Store::new(store_root)?;
     if cmd.as_deref() == Some("gc") {
         return build::gc(&store);
+    }
+    if cmd.as_deref() == Some("fmt") {
+        if release || target.is_some() || timings || no_incremental {
+            bail!("build-only options do not apply to `corgi fmt` ({USAGE})");
+        }
+        return build::fmt(
+            store,
+            &dir,
+            workspace,
+            package.as_deref(),
+            verbose,
+            &fmt_args,
+        );
     }
     let mode = match cmd.as_deref() {
         Some("check") => build::Mode::Check,

@@ -51,7 +51,10 @@ pub struct Package {
 
 impl Package {
     pub fn root(&self) -> PathBuf {
-        Path::new(&self.manifest_path).parent().unwrap().to_path_buf()
+        Path::new(&self.manifest_path)
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 }
 
@@ -188,9 +191,11 @@ pub struct UgDep {
 }
 
 pub fn lib_target(p: &Package) -> Option<&Target> {
-    p.targets
-        .iter()
-        .find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib" || k == "proc-macro"))
+    p.targets.iter().find(|t| {
+        t.kind
+            .iter()
+            .any(|k| k == "lib" || k == "rlib" || k == "proc-macro")
+    })
 }
 
 pub fn is_proc_macro(p: &Package) -> bool {

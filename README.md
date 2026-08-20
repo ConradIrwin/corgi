@@ -6,6 +6,7 @@ content-addressed store** shared by any number of worktrees.
 
 ```
 corgi build [--dir DIR] [-p PACKAGE] [-v] # store at ~/.cache/corgi, override with $CORGI_STORE
+corgi fmt [--dir DIR] [-p PACKAGE] [--workspace] [--check] [-- RUSTFMT_ARGS...]
 ```
 
 Installing corgi requires Rust 1.90 or newer:
@@ -19,6 +20,11 @@ cargo install corgi-build
 Cargo is used only for what it is genuinely good at — resolution (`cargo fetch`
 + `cargo metadata --filter-platform`). Compilation is planned and executed by
 corgi, invoking `rustc` directly so that every input is explicit.
+
+`corgi fmt` is intentionally lighter weight: it installs the SHA-256-verified
+`rustfmt-preview` component matching the exact project toolchain, then delegates
+target discovery and formatting to that pinned `cargo fmt`. It does not resolve
+the build graph or interact with the build cache.
 
 The dependency graph is decomposed into **units**: lib compile, proc-macro
 compile, build.rs compile, build.rs *run*, and bin compile+link. Each unit is

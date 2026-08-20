@@ -34,8 +34,11 @@ impl CargoConfig {
                 flags.extend(entry.iter().cloned());
             }
         }
-        let mut cfg_entries: Vec<&(String, Vec<String>)> =
-            self.target_rustflags.iter().filter(|(s, _)| s.starts_with("cfg(")).collect();
+        let mut cfg_entries: Vec<&(String, Vec<String>)> = self
+            .target_rustflags
+            .iter()
+            .filter(|(s, _)| s.starts_with("cfg("))
+            .collect();
         cfg_entries.sort_by(|a, b| a.0.cmp(&b.0));
         if !cfg_entries.is_empty() {
             let info = TripleInfo::of(triple)?;
@@ -66,15 +69,18 @@ pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>
             if p.is_file() {
                 let text = std::fs::read_to_string(&p)
                     .with_context(|| format!("reading {}", p.display()))?;
-                let config =
-                    parse(&text).with_context(|| format!("parsing {}", p.display()))?;
+                let config = parse(&text).with_context(|| format!("parsing {}", p.display()))?;
                 return Ok((config, Some(d.to_path_buf())));
             }
         }
         dir = d.parent();
     }
     Ok((
-        CargoConfig { build_rustflags: Vec::new(), target_rustflags: Vec::new(), env: Vec::new() },
+        CargoConfig {
+            build_rustflags: Vec::new(),
+            target_rustflags: Vec::new(),
+            env: Vec::new(),
+        },
         None,
     ))
 }
@@ -143,13 +149,26 @@ fn parse(text: &str) -> Result<CargoConfig> {
             }
             // Command aliases and network/UI preferences never change what
             // gets compiled.
-            "alias" | "net" | "http" | "term" | "registries" | "registry" | "cargo-new"
-            | "future-incompat-report" | "cache" | "install" | "doc" => {}
+            "alias"
+            | "net"
+            | "http"
+            | "term"
+            | "registries"
+            | "registry"
+            | "cargo-new"
+            | "future-incompat-report"
+            | "cache"
+            | "install"
+            | "doc" => {}
             other => bail!("unsupported .cargo/config section [{other}]"),
         }
     }
     env.sort();
-    Ok(CargoConfig { build_rustflags, target_rustflags, env })
+    Ok(CargoConfig {
+        build_rustflags,
+        target_rustflags,
+        env,
+    })
 }
 
 /// Cargo accepts rustflags as an array of strings or one space-separated
@@ -160,7 +179,9 @@ fn flag_list(value: &toml::Value) -> Result<Vec<String>> {
         toml::Value::Array(items) => items
             .iter()
             .map(|i| {
-                i.as_str().map(str::to_string).context("rustflags entries must be strings")
+                i.as_str()
+                    .map(str::to_string)
+                    .context("rustflags entries must be strings")
             })
             .collect(),
         _ => bail!("rustflags must be a string or an array of strings"),
@@ -403,7 +424,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.rustflags_for("aarch64-apple-darwin").unwrap(),
-            vec!["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+            vec![
+                "-C",
+                "symbol-mangling-version=v0",
+                "--cfg",
+                "tokio_unstable"
+            ]
         );
     }
 
@@ -427,12 +453,22 @@ mod tests {
         // No target entry matches on macOS: the build flags apply.
         assert_eq!(
             config.rustflags_for("aarch64-apple-darwin").unwrap(),
-            vec!["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+            vec![
+                "-C",
+                "symbol-mangling-version=v0",
+                "--cfg",
+                "tokio_unstable"
+            ]
         );
         // A matching cfg entry replaces the build flags entirely.
         assert_eq!(
             config.rustflags_for("x86_64-pc-windows-msvc").unwrap(),
-            vec!["--cfg", "windows_slim_errors", "-C", "target-feature=+crt-static"]
+            vec![
+                "--cfg",
+                "windows_slim_errors",
+                "-C",
+                "target-feature=+crt-static"
+            ]
         );
         // A matching literal triple does the same.
         assert_eq!(
@@ -475,7 +511,10 @@ mod tests {
             config.rustflags_for("x86_64-unknown-linux-gnu").unwrap(),
             vec!["-C", "link-arg=-fuse-ld=lld"]
         );
-        assert!(config.rustflags_for("aarch64-apple-darwin").unwrap().is_empty());
+        assert!(config
+            .rustflags_for("aarch64-apple-darwin")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -491,7 +530,10 @@ mod tests {
         assert_eq!(
             config.env,
             vec![
-                ("MACOSX_DEPLOYMENT_TARGET".to_string(), "10.15.7".to_string()),
+                (
+                    "MACOSX_DEPLOYMENT_TARGET".to_string(),
+                    "10.15.7".to_string()
+                ),
                 ("ZED_B".to_string(), "two".to_string()),
             ]
         );
@@ -513,6 +555,7 @@ mod tests {
             assert!(parse(bad).is_err(), "expected hard error for: {bad}");
         }
         // Aliases and network settings never change a build: ignored.
-        parse("[alias]\nxtask = \"run --package xtask --\"\n[net]\ngit-fetch-with-cli = true").unwrap();
+        parse("[alias]\nxtask = \"run --package xtask --\"\n[net]\ngit-fetch-with-cli = true")
+            .unwrap();
     }
 }

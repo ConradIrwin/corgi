@@ -25,11 +25,17 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
     if canonical.symlink_metadata().is_ok() {
         // leftover alias symlink from an old corgi, or a dir from a
         // crashed audit whose slot we cannot know: discard it
-        fs::remove_file(&canonical).or_else(|_| fs::remove_dir_all(&canonical)).ok();
+        fs::remove_file(&canonical)
+            .or_else(|_| fs::remove_dir_all(&canonical))
+            .ok();
     }
     let stores = [base.join("store-a"), base.join("store-b")];
     for (i, s) in stores.iter().enumerate() {
-        eprintln!("corgi-audit: ===== build {}/2 (store {}) =====", i + 1, s.display());
+        eprintln!(
+            "corgi-audit: ===== build {}/2 (store {}) =====",
+            i + 1,
+            s.display()
+        );
         if s.exists() {
             fs::rename(s, &canonical).context("unparking audit store")?;
         }
