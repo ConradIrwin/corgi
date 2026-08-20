@@ -343,6 +343,12 @@ struct ToolSpec {
     /// build script (right for graph-wide tools like a wasm C compiler).
     #[serde(default)]
     packages: Vec<String>,
+    /// How the archive is fetched. Empty = plain unauthenticated download.
+    /// "github": a GitHub release asset of a private repo, downloaded via
+    /// the gh CLI's stored credentials. Auth affects transport only — the
+    /// sha256 pin remains the tool's identity either way.
+    #[serde(default)]
+    auth: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -592,9 +598,37 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
     let archive = work.join("archive");
-    let st = Command::new("curl").args(["-sSfL", "-o"]).arg(&archive).arg(&t.url).status()?;
-    if !st.success() {
-        bail!("download failed: {}", t.url);
+    match t.auth.as_str() {
+        "" => {
+            let st =
+                Command::new("curl").args(["-sSfL", "-o"]).arg(&archive).arg(&t.url).status()?;
+            if !st.success() {
+                bail!("download failed: {}", t.url);
+            }
+        }
+        "github" => {
+            let (repo, tag, asset) = parse_github_release_url(&t.url).with_context(|| {
+                format!("tool {}: auth = \"github\" requires a github.com release-asset url", t.name)
+            })?;
+            let st = Command::new("gh")
+                .args(["release", "download", &tag, "-R", &repo, "--pattern", &asset, "--output"])
+                .arg(&archive)
+                .status()
+                .with_context(|| {
+                    format!(
+                        "tool {}: running gh (auth = \"github\" needs the GitHub CLI, logged in)",
+                        t.name
+                    )
+                })?;
+            if !st.success() {
+                bail!(
+                    "tool {}: gh release download failed for {} (is `gh auth status` ok?)",
+                    t.name,
+                    t.url
+                );
+            }
+        }
+        other => bail!("tool {}: unknown auth scheme `{other}` (supported: \"github\")", t.name),
     }
     let actual = crate::store::sha256_file(&archive)?;
     if actual != t.sha256 {
@@ -616,6 +650,23 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
+}
+
+/// Split a GitHub release-asset url into (owner/repo, tag, asset name):
+/// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}.
+fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .with_context(|| format!("not a github.com url: {url}"))?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        [owner, repo, "releases", "download", tag, asset]
+            if !owner.is_empty() && !repo.is_empty() && !tag.is_empty() && !asset.is_empty() =>
+        {
+            Ok((format!("{owner}/{repo}"), tag.to_string(), asset.to_string()))
+        }
+        _ => bail!("not a release-asset url (expected .../releases/download/<tag>/<asset>): {url}"),
+    }
 }
 
 /// Resolve the host triple *without* a rustc: dcargo's own build constants.
@@ -2961,6 +3012,29 @@ fn ws_relative_pkg_id(id: &str, workspace_root: &str) -> String {
         }
     }
     id.to_string()
+}
+
+#[cfg(test)]
+mod tool_url_tests {
+    use super::parse_github_release_url;
+
+    #[test]
+    fn release_asset_urls_split_into_repo_tag_and_asset() {
+        let (repo, tag, asset) = parse_github_release_url(
+            "https://github.com/zed-industries/delta-terminal/releases/download/build-abc123/ex-terminal-aarch64-macos.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(repo, "zed-industries/delta-terminal");
+        assert_eq!(tag, "build-abc123");
+        assert_eq!(asset, "ex-terminal-aarch64-macos.tar.gz");
+    }
+
+    #[test]
+    fn non_release_urls_are_rejected() {
+        assert!(parse_github_release_url("https://example.com/a/b/releases/download/t/x").is_err());
+        assert!(parse_github_release_url("https://github.com/o/r/archive/main.tar.gz").is_err());
+        assert!(parse_github_release_url("https://github.com/o/r/releases/download/tag").is_err());
+    }
 }
 
 #[cfg(test)]
