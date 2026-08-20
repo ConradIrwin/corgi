@@ -1838,14 +1838,12 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // building any member from any directory lands artifacts in one place.
     let dtarget = Path::new(&ctx.workspace_root).join("target");
     let mut written = Vec::new();
+    let mut test_harnesses = Vec::new();
 
-    // Test harnesses run fresh every time (results deliberately uncached
-    // for now, so cargo-vs-corgi comparisons stay honest). Unsandboxed,
-    // exactly as if run by hand: ambient env untouched (no CARGO_* vars),
-    // only cwd = the package root, which the location-free artifact
-    // contract requires (baked-in "." manifest paths resolve there).
+    // Export every test harness before declaring the build finished. They
+    // run afterward, fresh every time (results deliberately uncached for
+    // now, so cargo-vs-corgi comparisons stay honest).
     if matches!(mode, Mode::Test) {
-        let mut failures: Vec<String> = Vec::new();
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(u.kind, Kind::Test) || !u.is_root {
                 continue;
@@ -1865,21 +1863,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
-            status!("Running", "tests: {} ({})", u.target.name, dest.display());
-            let mut c = Command::new(&dest);
-            c.current_dir(pkg.root());
-            if let Some(filter) = &test_filter {
-                c.arg(filter);
-            }
-            c.args(&exec_args);
-            let st = c.status().with_context(|| format!("running test {}", u.target.name))?;
-            if !st.success() {
-                failures.push(u.target.name.clone());
-            }
-        }
-        if !failures.is_empty() {
-            status!("Finished", "in {:.2}s", t0.elapsed().as_secs_f64());
-            bail!("{} test target(s) failed: {}", failures.len(), failures.join(", "));
+            test_harnesses.push((u.target.name.clone(), pkg.root(), dest));
         }
     }
 
@@ -1937,15 +1921,41 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             crate::store::EXPORT_CHECK_BYTES.load(Relaxed),
         );
     }
-    eprintln!(
-        "{:>12} in {:.2}s — {executed} executed, {cached} cached",
+    status!(
         "Finished",
+        "in {:.2}s — {executed} executed, {cached} cached",
         t0.elapsed().as_secs_f64()
     );
     for path in written {
         match path.strip_prefix(&ctx.workspace_root) {
             Ok(relative) => status!("Output", "`{}`", relative.display()),
             Err(_) => status!("Output", "`{}`", path.display()),
+        }
+    }
+    if matches!(mode, Mode::Test) {
+        // Unsandboxed, exactly as if run by hand: ambient env untouched (no
+        // CARGO_* vars), only cwd = the package root, which the location-free
+        // artifact contract requires (baked-in "." manifest paths resolve
+        // there).
+        let mut failures: Vec<String> = Vec::new();
+        for (name, package_root, dest) in test_harnesses {
+            match dest.strip_prefix(&ctx.workspace_root) {
+                Ok(relative) => status!("Running", "test {}", relative.display()),
+                Err(_) => status!("Running", "test {}", dest.display()),
+            }
+            let mut c = Command::new(&dest);
+            c.current_dir(package_root);
+            if let Some(filter) = &test_filter {
+                c.arg(filter);
+            }
+            c.args(&exec_args);
+            let st = c.status().with_context(|| format!("running test {name}"))?;
+            if !st.success() {
+                failures.push(name);
+            }
+        }
+        if !failures.is_empty() {
+            bail!("{} test target(s) failed: {}", failures.len(), failures.join(", "));
         }
     }
     maybe_auto_gc(&ctx.store);
