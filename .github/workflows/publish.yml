@@ -1,0 +1,61 @@
+name: Publish to crates.io
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish corgi-build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Set per-push version
+        id: version
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          version="0.1.${RUN_NUMBER}+$(date -u +%y%m%d)"
+          python3 - "$version" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          manifest = pathlib.Path("Cargo.toml")
+          contents = manifest.read_text()
+          contents, replacements = re.subn(
+              r'(?m)^(version = ")[^"]+(")$',
+              rf'\g<1>{sys.argv[1]}\g<2>',
+              contents,
+              count=1,
+          )
+          if replacements != 1:
+              raise SystemExit("could not update package version in Cargo.toml")
+          manifest.write_text(contents)
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Update lockfile
+        run: cargo check
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish ${{ steps.version.outputs.version }}
+        run: cargo publish --locked --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

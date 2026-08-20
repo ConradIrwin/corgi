@@ -1,8 +1,15 @@
 [package]
-name = "corgi"
+name = "corgi-build"
 version = "0.1.0"
 edition = "2021"
 description = "PoC: deterministic, content-addressed, lock-free cargo-compatible build tool"
+license = "MIT"
+repository = "https://github.com/ConradIrwin/corgi"
+readme = "README.md"
+
+[[bin]]
+name = "corgi"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
