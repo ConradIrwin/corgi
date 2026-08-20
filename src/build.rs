@@ -755,9 +755,14 @@ fn host_triple() -> Result<String> {
     Ok(format!("{arch}-{os}"))
 }
 
-/// The pin is mandatory and must be concrete. No floating channels, no
-/// ambient-rustup fallback: builds are a function of the repo, full stop.
 fn read_toolchain_pin(dir: &Path) -> Result<String> {
+    read_toolchain_pin_with(dir, || current_toolchain_channel(dir))
+}
+
+fn read_toolchain_pin_with(
+    dir: &Path,
+    current_channel: impl FnOnce() -> Result<String>,
+) -> Result<String> {
     // the pin may live at the workspace root above the package being built
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
@@ -783,10 +788,11 @@ fn read_toolchain_pin(dir: &Path) -> Result<String> {
     } else if legacy.exists() {
         fs::read_to_string(&legacy)?.trim().to_string()
     } else {
-        bail!(
-            "corgi requires a pinned toolchain: create rust-toolchain.toml with \
-             `[toolchain]\nchannel = \"<exact version>\"` (e.g. \"1.94.1\" or \"nightly-2026-03-25\")"
-        );
+        let channel = current_channel().context("determining the current Rust version")?;
+        let text = format!("[toolchain]\nchannel = \"{channel}\"\n");
+        fs::write(&toml_p, text).with_context(|| format!("creating {}", toml_p.display()))?;
+        status!("Created", "{} ({channel})", toml_p.display());
+        channel
     };
     if !is_concrete_channel(&channel) {
         bail!(
@@ -795,6 +801,42 @@ fn read_toolchain_pin(dir: &Path) -> Result<String> {
         );
     }
     Ok(channel)
+}
+
+fn current_toolchain_channel(dir: &Path) -> Result<String> {
+    let output = capture(
+        Command::new("rustc").arg("-vV").current_dir(dir),
+        "rustc -vV",
+    )?;
+    toolchain_channel_from_rustc_version(&output)
+}
+
+fn toolchain_channel_from_rustc_version(output: &str) -> Result<String> {
+    let release = output
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .context("rustc -vV: no release line")?
+        .trim();
+
+    if release.contains("-nightly") || release.contains("-beta") {
+        let date = output
+            .lines()
+            .find_map(|line| line.strip_prefix("commit-date: "))
+            .context("rustc -vV: no commit-date line")?
+            .trim();
+        let channel = if release.contains("-nightly") {
+            "nightly"
+        } else {
+            "beta"
+        };
+        return Ok(format!("{channel}-{date}"));
+    }
+
+    if is_concrete_channel(release) {
+        Ok(release.to_string())
+    } else {
+        bail!("current rustc release `{release}` cannot be pinned to an exact rustup toolchain")
+    }
 }
 
 fn is_concrete_channel(c: &str) -> bool {
@@ -3840,6 +3882,65 @@ mod tool_url_tests {
         assert!(parse_github_release_url("https://example.com/a/b/releases/download/t/x").is_err());
         assert!(parse_github_release_url("https://github.com/o/r/archive/main.tar.gz").is_err());
         assert!(parse_github_release_url("https://github.com/o/r/releases/download/tag").is_err());
+    }
+}
+
+#[cfg(test)]
+mod toolchain_pin_tests {
+    use super::{read_toolchain_pin_with, toolchain_channel_from_rustc_version};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn missing_pin_is_created_from_the_current_stable_toolchain() {
+        let dir = temp_dir();
+
+        let channel = read_toolchain_pin_with(&dir, || Ok("1.97.1".to_string())).unwrap();
+
+        assert_eq!(channel, "1.97.1");
+        assert_eq!(
+            fs::read_to_string(dir.join("rust-toolchain.toml")).unwrap(),
+            "[toolchain]\nchannel = \"1.97.1\"\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rustc_verbose_version_yields_exact_channels() {
+        assert_eq!(
+            toolchain_channel_from_rustc_version(
+                "rustc 1.97.1\nrelease: 1.97.1\ncommit-date: 2026-03-12\n"
+            )
+            .unwrap(),
+            "1.97.1"
+        );
+        assert_eq!(
+            toolchain_channel_from_rustc_version(
+                "rustc 1.99.0-nightly\nrelease: 1.99.0-nightly\ncommit-date: 2026-03-25\n"
+            )
+            .unwrap(),
+            "nightly-2026-03-25"
+        );
+        assert_eq!(
+            toolchain_channel_from_rustc_version(
+                "rustc 1.98.0-beta.2\nrelease: 1.98.0-beta.2\ncommit-date: 2026-03-20\n"
+            )
+            .unwrap(),
+            "beta-2026-03-20"
+        );
+    }
+
+    fn temp_dir() -> PathBuf {
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "corgi-toolchain-pin-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        dir
     }
 }
 
