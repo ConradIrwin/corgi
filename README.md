@@ -7,6 +7,8 @@ content-addressed store** shared by any number of worktrees.
 ```
 corgi build [--dir DIR] [-p PACKAGE] [-v] # store at ~/.cache/corgi, override with $CORGI_STORE
 corgi fmt [--dir DIR] [-p PACKAGE] [--workspace] [--check] [-- RUSTFMT_ARGS...]
+corgi clean                                # immediately trim stale cache entries
+corgi clean -cache                         # remove the entire Corgi store
 ```
 
 Installing corgi requires Rust 1.90 or newer:
@@ -57,6 +59,10 @@ Results live in a machine-wide store:
   tmp/                  scratch; everything is published by atomic rename
 ```
 
+Cache entries expire after 5 days by default. Successful builds trigger an
+automatic cleanup at most once per day, while `corgi clean` runs the same trim
+immediately. `corgi clean -cache` removes the entire Corgi store.
+
 ### The three blockers, addressed
 
 | blocker | fix |
@@ -81,7 +87,7 @@ Results live in a machine-wide store:
   `-Csplit-debuginfo=unpacked` and `-Wl,-oso_prefix` so debug-map entries
   are recorded relative to the workspace root; the CGU objects export next
   to the binary (`target/debug/*.rcgu.o`, cargo's own convention). Modern
-  ld records zero OSO timestamps, so gc's use-touching never stales them
+  ld records zero OSO timestamps, so clean's use-touching never stales them
 - std sources install as a side-car (`tools/rust-src-<ver>`, never inside
   the sysroot — rustc would devirtualize std paths and flip every key).
   Everything you write and depend on debugs with zero configuration; for

@@ -827,22 +827,25 @@ fn is_concrete_channel(c: &str) -> bool {
 /// blobs are touched whenever a referencing action is used, so a stale
 /// blob implies only stale actions point at it. Deleting something in
 /// use is benign: probes self-heal by rebuilding.
-pub fn gc(store: &Store) -> Result<()> {
-    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    let (files, dirs, bytes) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600))?;
+pub fn clean(store: &Store, all: bool) -> Result<()> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
+    if all {
+        fs::remove_dir_all(&store.root)
+            .with_context(|| format!("removing cache {}", store.root.display()))?;
+        eprintln!("{:>12} removed {}", "CLEAN", store.root.display());
+        return Ok(());
+    }
+    let (files, dirs, bytes) = clean_trim(store, TTL)?;
     eprintln!(
-        "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) older than {days} days",
-        "GC",
+        "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) older than 5 days",
+        "CLEAN",
         bytes as f64 / 1e6
     );
     Ok(())
 }
 
 /// Auto-trim after builds, at most once per day (Go's trim.txt scheme).
-fn maybe_auto_gc(store: &Store) {
+fn maybe_auto_clean(store: &Store) {
     let marker = store.root.join("cache").join("trim.txt");
     if let Ok(md) = fs::metadata(&marker) {
         if let Ok(age) = md
@@ -856,17 +859,14 @@ fn maybe_auto_gc(store: &Store) {
             return; // clock skew: fine, skip
         }
     }
-    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    if let Err(e) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600)) {
-        eprintln!("corgi warning: gc trim failed: {e:#}");
+    let ttl = std::time::Duration::from_secs(5 * 24 * 3600);
+    if let Err(e) = clean_trim(store, ttl) {
+        eprintln!("corgi warning: clean trim failed: {e:#}");
     }
     let _ = store.write_atomic(&marker, b"trimmed\n");
 }
 
-fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
+fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
     let now = std::time::SystemTime::now();
     let cutoff = now.checked_sub(ttl).context("ttl too large")?;
     let stale = |p: &Path| -> bool {
@@ -1820,7 +1820,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     };
     let mut meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
     // A cached plan says nothing about dependency sources still being
-    // extracted in the store (gc may have trimmed them); verify cheaply
+    // extracted in the store (clean may have trimmed them); verify cheaply
     // and re-resolve once if anything is missing.
     if from_cache
         && meta
@@ -2394,7 +2394,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             );
         }
     }
-    maybe_auto_gc(&ctx.store);
+    maybe_auto_clean(&ctx.store);
     if matches!(mode, Mode::Run) {
         let root_bins: Vec<usize> = ctx
             .units

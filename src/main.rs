@@ -25,11 +25,12 @@ fn real_main() -> Result<()> {
     let mut package: Option<String> = None;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
+    let mut clean_cache = false;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
     let mut fmt_args: Vec<String> = Vec::new();
-    const USAGE: &str = "usage: corgi build|check|clippy|fmt|run|test|audit|gc \
-[--dir DIR] [-p PACKAGE] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
+    const USAGE: &str = "usage: corgi build|check|clippy|fmt|run|test|audit|clean \
+[--dir DIR] [-p PACKAGE] [--workspace] [--release] [--target TRIPLE] [-v] [-cache] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => {
@@ -53,11 +54,12 @@ fn real_main() -> Result<()> {
             "--workspace" => workspace = true,
             "-p" | "--package" => package = Some(args.next().context("--package needs a value")?),
             "--target" => target = Some(args.next().context("--target needs a value")?),
-            "build" | "check" | "clippy" | "fmt" | "run" | "test" | "audit" | "gc"
+            "build" | "check" | "clippy" | "fmt" | "run" | "test" | "audit" | "clean"
                 if cmd.is_none() =>
             {
                 cmd = Some(a)
             }
+            "-cache" if cmd.as_deref() == Some("clean") => clean_cache = true,
             _ if cmd.as_deref() == Some("test") && test_filter.is_none() && !a.starts_with('-') => {
                 test_filter = Some(a)
             }
@@ -77,7 +79,7 @@ fn real_main() -> Result<()> {
     if workspace && package.is_some() {
         bail!("`--workspace` cannot be used with `--package`");
     }
-    if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("gc")) {
+    if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("clean")) {
         bail!(
             "`--package` does not apply to `corgi {}`",
             cmd.as_deref().unwrap_or("")
@@ -106,8 +108,8 @@ fn real_main() -> Result<()> {
         return audit::audit(&dir, release, verbose, target.as_deref());
     }
     let store = store::Store::new(store_root)?;
-    if cmd.as_deref() == Some("gc") {
-        return build::gc(&store);
+    if cmd.as_deref() == Some("clean") {
+        return build::clean(&store, clean_cache);
     }
     if cmd.as_deref() == Some("fmt") {
         if release || target.is_some() || timings || no_incremental {
