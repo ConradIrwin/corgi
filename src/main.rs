@@ -22,12 +22,13 @@ fn real_main() -> Result<()> {
     let mut no_incremental = false;
     let mut release = false;
     let mut workspace = false;
+    let mut package: Option<String> = None;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
     const USAGE: &str = "usage: corgi build|check|clippy|run|test|audit|gc \
-[--dir DIR] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
+[--dir DIR] [-p PACKAGE] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => {
@@ -42,6 +43,9 @@ fn real_main() -> Result<()> {
             "--no-incremental" => no_incremental = true,
             "--release" => release = true,
             "--workspace" => workspace = true,
+            "-p" | "--package" => {
+                package = Some(args.next().context("--package needs a value")?)
+            }
             "--target" => target = Some(args.next().context("--target needs a value")?),
             "build" | "check" | "clippy" | "run" | "test" | "audit" | "gc" if cmd.is_none() => {
                 cmd = Some(a)
@@ -60,6 +64,12 @@ fn real_main() -> Result<()> {
     }
     if workspace && matches!(cmd.as_deref(), Some("run") | Some("audit")) {
         bail!("`--workspace` does not apply to `corgi {}`", cmd.as_deref().unwrap_or(""));
+    }
+    if workspace && package.is_some() {
+        bail!("`--workspace` cannot be used with `--package`");
+    }
+    if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("gc")) {
+        bail!("`--package` does not apply to `corgi {}`", cmd.as_deref().unwrap_or(""));
     }
 
     let dir = match dir {
@@ -99,6 +109,7 @@ fn real_main() -> Result<()> {
             verbose,
             release,
             workspace,
+            package,
             target,
             mode,
             timings,

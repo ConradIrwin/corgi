@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct Metadata {
     #[serde(default)]
     pub workspace_members: Vec<String>,
+    #[serde(default)]
+    pub workspace_default_members: Vec<String>,
     pub packages: Vec<Package>,
     pub resolve: Resolve,
     pub workspace_root: String,
@@ -24,6 +26,8 @@ pub struct Package {
     pub features: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub links: Option<String>,
+    #[serde(default)]
+    pub default_run: Option<String>,
     pub targets: Vec<Target>,
     #[serde(default)]
     pub authors: Vec<String>,

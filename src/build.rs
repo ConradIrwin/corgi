@@ -1169,6 +1169,8 @@ pub struct BuildOpts {
     /// Take every workspace member's units as roots instead of the
     /// package at the build dir (cargo's --workspace).
     pub workspace: bool,
+    /// Cargo package name selected by `-p` or `--package`.
+    pub package: Option<String>,
     pub target: Option<String>,
     pub mode: Mode,
     pub timings: bool,
@@ -1186,6 +1188,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         verbose,
         release,
         workspace,
+        package,
         target,
         mode,
         timings,
@@ -1362,7 +1365,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             // RUSTC is pinned (cargo otherwise resolves `rustc` from PATH,
             // and a rustup shim picks its toolchain by cwd), and cwd is the
             // build dir so cargo's own config discovery sees the workspace.
-            if capture(
+            if capture_with_live_stderr(
                 Command::new(&cargo_bin)
                     .args(["fetch", "--locked", "--manifest-path"])
                     .arg(&manifest)
@@ -1374,7 +1377,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             .is_err()
             {
                 eprintln!("corgi: Cargo.lock is missing or stale; letting cargo update it");
-                capture(
+                capture_with_live_stderr(
                     Command::new(&cargo_bin)
                         .args(["fetch", "--manifest-path"])
                         .arg(&manifest)
@@ -1392,7 +1395,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             meta_cmd.env("RUSTC", &rustc);
             meta_cmd.current_dir(&dir);
             meta_cmd.arg("--manifest-path").arg(&manifest);
-            let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
+            let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
             let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
             // Feature unification over a FIXED universe (whole workspace, or the
             // declared member set for cross targets) — never scoped to the requested
@@ -1424,7 +1427,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 }
             }
             ug_cmd.arg("--manifest-path").arg(&ws_manifest);
-            let ug_json = capture(&mut ug_cmd, "cargo build --unit-graph")?;
+            let ug_json = capture_with_live_stderr(&mut ug_cmd, "cargo build --unit-graph")?;
             save_plan(&store, &plan_ptr, &dir, &meta, &meta_json, &ug_json)?;
             Ok((meta_json, ug_json))
         }
@@ -1476,14 +1479,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let root_pi: Option<usize> = if workspace {
-        None
-    } else {
-        let root_id = meta.resolve.root.clone().context(
-            "no root package (build from a member directory, or pass --workspace)",
-        )?;
-        Some(pkgs[&root_id])
-    };
+    let root_pi = select_root_package(&meta, &pkgs, workspace, package.as_deref(), mode)?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, root_pi)?;
     let profile_name = units
@@ -1944,18 +1940,14 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             .filter(|(_, u)| matches!(u.kind, Kind::Bin) && u.is_root)
             .map(|(i, _)| i)
             .collect();
-        let bin_index = match root_bins.as_slice() {
-            [only] => *only,
-            _ => bail!(
-                "`corgi run` needs exactly one binary target, found {}: [{}]",
-                root_bins.len(),
-                root_bins
-                    .iter()
-                    .map(|&i| ctx.units[i].target.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
+        let package = root_bins
+            .first()
+            .map(|&i| &ctx.meta.packages[ctx.units[i].pkg])
+            .context("selected package has no runnable binary target")?;
+        let bin_index = select_run_binary(
+            package.default_run.as_deref(),
+            root_bins.iter().map(|&i| (i, ctx.units[i].target.name.as_str())),
+        )?;
         let dest = dtarget.join(&ctx.profile_name).join(&ctx.units[bin_index].target.name);
         eprintln!("corgi:  running {}", dest.display());
         // Exactly a manual run of the exported binary: ambient env, the
@@ -2122,6 +2114,17 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {
+    let out = cmd
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("running {what}"))?;
+    if !out.status.success() {
+        bail!("{what} failed with {}", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for d in std::env::split_paths(&path) {
@@ -2154,6 +2157,89 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
             (format!("CARGO_CFG_{}", k.to_uppercase().replace('-', "_")), vs.join(","))
         })
         .collect()
+}
+
+fn select_root_package(
+    metadata: &Metadata,
+    package_indices: &HashMap<String, usize>,
+    workspace: bool,
+    package: Option<&str>,
+    mode: Mode,
+) -> Result<Option<usize>> {
+    if workspace {
+        return Ok(None);
+    }
+    if let Some(package) = package {
+        let workspace_members: BTreeSet<&str> =
+            metadata.workspace_members.iter().map(String::as_str).collect();
+        let matches: Vec<usize> = metadata
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                workspace_members.contains(candidate.id.as_str()) && candidate.name == package
+            })
+            .map(|(index, _)| index)
+            .collect();
+        return match matches.as_slice() {
+            [index] => Ok(Some(*index)),
+            [] => bail!("package `{package}` is not a workspace member"),
+            _ => bail!("package specification `{package}` is ambiguous"),
+        };
+    }
+    if let Some(root_id) = &metadata.resolve.root {
+        return package_indices
+            .get(root_id)
+            .copied()
+            .map(Some)
+            .with_context(|| format!("root package {root_id} missing from metadata"));
+    }
+    if matches!(mode, Mode::Run) {
+        let default_members: Vec<usize> = metadata
+            .workspace_default_members
+            .iter()
+            .filter_map(|id| package_indices.get(id).copied())
+            .collect();
+        return match default_members.as_slice() {
+            [index] => Ok(Some(*index)),
+            [] => bail!("virtual workspace has no default package; use `-p PACKAGE`"),
+            _ => bail!(
+                "virtual workspace has multiple default packages: [{}]; use `-p PACKAGE`",
+                default_members
+                    .iter()
+                    .map(|&index| metadata.packages[index].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    }
+    bail!("no root package (build from a member directory, or pass --workspace)")
+}
+
+fn select_run_binary<'a>(
+    default_run: Option<&str>,
+    binaries: impl Iterator<Item = (usize, &'a str)>,
+) -> Result<usize> {
+    let binaries: Vec<(usize, &str)> = binaries.collect();
+    if let Some(default_run) = default_run {
+        return binaries
+            .iter()
+            .find(|(_, name)| *name == default_run)
+            .map(|(index, _)| *index)
+            .with_context(|| {
+                format!(
+                    "default-run target `{default_run}` is not available; check its required features"
+                )
+            });
+    }
+    match binaries.as_slice() {
+        [(index, _)] => Ok(*index),
+        _ => bail!(
+            "`corgi run` could not determine which binary to run; found {}: [{}]",
+            binaries.len(),
+            binaries.iter().map(|(_, name)| *name).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// Translate cargo's unit-graph into corgi units. Cargo did the real
@@ -3012,6 +3098,90 @@ fn ws_relative_pkg_id(id: &str, workspace_root: &str) -> String {
         }
     }
     id.to_string()
+}
+
+#[cfg(test)]
+mod run_selection_tests {
+    use super::{select_root_package, select_run_binary, Mode};
+    use crate::meta::Metadata;
+    use std::collections::HashMap;
+
+    #[test]
+    fn run_uses_the_single_workspace_default_member() {
+        let metadata = metadata();
+        let package_indices = metadata
+            .packages
+            .iter()
+            .enumerate()
+            .map(|(index, package)| (package.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+
+        let selected =
+            select_root_package(&metadata, &package_indices, false, None, Mode::Run).unwrap();
+
+        assert_eq!(selected, Some(0));
+        assert_eq!(metadata.packages[selected.unwrap()].name, "delta");
+    }
+
+    #[test]
+    fn explicit_package_overrides_the_workspace_default_member() {
+        let metadata = metadata();
+        let package_indices = metadata
+            .packages
+            .iter()
+            .enumerate()
+            .map(|(index, package)| (package.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+
+        let selected =
+            select_root_package(&metadata, &package_indices, false, Some("helper"), Mode::Run)
+                .unwrap();
+
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn default_run_selects_among_multiple_binaries() {
+        let selected =
+            select_run_binary(Some("delta"), [(4, "delta-cli"), (9, "delta")].into_iter())
+                .unwrap();
+
+        assert_eq!(selected, 9);
+        assert!(select_run_binary(None, [(4, "delta-cli"), (9, "delta")].into_iter()).is_err());
+    }
+
+    fn metadata() -> Metadata {
+        serde_json::from_value(serde_json::json!({
+            "workspace_members": ["delta 0.1.0 (path+file:///workspace/crates/delta)", "helper 0.1.0 (path+file:///workspace/crates/helper)"],
+            "workspace_default_members": ["delta 0.1.0 (path+file:///workspace/crates/delta)"],
+            "packages": [
+                {
+                    "name": "delta",
+                    "version": "0.1.0",
+                    "id": "delta 0.1.0 (path+file:///workspace/crates/delta)",
+                    "source": null,
+                    "manifest_path": "/workspace/crates/delta/Cargo.toml",
+                    "edition": "2021",
+                    "default_run": "delta",
+                    "targets": [],
+                    "metadata": {}
+                },
+                {
+                    "name": "helper",
+                    "version": "0.1.0",
+                    "id": "helper 0.1.0 (path+file:///workspace/crates/helper)",
+                    "source": null,
+                    "manifest_path": "/workspace/crates/helper/Cargo.toml",
+                    "edition": "2021",
+                    "targets": [],
+                    "metadata": {}
+                }
+            ],
+            "resolve": {"root": null},
+            "workspace_root": "/workspace"
+        }))
+        .unwrap()
+    }
 }
 
 #[cfg(test)]

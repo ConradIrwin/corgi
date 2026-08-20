@@ -5,7 +5,7 @@ A Cargo.toml-compatible build tool for Rust that makes builds **deterministic**
 content-addressed store** shared by any number of worktrees.
 
 ```
-corgi build [--dir DIR] [-v]      # store at ~/.cache/corgi, override with $CORGI_STORE
+corgi build [--dir DIR] [-p PACKAGE] [-v] # store at ~/.cache/corgi, override with $CORGI_STORE
 ```
 
 ## How it works
