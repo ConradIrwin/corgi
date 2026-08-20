@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("dcargo: error: {e:#}");
+        eprintln!("corgi: error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -26,7 +26,7 @@ fn real_main() -> Result<()> {
     let mut cmd: Option<String> = None;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
-    const USAGE: &str = "usage: dcargo build|check|clippy|run|test|audit|gc \
+    const USAGE: &str = "usage: corgi build|check|clippy|run|test|audit|gc \
 [--dir DIR] [--workspace] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -56,10 +56,10 @@ fn real_main() -> Result<()> {
         }
     }
     if !exec_args.is_empty() && !matches!(cmd.as_deref(), Some("run") | Some("test")) {
-        bail!("`--` arguments only apply to `dcargo run` and `dcargo test` ({USAGE})");
+        bail!("`--` arguments only apply to `corgi run` and `corgi test` ({USAGE})");
     }
     if workspace && matches!(cmd.as_deref(), Some("run") | Some("audit")) {
-        bail!("`--workspace` does not apply to `dcargo {}`", cmd.as_deref().unwrap_or(""));
+        bail!("`--workspace` does not apply to `corgi {}`", cmd.as_deref().unwrap_or(""));
     }
 
     let dir = match dir {
@@ -68,14 +68,14 @@ fn real_main() -> Result<()> {
     };
     // Default: the store lives *directly at* the canonical machine-wide
     // path, so embedded OUT_DIR paths are canonical with no indirection.
-    // DCARGO_STORE relocates it (a symlink alias then preserves the
+    // CORGI_STORE relocates it (a symlink alias then preserves the
     // canonical spelling).
-    let store_root = std::env::var_os("DCARGO_STORE").map(PathBuf::from).unwrap_or_else(|| {
+    let store_root = std::env::var_os("CORGI_STORE").map(PathBuf::from).unwrap_or_else(|| {
         if cfg!(target_os = "macos") {
-            PathBuf::from("/Users/Shared/dcargo")
+            PathBuf::from("/Users/Shared/corgi")
         } else {
             let home = std::env::var_os("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".cache/dcargo")
+            PathBuf::from(home).join(".cache/corgi")
         }
     });
     if cmd.as_deref() == Some("audit") {

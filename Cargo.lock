@@ -30,6 +30,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "corgi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jobserver",
+ "memchr",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -45,19 +58,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "dcargo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "jobserver",
- "memchr",
- "serde",
- "serde_json",
- "sha2",
- "toml",
 ]
 
 [[package]]

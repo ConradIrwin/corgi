@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
-const TOOL_VERSION: &str = "dcargo/0.21";
+const TOOL_VERSION: &str = "corgi/0.21";
 
 // Profiles come per unit from cargo's unit graph — inheritance,
 // build-override, per-package overrides, and platform defaults already
@@ -218,7 +218,7 @@ pub struct Ctx {
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
-    /// Emit a per-unit timing report (target/dcargo-timings/).
+    /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
     /// store-managed state. Off under --no-incremental (audit, CI).
@@ -255,7 +255,7 @@ pub struct Ctx {
     host_rustflags: Vec<String>,
     /// Resolved [env] entries, sorted; applied and keyed on every action.
     config_env: Vec<(String, String)>,
-    /// dcargo.toml [extra-inputs]: package -> package-root-relative reads
+    /// corgi.toml [extra-inputs]: package -> package-root-relative reads
     /// outside the package, granted to its actions and hashed as inputs.
     extra_inputs: ExtraInputs,
 }
@@ -370,7 +370,7 @@ struct UniverseDef {
     packages: Vec<String>,
 }
 
-/// Workspace dcargo.toml: sha256-pinned tools, plan-time env probes, and
+/// Workspace corgi.toml: sha256-pinned tools, plan-time env probes, and
 /// feature universes. Every setting names the packages it applies to, and
 /// only those actions key on it — the file itself is never hashed into
 /// keys, so comment or command-text edits rebuild nothing. Parsed with
@@ -378,7 +378,7 @@ struct UniverseDef {
 /// or keys are hard errors via deny_unknown_fields.
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct DcargoToml {
+struct CorgiToml {
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
     #[serde(default)]
@@ -395,13 +395,13 @@ struct DcargoToml {
 
 type Universes = Vec<(String, Vec<String>)>;
 type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
-type DcargoManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes, ExtraInputs);
+type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes, ExtraInputs);
 
-fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
+fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
     while let Some(d) = cur {
-        let p = d.join("dcargo.toml");
+        let p = d.join("corgi.toml");
         if p.exists() {
             found = Some(p);
             break;
@@ -410,7 +410,7 @@ fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
     }
     let Some(p) = found else { return Ok(None) };
     let text = fs::read_to_string(&p)?;
-    let parsed: DcargoToml =
+    let parsed: CorgiToml =
         toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     let mut specs: Vec<ToolSpec> = Vec::new();
     for (name, mut t) in parsed.tools {
@@ -437,7 +437,7 @@ fn read_dcargo_toml(dir: &Path) -> Result<Option<DcargoManifest>> {
 }
 
 /// Resolved lint flags for one workspace member. Lints are inputs like
-/// any probe value: dcargo is the producer (cargo exposes no API for
+/// any probe value: corgi is the producer (cargo exposes no API for
 /// them — checked: unit graph, cargo metadata, and build-plan, which is
 /// removed), the manifests they come from never enter keys, and only
 /// these resolved values do.
@@ -593,7 +593,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
         touch_tool_marker(&dest);
         return Ok(dest.join(exported));
     }
-    eprintln!("dcargo: installing tool {} {} (sha256-pinned)", t.name, t.version);
+    eprintln!("corgi: installing tool {} {} (sha256-pinned)", t.name, t.version);
     let work = store.tmp_path("tool");
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
@@ -669,9 +669,9 @@ fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
     }
 }
 
-/// Resolve the host triple *without* a rustc: dcargo's own build constants.
+/// Resolve the host triple *without* a rustc: corgi's own build constants.
 /// Cross-checked later against the pinned rustc's self-reported host.
-/// (Known gap: under Rosetta an x86_64 dcargo resolves x86_64-apple-darwin.)
+/// (Known gap: under Rosetta an x86_64 corgi resolves x86_64-apple-darwin.)
 fn host_triple() -> Result<String> {
     let arch = std::env::consts::ARCH;
     let os = match std::env::consts::OS {
@@ -711,7 +711,7 @@ fn read_toolchain_pin(dir: &Path) -> Result<String> {
         fs::read_to_string(&legacy)?.trim().to_string()
     } else {
         bail!(
-            "dcargo requires a pinned toolchain: create rust-toolchain.toml with \
+            "corgi requires a pinned toolchain: create rust-toolchain.toml with \
              `[toolchain]\nchannel = \"<exact version>\"` (e.g. \"1.94.1\" or \"nightly-2026-03-25\")"
         );
     };
@@ -748,10 +748,10 @@ fn is_concrete_channel(c: &str) -> bool {
 /// blob implies only stale actions point at it. Deleting something in
 /// use is benign: probes self-heal by rebuilding.
 pub fn gc(store: &Store) -> Result<()> {
-    let days: u64 = std::env::var("DCARGO_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     let (files, dirs, bytes) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600))?;
     eprintln!(
-        "dcargo: gc removed {files} files and {dirs} dirs ({:.1} MB) older than {days} days",
+        "corgi: gc removed {files} files and {dirs} dirs ({:.1} MB) older than {days} days",
         bytes as f64 / 1e6
     );
     Ok(())
@@ -769,9 +769,9 @@ fn maybe_auto_gc(store: &Store) {
             return; // clock skew: fine, skip
         }
     }
-    let days: u64 = std::env::var("DCARGO_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let days: u64 = std::env::var("CORGI_GC_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     if let Err(e) = gc_trim(store, std::time::Duration::from_secs(days * 24 * 3600)) {
-        eprintln!("dcargo: warning: gc trim failed: {e:#}");
+        eprintln!("corgi: warning: gc trim failed: {e:#}");
     }
     let _ = store.write_atomic(&marker, b"trimmed\n");
 }
@@ -832,12 +832,12 @@ fn gc_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
             }
         }
     }
-    // tools/: judged by the .dcargo-used marker every build refreshes
+    // tools/: judged by the .corgi-used marker every build refreshes
     for p in read_dir_paths(&store.root.join("tools"))? {
         if !p.is_dir() {
             continue;
         }
-        let marker = p.join(".dcargo-used");
+        let marker = p.join(".corgi-used");
         if !marker.exists() {
             // Seed a marker rather than judging by dir mtime: tarball-derived
             // dirs keep the archive's embedded (often ancient) timestamps.
@@ -940,7 +940,7 @@ fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Refresh a tool/toolchain dir's use marker (throttled like all touches).
 fn touch_tool_marker(dir: &Path) {
-    let marker = dir.join(".dcargo-used");
+    let marker = dir.join(".corgi-used");
     if !marker.exists() {
         let _ = fs::write(&marker, b"used\n");
         return;
@@ -957,7 +957,7 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
         touch_tool_marker(&dest);
         return Ok(bin);
     }
-    eprintln!("dcargo: installing toolchain {channel}-{triple} into {}", dest.display());
+    eprintln!("corgi: installing toolchain {channel}-{triple} into {}", dest.display());
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
         (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
     } else if let Some(d) = channel.strip_prefix("beta-") {
@@ -1004,7 +1004,7 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
         if !st.success() {
             bail!("copying component {comp} failed");
         }
-        eprintln!("dcargo:   {comp} {ver} verified (sha256 {}…)", &expected[..12]);
+        eprintln!("corgi:   {comp} {ver} verified (sha256 {}…)", &expected[..12]);
     }
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&install, &dest) {
@@ -1028,7 +1028,7 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
         touch_tool_marker(&dest);
         return Ok(());
     }
-    eprintln!("dcargo: installing rust-src {channel} (sha256-pinned)");
+    eprintln!("corgi: installing rust-src {channel} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
         (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
     } else if let Some(d) = channel.strip_prefix("beta-") {
@@ -1075,7 +1075,7 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str) -> Result<()> {
     if driver.is_file() {
         return Ok(());
     }
-    eprintln!("dcargo: installing clippy {channel} (sha256-pinned)");
+    eprintln!("corgi: installing clippy {channel} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
         (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
     } else if let Some(d) = channel.strip_prefix("beta-") {
@@ -1123,7 +1123,7 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
         touch_tool_marker(&dest);
         return Ok(());
     }
-    eprintln!("dcargo: installing rust-std for {target} (sha256-pinned)");
+    eprintln!("corgi: installing rust-std for {target} (sha256-pinned)");
     let (base, ver) = if let Some(d) = channel.strip_prefix("nightly-") {
         (format!("https://static.rust-lang.org/dist/{d}"), "nightly".to_string())
     } else if let Some(d) = channel.strip_prefix("beta-") {
@@ -1206,7 +1206,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // is the one honored channel.
     for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"] {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
-            bail!("{var} is set; dcargo only honors rustflags from .cargo/config.toml");
+            bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
     }
     let (cargo_config, config_dir) = crate::config::discover(&dir)?;
@@ -1217,7 +1217,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // Debugger convenience, deliberately outside the sysroot (see
     // ensure_rust_src). Failure is non-fatal: builds don't need sources.
     if let Err(e) = ensure_rust_src(&store, &channel) {
-        eprintln!("dcargo: warning: rust-src install failed ({e}); std source display in debuggers unavailable");
+        eprintln!("corgi: warning: rust-src install failed ({e}); std source display in debuggers unavailable");
     }
     // Hand actions only the *logical* toolchain path (via the store alias):
     // physical per-store paths leak into ld's UUID (it hashes the link
@@ -1236,7 +1236,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         .trim()
         .to_string();
     if host != host_guess {
-        bail!("host triple mismatch: dcargo resolved {host_guess}, pinned rustc reports {host}");
+        bail!("host triple mismatch: corgi resolved {host_guess}, pinned rustc reports {host}");
     }
     // Rustflags resolve against the platform a unit compiles for; host
     // units (build scripts, proc-macros) only get them when no explicit
@@ -1293,7 +1293,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // Dependency sources live in the store: cargo (fetch/metadata/
     // unit-graph) runs with CARGO_HOME at the canonical store path, so
     // registry and git checkouts land at machine-independent locations
-    // that exist wherever a dcargo store does. Debug info referencing dep
+    // that exist wherever a corgi store does. Debug info referencing dep
     // sources therefore needs no remapping and no debugger fixups. Side
     // effect (deliberate): the user's ~/.cargo/config.toml no longer
     // silently shapes hermetic builds.
@@ -1302,14 +1302,14 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let t_setup_done = Instant::now();
     // ---- plan-phase cache -------------------------------------------------
     // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
-    // changed. Their outputs are a pure function of: dcargo itself, the
+    // changed. Their outputs are a pure function of: corgi itself, the
     // pinned toolchain, target/profile, the tools manifest (feature
     // universes), every workspace manifest, the lockfile, cargo config, and
     // the member-glob directory listings. A pointer keyed on the cheap
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let (universes, extra_inputs) = match read_dcargo_toml(&dir)? {
+    let (universes, extra_inputs) = match read_corgi_toml(&dir)? {
         Some((_, _, u, x)) => (u, x),
         None => (Universes::new(), ExtraInputs::new()),
     };
@@ -1353,7 +1353,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
     let resolve_now = || -> Result<(String, String)> {
         {
-            eprintln!("dcargo: resolving/fetching dependencies via cargo (metadata only)");
+            eprintln!("corgi: resolving/fetching dependencies via cargo (metadata only)");
             // Never bother the user about a stale lockfile: try --locked
             // first (it never writes), and when cargo rejects it, run once
             // unlocked so cargo brings Cargo.lock up to date, then continue.
@@ -1373,7 +1373,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             )
             .is_err()
             {
-                eprintln!("dcargo: Cargo.lock is missing or stale; letting cargo update it");
+                eprintln!("corgi: Cargo.lock is missing or stale; letting cargo update it");
                 capture(
                     Command::new(&cargo_bin)
                         .args(["fetch", "--manifest-path"])
@@ -1432,7 +1432,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let from_cache = plan.is_some();
     let (mut meta_json, mut ug_json) = match plan {
         Some(cached) => {
-            eprintln!("dcargo: plan unchanged (cached resolve; skipping cargo)");
+            eprintln!("corgi: plan unchanged (cached resolve; skipping cargo)");
             cached
         }
         None => resolve_now()?,
@@ -1442,7 +1442,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // extracted in the store (gc may have trimmed them); verify cheaply
     // and re-resolve once if anything is missing.
     if from_cache && meta.packages.iter().any(|p| p.source.is_some() && !p.root().exists()) {
-        eprintln!("dcargo: dependency sources missing from the store; re-fetching");
+        eprintln!("corgi: dependency sources missing from the store; re-fetching");
         let (m, u) = resolve_now()?;
         meta_json = m;
         ug_json = u;
@@ -1533,17 +1533,17 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     };
     // One-shot warnings for profile settings we deliberately don't honor.
     if units.iter().any(|u| u.profile.lto_enabled()) {
-        eprintln!("dcargo: warning: profile requests lto; not supported yet, building without");
+        eprintln!("corgi: warning: profile requests lto; not supported yet, building without");
     }
     if units.iter().any(|u| u.profile.rpath) {
-        eprintln!("dcargo: warning: profile requests rpath; ignored");
+        eprintln!("corgi: warning: profile requests rpath; ignored");
     }
     if units.iter().any(|u| {
         u.profile.debuginfo_flag() != "0"
             && matches!(u.profile.split_debuginfo.as_deref(), Some("packed") | Some("off"))
     }) {
         eprintln!(
-            "dcargo: warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (determinism requires it)"
+            "corgi: warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (determinism requires it)"
         );
     }
     // Under check, everything needed for *execution* (build scripts, their
@@ -1617,7 +1617,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // stanza — loop until green.
     let sandbox = host.contains("apple") && Path::new("/usr/bin/sandbox-exec").is_file();
     if sandbox {
-        eprintln!("dcargo: hermetic sandbox enabled (seatbelt)");
+        eprintln!("corgi: hermetic sandbox enabled (seatbelt)");
     }
     // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
     // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
@@ -1663,7 +1663,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    if let Some((specs, probes, _, _)) = read_dcargo_toml(&dir)? {
+    if let Some((specs, probes, _, _)) = read_corgi_toml(&dir)? {
         for t in &specs {
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
@@ -1677,7 +1677,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             } else {
                 format!(" (packages {:?})", t.packages)
             };
-            eprintln!("dcargo: tool {} {} -> ${}{scope}", t.name, t.version, t.env);
+            eprintln!("corgi: tool {} {} -> ${}{scope}", t.name, t.version, t.env);
             // The setting's own identity: exactly the scoped actions key
             // on it, so a pin edit has exactly the declared blast radius.
             let id = sha256_hex(
@@ -1721,7 +1721,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             )?;
             let val = out.trim().to_string();
             eprintln!(
-                "dcargo: env {}={} (packages {:?}{})",
+                "corgi: env {}={} (packages {:?}{})",
                 probe.name,
                 val,
                 probe.packages,
@@ -1751,7 +1751,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             None => "workspace".to_string(),
         };
         eprintln!(
-            "dcargo: building {building} — {} units (store {})",
+            "corgi: building {building} — {} units (store {})",
             units.len(),
             store.root.display()
         );
@@ -1764,7 +1764,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     if let Some(config_location) = &config_dir {
         if config_location != Path::new(&workspace_root) {
             bail!(
-                ".cargo/config found at {} but the workspace root is {}; dcargo only honors the workspace's own config",
+                ".cargo/config found at {} but the workspace root is {}; corgi only honors the workspace's own config",
                 config_location.display(),
                 workspace_root
             );
@@ -1826,7 +1826,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let t_sched_done = Instant::now();
 
     if matches!(mode, Mode::Test) {
-        fs::create_dir_all("/tmp/dcargo/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
+        fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
     }
 
     // Exports anchor at the WORKSPACE root (cargo's target/ convention):
@@ -1834,7 +1834,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let dtarget = Path::new(&ctx.workspace_root).join("target");
 
     // Test harnesses run fresh every time (results deliberately uncached
-    // for now, so cargo-vs-dcargo comparisons stay honest). Unsandboxed,
+    // for now, so cargo-vs-corgi comparisons stay honest). Unsandboxed,
     // exactly as if run by hand: ambient env untouched (no CARGO_* vars),
     // only cwd = the package root, which the location-free artifact
     // contract requires (baked-in "." manifest paths resolve there).
@@ -1859,7 +1859,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
-            eprintln!("dcargo: running tests: {} ({})", u.target.name, dest.display());
+            eprintln!("corgi: running tests: {} ({})", u.target.name, dest.display());
             let mut c = Command::new(&dest);
             c.current_dir(pkg.root());
             if let Some(filter) = &test_filter {
@@ -1872,7 +1872,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             }
         }
         if !failures.is_empty() {
-            eprintln!("dcargo: finished in {:.2}s", t0.elapsed().as_secs_f64());
+            eprintln!("corgi: finished in {:.2}s", t0.elapsed().as_secs_f64());
             bail!("{} test target(s) failed: {}", failures.len(), failures.join(", "));
         }
     }
@@ -1887,7 +1887,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             let m = r.main.as_ref().context("bin artifact missing")?;
             let dest = dtarget.join(&ctx.profile_name).join(&t.name);
             ctx.store.export(&m.hash, &dest, true)?;
-            eprintln!("dcargo:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
+            eprintln!("corgi:   bin {}  (sha256 {}…)", dest.display(), &m.hash[..12]);
             for o in &r.res.outputs {
                 if o.name.ends_with(".rcgu.o") {
                     // The binary's debug map references these objects
@@ -1905,16 +1905,16 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                         let clean = o.name.replace(&format!("-{k16}"), "");
                         let dest = dtarget.join(tgt).join(&ctx.profile_name).join(&clean);
                         ctx.store.export(&o.hash, &dest, true)?;
-                        eprintln!("dcargo:   cdylib {}  (sha256 {}…)", dest.display(), &o.hash[..12]);
+                        eprintln!("corgi:   cdylib {}  (sha256 {}…)", dest.display(), &o.hash[..12]);
                     }
                 }
             }
         }
     }
-    if std::env::var_os("DCARGO_TIMING").is_some() {
+    if std::env::var_os("CORGI_TIMING").is_some() {
         use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
-            "dcargo-timing: setup {:.3}s | plan {:.3}s | identity+tools {:.3}s | schedule {:.3}s (src-hash sum {:.3}s across workers) | export {:.3}s",
+            "corgi-timing: setup {:.3}s | plan {:.3}s | identity+tools {:.3}s | schedule {:.3}s (src-hash sum {:.3}s across workers) | export {:.3}s",
             (t_setup_done - t0).as_secs_f64(),
             (t_plan_done - t_setup_done).as_secs_f64(),
             (t_ctx_done - t_plan_done).as_secs_f64(),
@@ -1923,7 +1923,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             t_sched_done.elapsed().as_secs_f64(),
         );
         eprintln!(
-            "dcargo-timing: hinted dirs {}, files statted {}, files content-rehashed {}, immutable src-hash hits {}, export-check bytes hashed {}",
+            "corgi-timing: hinted dirs {}, files statted {}, files content-rehashed {}, immutable src-hash hits {}, export-check bytes hashed {}",
             crate::store::HINTED_DIRS.load(Relaxed),
             crate::store::STAT_FILES.load(Relaxed),
             crate::store::REHASHED_FILES.load(Relaxed),
@@ -1932,7 +1932,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         );
     }
     eprintln!(
-        "dcargo: finished in {:.2}s — {executed} executed, {cached} cached",
+        "corgi: finished in {:.2}s — {executed} executed, {cached} cached",
         t0.elapsed().as_secs_f64()
     );
     maybe_auto_gc(&ctx.store);
@@ -1947,7 +1947,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         let bin_index = match root_bins.as_slice() {
             [only] => *only,
             _ => bail!(
-                "`dcargo run` needs exactly one binary target, found {}: [{}]",
+                "`corgi run` needs exactly one binary target, found {}: [{}]",
                 root_bins.len(),
                 root_bins
                     .iter()
@@ -1957,9 +1957,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             ),
         };
         let dest = dtarget.join(&ctx.profile_name).join(&ctx.units[bin_index].target.name);
-        eprintln!("dcargo:  running {}", dest.display());
+        eprintln!("corgi:  running {}", dest.display());
         // Exactly a manual run of the exported binary: ambient env, the
-        // caller's cwd, inherited stdio; dcargo sets nothing (no CARGO_*
+        // caller's cwd, inherited stdio; corgi sets nothing (no CARGO_*
         // vars). The exit status is the child's, signals reported the way
         // a shell would (128 + signal).
         let status = Command::new(&dest)
@@ -2156,7 +2156,7 @@ fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Translate cargo's unit-graph into dcargo units. Cargo did the real
+/// Translate cargo's unit-graph into corgi units. Cargo did the real
 /// resolution (per-platform features, cfg-gated deps, host/target split);
 /// we only re-shape it.
 fn translate_unit_graph(
@@ -2684,7 +2684,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
 
     let st = state.into_inner().unwrap();
     if !st.errors.is_empty() {
-        eprintln!("\ndcargo: ===== {} units failed =====", st.errors.len());
+        eprintln!("\ncorgi: ===== {} units failed =====", st.errors.len());
         for (i, e) in st.errors.iter().enumerate() {
             let lines: Vec<&str> = e.lines().collect();
             let tail = lines.len().saturating_sub(22);
@@ -2723,7 +2723,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             });
         }
         if let Err(e) = write_timings_report(ctx, &rows, wall, st.executed, st.cached, cached_walk_ns) {
-            eprintln!("dcargo: warning: could not write timings report: {e:#}");
+            eprintln!("corgi: warning: could not write timings report: {e:#}");
         }
     }
     Ok((st.executed, st.cached))
@@ -2821,7 +2821,7 @@ fn write_timings_report(
     let sum_key: u64 = rows.iter().map(|r| r.phases.key_ns).sum();
     let sum_finish: u64 = rows.iter().map(|r| r.phases.finish_ns).sum();
     let html = format!(
-        "<!doctype html><meta charset=utf-8><title>dcargo timings</title><style>\
+        "<!doctype html><meta charset=utf-8><title>corgi timings</title><style>\
 body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
 .row{{display:flex;align-items:center;height:14px}}\
 .lbl{{width:340px;flex:none;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
@@ -2829,7 +2829,7 @@ body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
 .bar.lib{{background:#7cb3e8}}.bar.link{{background:#b07ce8}}.bar.bsr{{background:#e8a67c}}\
 .bar i{{display:block;position:absolute;left:0;top:0;bottom:0;background:#2c6cb0;border-radius:2px 0 0 2px}}\
 table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;padding:2px 8px;text-align:left;font-size:12px}}\
-</style>\n<h1>dcargo timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
+</style>\n<h1>corgi timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
 <div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>total</th><th>rustc</th><th>front-end</th><th>ingest</th><th>key</th><th>cache</th><th>validate</th><th>finish</th><th>other</th></tr>{table}</table>\n\
 <p>phase totals across executed units: rustc {:.1}s · ingest {:.1}s ({:.2} GB hashed) · key {:.1}s · finish {:.1}s · cache-hit walk {:.1}s</p>\n",
         wall.as_secs_f64(),
@@ -2844,19 +2844,19 @@ table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;pa
         sum_finish as f64 / 1e9,
         cached_walk_ns as f64 / 1e9,
     );
-    let dir = Path::new(&ctx.workspace_root).join("target/dcargo-timings");
+    let dir = Path::new(&ctx.workspace_root).join("target/corgi-timings");
     fs::create_dir_all(&dir)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let path = dir.join(format!("dcargo-timing-{stamp}.html"));
+    let path = dir.join(format!("corgi-timing-{stamp}.html"));
     fs::write(&path, &html)?;
-    fs::write(dir.join("dcargo-timing.html"), &html)?;
-    eprintln!("dcargo:   timings report: {}", path.display());
+    fs::write(dir.join("corgi-timing.html"), &html)?;
+    eprintln!("corgi:   timings report: {}", path.display());
     for r in by_dur.iter().take(5) {
         eprintln!(
-            "dcargo:   slow: {:>7.2}s  {}",
+            "corgi:   slow: {:>7.2}s  {}",
             (r.end_ns - r.start_ns) as f64 / 1e9,
             r.label
         );
@@ -2909,10 +2909,10 @@ fn expected_outputs(
                         "--print",
                         "file-names",
                         "--crate-name",
-                        "dcargoprobe",
+                        "corgiprobe",
                         "--crate-type",
                         crate_types,
-                        "-Cextra-filename=-XDCARGOX",
+                        "-Cextra-filename=-XCORGIX",
                     ]);
                     if !host {
                         if let Some(t) = &ctx.target {
@@ -2940,7 +2940,7 @@ fn expected_outputs(
     };
     let mut out: Vec<String> = pattern
         .iter()
-        .map(|n| n.replace("dcargoprobe", crate_name).replace("-XDCARGOX", &format!("-{k16}")))
+        .map(|n| n.replace("corgiprobe", crate_name).replace("-XCORGIX", &format!("-{k16}")))
         .collect();
     // pipelined pure-rlib compiles emit metadata alongside the rlib
     if crate_types == "lib" {
@@ -3222,7 +3222,7 @@ fn compile(
         // Itself-vs-Name answer off the variable's mere presence. One
         // fixed machine-global path keeps the baked value identical
         // everywhere (a workspace path would trip the location tripwire).
-        env.push(("CARGO_TARGET_TMPDIR".to_string(), "/tmp/dcargo/target-tmp".to_string()));
+        env.push(("CARGO_TARGET_TMPDIR".to_string(), "/tmp/corgi/target-tmp".to_string()));
     }
     let unit_rustflags: &[String] =
         if unit.host { &ctx.host_rustflags } else { &ctx.target_rustflags };
@@ -3346,7 +3346,7 @@ fn compile(
         // A record that does not cover the expected outputs was written by
         // a buggy or interrupted run: heal by dropping it and re-executing.
         eprintln!(
-            "dcargo: discarding corrupt action record for {} ({crate_name})",
+            "corgi: discarding corrupt action record for {} ({crate_name})",
             pkg.name
         );
         fs::remove_file(ctx.store.action_path(&key)).ok();
@@ -3507,7 +3507,7 @@ fn compile(
     }
     if let Some(d) = &incr_dir {
         cmd.arg(format!("-Cincremental={}", d.display()));
-        if std::env::var_os("DCARGO_INCR_INFO").is_some() {
+        if std::env::var_os("CORGI_INCR_INFO").is_some() {
             // Debug aid: rustc reports session hard-link counts on stderr.
             // RUSTC_BOOTSTRAP flips the tracked unstable-features option,
             // so toggling this costs one full-red loop each way and keeps
@@ -3576,7 +3576,7 @@ fn compile(
     }
 
     if ctx.verbose {
-        eprintln!("dcargo: exec {cmd:?}");
+        eprintln!("corgi: exec {cmd:?}");
     }
     ctx.jobserver.configure(&mut cmd);
     // One token per running compiler (its implicit thread); rustc acquires
@@ -3872,7 +3872,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     ctx.jobserver.configure(&mut cmd);
     let _job_token = ctx.jobserver.acquire().context("acquiring jobserver token")?;
     if ctx.verbose {
-        eprintln!("dcargo: exec {cmd:?}");
+        eprintln!("corgi: exec {cmd:?}");
     }
     let out = cmd.output().with_context(|| format!("running build script for {}", pkg.name))?;
     fs::remove_dir_all(&scratch).ok();
@@ -3892,7 +3892,7 @@ fn run_build_script(ctx: &Ctx, uidx: usize, results: &[OnceLock<UnitResult>]) ->
     let mut warnings = Vec::new();
     let bs = parse_directives(&stdout, &mut warnings)?;
     for w in warnings {
-        eprintln!("dcargo: warning ({} build script): {w}", pkg.name);
+        eprintln!("corgi: warning ({} build script): {w}", pkg.name);
     }
 
     scan_dir_for_workspace_path(&stage_out, &ctx.workspace_root)?;

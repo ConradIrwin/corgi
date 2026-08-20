@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Hash-work counters for `DCARGO_TIMING=1` reports (relaxed: stats only).
+/// Hash-work counters for `CORGI_TIMING=1` reports (relaxed: stats only).
 pub static STAT_FILES: AtomicU64 = AtomicU64::new(0);
 pub static REHASHED_FILES: AtomicU64 = AtomicU64::new(0);
 pub static HINTED_DIRS: AtomicU64 = AtomicU64::new(0);
@@ -141,7 +141,7 @@ pub struct Store {
     pub root: PathBuf,
     /// Canonical machine-independent spelling of the store root, routed
     /// through a symlink at a path that exists on every machine
-    /// (default /Users/Shared/dcargo). A poor man's bind mount.
+    /// (default /Users/Shared/corgi). A poor man's bind mount.
     pub alias: Option<PathBuf>,
     counter: AtomicU64,
 }
@@ -155,7 +155,7 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
     if alias.exists() && !fs::symlink_metadata(alias)?.file_type().is_symlink() {
         return Err(anyhow!("{} exists and is not a symlink", alias.display()));
     }
-    let tmp = alias.with_file_name(format!(".dcargo-alias-{}", std::process::id()));
+    let tmp = alias.with_file_name(format!(".corgi-alias-{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(root, &tmp)?;
     fs::rename(&tmp, alias)?; // atomic swap, lock-free like everything else
@@ -170,12 +170,12 @@ impl Store {
         // canonicalize so sandbox path rules match kernel-resolved paths
         // (e.g. /tmp/store -> /private/tmp/store)
         let root = root.canonicalize()?;
-        let alias = if std::env::var_os("DCARGO_NO_ALIAS").is_some() {
+        let alias = if std::env::var_os("CORGI_NO_ALIAS").is_some() {
             None
         } else {
-            let alias_path = std::env::var_os("DCARGO_ALIAS")
+            let alias_path = std::env::var_os("CORGI_ALIAS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/Users/Shared/dcargo"));
+                .unwrap_or_else(|| PathBuf::from("/Users/Shared/corgi"));
             if root == alias_path {
                 // the store already lives at the canonical path: no alias,
                 // no symlink, nothing for realpath() to see through
@@ -184,7 +184,7 @@ impl Store {
             match setup_alias(&alias_path, &root) {
                 Ok(()) => Some(alias_path),
                 Err(e) => {
-                    eprintln!("dcargo: warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
+                    eprintln!("corgi: warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
                     None
                 }
             }
@@ -411,7 +411,7 @@ impl Store {
         let tmp = dest
             .parent()
             .unwrap()
-            .join(format!(".dcargo-tmp-{}", std::process::id()));
+            .join(format!(".corgi-tmp-{}", std::process::id()));
         fs::copy(self.cache_path(hash), &tmp)?;
         if executable {
             use std::os::unix::fs::PermissionsExt;
@@ -481,7 +481,7 @@ mod scan_tests {
     use super::sha256_file_scan;
 
     fn scan(content: &[u8], needle: &[u8]) -> bool {
-        let path = std::env::temp_dir().join(format!("dcargo-scan-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("corgi-scan-test-{}", std::process::id()));
         std::fs::write(&path, content).unwrap();
         let (_, found) = sha256_file_scan(&path, needle).unwrap();
         std::fs::remove_file(&path).ok();

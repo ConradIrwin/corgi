@@ -12,7 +12,7 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
     let exe = std::env::current_exe()?;
     // NOT env::temp_dir(): audit stores must survive across invocations
     // for cache reuse, and $TMPDIR can be session-scoped.
-    let base = PathBuf::from("/tmp/dcargo-audit");
+    let base = PathBuf::from("/tmp/corgi-audit");
     fs::create_dir_all(&base)?;
     // Each build's store physically occupies the SAME canonical path -- a
     // real directory, no symlink alias -- exactly like production stores on
@@ -21,15 +21,15 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
     // it embeds in line tables) would record per-store physical paths and
     // report nondeterminism that production never exhibits. Stores are
     // parked aside between runs so warm re-audits stay cheap.
-    let canonical = PathBuf::from("/Users/Shared/dcargo-audit");
+    let canonical = PathBuf::from("/Users/Shared/corgi-audit");
     if canonical.symlink_metadata().is_ok() {
-        // leftover alias symlink from an old dcargo, or a dir from a
+        // leftover alias symlink from an old corgi, or a dir from a
         // crashed audit whose slot we cannot know: discard it
         fs::remove_file(&canonical).or_else(|_| fs::remove_dir_all(&canonical)).ok();
     }
     let stores = [base.join("store-a"), base.join("store-b")];
     for (i, s) in stores.iter().enumerate() {
-        eprintln!("dcargo-audit: ===== build {}/2 (store {}) =====", i + 1, s.display());
+        eprintln!("corgi-audit: ===== build {}/2 (store {}) =====", i + 1, s.display());
         if s.exists() {
             fs::rename(s, &canonical).context("unparking audit store")?;
         }
@@ -46,8 +46,8 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
         if let Some(t) = target {
             c.args(["--target", t]);
         }
-        c.env("DCARGO_STORE", &canonical);
-        c.env_remove("DCARGO_ALIAS");
+        c.env("CORGI_STORE", &canonical);
+        c.env_remove("CORGI_ALIAS");
         let st = c.status().context("spawning audit build")?;
         // park even on failure so the state stays inspectable
         fs::rename(&canonical, s).context("parking audit store")?;
@@ -83,22 +83,22 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
         }
     }
 
-    eprintln!("dcargo-audit: {identical} artifacts bit-identical across independent builds");
+    eprintln!("corgi-audit: {identical} artifacts bit-identical across independent builds");
     for k in &only {
-        eprintln!("dcargo-audit: KEY INSTABILITY: {k} — action keys differed between runs");
+        eprintln!("corgi-audit: KEY INSTABILITY: {k} — action keys differed between runs");
     }
     for k in &diffs {
-        eprintln!("dcargo-audit: NONDETERMINISTIC OUTPUT: {k}");
+        eprintln!("corgi-audit: NONDETERMINISTIC OUTPUT: {k}");
         for (s, tag) in stores.iter().zip(["A", "B"]) {
             let data = fs::read(s.join("pool").join(k))?;
             let needle = s.display().to_string();
             if data.windows(needle.len()).any(|w| w == needle.as_bytes()) {
-                eprintln!("dcargo-audit:   hint: store {tag}'s artifact embeds its own store path");
+                eprintln!("corgi-audit:   hint: store {tag}'s artifact embeds its own store path");
             }
         }
     }
     if only.is_empty() && diffs.is_empty() {
-        eprintln!("dcargo-audit: PASS");
+        eprintln!("corgi-audit: PASS");
         Ok(())
     } else {
         bail!(

@@ -1,18 +1,18 @@
-# dcargo — proof of concept
+# corgi — proof of concept
 
 A Cargo.toml-compatible build tool for Rust that makes builds **deterministic**
 (bazel-style), **lock-free** under concurrency, and cached in a **central
 content-addressed store** shared by any number of worktrees.
 
 ```
-dcargo build [--dir DIR] [-v]      # store at ~/.cache/dcargo, override with $DCARGO_STORE
+corgi build [--dir DIR] [-v]      # store at ~/.cache/corgi, override with $CORGI_STORE
 ```
 
 ## How it works
 
 Cargo is used only for what it is genuinely good at — resolution (`cargo fetch`
 + `cargo metadata --filter-platform`). Compilation is planned and executed by
-dcargo, invoking `rustc` directly so that every input is explicit.
+corgi, invoking `rustc` directly so that every input is explicit.
 
 The dependency graph is decomposed into **units**: lib compile, proc-macro
 compile, build.rs compile, build.rs *run*, and bin compile+link. Each unit is
@@ -30,7 +30,7 @@ an **action** keyed by a SHA-256 over a canonical JSON of every input:
 Results live in a machine-wide store:
 
 ```
-/Users/Shared/dcargo/
+/Users/Shared/corgi/
   cache/<xx>/<sha256>   content-addressed artifacts (rlibs, dylibs, bins)
   cache/<xx>/<key>.json action records in the same tree, Go-style: name is the
                         INPUT key, content is the answer (outputs, directives)
@@ -78,7 +78,7 @@ Results live in a machine-wide store:
 
   ```
   settings set target.source-map /rustc/$(rustc -vV | sed -n 's/commit-hash: //p') \
-      /Users/Shared/dcargo/tools/rust-src-<ver>/lib/rustlib/src/rust
+      /Users/Shared/corgi/tools/rust-src-<ver>/lib/rustlib/src/rust
   ```
 - on macOS the proc-macro dylib install name is pinned
   (`-Wl,-install_name,/dc/...`) — ld64 otherwise embeds the temp output path
@@ -118,9 +118,9 @@ at two layers:
   hashes are immutable and cached once, keyed by `source|name|version`.
 
 Lockfile handling never bothers the user: cargo runs with `--locked` (which
-never writes), and if it rejects a missing/stale `Cargo.lock`, dcargo reruns
+never writes), and if it rejects a missing/stale `Cargo.lock`, corgi reruns
 once unlocked so cargo brings the lock up to date, then continues — the plan
-fingerprint hashes the lock *after* that step. dcargo itself never writes the
+fingerprint hashes the lock *after* that step. corgi itself never writes the
 lock.
 
 - **Export hints**: exported artifacts (the ~1 GiB zed binary) are verified
@@ -128,7 +128,7 @@ lock.
   outputs are still detected and repaired from the CAS.
 
 Measured no-op: cloud worker (465 units) 1.9s -> **0.11s**; zed (1,678 units)
-3.7s -> **0.15s**. `DCARGO_TIMING=1` prints a phase/hash-work breakdown.
+3.7s -> **0.15s**. `CORGI_TIMING=1` prints a phase/hash-work breakdown.
 
 ## Verified behaviour
 
@@ -165,12 +165,12 @@ Seatbelt cannot remount paths (it is allow/deny only; macOS has no per-process
 mount namespaces), so path canonicalization is done differently:
 
 1. **Canonical store location**: the store lives directly at
-   `/Users/Shared/dcargo` (world-writable, admin-free, same path on every
+   `/Users/Shared/corgi` (world-writable, admin-free, same path on every
    Mac), so embedded OUT_DIR strings are machine-independent with no
    indirection at all — nothing for `realpath()` to see through. Relocating
-   the store (`DCARGO_STORE=...`) falls back to a symlink alias at the
+   the store (`CORGI_STORE=...`) falls back to a symlink alias at the
    canonical path, and the two modes produce bit-identical artifacts.
-   Upgrade path: an `/etc/synthetic.conf` firmlink (`/dcargo`, the Nix
+   Upgrade path: an `/etc/synthetic.conf` firmlink (`/corgi`, the Nix
    approach) for a root-level name. Note `/Users/Shared` is world-writable:
    fine for a single-dev machine, but a genuinely multi-user store wants a
    root-owned location plus a daemon (the Nix model).
@@ -191,7 +191,7 @@ mount namespaces), so path canonicalization is done differently:
 
 Verified: a crate whose build.rs bakes OUT_DIR into generated code produces
 bit-identical binaries from stores at different locations, and the embedded
-path reads `/Users/Shared/dcargo/outdirs/<key>/out` everywhere — including
+path reads `/Users/Shared/corgi/outdirs/<key>/out` everywhere — including
 inside cc-generated archive member names, which the byte-patch era got wrong.
 
 ## Exec allowlist = the cache key (toolchain identity)
@@ -213,10 +213,10 @@ knob folds into the action key like any other input.
 
 Pinning is mandatory and concrete: `rust-toolchain.toml` must name an exact
 version (`1.94.1`, `nightly-2026-03-25`); floating channels and missing pins
-are hard errors, and there is no ambient-rustup fallback. dcargo installs
+are hard errors, and there is no ambient-rustup fallback. corgi installs
 rustc + rust-std + cargo from static.rust-lang.org into the store
 (sha256-verified, atomic rename), so a machine needs no Rust installed at
-all. The host triple is resolved from dcargo's own build constants (needed
+all. The host triple is resolved from corgi's own build constants (needed
 before a rustc exists, to pick tarballs) and cross-checked against the
 pinned rustc's self-reported `host:`.
 
@@ -229,7 +229,7 @@ keys. Sysroot content identity (rust-src presence) is now folded into every
 action key. Managed toolchains without rust-src are preferable: std paths
 stay in upstream's canonical `/rustc/<commit>/` form on every machine.
 
-## Scoped workspace settings (dcargo.toml)
+## Scoped workspace settings (corgi.toml)
 
 One optional file at the workspace root; every setting names the packages
 it applies to, and **only those packages' actions key on it** — the file
@@ -261,7 +261,7 @@ packages' build scripts re-run; a probe's *value* keys the scoped actions
 all under dev — so a new git commit can't bust the dev cache. Bare-name
 spawns (`Command::new("cmake")`) resolve through a per-subset shim dir on
 the action PATH. Per-crate settings live elsewhere, in each crate's own
-manifest: `[package.metadata.dcargo] extra-inputs = [...]`.
+manifest: `[package.metadata.corgi] extra-inputs = [...]`.
 
 ## The dev loop: incremental namespace, jobserver, timings
 
@@ -279,7 +279,7 @@ without it, 18 concurrent rustcs at codegen-units=16 meant ~290 runnable
 threads on 18 cores and ~2x per-unit inflation. Blob hashing uses the
 sha2 crate's hardware intrinsics (~2.6 GB/s measured; 5x over software).
 
-`--timings` writes target/dcargo-timings/dcargo-timing-<ts>.html: a
+`--timings` writes target/corgi-timings/corgi-timing-<ts>.html: a
 gantt of executed units with front-end/codegen splits, per-unit phase
 columns (rustc, ingest bytes+time, key, cache, validate), phase totals,
 and a top-5 stderr summary. Measured editor-edit loop on zed after all
@@ -289,7 +289,7 @@ residual gap is dependents' codegen reuse, under investigation.
 
 ## Lints and clippy
 
-`[lints]` / `[workspace.lints]` are resolved by dcargo at plan time
+`[lints]` / `[workspace.lints]` are resolved by corgi at plan time
 (cargo exposes them through no API — checked: metadata, unit graph, and
 build-plan, which is removed) and treated as inputs like any probe value:
 the manifests never enter keys, only the resolved flags do, per member.
@@ -297,13 +297,13 @@ Rust-tool lints key every mode; clippy:: lints key clippy actions only —
 they're inert to rustc, so editing them never busts check or build
 caches (cargo can't say the same).
 
-`dcargo clippy` is check mode with clippy-driver as the executor for
+`corgi clippy` is check mode with clippy-driver as the executor for
 local packages' checked units, in their own key namespace (`--cfg
 clippy` is code-visible, so sharing rmetas with check would be a lie);
 the whole dependency layer shares check's rmetas. clippy.toml is a
 hashed input (clippy-driver reports it in dep-info; verified against the
 hermeticity validator). Diagnostics replay from the store: a warm
-full-workspace `dcargo clippy` on zed is 0.2s, and check/clippy
+full-workspace `corgi clippy` on zed is 0.2s, and check/clippy
 alternation is 0-executed in both directions — no fingerprint thrash.
 
 ## Root-manifest blast radius (readable = keyed, by construction)
@@ -334,7 +334,7 @@ equivalent — they are bounded by the sandbox and the package hash instead.
 
 ## Cross-compilation (--target)
 
-`dcargo build --target wasm32-unknown-unknown` builds cdylib deployables:
+`corgi build --target wasm32-unknown-unknown` builds cdylib deployables:
 rust-std for the target is fetched/verified into the pinned toolchain,
 units split into host (proc-macros, build scripts + their deps) and target
 platforms, and the target triple joins the action keys. Resolution now
@@ -359,7 +359,7 @@ the toolchain hash.
   supersedes it, conservatively)
 - `[profile.*]` honored per unit straight from cargo's unit graph
   (inheritance, `build-override`, per-package overrides, and platform
-  defaults are cargo-resolved — dcargo never re-derives them from
+  defaults are cargo-resolved — corgi never re-derives them from
   Cargo.toml). Not yet honored: `lto` (warned, built without), `rpath`,
   `incremental`; darwin linking units always use split-debuginfo=unpacked
   with `-oso_prefix` (determinism requires it); build scripts always see

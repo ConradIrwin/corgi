@@ -1,5 +1,5 @@
 [package]
-name = "dcargo"
+name = "corgi"
 version = "0.1.0"
 edition = "2021"
 description = "PoC: deterministic, content-addressed, lock-free cargo-compatible build tool"

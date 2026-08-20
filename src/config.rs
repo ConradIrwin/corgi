@@ -1,6 +1,6 @@
 //! Workspace `.cargo/config.toml` resolution.
 //!
-//! dcargo honors the narrow slice of cargo configuration that changes what
+//! corgi honors the narrow slice of cargo configuration that changes what
 //! gets compiled: `build.rustflags`, `target.<spec>.rustflags`, and `[env]`.
 //! Everything else that would alter build semantics is a hard error, so a
 //! config the tool cannot faithfully reproduce never builds silently wrong.
@@ -23,7 +23,7 @@ impl CargoConfig {
     /// all matching `target.<triple>` and `target.'cfg(...)'` entries are
     /// concatenated; `build.rustflags` applies only when no target entry
     /// matched. Cargo's join order for multiple matches is incidental, so
-    /// dcargo pins one: literal triple entries first, then cfg entries in
+    /// corgi pins one: literal triple entries first, then cfg entries in
     /// lexicographic spec order.
     pub fn rustflags_for(&self, triple: &str) -> Result<Vec<String>> {
         let mut flags = Vec::new();
@@ -94,7 +94,7 @@ fn parse(text: &str) -> Result<CargoConfig> {
                         "rustflags" => {
                             build_rustflags = flag_list(v).context("build.rustflags")?;
                         }
-                        // Parallelism and layout preferences: dcargo owns
+                        // Parallelism and layout preferences: corgi owns
                         // both, and rustdoc is not run.
                         "jobs" | "target-dir" | "incremental" | "rustdocflags" => {}
                         other => bail!("unsupported .cargo/config key build.{other}"),
@@ -134,7 +134,7 @@ fn parse(text: &str) -> Result<CargoConfig> {
                         name.as_str(),
                         "TMPDIR" | "PATH" | "HOME" | "OUT_DIR" | "SDKROOT" | "RUSTFLAGS"
                     ) || name.starts_with("CARGO_")
-                        || name.starts_with("DCARGO_");
+                        || name.starts_with("CORGI_");
                     if managed {
                         bail!("env.{name} collides with a tool-managed variable");
                     }
@@ -334,7 +334,7 @@ fn parse_expr(tokens: &[Token], pos: &mut usize) -> Result<CfgExpr> {
     }
 }
 
-/// Reject predicates dcargo cannot evaluate, up front and regardless of
+/// Reject predicates corgi cannot evaluate, up front and regardless of
 /// short-circuiting, so unsupported configs fail on load.
 fn validate_cfg(expr: &CfgExpr) -> Result<()> {
     match expr {
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn semantics_bearing_config_is_a_hard_error() {
         // Alternate compilers, linkers, profiles, forced env shapes, and
-        // predicates dcargo cannot evaluate must refuse to build rather
+        // predicates corgi cannot evaluate must refuse to build rather
         // than silently diverge from cargo.
         for bad in [
             "[build]\nrustc = \"my-rustc\"",
