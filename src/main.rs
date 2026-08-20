@@ -24,13 +24,14 @@ fn real_main() -> Result<()> {
     let mut workspace = false;
     let mut package: Option<String> = None;
     let mut target: Option<String> = None;
+    let mut root: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut clean_cache = false;
     let mut test_filter: Option<String> = None;
     let mut exec_args: Vec<String> = Vec::new();
     let mut fmt_args: Vec<String> = Vec::new();
     const USAGE: &str = "usage: corgi build|check|clippy|fmt|run|test|audit|clean \
-[--dir DIR] [-p PACKAGE] [--workspace] [--release] [--target TRIPLE] [-v] [-cache] [TESTNAME] [-- ARGS...]";
+[--dir DIR] [-p PACKAGE] [--root NAME] [--workspace] [--release] [--target TRIPLE] [-v] [-cache] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => {
@@ -54,6 +55,7 @@ fn real_main() -> Result<()> {
             "--workspace" => workspace = true,
             "-p" | "--package" => package = Some(args.next().context("--package needs a value")?),
             "--target" => target = Some(args.next().context("--target needs a value")?),
+            "--root" => root = Some(args.next().context("--root needs a value")?),
             "build" | "check" | "clippy" | "fmt" | "run" | "test" | "audit" | "clean"
                 if cmd.is_none() =>
             {
@@ -79,11 +81,17 @@ fn real_main() -> Result<()> {
     if workspace && package.is_some() {
         bail!("`--workspace` cannot be used with `--package`");
     }
+    if workspace && root.is_some() {
+        bail!("`--workspace` cannot be used with `--root`");
+    }
     if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("clean")) {
         bail!(
             "`--package` does not apply to `corgi {}`",
             cmd.as_deref().unwrap_or("")
         );
+    }
+    if root.is_some() && cmd.as_deref() == Some("clean") {
+        bail!("`--root` does not apply to `corgi clean`");
     }
 
     let dir = match dir {
@@ -105,14 +113,14 @@ fn real_main() -> Result<()> {
             }
         });
     if cmd.as_deref() == Some("audit") {
-        return audit::audit(&dir, release, verbose, target.as_deref());
+        return audit::audit(&dir, release, verbose, target.as_deref(), root.as_deref());
     }
     let store = store::Store::new(store_root)?;
     if cmd.as_deref() == Some("clean") {
         return build::clean(&store, clean_cache);
     }
     if cmd.as_deref() == Some("fmt") {
-        if release || target.is_some() || timings || no_incremental {
+        if release || target.is_some() || root.is_some() || timings || no_incremental {
             bail!("build-only options do not apply to `corgi fmt` ({USAGE})");
         }
         return build::fmt(
@@ -140,6 +148,7 @@ fn real_main() -> Result<()> {
             workspace,
             package,
             target,
+            root,
             mode,
             timings,
             no_incremental,

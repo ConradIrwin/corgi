@@ -8,7 +8,13 @@ use std::process::Command;
 /// stores (different physical paths, same canonical alias), then demand
 /// bit-identical artifacts under identical action keys. Every leak this
 /// project has found would have been caught by this check.
-pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> Result<()> {
+pub fn audit(
+    dir: &Path,
+    release: bool,
+    verbose: bool,
+    target: Option<&str>,
+    root: Option<&str>,
+) -> Result<()> {
     let exe = std::env::current_exe()?;
     // NOT env::temp_dir(): audit stores must survive across invocations
     // for cache reuse, and $TMPDIR can be session-scoped.
@@ -51,6 +57,9 @@ pub fn audit(dir: &Path, release: bool, verbose: bool, target: Option<&str>) -> 
         }
         if let Some(t) = target {
             c.args(["--target", t]);
+        }
+        if let Some(r) = root {
+            c.args(["--root", r]);
         }
         c.env("CORGI_STORE", &canonical);
         c.env_remove("CORGI_ALIAS");

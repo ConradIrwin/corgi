@@ -375,12 +375,12 @@ struct EnvProbe {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UniverseDef {
+struct RootDef {
     packages: Vec<String>,
 }
 
 /// Workspace corgi.toml: sha256-pinned tools, plan-time env probes, and
-/// feature universes. Every setting names the packages it applies to, and
+/// named resolution roots. Every setting names the packages it applies to, and
 /// only those actions key on it — the file itself is never hashed into
 /// keys, so comment or command-text edits rebuild nothing. Parsed with
 /// the `toml` crate (the parser cargo itself builds on); unknown sections
@@ -393,7 +393,7 @@ struct CorgiToml {
     #[serde(default)]
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
-    universe: std::collections::BTreeMap<String, UniverseDef>,
+    roots: std::collections::BTreeMap<String, RootDef>,
     /// Reads outside a package's root that its actions may perform:
     /// package name -> package-root-relative paths, granted and hashed as
     /// inputs. Lives here rather than in package manifests so dependency
@@ -402,9 +402,9 @@ struct CorgiToml {
     extra_inputs: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-type Universes = Vec<(String, Vec<String>)>;
+type RootSets = std::collections::BTreeMap<String, Vec<String>>;
 type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
-type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, Universes, ExtraInputs);
+type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, RootSets, ExtraInputs);
 
 fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
     let mut found: Option<PathBuf> = None;
@@ -445,12 +445,19 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
         }
         probes.push(e);
     }
-    let universes: Universes = parsed
-        .universe
-        .into_iter()
-        .map(|(k, v)| (k, v.packages))
-        .collect();
-    Ok(Some((specs, probes, universes, parsed.extra_inputs)))
+    let mut root_sets = RootSets::new();
+    for (name, mut def) in parsed.roots {
+        def.packages.sort();
+        def.packages.dedup();
+        if def.packages.is_empty() {
+            bail!(
+                "root `{name}` in {} needs a non-empty packages list",
+                p.display()
+            );
+        }
+        root_sets.insert(name, def.packages);
+    }
+    Ok(Some((specs, probes, root_sets, parsed.extra_inputs)))
 }
 
 /// Resolved lint flags for one workspace member. Lints are inputs like
@@ -1507,6 +1514,8 @@ pub struct BuildOpts {
     /// Cargo package name selected by `-p` or `--package`.
     pub package: Option<String>,
     pub target: Option<String>,
+    /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
+    pub root: Option<String>,
     pub mode: Mode,
     pub timings: bool,
     pub no_incremental: bool,
@@ -1590,6 +1599,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         workspace,
         package,
         target,
+        root,
         mode,
         timings,
         no_incremental,
@@ -1716,20 +1726,30 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // ---- plan-phase cache -------------------------------------------------
     // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
     // changed. Their outputs are a pure function of: corgi itself, the
-    // pinned toolchain, target/profile, the tools manifest (feature
-    // universes), every workspace manifest, the lockfile, cargo config, and
+    // pinned toolchain, target/profile, the selected named root set, every
+    // workspace manifest, the lockfile, cargo config, and
     // the member-glob directory listings. A pointer keyed on the cheap
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let (universes, extra_inputs) = match read_corgi_toml(&dir)? {
+    let (root_sets, extra_inputs) = match read_corgi_toml(&dir)? {
         Some((_, _, u, x)) => (u, x),
-        None => (Universes::new(), ExtraInputs::new()),
+        None => (RootSets::new(), ExtraInputs::new()),
     };
-    // Only the universes shape the plan (they pick the feature-unification
-    // member set); tools and env probes don't, so their edits — or any
-    // comment — must not even cost a replan.
-    let universe_id = sha256_hex(format!("{universes:?}").as_bytes());
+    let resolution_roots = match root.as_deref() {
+        Some(name) => Some(root_sets.get(name).cloned().with_context(|| {
+            let available = root_sets.keys().cloned().collect::<Vec<_>>().join(", ");
+            if available.is_empty() {
+                format!("unknown root `{name}`; corgi.toml defines no roots")
+            } else {
+                format!("unknown root `{name}`; available roots: {available}")
+            }
+        })?),
+        None => None,
+    };
+    // Only the selected roots shape this plan; unrelated root definitions,
+    // tools, env probes, and comments must not even cost a replan.
+    let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) {
         "test"
@@ -1741,7 +1761,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
-            universe_id,
+            roots_id,
         )
         .as_bytes(),
     );
@@ -1814,9 +1834,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
             let meta: Metadata =
                 serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
-            // Feature unification over a FIXED universe (whole workspace, or the
-            // declared member set for cross targets) — never scoped to the requested
-            // package, so a dep's features don't depend on what you're building.
+            // Feature unification over fixed roots (the whole workspace, or
+            // the explicitly selected named set) — never scoped to the
+            // requested package, so a dependency's features don't depend on
+            // which package is selected from the resulting graph.
             let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
             let mut ug_cmd = Command::new(&cargo_bin);
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
@@ -1833,11 +1854,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             if let Some(t) = &target {
                 ug_cmd.args(["--target", t]);
             }
-            match target
-                .as_ref()
-                .and_then(|t| universes.iter().find(|(k, _)| k == t))
-            {
-                Some((_, members)) => {
+            match &resolution_roots {
+                Some(members) => {
                     for m in members {
                         ug_cmd.args(["-p", m]);
                     }
@@ -1904,9 +1922,24 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let root_packages = select_root_packages(&meta, &pkgs, workspace, package.as_deref(), mode)?;
+    let root_packages = if root.is_some() && package.is_none() {
+        None
+    } else {
+        select_root_packages(&meta, &pkgs, workspace, package.as_deref(), mode)?
+    };
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref())?;
+    if matches!(mode, Mode::Test)
+        && package.is_some()
+        && !units
+            .iter()
+            .any(|unit| unit.is_root && matches!(unit.kind, Kind::Test))
+    {
+        bail!(
+            "package `{}` has no test targets in the selected root graph",
+            package.as_deref().unwrap_or_default()
+        );
+    }
     let profile_name = units
         .iter()
         .find(|u| u.is_root)
@@ -2214,6 +2247,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
 
     {
         let building = match root_packages.as_ref() {
+            None if let Some(root) = root.as_deref() => format!("root set {root}"),
             Some(packages) if packages.len() == 1 => {
                 let pi = *packages.iter().next().expect("one selected package");
                 let root_pkg = &meta.packages[pi];
@@ -2837,17 +2871,31 @@ fn translate_unit_graph(
             }
         }
     }
-    // The graph covers the whole universe; build only the requested
-    // subgraph (with universe-unified features): one package's roots, or
-    // every root cargo reported when building the whole workspace.
-    let mut stack: Vec<usize> = g
+    // Cargo's roots establish feature resolution. Prefer the requested
+    // package's Cargo roots when it has them; otherwise select its existing
+    // non-build-script units from the resolved graph without promoting it to
+    // a Cargo root (which would change default features).
+    let cargo_roots: Vec<usize> = g
         .roots
         .iter()
         .copied()
         .filter(|&r| root_packages.is_none_or(|packages| packages.contains(&units[r].pkg)))
         .collect();
+    let mut stack = cargo_roots;
     if stack.is_empty() {
-        bail!("requested package has no buildable roots in the unit graph");
+        if let Some(packages) = root_packages {
+            stack = units
+                .iter()
+                .enumerate()
+                .filter(|(_, unit)| {
+                    packages.contains(&unit.pkg) && !matches!(unit.kind, Kind::Bsc | Kind::Bsr)
+                })
+                .map(|(index, _)| index)
+                .collect();
+        }
+    }
+    if stack.is_empty() {
+        bail!("requested package is not present in the selected root graph");
     }
     for &r in &stack {
         units[r].is_root = true;
@@ -5097,4 +5145,95 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
         }
     }
     Ok(bs)
+}
+
+#[cfg(test)]
+mod named_root_tests {
+    use super::{translate_unit_graph, CorgiToml};
+    use crate::meta::UnitGraph;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn roots_are_named_package_sets() {
+        let parsed: CorgiToml = toml::from_str(
+            r#"
+                [roots.web]
+                packages = ["cloud_worker", "github_worker"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.roots["web"].packages,
+            ["cloud_worker", "github_worker"]
+        );
+    }
+
+    #[test]
+    fn legacy_root_sections_are_rejected() {
+        for section in ["target", "universe"] {
+            let text = format!(
+                r#"
+                    [{section}.wasm32-unknown-unknown]
+                    packages = ["cloud_worker"]
+                "#
+            );
+            let error = toml::from_str::<CorgiToml>(&text)
+                .err()
+                .expect("legacy root section must be rejected");
+
+            assert!(error
+                .to_string()
+                .contains(&format!("unknown field `{section}`")));
+        }
+    }
+
+    #[test]
+    fn a_reachable_non_root_keeps_the_features_from_the_root_graph() {
+        let graph: UnitGraph = serde_json::from_value(serde_json::json!({
+            "roots": [0],
+            "units": [
+                {
+                    "pkg_id": "cloud",
+                    "target": {
+                        "name": "cloud_worker",
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "src_path": "cloud/src/main.rs",
+                        "edition": "2021"
+                    },
+                    "platform": "wasm32-unknown-unknown",
+                    "mode": "build",
+                    "features": [],
+                    "dependencies": [
+                        {"index": 1, "extern_crate_name": "shared_runtime"}
+                    ]
+                },
+                {
+                    "pkg_id": "shared",
+                    "target": {
+                        "name": "shared_runtime",
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "src_path": "shared/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "platform": "wasm32-unknown-unknown",
+                    "mode": "build",
+                    "features": ["git", "http"],
+                    "dependencies": []
+                }
+            ]
+        }))
+        .unwrap();
+        let packages = HashMap::from([("cloud".to_string(), 0), ("shared".to_string(), 1)]);
+        let selected = BTreeSet::from([1]);
+
+        let units = translate_unit_graph(&graph, &packages, Some(&selected)).unwrap();
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].pkg, 1);
+        assert!(units[0].is_root);
+        assert_eq!(units[0].features, ["git", "http"]);
+    }
 }
