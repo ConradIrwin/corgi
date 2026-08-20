@@ -23,17 +23,38 @@ fn real_main() -> Result<()> {
     let mut release = false;
     let mut target: Option<String> = None;
     let mut cmd: Option<String> = None;
+    let mut test_filter: Option<String> = None;
+    let mut exec_args: Vec<String> = Vec::new();
+    const USAGE: &str = "usage: dcargo build|check|clippy|run|test|audit|gc \
+[--dir DIR] [--release] [--target TRIPLE] [-v] [TESTNAME] [-- ARGS...]";
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--" => {
+                for rest in args.by_ref() {
+                    exec_args.push(rest);
+                }
+                break;
+            }
             "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
             "-v" | "--verbose" => verbose = true,
             "--timings" => timings = true,
             "--no-incremental" => no_incremental = true,
             "--release" => release = true,
             "--target" => target = Some(args.next().context("--target needs a value")?),
-            "build" | "check" | "clippy" | "test" | "audit" | "gc" if cmd.is_none() => cmd = Some(a),
-            _ => bail!("unknown argument `{a}` (usage: dcargo build|check|clippy|test|gc [--dir DIR] [--release] [--target TRIPLE] [-v])"),
+            "build" | "check" | "clippy" | "run" | "test" | "audit" | "gc" if cmd.is_none() => {
+                cmd = Some(a)
+            }
+            _ if cmd.as_deref() == Some("test")
+                && test_filter.is_none()
+                && !a.starts_with('-') =>
+            {
+                test_filter = Some(a)
+            }
+            _ => bail!("unknown argument `{a}` ({USAGE})"),
         }
+    }
+    if !exec_args.is_empty() && !matches!(cmd.as_deref(), Some("run") | Some("test")) {
+        bail!("`--` arguments only apply to `dcargo run` and `dcargo test` ({USAGE})");
     }
 
     let dir = match dir {
@@ -62,12 +83,22 @@ fn real_main() -> Result<()> {
     let mode = match cmd.as_deref() {
         Some("check") => build::Mode::Check,
         Some("clippy") => build::Mode::Clippy,
+        Some("run") => build::Mode::Run,
         Some("test") => build::Mode::Test,
         _ => build::Mode::Build,
     };
     build::build(
         store,
         &dir,
-        build::BuildOpts { verbose, release, target, mode, timings, no_incremental },
+        build::BuildOpts {
+            verbose,
+            release,
+            target,
+            mode,
+            timings,
+            no_incremental,
+            test_filter,
+            exec_args,
+        },
     )
 }

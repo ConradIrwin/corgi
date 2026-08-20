@@ -25,6 +25,9 @@ const TOOL_VERSION: &str = "dcargo/0.20";
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
     Build,
+    /// Build, then execute the root binary exactly as a manual run of the
+    /// exported artifact: ambient env, the caller's cwd, inherited stdio.
+    Run,
     Check,
     /// Check mode with clippy-driver as the executor for workspace-member
     /// units (their own key namespace; the dependency layer is shared
@@ -1116,10 +1119,25 @@ pub struct BuildOpts {
     pub mode: Mode,
     pub timings: bool,
     pub no_incremental: bool,
+    /// Test-name filter (cargo's positional TESTNAME), passed to every
+    /// harness.
+    pub test_filter: Option<String>,
+    /// Arguments after `--`: the program's argv for `run`, harness
+    /// arguments for `test`.
+    pub exec_args: Vec<String>,
 }
 
 pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
-    let BuildOpts { verbose, release, target, mode, timings, no_incremental } = opts;
+    let BuildOpts {
+        verbose,
+        release,
+        target,
+        mode,
+        timings,
+        no_incremental,
+        test_filter,
+        exec_args,
+    } = opts;
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -1285,11 +1303,17 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             // first (it never writes), and when cargo rejects it, run once
             // unlocked so cargo brings Cargo.lock up to date, then continue.
             // The plan fingerprint hashes the lock *after* this step.
+            // The probes must not depend on the caller's environment:
+            // RUSTC is pinned (cargo otherwise resolves `rustc` from PATH,
+            // and a rustup shim picks its toolchain by cwd), and cwd is the
+            // build dir so cargo's own config discovery sees the workspace.
             if capture(
                 Command::new(&cargo_bin)
                     .args(["fetch", "--locked", "--manifest-path"])
                     .arg(&manifest)
-                    .env("CARGO_HOME", &cargo_home),
+                    .env("CARGO_HOME", &cargo_home)
+                    .env("RUSTC", &rustc)
+                    .current_dir(&dir),
                 "cargo fetch --locked",
             )
             .is_err()
@@ -1299,7 +1323,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                     Command::new(&cargo_bin)
                         .args(["fetch", "--manifest-path"])
                         .arg(&manifest)
-                        .env("CARGO_HOME", &cargo_home),
+                        .env("CARGO_HOME", &cargo_home)
+                        .env("RUSTC", &rustc)
+                        .current_dir(&dir),
                     "cargo fetch",
                 )?;
             }
@@ -1308,6 +1334,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             let mut meta_cmd = Command::new(&cargo_bin);
             meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
             meta_cmd.env("CARGO_HOME", &cargo_home);
+            meta_cmd.env("RUSTC", &rustc);
+            meta_cmd.current_dir(&dir);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             let meta_json = capture(&mut meta_cmd, "cargo metadata")?;
             let meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
@@ -1318,6 +1346,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             let mut ug_cmd = Command::new(&cargo_bin);
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
             ug_cmd.env("CARGO_HOME", &cargo_home);
+            ug_cmd.env("RUSTC", &rustc);
+            ug_cmd.current_dir(&dir);
             ug_cmd.args(["build", "--unit-graph", "-Zunstable-options", "--locked"]);
             if matches!(mode, Mode::Test) {
                 ug_cmd.arg("--tests");
@@ -1739,7 +1769,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
 
     // Test harnesses run fresh every time (results deliberately uncached
     // for now, so cargo-vs-dcargo comparisons stay honest). Unsandboxed,
-    // ambient env, cwd = the package root -- cargo's semantics.
+    // exactly as if run by hand: ambient env untouched (no CARGO_* vars),
+    // only cwd = the package root, which the location-free artifact
+    // contract requires (baked-in "." manifest paths resolve there).
     if matches!(mode, Mode::Test) {
         let mut failures: Vec<String> = Vec::new();
         for (i, u) in ctx.units.iter().enumerate() {
@@ -1764,9 +1796,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             eprintln!("dcargo: running tests: {} ({})", u.target.name, dest.display());
             let mut c = Command::new(&dest);
             c.current_dir(pkg.root());
-            for (k, v) in ctx.pkg_env(pkg) {
-                c.env(k, v);
+            if let Some(filter) = &test_filter {
+                c.arg(filter);
             }
+            c.args(&exec_args);
             let st = c.status().with_context(|| format!("running test {}", u.target.name))?;
             if !st.success() {
                 failures.push(u.target.name.clone());
@@ -1779,7 +1812,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     }
 
     for (i, u) in ctx.units.iter().enumerate() {
-        if !matches!(mode, Mode::Build) {
+        if !matches!(mode, Mode::Build | Mode::Run) {
             break;
         }
         if matches!(u.kind, Kind::Bin) && u.is_root {
@@ -1837,6 +1870,45 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     maybe_auto_gc(&ctx.store);
+    if matches!(mode, Mode::Run) {
+        let root_bins: Vec<usize> = ctx
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| matches!(u.kind, Kind::Bin) && u.is_root)
+            .map(|(i, _)| i)
+            .collect();
+        let bin_index = match root_bins.as_slice() {
+            [only] => *only,
+            _ => bail!(
+                "`dcargo run` needs exactly one binary target, found {}: [{}]",
+                root_bins.len(),
+                root_bins
+                    .iter()
+                    .map(|&i| ctx.units[i].target.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let dest = dtarget.join(&ctx.profile_name).join(&ctx.units[bin_index].target.name);
+        eprintln!("dcargo:  running {}", dest.display());
+        // Exactly a manual run of the exported binary: ambient env, the
+        // caller's cwd, inherited stdio; dcargo sets nothing (no CARGO_*
+        // vars). The exit status is the child's, signals reported the way
+        // a shell would (128 + signal).
+        let status = Command::new(&dest)
+            .args(&exec_args)
+            .status()
+            .with_context(|| format!("running {}", dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                std::process::exit(128 + signal);
+            }
+        }
+        std::process::exit(status.code().unwrap_or(1));
+    }
     Ok(())
 }
 
