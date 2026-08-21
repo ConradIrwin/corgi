@@ -100,6 +100,10 @@ pub struct TestArgs {
     #[command(flatten)]
     pub build: WorkspaceBuildArgs,
 
+    /// Run tests even if a successful result is cached
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
     /// Name filter passed to every test harness
     #[arg(value_name = "TESTNAME")]
     pub filter: Option<String>,

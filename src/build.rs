@@ -1596,6 +1596,8 @@ pub struct BuildOpts {
     pub mode: Mode,
     pub timings: bool,
     pub no_incremental: bool,
+    /// Ignore cached successful test results while retaining build cache hits.
+    pub force_tests: bool,
     /// Test-name filter (cargo's positional TESTNAME), passed to every
     /// harness.
     pub test_filter: Option<String>,
@@ -1680,6 +1682,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         mode,
         timings,
         no_incremental,
+        force_tests,
         test_filter,
         exec_args,
     } = opts;
@@ -2464,7 +2467,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 }
             }
             let pass_key = test_pass_key(&r.key)?;
-            let cached_pass = canonical_run && load_test_pass(&ctx.store, &pass_key);
+            let cached_pass =
+                canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
             harnesses.push(TestHarness {
                 name: u.target.name.clone(),
                 path: dest,
