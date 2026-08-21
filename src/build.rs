@@ -1829,7 +1829,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) {
-        "test"
+        "cargo-test"
     } else {
         "build"
     };
@@ -1921,7 +1921,17 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             ug_cmd.env("CARGO_HOME", &cargo_home);
             ug_cmd.env("RUSTC", &rustc);
             ug_cmd.current_dir(&dir);
-            ug_cmd.args(["build", "--unit-graph", "-Zunstable-options", "--locked"]);
+            let unit_graph_command = if matches!(mode, Mode::Test) {
+                "test"
+            } else {
+                "build"
+            };
+            ug_cmd.args([
+                unit_graph_command,
+                "--unit-graph",
+                "-Zunstable-options",
+                "--locked",
+            ]);
             if matches!(mode, Mode::Test) {
                 ug_cmd.arg("--tests");
             }
@@ -1942,7 +1952,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 }
             }
             ug_cmd.arg("--manifest-path").arg(&ws_manifest);
-            let ug_json = capture_with_live_stderr(&mut ug_cmd, "cargo build --unit-graph")?;
+            let ug_json = capture_with_live_stderr(
+                &mut ug_cmd,
+                &format!("cargo {unit_graph_command} --unit-graph"),
+            )?;
             save_plan(&store, &plan_ptr, &dir, &meta, &meta_json, &ug_json)?;
             Ok((meta_json, ug_json))
         }
