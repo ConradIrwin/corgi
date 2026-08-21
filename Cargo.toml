@@ -14,6 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4.5", default-features = false, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "usage",
+] }
 jobserver = "0.1.35"
 memchr = "2.8.3"
 serde = { version = "1", features = ["derive"] }

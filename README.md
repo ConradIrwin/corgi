@@ -35,7 +35,7 @@ machines.
 ```
 cargo install corgi-build
 
-corgi [ build | run | test | check | fmt | clippy | clean ] ...
+corgi [ build | run | test | check | clippy | fmt | audit | clean ] ...
 ```
 
 There are definitely sub-options and commands missing; please file reports or

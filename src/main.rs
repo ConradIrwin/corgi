@@ -1,10 +1,12 @@
 mod audit;
 mod build;
+mod cli;
 mod config;
 mod meta;
 mod store;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
+use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 
 fn main() {
@@ -15,85 +17,17 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let mut dir: Option<PathBuf> = None;
-    let mut verbose = false;
-    let mut timings = false;
-    let mut no_incremental = false;
-    let mut release = false;
-    let mut workspace = false;
-    let mut package: Option<String> = None;
-    let mut target: Option<String> = None;
-    let mut root: Option<String> = None;
-    let mut cmd: Option<String> = None;
-    let mut clean_cache = false;
-    let mut test_filter: Option<String> = None;
-    let mut exec_args: Vec<String> = Vec::new();
-    let mut fmt_args: Vec<String> = Vec::new();
-    const USAGE: &str = "usage: corgi build|check|clippy|fmt|run|test|audit|clean \
-[--dir DIR] [-p PACKAGE] [--root NAME] [--workspace] [--release] [--target TRIPLE] [-v] [-cache] [TESTNAME] [-- ARGS...]";
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--" => {
-                if cmd.as_deref() == Some("fmt") {
-                    fmt_args.push("--".to_string());
-                }
-                for rest in args.by_ref() {
-                    if cmd.as_deref() == Some("fmt") {
-                        fmt_args.push(rest);
-                    } else {
-                        exec_args.push(rest);
-                    }
-                }
-                break;
-            }
-            "-C" | "--dir" => dir = Some(args.next().context("--dir needs a value")?.into()),
-            "-v" | "--verbose" => verbose = true,
-            "--timings" => timings = true,
-            "--no-incremental" => no_incremental = true,
-            "--release" => release = true,
-            "--workspace" => workspace = true,
-            "-p" | "--package" => package = Some(args.next().context("--package needs a value")?),
-            "--target" => target = Some(args.next().context("--target needs a value")?),
-            "--root" => root = Some(args.next().context("--root needs a value")?),
-            "build" | "check" | "clippy" | "fmt" | "run" | "test" | "audit" | "clean"
-                if cmd.is_none() =>
-            {
-                cmd = Some(a)
-            }
-            "-cache" if cmd.as_deref() == Some("clean") => clean_cache = true,
-            _ if cmd.as_deref() == Some("test") && test_filter.is_none() && !a.starts_with('-') => {
-                test_filter = Some(a)
-            }
-            _ if cmd.as_deref() == Some("fmt") => fmt_args.push(a),
-            _ => bail!("unknown argument `{a}` ({USAGE})"),
-        }
-    }
-    if !exec_args.is_empty() && !matches!(cmd.as_deref(), Some("run") | Some("test")) {
-        bail!("`--` arguments only apply to `corgi run` and `corgi test` ({USAGE})");
-    }
-    if workspace && matches!(cmd.as_deref(), Some("run") | Some("audit")) {
-        bail!(
-            "`--workspace` does not apply to `corgi {}`",
-            cmd.as_deref().unwrap_or("")
-        );
-    }
-    if workspace && package.is_some() {
-        bail!("`--workspace` cannot be used with `--package`");
-    }
-    if workspace && root.is_some() {
-        bail!("`--workspace` cannot be used with `--root`");
-    }
-    if package.is_some() && matches!(cmd.as_deref(), Some("audit") | Some("clean")) {
-        bail!(
-            "`--package` does not apply to `corgi {}`",
-            cmd.as_deref().unwrap_or("")
-        );
-    }
-    if root.is_some() && cmd.as_deref() == Some("clean") {
-        bail!("`--root` does not apply to `corgi clean`");
-    }
-
+    let argv: Vec<_> = std::env::args_os().collect();
+    let had_argument_delimiter = argv.iter().any(|arg| arg == "--");
+    let cli::Cli {
+        dir,
+        verbose,
+        command,
+    } = cli::Cli::parse_from(argv);
+    let Some(command) = command else {
+        cli::Cli::command().print_help()?;
+        return Ok(());
+    };
     let dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
@@ -112,48 +46,98 @@ fn real_main() -> Result<()> {
                 PathBuf::from(home).join(".cache/corgi")
             }
         });
-    if cmd.as_deref() == Some("audit") {
-        return audit::audit(&dir, release, verbose, target.as_deref(), root.as_deref());
-    }
-    let store = store::Store::new(store_root)?;
-    if cmd.as_deref() == Some("clean") {
-        return build::clean(&store, clean_cache);
-    }
-    if cmd.as_deref() == Some("fmt") {
-        if release || target.is_some() || root.is_some() || timings || no_incremental {
-            bail!("build-only options do not apply to `corgi fmt` ({USAGE})");
-        }
-        return build::fmt(
-            store,
+
+    match command {
+        cli::Command::Audit(args) => audit::audit(
             &dir,
-            workspace,
-            package.as_deref(),
+            args.release,
             verbose,
-            &fmt_args,
-        );
+            args.target.as_deref(),
+            args.root.as_deref(),
+        ),
+        command => {
+            let store = store::Store::new(store_root)?;
+            let run_build = |store: store::Store,
+                             args: cli::BuildArgs,
+                             workspace: bool,
+                             mode: build::Mode,
+                             test_filter: Option<String>,
+                             exec_args: Vec<String>| {
+                build::build(
+                    store,
+                    &dir,
+                    build::BuildOpts {
+                        verbose,
+                        release: args.release,
+                        workspace,
+                        package: args.package,
+                        target: args.target,
+                        root: args.root,
+                        mode,
+                        timings: args.timings,
+                        no_incremental: args.no_incremental,
+                        test_filter,
+                        exec_args,
+                    },
+                )
+            };
+            match command {
+                cli::Command::Build(args) => run_build(
+                    store,
+                    args.build,
+                    args.workspace,
+                    build::Mode::Build,
+                    None,
+                    Vec::new(),
+                ),
+                cli::Command::Check(args) => run_build(
+                    store,
+                    args.build,
+                    args.workspace,
+                    build::Mode::Check,
+                    None,
+                    Vec::new(),
+                ),
+                cli::Command::Clippy(args) => run_build(
+                    store,
+                    args.build,
+                    args.workspace,
+                    build::Mode::Clippy,
+                    None,
+                    Vec::new(),
+                ),
+                cli::Command::Run(args) => run_build(
+                    store,
+                    args.build,
+                    false,
+                    build::Mode::Run,
+                    None,
+                    args.exec_args,
+                ),
+                cli::Command::Test(args) => run_build(
+                    store,
+                    args.build.build,
+                    args.build.workspace,
+                    build::Mode::Test,
+                    args.filter,
+                    args.exec_args,
+                ),
+                cli::Command::Fmt(mut args) => {
+                    if had_argument_delimiter {
+                        args.args.insert(0, "--".to_string());
+                    }
+                    build::fmt(
+                        store,
+                        &dir,
+                        args.workspace,
+                        args.package.as_deref(),
+                        verbose,
+                        &args.args,
+                    )
+                }
+                cli::Command::Clean(args) => build::clean(&store, args.cache),
+                cli::Command::Audit(_) => unreachable!(),
+            }
+        }
     }
-    let mode = match cmd.as_deref() {
-        Some("check") => build::Mode::Check,
-        Some("clippy") => build::Mode::Clippy,
-        Some("run") => build::Mode::Run,
-        Some("test") => build::Mode::Test,
-        _ => build::Mode::Build,
-    };
-    build::build(
-        store,
-        &dir,
-        build::BuildOpts {
-            verbose,
-            release,
-            workspace,
-            package,
-            target,
-            root,
-            mode,
-            timings,
-            no_incremental,
-            test_filter,
-            exec_args,
-        },
-    )
 }
