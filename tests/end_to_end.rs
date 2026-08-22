@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -45,7 +45,8 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::env::current_dir()
+        .expect("failed to determine test working directory")
         .join("tests")
         .join("fixtures")
         .join(name)

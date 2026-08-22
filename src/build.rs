@@ -4676,6 +4676,29 @@ fn compile(
             "CARGO_TARGET_TMPDIR".to_string(),
             "/tmp/corgi/target-tmp".to_string(),
         ));
+        let mut binary_environment = Vec::new();
+        for dependency in &unit.deps {
+            let binary_unit = &ctx.units[dependency.unit];
+            if binary_unit.pkg != unit.pkg || !matches!(binary_unit.kind, Kind::Bin) {
+                continue;
+            }
+            let binary_result = results[dependency.unit]
+                .get()
+                .context("integration-test binary not built")?;
+            let binary = binary_result
+                .main
+                .as_ref()
+                .context("integration-test binary artifact missing")?;
+            let binary_path = ctx
+                .pool_logical
+                .join(Store::pool_file_name(&binary.name, &binary_result.key));
+            binary_environment.push((
+                format!("CARGO_BIN_EXE_{}", binary_unit.target.name),
+                binary_path.display().to_string(),
+            ));
+        }
+        binary_environment.sort();
+        env.extend(binary_environment);
     }
     let unit_rustflags: &[String] = if unit.host {
         &ctx.host_rustflags
