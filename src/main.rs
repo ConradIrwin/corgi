@@ -72,6 +72,7 @@ fn real_main() -> Result<()> {
                         release: args.release,
                         workspace,
                         package: args.package,
+                        features: args.features,
                         target: args.target,
                         root: args.root,
                         mode,
