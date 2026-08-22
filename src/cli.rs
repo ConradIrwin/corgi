@@ -54,7 +54,7 @@ pub struct BuildArgs {
     #[arg(long)]
     pub release: bool,
 
-    /// Select a package by Cargo package name
+    /// Determine the execution package
     #[arg(short = 'p', long, value_name = "PACKAGE")]
     pub package: Option<String>,
 
