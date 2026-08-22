@@ -5,14 +5,14 @@ use std::{
 
 #[test]
 fn package_selection_infers_its_feature_unification_root() {
-    let output = run_test_compile("root-inference", []);
+    let output = run_test_compile("root-inference", ["-p", "app"]);
 
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "app root\n");
 }
 
 #[test]
 fn features_enable_only_the_selected_packages_feature() {
-    let output = run_test_compile("feature-selection", ["--features", "special"]);
+    let output = run_test_compile("feature-selection", ["-p", "app", "--features", "special"]);
 
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
@@ -29,7 +29,7 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     let _ = std::fs::remove_dir_all(&target);
 
     let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
-        .args(["build", "-p", "app"])
+        .arg("build")
         .args(arguments)
         .arg("-C")
         .arg(&fixture)
