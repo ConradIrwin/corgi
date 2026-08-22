@@ -12,6 +12,10 @@ readme = "README.md"
 name = "corgi"
 path = "src/main.rs"
 
+[[test]]
+name = "end_to_end"
+path = "tests/end_to_end.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", default-features = false, features = [
