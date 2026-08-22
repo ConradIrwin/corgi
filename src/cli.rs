@@ -58,6 +58,10 @@ pub struct BuildArgs {
     #[arg(short = 'p', long, value_name = "PACKAGE")]
     pub package: Option<String>,
 
+    /// Enable the given features
+    #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
+    pub features: Vec<String>,
+
     /// Build for TRIPLE
     #[arg(long, value_name = "TRIPLE")]
     pub target: Option<String>,
@@ -175,6 +179,7 @@ mod tests {
             "corgi audit:",
             "corgi clean:",
             "--no-incremental",
+            "--features",
             "--cache",
         ] {
             assert!(help.contains(expected), "help omitted {expected}");
@@ -208,6 +213,26 @@ mod tests {
             Cli::try_parse_from(["corgi", "build", "--workspace", "--package", "app"]).is_err()
         );
         assert!(Cli::try_parse_from(["corgi", "run", "--workspace"]).is_err());
+    }
+
+    #[test]
+    fn features_accept_repeated_and_comma_separated_values() {
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "build",
+            "-p",
+            "app",
+            "--features",
+            "alpha,beta",
+            "-F",
+            "gamma",
+        ])
+        .unwrap();
+        let Some(Command::Build(args)) = cli.command else {
+            panic!("build command not parsed");
+        };
+
+        assert_eq!(args.build.features, ["alpha", "beta", "gamma"]);
     }
 
     #[test]

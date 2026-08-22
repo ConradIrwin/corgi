@@ -1637,6 +1637,7 @@ pub struct BuildOpts {
     pub workspace: bool,
     /// Cargo package name selected by `-p` or `--package`.
     pub package: Option<String>,
+    pub features: Vec<String>,
     pub target: Option<String>,
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
     pub root: Option<String>,
@@ -1651,6 +1652,25 @@ pub struct BuildOpts {
     /// Arguments after `--`: the program's argv for `run`, harness
     /// arguments for `test`.
     pub exec_args: Vec<String>,
+}
+
+/// Normalizes requested features and preserves Cargo's `-p` scoping even when
+/// Corgi resolves a broader fixed package set.
+fn select_features(features: &[String], package: Option<&str>) -> Vec<String> {
+    let mut selected = features
+        .iter()
+        .flat_map(|features| {
+            features.split(|character: char| character == ',' || character.is_whitespace())
+        })
+        .filter(|feature| !feature.is_empty())
+        .map(|feature| match package {
+            Some(package) if !feature.contains('/') => format!("{package}/{feature}"),
+            _ => feature.to_string(),
+        })
+        .collect::<Vec<_>>();
+    selected.sort();
+    selected.dedup();
+    selected
 }
 
 /// Format workspace sources with the exact rustfmt component matching the
@@ -1724,6 +1744,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         release,
         workspace,
         package,
+        features,
         target,
         root,
         mode,
@@ -1733,6 +1754,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         test_filter,
         exec_args,
     } = opts;
+    let selected_features = select_features(&features, package.as_deref());
     let t0 = Instant::now();
     let dir = dir
         .canonicalize()
@@ -1865,9 +1887,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     };
     let resolution_roots =
         select_resolution_roots(&root_sets, root.as_deref(), package.as_deref())?;
-    // Only the selected roots shape this plan; unrelated root definitions,
-    // tools, env probes, and comments must not even cost a replan.
+    // Only the selected roots and requested features shape this plan; unrelated
+    // root definitions, tools, env probes, and comments must not even cost a
+    // replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
+    let features_id = sha256_hex(format!("{selected_features:?}").as_bytes());
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) {
         "cargo-test"
@@ -1876,10 +1900,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
+            features_id,
         )
         .as_bytes(),
     );
@@ -1991,6 +2016,9 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
                 None => {
                     ug_cmd.arg("--workspace");
                 }
+            }
+            for feature in &selected_features {
+                ug_cmd.args(["--features", feature]);
             }
             ug_cmd.arg("--manifest-path").arg(&ws_manifest);
             let ug_json = capture_with_live_stderr(
@@ -5772,5 +5800,36 @@ mod named_root_tests {
         assert_eq!(units[0].pkg, 1);
         assert!(units[0].is_root);
         assert_eq!(units[0].features, ["git", "http"]);
+    }
+}
+
+#[cfg(test)]
+mod feature_selection_tests {
+    use super::select_features;
+
+    #[test]
+    fn package_selection_qualifies_unqualified_features() {
+        let selected = select_features(
+            &[
+                "tls".to_string(),
+                "dependency/tracing".to_string(),
+                "json gzip".to_string(),
+                "tls".to_string(),
+            ],
+            Some("app"),
+        );
+
+        assert_eq!(
+            selected,
+            ["app/gzip", "app/json", "app/tls", "dependency/tracing"]
+        );
+    }
+
+    #[test]
+    fn workspace_selection_preserves_unqualified_features() {
+        let selected =
+            select_features(&["tls".to_string(), "dependency/tracing".to_string()], None);
+
+        assert_eq!(selected, ["dependency/tracing", "tls"]);
     }
 }
