@@ -5,12 +5,33 @@ use std::{
 
 #[test]
 fn package_selection_infers_its_feature_unification_root() {
-    let fixture = fixture_path("root-inference");
+    let output = run_test_compile("root-inference", []);
+
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "app root\n");
+}
+
+#[test]
+fn features_enable_only_the_selected_packages_feature() {
+    let output = run_test_compile("feature-selection", ["--features", "special"]);
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "app special; sibling plain\n"
+    );
+}
+
+fn run_test_compile<const ARGUMENT_COUNT: usize>(
+    fixture_name: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+) -> Output {
+    let fixture = fixture_path(fixture_name);
     let target = fixture.join("target");
     let _ = std::fs::remove_dir_all(&target);
 
     let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
-        .args(["build", "-p", "app", "-C"])
+        .args(["build", "-p", "app"])
+        .args(arguments)
+        .arg("-C")
         .arg(&fixture)
         .output()
         .expect("failed to invoke corgi");
@@ -20,7 +41,7 @@ fn package_selection_infers_its_feature_unification_root() {
         .output()
         .expect("failed to run app");
     assert_success(&output, "app");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "app root\n");
+    output
 }
 
 fn fixture_path(name: &str) -> PathBuf {
