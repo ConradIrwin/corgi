@@ -483,6 +483,53 @@ type RootSets = std::collections::BTreeMap<String, Vec<String>>;
 type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
 type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, RootSets, ExtraInputs);
 
+/// Selects the fixed package set used for feature resolution.
+///
+/// An explicit root takes precedence. Otherwise, selecting a package implicitly
+/// selects the one named root that lists it. Packages not listed in any root
+/// continue to resolve against the workspace.
+fn select_resolution_roots(
+    root_sets: &RootSets,
+    root: Option<&str>,
+    package: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    if let Some(name) = root {
+        return root_sets.get(name).cloned().map(Some).with_context(|| {
+            let available = root_sets.keys().cloned().collect::<Vec<_>>().join(", ");
+            if available.is_empty() {
+                format!("unknown root `{name}`; corgi.toml defines no roots")
+            } else {
+                format!("unknown root `{name}`; available roots: {available}")
+            }
+        });
+    }
+
+    let Some(package) = package else {
+        return Ok(None);
+    };
+    let matching_roots = root_sets
+        .iter()
+        .filter_map(|(name, packages)| {
+            packages
+                .iter()
+                .any(|candidate| candidate == package)
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    match matching_roots.as_slice() {
+        [] => Ok(None),
+        [name] => Ok(root_sets.get(*name).cloned()),
+        names => bail!(
+            "package `{package}` belongs to multiple roots: {}; pass --root to select one",
+            names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
     let mut found: Option<PathBuf> = None;
     let mut cur = Some(dir);
@@ -1816,17 +1863,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         Some((_, _, root_sets, extra_inputs)) => (root_sets, extra_inputs),
         None => (RootSets::new(), ExtraInputs::new()),
     };
-    let resolution_roots = match root.as_deref() {
-        Some(name) => Some(root_sets.get(name).cloned().with_context(|| {
-            let available = root_sets.keys().cloned().collect::<Vec<_>>().join(", ");
-            if available.is_empty() {
-                format!("unknown root `{name}`; corgi.toml defines no roots")
-            } else {
-                format!("unknown root `{name}`; available roots: {available}")
-            }
-        })?),
-        None => None,
-    };
+    let resolution_roots =
+        select_resolution_roots(&root_sets, root.as_deref(), package.as_deref())?;
     // Only the selected roots shape this plan; unrelated root definitions,
     // tools, env probes, and comments must not even cost a replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
@@ -5569,7 +5607,7 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
 
 #[cfg(test)]
 mod named_root_tests {
-    use super::{translate_unit_graph, CorgiToml};
+    use super::{select_resolution_roots, translate_unit_graph, CorgiToml, RootSets};
     use crate::meta::UnitGraph;
     use std::collections::{BTreeSet, HashMap};
 
@@ -5586,6 +5624,85 @@ mod named_root_tests {
         assert_eq!(
             parsed.roots["web"].packages,
             ["cloud_worker", "github_worker"]
+        );
+    }
+
+    #[test]
+    fn package_selection_infers_its_named_root() {
+        let roots = RootSets::from([
+            (
+                "native".to_string(),
+                vec!["api_server".to_string(), "scheduler".to_string()],
+            ),
+            (
+                "web".to_string(),
+                vec!["cloud_worker".to_string(), "github_worker".to_string()],
+            ),
+        ]);
+
+        let selected = select_resolution_roots(&roots, None, Some("cloud_worker")).unwrap();
+
+        assert_eq!(
+            selected,
+            Some(vec![
+                "cloud_worker".to_string(),
+                "github_worker".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn package_selection_without_a_named_root_uses_the_workspace() {
+        let roots = RootSets::from([(
+            "web".to_string(),
+            vec!["cloud_worker".to_string(), "github_worker".to_string()],
+        )]);
+
+        let selected = select_resolution_roots(&roots, None, Some("shared")).unwrap();
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn explicit_root_overrides_package_root_inference() {
+        let roots = RootSets::from([
+            (
+                "native".to_string(),
+                vec!["api_server".to_string(), "shared".to_string()],
+            ),
+            (
+                "web".to_string(),
+                vec!["cloud_worker".to_string(), "shared".to_string()],
+            ),
+        ]);
+
+        let selected =
+            select_resolution_roots(&roots, Some("native"), Some("cloud_worker")).unwrap();
+
+        assert_eq!(
+            selected,
+            Some(vec!["api_server".to_string(), "shared".to_string()])
+        );
+    }
+
+    #[test]
+    fn package_selection_rejects_ambiguous_named_roots() {
+        let roots = RootSets::from([
+            (
+                "native".to_string(),
+                vec!["api_server".to_string(), "shared".to_string()],
+            ),
+            (
+                "web".to_string(),
+                vec!["cloud_worker".to_string(), "shared".to_string()],
+            ),
+        ]);
+
+        let error = select_resolution_roots(&roots, None, Some("shared")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "package `shared` belongs to multiple roots: native, web; pass --root to select one"
         );
     }
 
