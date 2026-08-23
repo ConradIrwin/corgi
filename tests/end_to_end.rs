@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -28,7 +28,7 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     let target = fixture.join("target");
     let _ = std::fs::remove_dir_all(&target);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = Command::new(corgi_executable())
         .arg("build")
         .args(arguments)
         .arg("-C")
@@ -45,7 +45,8 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::env::current_dir()
+        .expect("failed to determine test working directory")
         .join("tests")
         .join("fixtures")
         .join(name)
@@ -53,6 +54,15 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn corgi_executable() -> PathBuf {
+    std::env::current_exe()
+        .expect("failed to determine test executable")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("test executable is not under a profile directory")
+        .join(executable_name("corgi"))
 }
 
 fn assert_success(output: &Output, command: &str) {
