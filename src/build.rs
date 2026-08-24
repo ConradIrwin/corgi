@@ -205,6 +205,14 @@ struct ToolRt {
     id: String,
     bin: String,
     packages: Vec<String>,
+    targets: Vec<String>,
+}
+
+impl ToolRt {
+    fn is_visible_to(&self, package: &str, target: &str) -> bool {
+        (self.packages.is_empty() || self.packages.iter().any(|candidate| candidate == package))
+            && (self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target))
+    }
 }
 
 /// Where an action's wall time went (ns), for the timings report.
@@ -490,6 +498,9 @@ struct ToolSpec {
     /// build script (right for graph-wide tools like a wasm C compiler).
     #[serde(default)]
     packages: Vec<String>,
+    /// Compilation targets whose build scripts see this tool; empty = all.
+    #[serde(default)]
+    targets: Vec<String>,
     /// How the archive is fetched. Empty = plain unauthenticated download.
     /// "github": a GitHub release asset of a private repo, downloaded via
     /// the gh CLI's stored credentials. Auth affects transport only — the
@@ -1005,6 +1016,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         path: String::new(),
         env: String::new(),
         packages: Vec::new(),
+        targets: Vec::new(),
         auth: String::new(),
     };
     let installed = ensure_tool(store, &spec)?;
@@ -2829,6 +2841,21 @@ fn build_inner(
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
     if let Some((specs, probes, _, _)) = read_corgi_toml(&dir)? {
         for t in &specs {
+            let active = units.iter().any(|unit| {
+                let package_name = &meta.packages[unit.pkg].name;
+                let platform = if unit.host {
+                    &host
+                } else {
+                    target.as_deref().unwrap_or(&host)
+                };
+                matches!(unit.kind, Kind::Bsr)
+                    && (t.packages.is_empty()
+                        || t.packages.iter().any(|package| package == package_name))
+                    && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
+            });
+            if !active {
+                continue;
+            }
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
             let logical = store
@@ -2865,6 +2892,7 @@ fn build_inner(
                 id,
                 bin: t.bin.clone(),
                 packages: t.packages.clone(),
+                targets: t.targets.clone(),
             });
         }
         // Plan-time probes: ambient reads happen HERE, outside the
@@ -5362,6 +5390,29 @@ mod tool_url_tests {
 }
 
 #[cfg(test)]
+mod tool_scope_tests {
+    use super::ToolRt;
+
+    #[test]
+    fn target_scoped_tool_is_visible_only_to_matching_package_and_target() {
+        let tool = ToolRt {
+            name: "ghostty".into(),
+            version: "1".into(),
+            env: "GHOSTTY_PREFIX".into(),
+            value: "/tools/ghostty".into(),
+            id: "pin".into(),
+            bin: String::new(),
+            packages: vec!["terminal".into()],
+            targets: vec!["x86_64-unknown-linux-gnu".into()],
+        };
+
+        assert!(tool.is_visible_to("terminal", "x86_64-unknown-linux-gnu"));
+        assert!(!tool.is_visible_to("terminal", "aarch64-apple-darwin"));
+        assert!(!tool.is_visible_to("other", "x86_64-unknown-linux-gnu"));
+    }
+}
+
+#[cfg(test)]
 mod toolchain_pin_tests {
     use super::{read_toolchain_pin_with, toolchain_channel_from_rustc_version};
     use std::fs;
@@ -6426,7 +6477,7 @@ fn run_build_script(
     let visible_tools: Vec<&ToolRt> = ctx
         .tools
         .iter()
-        .filter(|t| t.packages.is_empty() || t.packages.iter().any(|p| p == &pkg.name))
+        .filter(|tool| tool.is_visible_to(&pkg.name, &plat_triple))
         .collect();
     for t in &visible_tools {
         env.push((t.env.clone(), t.value.clone()));
