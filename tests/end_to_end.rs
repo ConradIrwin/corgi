@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -69,6 +69,12 @@ fn early_build_failures_are_recorded() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn clippy_runs_from_the_selected_packages_directory() {
+    let fixture = fixture_path("clippy-package-directory");
+    run_corgi(&fixture, "clippy", ["-p", "app"]);
+}
+
 fn run_test_compile<const ARGUMENT_COUNT: usize>(
     fixture_name: &str,
     arguments: [&str; ARGUMENT_COUNT],
@@ -77,14 +83,7 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     let target = fixture.join("target");
     let _ = std::fs::remove_dir_all(&target);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
-        .arg("build")
-        .args(arguments)
-        .arg("-C")
-        .arg(&fixture)
-        .output()
-        .expect("failed to invoke corgi");
-    assert_success(&output, "corgi build");
+    run_corgi(&fixture, "build", arguments);
 
     let output = Command::new(target.join("debug").join(executable_name("app")))
         .output()
@@ -93,9 +92,25 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     output
 }
 
+fn run_corgi<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+) -> Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg(command)
+        .args(arguments)
+        .arg("-C")
+        .arg(fixture)
+        .output()
+        .expect("failed to invoke corgi");
+    assert_success(&output, &format!("corgi {command}"));
+    output
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     std::env::current_dir()
-        .unwrap()
+        .expect("failed to determine test working directory")
         .join("tests")
         .join("fixtures")
         .join(name)
