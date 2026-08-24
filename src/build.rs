@@ -2401,7 +2401,13 @@ fn build_inner(
     if let Some(bytes) = store.load_action(&plan_ptr) {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
             if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
-                if plan_fingerprint(&ws_root, &entry.files, &entry.glob_dirs) == entry.fingerprint {
+                if plan_fingerprint(
+                    &ws_root,
+                    &entry.files,
+                    &entry.glob_dirs,
+                    &entry.package_roots,
+                ) == entry.fingerprint
+                {
                     let meta_text = fs::read(store.cache_path(&entry.meta_blob))
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok());
@@ -3263,15 +3269,24 @@ struct PlanEntry {
     /// Workspace-root-relative dirs whose set of crate subdirs shapes the
     /// plan (member globs like `crates/*` pick up new directories).
     glob_dirs: Vec<String>,
+    /// Workspace-root-relative local package directories whose conventional
+    /// Cargo target layout shapes the plan.
+    package_roots: Vec<String>,
     fingerprint: String,
     meta_blob: String,
     ug_blob: String,
 }
 
 /// Hash every plan input: file contents, plus (for glob dirs) the sorted
-/// child directory names that contain a Cargo.toml. Missing files hash as
-/// absent, so their later appearance invalidates too.
-fn plan_fingerprint(ws_root: &Path, files: &[String], glob_dirs: &[String]) -> String {
+/// child directory names that contain a Cargo.toml, and each local package's
+/// implicitly discovered Cargo targets. Missing files hash as absent, so their
+/// later appearance invalidates too.
+fn plan_fingerprint(
+    ws_root: &Path,
+    files: &[String],
+    glob_dirs: &[String],
+    package_roots: &[String],
+) -> String {
     let mut buf: Vec<u8> = Vec::new();
     for f in files {
         buf.extend_from_slice(f.as_bytes());
@@ -3298,6 +3313,40 @@ fn plan_fingerprint(ws_root: &Path, files: &[String], glob_dirs: &[String]) -> S
         for n in &names {
             buf.extend_from_slice(n.as_bytes());
             buf.push(0);
+        }
+        buf.push(0xff);
+    }
+    for package_root in package_roots {
+        buf.extend_from_slice(package_root.as_bytes());
+        buf.push(0);
+        let package_root = plan_abs(ws_root, package_root);
+        for path in ["build.rs", "src/lib.rs", "src/main.rs"] {
+            if package_root.join(path).is_file() {
+                buf.extend_from_slice(path.as_bytes());
+                buf.push(0);
+            }
+        }
+        for directory in ["src/bin", "tests", "examples", "benches"] {
+            let mut targets = Vec::new();
+            if let Ok(entries) = fs::read_dir(package_root.join(directory)) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+                    {
+                        targets.push(name);
+                    } else if path.is_dir() && path.join("main.rs").is_file() {
+                        targets.push(format!("{name}/main.rs"));
+                    }
+                }
+            }
+            targets.sort();
+            for target in targets {
+                buf.extend_from_slice(directory.as_bytes());
+                buf.push(b'/');
+                buf.extend_from_slice(target.as_bytes());
+                buf.push(0);
+            }
         }
         buf.push(0xff);
     }
@@ -3358,12 +3407,16 @@ fn save_plan(
         files.insert(rel_path(&ws_root, &dir.join(name)));
     }
     let mut glob_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut package_roots: BTreeSet<String> = BTreeSet::new();
     for p in &meta.packages {
         if p.source.is_some() {
             continue; // registry/git packages are pinned by the lockfile
         }
         let mp = Path::new(&p.manifest_path);
         files.insert(rel_path(&ws_root, mp));
+        if let Some(package_root) = mp.parent() {
+            package_roots.insert(rel_path(&ws_root, package_root));
+        }
         // the dir *containing* crate dirs: a new subdir with a Cargo.toml
         // may enter a `crates/*` members glob
         if let Some(container) = mp.parent().and_then(Path::parent) {
@@ -3374,12 +3427,14 @@ fn save_plan(
     }
     let files: Vec<String> = files.into_iter().collect();
     let glob_dirs: Vec<String> = glob_dirs.into_iter().collect();
+    let package_roots: Vec<String> = package_roots.into_iter().collect();
     let entry = PlanEntry {
         ws_root_rel: rel_path(dir, &ws_root),
         ws_root_abs: meta.workspace_root.clone(),
-        fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs),
+        fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs, &package_roots),
         files,
         glob_dirs,
+        package_roots,
         meta_blob: store.insert_bytes(meta_json.as_bytes())?,
         ug_blob: store.insert_bytes(ug_json.as_bytes())?,
     };
