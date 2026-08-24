@@ -1,0 +1,9 @@
+[package]
+name = "all_targets_app"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "custom"
+path = "benches/custom.rs"
+harness = false

@@ -30,7 +30,7 @@ pub enum Command {
     Check(WorkspaceBuildArgs),
 
     /// Check the selected package with Clippy
-    Clippy(WorkspaceBuildArgs),
+    Clippy(ClippyArgs),
 
     /// Build and run a binary
     Run(RunArgs),
@@ -87,6 +87,20 @@ pub struct WorkspaceBuildArgs {
     /// Select every workspace member
     #[arg(long, conflicts_with_all = ["package", "root"])]
     pub workspace: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ClippyArgs {
+    #[command(flatten)]
+    pub build: WorkspaceBuildArgs,
+
+    /// Check every library, binary, example, test, and benchmark target
+    #[arg(long)]
+    pub all_targets: bool,
+
+    /// Arguments passed to clippy-driver
+    #[arg(last = true, value_name = "CLIPPY_ARGS")]
+    pub clippy_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -179,6 +193,7 @@ mod tests {
             "corgi audit:",
             "corgi clean:",
             "--no-incremental",
+            "--all-targets",
             "--features",
             "--cache",
         ] {
@@ -244,6 +259,29 @@ mod tests {
         assert_eq!(args.filter.as_deref(), Some("parser"));
         assert_eq!(args.exec_args, ["--nocapture"]);
         assert!(Cli::try_parse_from(["corgi", "run", "--port", "8080"]).is_err());
+    }
+
+    #[test]
+    fn clippy_accepts_all_targets_and_delimited_arguments() {
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "clippy",
+            "-p",
+            "app",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .unwrap();
+        let Some(Command::Clippy(args)) = cli.command else {
+            panic!("clippy command not parsed");
+        };
+
+        assert_eq!(args.build.build.package.as_deref(), Some("app"));
+        assert!(args.all_targets);
+        assert_eq!(args.clippy_args, ["-D", "warnings"]);
+        assert!(Cli::try_parse_from(["corgi", "clippy", "-D", "warnings"]).is_err());
     }
 
     #[test]

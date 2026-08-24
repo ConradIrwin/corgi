@@ -3,4 +3,4 @@ members = ["app"]
 resolver = "2"
 
 [workspace.metadata]
-fixture = "clippy-package-directory"
+fixture = "clippy-all-targets"

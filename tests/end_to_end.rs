@@ -70,9 +70,59 @@ fn early_build_failures_are_recorded() {
 }
 
 #[test]
-fn clippy_runs_from_the_selected_packages_directory() {
+fn clippy_keys_delimited_arguments_without_poisoning_plain_runs() {
     let fixture = fixture_path("clippy-package-directory");
     run_corgi(&fixture, "clippy", ["-p", "app"]);
+
+    let denied = invoke_corgi(&fixture, "clippy", ["-p", "app", "--", "-D", "warnings"]);
+    assert_failure(&denied, "corgi clippy");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("unused variable"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    run_corgi(&fixture, "clippy", ["-p", "app"]);
+}
+
+#[test]
+fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
+    let fixture = fixture_path("clippy-all-targets");
+    run_corgi(
+        &fixture,
+        "clippy",
+        ["-p", "all_targets_app", "--", "-D", "warnings"],
+    );
+    run_corgi(
+        &fixture,
+        "clippy",
+        ["-p", "all_targets_app", "--all-targets"],
+    );
+
+    let denied = invoke_corgi(
+        &fixture,
+        "clippy",
+        [
+            "-p",
+            "all_targets_app",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    );
+    assert_failure(&denied, "corgi clippy --all-targets");
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    for target_warning in [
+        "example_warning",
+        "integration_warning",
+        "benchmark_warning",
+    ] {
+        assert!(
+            stderr.contains(target_warning),
+            "missing diagnostic for {target_warning}:\n{stderr}"
+        );
+    }
 }
 
 fn run_test_compile<const ARGUMENT_COUNT: usize>(
@@ -97,14 +147,23 @@ fn run_corgi<const ARGUMENT_COUNT: usize>(
     command: &str,
     arguments: [&str; ARGUMENT_COUNT],
 ) -> Output {
+    let output = invoke_corgi(fixture, command, arguments);
+    assert_success(&output, &format!("corgi {command}"));
+    output
+}
+
+fn invoke_corgi<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
         .arg(command)
-        .args(arguments)
         .arg("-C")
         .arg(fixture)
+        .args(arguments)
         .output()
         .expect("failed to invoke corgi");
-    assert_success(&output, &format!("corgi {command}"));
     output
 }
 
@@ -125,6 +184,15 @@ fn assert_success(output: &Output, command: &str) {
         output.status.success(),
         "{command} failed with {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failure(output: &Output, command: &str) {
+    assert!(
+        !output.status.success(),
+        "{command} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

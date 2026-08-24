@@ -2,7 +2,7 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,7 @@ struct UnitDep {
 struct Unit {
     pkg: usize,
     kind: Kind,
+    test_harness: bool,
     /// compiled for the host triple (proc-macros, build scripts, their deps);
     /// false = compiled for --target
     host: bool,
@@ -359,6 +360,7 @@ pub struct Ctx {
     /// the workspace clippy.toml when present.
     clippy_driver: String,
     clippy_id: String,
+    clippy_args: Vec<String>,
     clippy_conf: Option<PathBuf>,
     /// Logical path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
@@ -411,6 +413,8 @@ struct CompileKey<'a> {
     lints: &'a [String],
     /// clippy identity (driver version + clippy.toml hash); "" = rustc
     clippy: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clippy_args: Option<&'a [String]>,
     /// Incremental namespace: history-seeded, functionally equivalent but
     /// not bit-reproducible. Never mixes with the clean namespace.
     incr: bool,
@@ -759,6 +763,81 @@ fn resolve_lints(meta: &Metadata) -> Result<Vec<LintFlags>> {
         }
     }
     Ok(out)
+}
+
+fn targets_without_harness(meta: &Metadata) -> Result<HashSet<(usize, String, String)>> {
+    let mut targets = HashSet::new();
+    for (package_index, package) in meta.packages.iter().enumerate() {
+        if package.source.is_some() {
+            continue;
+        }
+        let text = fs::read_to_string(&package.manifest_path)
+            .with_context(|| format!("reading {}", package.manifest_path))?;
+        let manifest: toml::Value =
+            toml::from_str(&text).with_context(|| format!("parsing {}", package.manifest_path))?;
+        if let Some(table) = manifest.get("lib").and_then(toml::Value::as_table) {
+            record_target_without_harness(&mut targets, package_index, package, "lib", table)?;
+        }
+        for kind in ["bin", "example", "test", "bench"] {
+            let Some(entries) = manifest.get(kind).and_then(toml::Value::as_array) else {
+                continue;
+            };
+            for entry in entries {
+                let table = entry
+                    .as_table()
+                    .with_context(|| format!("[[{kind}]] is not a table"))?;
+                record_target_without_harness(&mut targets, package_index, package, kind, table)?;
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn record_target_without_harness(
+    targets: &mut HashSet<(usize, String, String)>,
+    package_index: usize,
+    package: &Package,
+    declared_kind: &str,
+    table: &toml::Table,
+) -> Result<()> {
+    if table.get("harness").and_then(toml::Value::as_bool) != Some(false) {
+        return Ok(());
+    }
+    let declared_name = table.get("name").and_then(toml::Value::as_str);
+    let declared_path = table
+        .get("path")
+        .and_then(toml::Value::as_str)
+        .map(|path| normalize_path(&package.root().join(path)));
+    let target = package
+        .targets
+        .iter()
+        .find(|target| {
+            if let Some(name) = declared_name {
+                return target.name == name;
+            }
+            if let Some(path) = &declared_path {
+                return normalize_path(Path::new(&target.src_path)) == *path;
+            }
+            declared_kind == "lib"
+                && !target.kind.iter().any(|kind| {
+                    matches!(
+                        kind.as_str(),
+                        "bin" | "example" | "test" | "bench" | "custom-build"
+                    )
+                })
+        })
+        .with_context(|| {
+            format!(
+                "could not match harness = false {declared_kind} target in {}",
+                package.manifest_path
+            )
+        })?;
+    targets.insert((
+        package_index,
+        target.kind.first().cloned().unwrap_or_default(),
+        target.name.clone(),
+    ));
+    Ok(())
 }
 
 /// Bare-name spawns (`Command::new("cmake")`) resolve through a shim dir
@@ -1703,6 +1782,8 @@ pub struct BuildOpts {
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
     pub root: Option<String>,
     pub mode: Mode,
+    pub all_targets: bool,
+    pub clippy_args: Vec<String>,
     pub timings: bool,
     pub no_incremental: bool,
     /// Ignore cached successful test results while retaining build cache hits.
@@ -1975,6 +2056,8 @@ fn build_inner(
         target,
         root,
         mode,
+        all_targets,
+        clippy_args,
         timings,
         no_incremental,
         force_tests,
@@ -2139,6 +2222,11 @@ fn build_inner(
     // replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
     let features_id = sha256_hex(format!("{selected_features:?}").as_bytes());
+    let target_set = if all_targets {
+        "all-targets"
+    } else {
+        "default-targets"
+    };
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) {
         "cargo-test"
@@ -2147,7 +2235,7 @@ fn build_inner(
     };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
@@ -2250,6 +2338,9 @@ fn build_inner(
             if matches!(mode, Mode::Test) {
                 ug_cmd.arg("--tests");
             }
+            if all_targets {
+                ug_cmd.arg("--all-targets");
+            }
             if release {
                 ug_cmd.arg("--release");
             }
@@ -2348,7 +2439,8 @@ fn build_inner(
         select_root_packages(&meta, &pkgs, workspace, package.as_deref(), mode)?
     };
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
-    let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref())?;
+    let targets_without_harness = targets_without_harness(&meta)?;
+    let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref(), &targets_without_harness)?;
     if matches!(mode, Mode::Test)
         && package.is_some()
         && !units
@@ -2393,27 +2485,27 @@ fn build_inner(
             let mut features = u.features.clone();
             features.sort();
             let prof = &u.profile;
-            let ident = sha256_hex(
-                format!(
-                    "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
-                    TOOL_VERSION,
-                    ws_relative_pkg_id(&meta.packages[u.pkg].id, &meta.workspace_root),
-                    u.target.name,
-                    u.target.kind,
-                    u.host,
-                    prof.name,
-                    prof.opt_level,
-                    prof.debuginfo_flag(),
-                    prof.codegen_units,
-                    prof.panic,
-                    prof.debug_assertions,
-                    prof.overflow_checks,
-                    features,
-                    dep_ids
-                )
-                .as_bytes(),
-            )[..16]
-                .to_string();
+            let mut ident_input = format!(
+                "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
+                TOOL_VERSION,
+                ws_relative_pkg_id(&meta.packages[u.pkg].id, &meta.workspace_root),
+                u.target.name,
+                u.target.kind,
+                u.host,
+                prof.name,
+                prof.opt_level,
+                prof.debuginfo_flag(),
+                prof.codegen_units,
+                prof.panic,
+                prof.debug_assertions,
+                prof.overflow_checks,
+                features,
+                dep_ids
+            );
+            if matches!(u.kind, Kind::Test) && !u.test_harness {
+                ident_input.push_str("\0harness=false");
+            }
+            let ident = sha256_hex(ident_input.as_bytes())[..16].to_string();
             memo[i] = Some(ident.clone());
             ident
         }
@@ -2770,6 +2862,7 @@ fn build_inner(
         clippy: matches!(mode, Mode::Clippy),
         clippy_driver,
         clippy_id,
+        clippy_args,
         clippy_conf,
         target_std_libdir,
         cfg_env_target,
@@ -3266,6 +3359,7 @@ fn translate_unit_graph(
     g: &meta::UnitGraph,
     pkgs: &HashMap<String, usize>,
     root_packages: Option<&BTreeSet<usize>>,
+    targets_without_harness: &HashSet<(usize, String, String)>,
 ) -> Result<Vec<Unit>> {
     let mut units: Vec<Unit> = Vec::with_capacity(g.units.len());
     for u in &g.units {
@@ -3279,14 +3373,23 @@ fn translate_unit_graph(
             Kind::Bsc
         } else if u.mode == "test" {
             Kind::Test
-        } else if u.target.kind.iter().any(|k| k == "bin") {
+        } else if u
+            .target
+            .crate_types
+            .iter()
+            .any(|crate_type| crate_type == "bin")
+        {
             Kind::Bin
         } else {
             Kind::Lib
         };
+        let target_kind = u.target.kind.first().cloned().unwrap_or_default();
+        let test_harness = matches!(kind, Kind::Test)
+            && !targets_without_harness.contains(&(pi, target_kind, u.target.name.clone()));
         units.push(Unit {
             pkg: pi,
             kind,
+            test_harness,
             host: u.platform.is_none(),
             is_root: false,
             target: u.target.clone(),
@@ -5523,6 +5626,9 @@ fn compile(
         profile: &pflags,
         lints: lint_flags,
         clippy: if clippy_action { &ctx.clippy_id } else { "" },
+        clippy_args: clippy_action
+            .then_some(ctx.clippy_args.as_slice())
+            .filter(|args| !args.is_empty()),
         incr: incr_action,
         ident: &ctx.idents[uidx],
         oso: &oso_rel,
@@ -5783,7 +5889,7 @@ fn compile(
     } else {
         cmd.arg("--emit=link,dep-info");
     }
-    if matches!(unit.kind, Kind::Test) {
+    if matches!(unit.kind, Kind::Test) && unit.test_harness {
         cmd.arg("--test");
     }
     if !unit.host {
@@ -5887,6 +5993,9 @@ fn compile(
     // the config can override anything tool-chosen.
     for flag in unit_rustflags {
         cmd.arg(flag);
+    }
+    if clippy_action {
+        cmd.args(&ctx.clippy_args);
     }
 
     if ctx.verbose {
@@ -6575,7 +6684,7 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
 mod named_root_tests {
     use super::{select_resolution_roots, translate_unit_graph, CorgiToml, RootSets};
     use crate::meta::UnitGraph;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     #[test]
     fn roots_are_named_package_sets() {
@@ -6732,7 +6841,8 @@ mod named_root_tests {
         let packages = HashMap::from([("cloud".to_string(), 0), ("shared".to_string(), 1)]);
         let selected = BTreeSet::from([1]);
 
-        let units = translate_unit_graph(&graph, &packages, Some(&selected)).unwrap();
+        let units =
+            translate_unit_graph(&graph, &packages, Some(&selected), &HashSet::new()).unwrap();
 
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].pkg, 1);
