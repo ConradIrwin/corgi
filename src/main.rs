@@ -3,6 +3,7 @@ mod build;
 mod cli;
 mod config;
 mod meta;
+mod report;
 mod store;
 
 use anyhow::Result;
@@ -11,6 +12,9 @@ use std::path::PathBuf;
 
 fn main() {
     if let Err(e) = real_main() {
+        if let Some(exit) = e.downcast_ref::<build::RunExit>() {
+            std::process::exit(exit.code);
+        }
         eprintln!("corgi error: {e:#}");
         std::process::exit(1);
     }

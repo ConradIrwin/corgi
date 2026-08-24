@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Hash-work counters for `CORGI_TIMING=1` reports (relaxed: stats only).
+/// Hash-work counters included in performance reports (relaxed: stats only).
 pub static STAT_FILES: AtomicU64 = AtomicU64::new(0);
 pub static REHASHED_FILES: AtomicU64 = AtomicU64::new(0);
 pub static HINTED_DIRS: AtomicU64 = AtomicU64::new(0);
@@ -176,7 +176,7 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
 
 impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
-        for d in ["cache", "pool", "outdirs", "tmp"] {
+        for d in ["cache", "pool", "outdirs", "tmp", "reports", "metrics"] {
             fs::create_dir_all(root.join(d))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths

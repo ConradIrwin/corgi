@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TOOL_VERSION: &str = "corgi/0.22";
@@ -44,6 +44,20 @@ pub enum Mode {
     Clippy,
     Test,
 }
+
+#[derive(Debug)]
+pub struct RunExit {
+    pub code: i32,
+    pub signal: Option<i32>,
+}
+
+impl std::fmt::Display for RunExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "executed program exited with {}", self.code)
+    }
+}
+
+impl std::error::Error for RunExit {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -98,6 +112,28 @@ struct ActionResult {
     stderr: String,
     #[serde(default)]
     bs: Option<BuildScriptOut>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheMiss {
+    NotFound,
+    RecordInvalid,
+    BlobMissing,
+    SentinelMissing,
+    OutputMismatch,
+}
+
+impl CacheMiss {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::RecordInvalid => "record_invalid",
+            Self::BlobMissing => "blob_missing",
+            Self::SentinelMissing => "sentinel_missing",
+            Self::OutputMismatch => "output_mismatch",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -191,11 +227,15 @@ struct UnitResult {
 }
 
 struct TestHarness {
+    unit_id: usize,
     name: String,
     path: PathBuf,
     cwd: PathBuf,
+    binary_environment: Vec<(String, String)>,
     pass_key: String,
     cached_pass: bool,
+    cache_bypassed: bool,
+    discovery_ns: u64,
     tests: Vec<String>,
 }
 
@@ -212,6 +252,13 @@ struct TestOutcome {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     elapsed: std::time::Duration,
+}
+
+struct TimedTestOutcome {
+    harness: usize,
+    start_ns: u64,
+    end_ns: u64,
+    outcome: Result<TestOutcome>,
 }
 
 struct TestCaptureFile {
@@ -301,6 +348,7 @@ pub struct Ctx {
     /// incremental state stays valid. -Cextra-filename keeps the full
     /// key16, so pool file names remain globally unique.
     idents: Vec<String>,
+    report_unit_keys: Vec<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
     /// Per-package resolved lint flags (empty for non-members).
@@ -325,6 +373,7 @@ pub struct Ctx {
     /// corgi.toml [extra-inputs]: package -> package-root-relative reads
     /// outside the package, granted to its actions and hashed as inputs.
     extra_inputs: ExtraInputs,
+    report: Arc<crate::report::Recorder>,
 }
 
 impl Ctx {
@@ -1090,6 +1139,17 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
             dirs += 1;
         }
     }
+    for path in read_dir_paths(&store.root.join("reports"))? {
+        if stale(&path) {
+            let size = fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if fs::remove_file(&path).is_ok() {
+                files += 1;
+                bytes += size;
+            }
+        }
+    }
     // hints/: pure accelerators
     if store.root.join("hints").exists() {
         for f in read_dir_paths(&store.root.join("hints"))? {
@@ -1629,6 +1689,7 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
 }
 
 /// Invocation options beyond the store and directory.
+#[derive(Clone)]
 pub struct BuildOpts {
     pub verbose: bool,
     pub release: bool,
@@ -1671,6 +1732,90 @@ fn select_features(features: &[String], package: Option<&str>) -> Vec<String> {
     selected.sort();
     selected.dedup();
     selected
+}
+
+fn report_run(
+    dir: &Path,
+    opts: &BuildOpts,
+    started_at: std::time::SystemTime,
+) -> crate::report::Run {
+    let command_name = match opts.mode {
+        Mode::Build => "build",
+        Mode::Run => "run",
+        Mode::Check => "check",
+        Mode::Clippy => "clippy",
+        Mode::Test => "test",
+    };
+    let selected_features = select_features(&opts.features, opts.package.as_deref());
+    let unix_nanos = started_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let run_id = format!("{unix_nanos:x}-{:x}", std::process::id());
+    let root = dir.display().to_string();
+    crate::report::Run {
+        id: run_id,
+        started_at_unix_ns: unix_nanos,
+        duration_ns: 0,
+        workspace: crate::report::Workspace { root },
+        command: crate::report::Command {
+            name: command_name.to_string(),
+            workspace: opts.workspace,
+            package: opts.package.clone(),
+            root_set: opts.root.clone(),
+            profile: if opts.release { "release" } else { "dev" }.to_string(),
+            target: opts.target.clone(),
+            features: selected_features,
+            incremental: !opts.no_incremental,
+            force_tests: opts.force_tests,
+            test_filter: opts.test_filter.clone(),
+            exec_args: opts.exec_args.clone(),
+        },
+        tool: crate::report::Tool {
+            corgi_version: env!("CARGO_PKG_VERSION").to_string(),
+            corgi_build_id: TOOL_VERSION.to_string(),
+            rustc_version: String::new(),
+            host: String::new(),
+            logical_cpus: std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(1),
+            toolchain: crate::report::ToolchainInput {
+                cc: String::new(),
+                ld: String::new(),
+                sdk: String::new(),
+                xcode: String::new(),
+            },
+            declared_environment: Vec::new(),
+            host_rustflags: Vec::new(),
+            target_rustflags: Vec::new(),
+        },
+        outcome: crate::report::Outcome::default(),
+    }
+}
+
+fn begin_report_stage(recorder: &crate::report::Recorder, name: &str) -> u64 {
+    let start_ns = recorder.elapsed_ns();
+    recorder.update(|report| {
+        report.run.outcome.stage = Some(name.to_string());
+        report.stages.insert(
+            name.to_string(),
+            crate::report::StageTiming {
+                start_ns,
+                end_ns: start_ns,
+            },
+        );
+    });
+    start_ns
+}
+
+fn finish_report_stage(recorder: &crate::report::Recorder, name: &str, start_ns: u64) {
+    let end_ns = recorder.elapsed_ns();
+    recorder.update(|report| {
+        report.stages.insert(
+            name.to_string(),
+            crate::report::StageTiming { start_ns, end_ns },
+        );
+    });
 }
 
 /// Format workspace sources with the exact rustfmt component matching the
@@ -1739,6 +1884,88 @@ pub fn fmt(
 }
 
 pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
+    let store_root = store.root.clone();
+    let started_at = std::time::SystemTime::now();
+    let monotonic_started_at = Instant::now();
+    let run = report_run(dir, &opts, started_at);
+    let path = store_root.join("reports").join(format!("{}.json", run.id));
+    let recorder = Arc::new(crate::report::Recorder::new_at(run, monotonic_started_at));
+    recorder.update(|report| report.run.outcome.stage = Some("setup".to_string()));
+    let result = build_inner(store, dir, opts, Arc::clone(&recorder));
+    if result.is_err() {
+        let end_ns = recorder.elapsed_ns();
+        recorder.update(|report| {
+            if let Some(stage) = &report.run.outcome.stage {
+                if let Some(timing) = report.stages.get_mut(stage) {
+                    timing.end_ns = end_ns;
+                }
+            }
+        });
+    }
+    recorder.update(|report| {
+        report.run.outcome = match &result {
+            Ok(()) => crate::report::Outcome {
+                status: crate::report::RunStatus::Success,
+                exit_code: Some(0),
+                ..crate::report::Outcome::default()
+            },
+            Err(error) => {
+                let run_exit = error.downcast_ref::<RunExit>();
+                crate::report::Outcome {
+                    status: if run_exit.is_some_and(|exit| exit.signal.is_some()) {
+                        crate::report::RunStatus::Interrupted
+                    } else {
+                        crate::report::RunStatus::Failed
+                    },
+                    stage: report.run.outcome.stage.clone(),
+                    message: Some(format!("{error:#}")),
+                    exit_code: Some(run_exit.map_or(1, |exit| exit.code)),
+                    signal: run_exit.and_then(|exit| exit.signal),
+                }
+            }
+        };
+        report.counters = crate::report::Counters {
+            source_hash_ns: report.counters.source_hash_ns,
+            hinted_directories: crate::store::HINTED_DIRS.load(Ordering::Relaxed),
+            files_statted: crate::store::STAT_FILES.load(Ordering::Relaxed),
+            files_rehashed: crate::store::REHASHED_FILES.load(Ordering::Relaxed),
+            immutable_source_hash_hits: crate::store::IMMUTABLE_HITS.load(Ordering::Relaxed),
+            export_check_bytes: crate::store::EXPORT_CHECK_BYTES.load(Ordering::Relaxed),
+        };
+        let mut workspace = crate::report::CacheCounts::default();
+        let mut dependencies = crate::report::CacheCounts::default();
+        for unit in &report.units {
+            let counts = if unit.package.scope == "workspace" {
+                &mut workspace
+            } else {
+                &mut dependencies
+            };
+            match unit.cache.result {
+                crate::report::UnitCacheResult::Hit => counts.hits += 1,
+                crate::report::UnitCacheResult::Miss => counts.misses += 1,
+                crate::report::UnitCacheResult::NotChecked => {}
+            }
+        }
+        report.cache.artifacts.workspace = workspace;
+        report.cache.artifacts.dependencies = dependencies;
+    });
+    match recorder.finish_to_path(&path) {
+        Ok(report) => {
+            if let Err(error) = crate::report::append_run(&store_root, &report) {
+                eprintln!("corgi warning: could not append run metrics: {error:#}");
+            }
+        }
+        Err(error) => eprintln!("corgi warning: could not write timing report: {error:#}"),
+    }
+    result
+}
+
+fn build_inner(
+    store: Store,
+    dir: &Path,
+    opts: BuildOpts,
+    recorder: Arc<crate::report::Recorder>,
+) -> Result<()> {
     let BuildOpts {
         verbose,
         release,
@@ -1756,9 +1983,13 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     } = opts;
     let selected_features = select_features(&features, package.as_deref());
     let t0 = Instant::now();
+    let mut report_stage_start = begin_report_stage(&recorder, "setup");
     let dir = dir
         .canonicalize()
         .with_context(|| format!("bad directory {}", dir.display()))?;
+    recorder.update(|report| {
+        report.run.workspace.root = dir.display().to_string();
+    });
     let manifest = dir.join("Cargo.toml");
     if !manifest.exists() {
         bail!("no Cargo.toml in {}", dir.display());
@@ -1801,6 +2032,10 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         .context("rustc -vV: no host line")?
         .trim()
         .to_string();
+    recorder.update(|report| {
+        report.run.tool.rustc_version = rustc_version.clone();
+        report.run.tool.host = host.clone();
+    });
     if host != host_guess {
         bail!("host triple mismatch: corgi resolved {host_guess}, pinned rustc reports {host}");
     }
@@ -1815,6 +2050,17 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         target_rustflags.clone()
     };
     let config_env = cargo_config.env;
+    recorder.update(|report| {
+        report.run.tool.declared_environment = config_env
+            .iter()
+            .map(|(name, value)| crate::report::EnvironmentInput {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        report.run.tool.host_rustflags = host_rustflags.clone();
+        report.run.tool.target_rustflags = target_rustflags.clone();
+    });
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
     let mut cfg_probe = Command::new(&rustc);
@@ -1871,7 +2117,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         .display()
         .to_string();
 
-    let t_setup_done = Instant::now();
+    finish_report_stage(&recorder, "setup", report_stage_start);
+    report_stage_start = begin_report_stage(&recorder, "plan");
     // ---- plan-phase cache -------------------------------------------------
     // cargo fetch + metadata + unit-graph cost ~0.8s even when nothing
     // changed. Their outputs are a pure function of: corgi itself, the
@@ -1908,6 +2155,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         )
         .as_bytes(),
     );
+    let plan_lookup_started = Instant::now();
     let mut plan: Option<(String, String)> = None; // (metadata json, unit-graph json)
     if let Some(bytes) = store.load_action(&plan_ptr) {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
@@ -1933,6 +2181,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             }
         }
     }
+    let plan_lookup_ns = plan_lookup_started.elapsed().as_nanos() as u64;
     let resolve_now = || -> Result<(String, String)> {
         {
             status!("Resolving", "dependencies via Cargo (metadata only)");
@@ -2041,18 +2290,30 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
     // A cached plan says nothing about dependency sources still being
     // extracted in the store (clean may have trimmed them); verify cheaply
     // and re-resolve once if anything is missing.
-    if from_cache
+    let cached_sources_missing = from_cache
         && meta
             .packages
             .iter()
-            .any(|p| p.source.is_some() && !p.root().exists())
-    {
+            .any(|p| p.source.is_some() && !p.root().exists());
+    if cached_sources_missing {
         status!("Fetching", "dependency sources missing from the store");
         let (m, u) = resolve_now()?;
         meta_json = m;
         ug_json = u;
         meta = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
     }
+    recorder.update(|report| {
+        report.cache.plan.result = Some(if cached_sources_missing {
+            crate::report::PlanCacheResult::Stale
+        } else if from_cache {
+            crate::report::PlanCacheResult::Hit
+        } else {
+            crate::report::PlanCacheResult::Miss
+        });
+        report.cache.plan.lookup_ns = plan_lookup_ns;
+        let workspace_root = Path::new(&meta.workspace_root);
+        report.run.workspace.root = workspace_root.display().to_string();
+    });
     // GC use-marker: dependency sources referenced by this plan stay
     // live. Git checkouts keep their marker at the checkout root, which
     // can be an ancestor of the package root.
@@ -2202,7 +2463,8 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         }
         check_mode = (0..units.len()).map(|i| !codegen[i]).collect();
     }
-    let t_plan_done = Instant::now();
+    finish_report_stage(&recorder, "plan", report_stage_start);
+    report_stage_start = begin_report_stage(&recorder, "prepare");
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
@@ -2252,6 +2514,13 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         String::new()
     };
     let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}");
+    let report_toolchain = crate::report::ToolchainInput {
+        cc: cc_v,
+        ld: ld_v,
+        sdk: sdk_v,
+        xcode: xcode_v,
+    };
+    recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
     // Unconditional where the platform supports it: there is exactly one
     // mode, and it fails hard. Errors name the missing input (denied exec,
     // undeclared read), and the fix is a pinned tool or extra-inputs
@@ -2456,6 +2725,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             );
         }
     }
+    let report_unit_keys = report_unit_keys(&meta, &units);
     let ctx = Ctx {
         store,
         verbose,
@@ -2494,6 +2764,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         )
         .context("creating jobserver")?,
         idents,
+        report_unit_keys,
         check_mode,
         lints,
         clippy: matches!(mode, Mode::Clippy),
@@ -2506,13 +2777,20 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         host_rustflags,
         config_env,
         extra_inputs,
+        report: Arc::clone(&recorder),
     };
 
-    let t_ctx_done = Instant::now();
+    register_report_units(&ctx);
+    finish_report_stage(&recorder, "prepare", report_stage_start);
+    report_stage_start = begin_report_stage(&recorder, "build");
     let results: Vec<OnceLock<UnitResult>> =
         (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let (executed, cached) = schedule(&ctx, &results)?;
-    let t_sched_done = Instant::now();
+    recorder.update(|report| {
+        report.counters.source_hash_ns = ctx.src_hash_nanos.load(Ordering::Relaxed)
+    });
+    finish_report_stage(&recorder, "build", report_stage_start);
+    report_stage_start = begin_report_stage(&recorder, "export");
 
     if matches!(mode, Mode::Test) {
         fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
@@ -2549,11 +2827,15 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             let cached_pass =
                 canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
             harnesses.push(TestHarness {
+                unit_id: i,
                 name: u.target.name.clone(),
                 path: dest,
                 cwd: ctx.meta.packages[u.pkg].root(),
+                binary_environment: binary_executable_environment(&ctx, u, &results)?,
                 pass_key,
                 cached_pass,
+                cache_bypassed: !canonical_run || force_tests,
+                discovery_ns: 0,
                 tests: Vec::new(),
             });
         }
@@ -2597,26 +2879,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             }
         }
     }
-    if std::env::var_os("CORGI_TIMING").is_some() {
-        use std::sync::atomic::Ordering::Relaxed;
-        eprintln!(
-            "corgi-timing: setup {:.3}s | plan {:.3}s | identity+tools {:.3}s | schedule {:.3}s (src-hash sum {:.3}s across workers) | export {:.3}s",
-            (t_setup_done - t0).as_secs_f64(),
-            (t_plan_done - t_setup_done).as_secs_f64(),
-            (t_ctx_done - t_plan_done).as_secs_f64(),
-            (t_sched_done - t_ctx_done).as_secs_f64(),
-            ctx.src_hash_nanos.load(Relaxed) as f64 / 1e9,
-            t_sched_done.elapsed().as_secs_f64(),
-        );
-        eprintln!(
-            "corgi-timing: hinted dirs {}, files statted {}, files content-rehashed {}, immutable src-hash hits {}, export-check bytes hashed {}",
-            crate::store::HINTED_DIRS.load(Relaxed),
-            crate::store::STAT_FILES.load(Relaxed),
-            crate::store::REHASHED_FILES.load(Relaxed),
-            crate::store::IMMUTABLE_HITS.load(Relaxed),
-            crate::store::EXPORT_CHECK_BYTES.load(Relaxed),
-        );
-    }
+    finish_report_stage(&recorder, "export", report_stage_start);
     status!(
         "Finished",
         "in {:.2}s — {executed} executed, {cached} cached",
@@ -2629,6 +2892,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
         }
     }
     if matches!(mode, Mode::Test) {
+        let test_stage_start = begin_report_stage(&recorder, "test");
         let canonical_run = test_filter.is_none() && exec_args.is_empty();
         run_tests(
             &ctx,
@@ -2637,8 +2901,11 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             &exec_args,
             canonical_run,
         )?;
+        finish_report_stage(&recorder, "test", test_stage_start);
     }
+    let cleanup_stage_start = begin_report_stage(&recorder, "cleanup");
     maybe_auto_clean(&ctx.store);
+    finish_report_stage(&recorder, "cleanup", cleanup_stage_start);
     if matches!(mode, Mode::Run) {
         let root_bins: Vec<usize> = ctx
             .units
@@ -2661,6 +2928,7 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             .join(&ctx.profile_name)
             .join(&ctx.units[bin_index].target.name);
         status!("Running", "`{}`", dest.display());
+        let execution_start = begin_report_stage(&recorder, "execute");
         // Exactly a manual run of the exported binary: ambient env, the
         // caller's cwd, inherited stdio; corgi sets nothing (no CARGO_*
         // vars). The exit status is the child's, signals reported the way
@@ -2669,14 +2937,32 @@ pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
             .args(&exec_args)
             .status()
             .with_context(|| format!("running {}", dest.display()))?;
+        let execution_end = recorder.elapsed_ns();
+        finish_report_stage(&recorder, "execute", execution_start);
         #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(signal) = status.signal() {
-                std::process::exit(128 + signal);
-            }
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(unix)]
+        let signal = status.signal();
+        #[cfg(not(unix))]
+        let signal = None;
+        let code = signal
+            .map(|signal| 128 + signal)
+            .unwrap_or_else(|| status.code().unwrap_or(1));
+        let execution = crate::report::Execution {
+            unit: ctx.report_unit_keys[bin_index].clone(),
+            program: dest.display().to_string(),
+            args: exec_args.clone(),
+            start_ns: execution_start,
+            end_ns: execution_end,
+            outcome: crate::report::ExecutionOutcome {
+                exit_code: status.code(),
+                signal,
+            },
+        };
+        recorder.update(|report| report.execution = Some(execution));
+        if code != 0 {
+            return Err(RunExit { code, signal }.into());
         }
-        std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
 }
@@ -3026,6 +3312,36 @@ fn translate_unit_graph(
         }
         units[i].deps = deps;
     }
+    // Cargo lists binaries built for CARGO_BIN_EXE_* as separate roots in the
+    // unit graph. Corgi needs explicit edges to schedule them before the
+    // integration test or benchmark whose environment references them.
+    let binary_units: Vec<(usize, bool, usize)> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| matches!(unit.kind, Kind::Bin))
+        .map(|(index, unit)| (unit.pkg, unit.host, index))
+        .collect();
+    for unit in &mut units {
+        if matches!(unit.kind, Kind::Test)
+            && unit
+                .target
+                .kind
+                .iter()
+                .any(|kind| kind == "test" || kind == "bench")
+        {
+            for (_, _, index) in binary_units
+                .iter()
+                .filter(|(package, host, _)| *package == unit.pkg && *host == unit.host)
+            {
+                if !unit.deps.iter().any(|dependency| dependency.unit == *index) {
+                    unit.deps.push(UnitDep {
+                        unit: *index,
+                        extern_name: None,
+                    });
+                }
+            }
+        }
+    }
     // build-script run units sometimes carry no feature list; inherit from
     // the script's compile unit so CARGO_FEATURE_* stays correct
     for i in 0..units.len() {
@@ -3114,29 +3430,29 @@ impl Ctx {
         Ok(())
     }
 
-    fn try_cache_hit(&self, key: &str) -> Result<Option<ActionResult>> {
+    fn try_cache_hit(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
         let Some(bytes) = self.store.load_action(key) else {
-            return Ok(None);
+            return Ok(Err(CacheMiss::NotFound));
         };
         let Ok(res) = serde_json::from_slice::<ActionResult>(&bytes) else {
-            return Ok(None);
+            return Ok(Err(CacheMiss::RecordInvalid));
         };
         for o in &res.outputs {
             let p = self.store.cache_path(&o.hash);
             if !p.exists() {
-                return Ok(None); // self-heal: treat as miss
+                return Ok(Err(CacheMiss::BlobMissing));
             }
             Store::touch_used(&p);
         }
         if res.bs.is_some() {
             let ok = self.store.root.join("outdirs").join(key).join(".ok");
             if !ok.exists() {
-                return Ok(None);
+                return Ok(Err(CacheMiss::SentinelMissing));
             }
             Store::touch_used(&ok);
         }
         self.materialize(key, &res)?;
-        Ok(Some(res))
+        Ok(Ok(res))
     }
 
     fn pkg_src_hash(&self, pi: usize) -> Result<String> {
@@ -3408,6 +3724,7 @@ fn save_test_pass(store: &Store, key: &str) -> Result<()> {
 fn configure_test_command(harness: &TestHarness) -> Command {
     let mut command = Command::new(&harness.path);
     command.current_dir(&harness.cwd);
+    command.envs(harness.binary_environment.iter().cloned());
     command
 }
 
@@ -3501,6 +3818,60 @@ fn run_tests(
     exec_args: &[String],
     canonical_run: bool,
 ) -> Result<()> {
+    let result = run_tests_inner(ctx, harnesses, filter, exec_args, canonical_run);
+    ctx.report.update(|report| {
+        let recorded_unit_ids = report
+            .test_harnesses
+            .iter()
+            .map(|harness| harness.unit.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for harness in harnesses
+            .iter()
+            .filter(|harness| !recorded_unit_ids.contains(&ctx.report_unit_keys[harness.unit_id]))
+        {
+            report.test_harnesses.push(crate::report::TestHarness {
+                unit: ctx.report_unit_keys[harness.unit_id].clone(),
+                name: harness.name.clone(),
+                cache: crate::report::HarnessCache {
+                    result: if harness.cache_bypassed {
+                        crate::report::UnitCacheResult::NotChecked
+                    } else if harness.cached_pass {
+                        crate::report::UnitCacheResult::Hit
+                    } else {
+                        crate::report::UnitCacheResult::Miss
+                    },
+                    pass_key: harness.pass_key.clone(),
+                    bypassed: harness.cache_bypassed,
+                },
+                discovery_ns: harness.discovery_ns,
+                duration_ns: 0,
+                summary: crate::report::TestSummary::default(),
+                tests: Vec::new(),
+            });
+        }
+        report.cache.test_results.hits = harnesses
+            .iter()
+            .filter(|harness| harness.cached_pass && !harness.cache_bypassed)
+            .count() as u64;
+        report.cache.test_results.misses = harnesses
+            .iter()
+            .filter(|harness| !harness.cached_pass && !harness.cache_bypassed)
+            .count() as u64;
+        report.cache.test_results.bypassed = harnesses
+            .iter()
+            .filter(|harness| harness.cache_bypassed)
+            .count() as u64;
+    });
+    result
+}
+
+fn run_tests_inner(
+    ctx: &Ctx,
+    harnesses: &mut [TestHarness],
+    filter: Option<&str>,
+    exec_args: &[String],
+    canonical_run: bool,
+) -> Result<()> {
     let started = Instant::now();
     let ignored_only = exec_args.iter().any(|argument| argument == "--ignored");
     let include_ignored = exec_args
@@ -3516,6 +3887,7 @@ fn run_tests(
             }
             continue;
         }
+        let discovery_started = Instant::now();
         let all_tests = list_tests(harness, false)?;
         let ignored: BTreeSet<String> = list_tests(harness, true)?.into_iter().collect();
         let candidates: Vec<String> = if ignored_only {
@@ -3532,6 +3904,7 @@ fn run_tests(
             .into_iter()
             .filter(|test| filter.is_none_or(|filter| test.contains(filter)))
             .collect();
+        harness.discovery_ns = discovery_started.elapsed().as_nanos() as u64;
         for name in &harness.tests {
             queue.push_back(TestCase {
                 harness: harness_index,
@@ -3549,7 +3922,7 @@ fn run_tests(
         cached_harnesses,
     );
     let queue = Mutex::new(queue);
-    let outcomes = Mutex::new(Vec::<Result<TestOutcome>>::new());
+    let outcomes = Mutex::new(Vec::<TimedTestOutcome>::new());
     let reporter = Mutex::new(());
     let worker_count = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -3561,10 +3934,16 @@ fn run_tests(
                 let Some(test) = queue.lock().unwrap().pop_front() else {
                     break;
                 };
+                let test_started_ns = started.elapsed().as_nanos() as u64;
                 let token = match ctx.jobserver.acquire().context("acquiring test job token") {
                     Ok(token) => token,
                     Err(error) => {
-                        outcomes.lock().unwrap().push(Err(error));
+                        outcomes.lock().unwrap().push(TimedTestOutcome {
+                            harness: test.harness,
+                            start_ns: test_started_ns,
+                            end_ns: started.elapsed().as_nanos() as u64,
+                            outcome: Err(error),
+                        });
                         break;
                     }
                 };
@@ -3606,14 +3985,53 @@ fn run_tests(
                         }
                     }
                 }
-                outcomes.lock().unwrap().push(result);
+                outcomes.lock().unwrap().push(TimedTestOutcome {
+                    harness: test.harness,
+                    start_ns: test_started_ns,
+                    end_ns: started.elapsed().as_nanos() as u64,
+                    outcome: result,
+                });
             });
         }
     });
     let mut failures = Vec::new();
     let mut harness_failed = vec![false; harnesses.len()];
-    for outcome in outcomes.into_inner().unwrap() {
-        let outcome = outcome?;
+    let mut harness_tests: Vec<Vec<crate::report::Test>> =
+        (0..harnesses.len()).map(|_| Vec::new()).collect();
+    let mut harness_summaries = vec![crate::report::TestSummary::default(); harnesses.len()];
+    let mut harness_start_ns = vec![u64::MAX; harnesses.len()];
+    let mut harness_end_ns = vec![0u64; harnesses.len()];
+    let mut infrastructure_error = None;
+    for timed_outcome in outcomes.into_inner().unwrap() {
+        harness_start_ns[timed_outcome.harness] =
+            harness_start_ns[timed_outcome.harness].min(timed_outcome.start_ns);
+        harness_end_ns[timed_outcome.harness] =
+            harness_end_ns[timed_outcome.harness].max(timed_outcome.end_ns);
+        let outcome = match timed_outcome.outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if infrastructure_error.is_none() {
+                    infrastructure_error = Some(error);
+                }
+                continue;
+            }
+        };
+        let report_outcome = if outcome.killed {
+            harness_summaries[outcome.harness].killed += 1;
+            crate::report::TestStatus::Killed
+        } else if outcome.success {
+            harness_summaries[outcome.harness].passed += 1;
+            crate::report::TestStatus::Passed
+        } else {
+            harness_summaries[outcome.harness].failed += 1;
+            crate::report::TestStatus::Failed
+        };
+        let duration_ns = outcome.elapsed.as_nanos() as u64;
+        harness_tests[outcome.harness].push(crate::report::Test {
+            name: outcome.name.clone(),
+            outcome: report_outcome,
+            duration_ns,
+        });
         if !outcome.success {
             harness_failed[outcome.harness] = true;
             failures.push(format!(
@@ -3621,6 +4039,33 @@ fn run_tests(
                 harnesses[outcome.harness].name, outcome.name
             ));
         }
+    }
+    for (index, harness) in harnesses.iter().enumerate() {
+        let test_harness = crate::report::TestHarness {
+            unit: ctx.report_unit_keys[harness.unit_id].clone(),
+            name: harness.name.clone(),
+            cache: crate::report::HarnessCache {
+                result: if harness.cache_bypassed {
+                    crate::report::UnitCacheResult::NotChecked
+                } else if harness.cached_pass {
+                    crate::report::UnitCacheResult::Hit
+                } else {
+                    crate::report::UnitCacheResult::Miss
+                },
+                pass_key: harness.pass_key.clone(),
+                bypassed: harness.cache_bypassed,
+            },
+            discovery_ns: harness.discovery_ns,
+            duration_ns: harness_end_ns[index]
+                .saturating_sub(harness_start_ns[index].min(harness_end_ns[index])),
+            summary: harness_summaries[index],
+            tests: std::mem::take(&mut harness_tests[index]),
+        };
+        ctx.report
+            .update(|report| report.test_harnesses.push(test_harness));
+    }
+    if let Some(error) = infrastructure_error {
+        return Err(error);
     }
     if canonical_run {
         for (index, harness) in harnesses.iter().enumerate() {
@@ -3691,11 +4136,15 @@ mod test_runner_tests {
 
     fn current_test_harness() -> TestHarness {
         TestHarness {
+            unit_id: 0,
             name: "corgi".to_string(),
             path: std::env::current_exe().unwrap(),
             cwd: std::env::current_dir().unwrap(),
+            binary_environment: Vec::new(),
             pass_key: String::new(),
             cached_pass: false,
+            cache_bypassed: false,
+            discovery_ns: 0,
             tests: Vec::new(),
         }
     }
@@ -3725,6 +4174,181 @@ fn describe(ctx: &Ctx, idx: usize) -> String {
         String::new()
     };
     format!("{} v{} ({what}{plat})", p.name, p.version)
+}
+
+fn report_action_kind(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Bsc => "compile_build_script",
+        Kind::Bsr => "run_build_script",
+        Kind::Test => "compile_test",
+        Kind::Lib | Kind::Bin => "compile",
+    }
+}
+
+fn report_unit_keys(meta: &Metadata, units: &[Unit]) -> Vec<String> {
+    units
+        .iter()
+        .map(|unit| {
+            let package = &meta.packages[unit.pkg];
+            let mut features = unit.features.clone();
+            features.sort();
+            let mut target_kinds = unit.target.kind.clone();
+            target_kinds.sort();
+            let mut crate_types = unit.target.crate_types.clone();
+            crate_types.sort();
+            let variant = serde_json::json!({
+                "package": ws_relative_pkg_id(&package.id, &meta.workspace_root),
+                "target": unit.target.name,
+                "target_kinds": target_kinds,
+                "crate_types": crate_types,
+                "action": report_action_kind(unit.kind),
+                "host": unit.host,
+                "features": features,
+                "profile": {
+                    "name": unit.profile.name,
+                    "opt_level": unit.profile.opt_level,
+                    "debuginfo": unit.profile.debuginfo,
+                    "codegen_units": unit.profile.codegen_units,
+                    "debug_assertions": unit.profile.debug_assertions,
+                    "overflow_checks": unit.profile.overflow_checks,
+                    "panic": unit.profile.panic,
+                    "lto": unit.profile.lto,
+                    "split_debuginfo": unit.profile.split_debuginfo,
+                    "incremental": unit.profile.incremental,
+                    "strip": unit.profile.strip,
+                    "rpath": unit.profile.rpath,
+                },
+            });
+            format!(
+                "{}:{}:{}",
+                package.name,
+                report_action_kind(unit.kind),
+                &sha256_hex(variant.to_string().as_bytes())[..16]
+            )
+        })
+        .collect()
+}
+
+fn register_report_units(ctx: &Ctx) {
+    let workspace_members: std::collections::HashSet<&str> = ctx
+        .meta
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for (id, unit) in ctx.units.iter().enumerate() {
+        let package = &ctx.meta.packages[unit.pkg];
+        let package_id = ws_relative_pkg_id(&package.id, &ctx.workspace_root);
+        let action_kind = report_action_kind(unit.kind);
+        let mut target_kinds = unit.target.kind.clone();
+        target_kinds.sort();
+        let mut crate_types = unit.target.crate_types.clone();
+        crate_types.sort();
+        let mut features = unit.features.clone();
+        features.sort();
+        let mut dependencies = unit
+            .deps
+            .iter()
+            .map(|dependency| crate::report::UnitDependency {
+                unit: ctx.report_unit_keys[dependency.unit].clone(),
+                role: if dependency.extern_name.is_some() {
+                    "extern"
+                } else if matches!(ctx.units[dependency.unit].kind, Kind::Bsr) {
+                    "build_script"
+                } else {
+                    "dependency"
+                }
+                .to_string(),
+                name: dependency.extern_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| {
+            (&left.unit, &left.role, &left.name).cmp(&(&right.unit, &right.role, &right.name))
+        });
+        let logical_hash = sha256_hex(
+            format!(
+                "report-unit\0{package_id}\0{}\0{:?}\0{:?}\0{action_kind}\0{}",
+                unit.target.name, target_kinds, crate_types, unit.host
+            )
+            .as_bytes(),
+        );
+        let logical_id = format!("{}:{action_kind}:{}", package.name, &logical_hash[..16]);
+        let scope = if workspace_members.contains(package.id.as_str()) {
+            "workspace"
+        } else {
+            package
+                .source
+                .as_deref()
+                .map(|source| {
+                    if source.starts_with("registry+") {
+                        "registry"
+                    } else if source.starts_with("git+") {
+                        "git"
+                    } else {
+                        "path"
+                    }
+                })
+                .unwrap_or("path")
+        };
+        let platform = if unit.host {
+            ctx.host.clone()
+        } else {
+            ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
+        };
+        let profile = &unit.profile;
+        let report_unit = crate::report::Unit {
+            id: ctx.report_unit_keys[id].clone(),
+            logical_id,
+            package: crate::report::Package {
+                id: package_id,
+                name: package.name.clone(),
+                version: package.version.clone(),
+                scope: scope.to_string(),
+                root: package.root().display().to_string(),
+            },
+            action: crate::report::UnitAction {
+                kind: action_kind.to_string(),
+                host: unit.host,
+                is_root: unit.is_root,
+            },
+            target: crate::report::Target {
+                name: unit.target.name.clone(),
+                kinds: target_kinds,
+                crate_types,
+                edition: unit.target.edition.clone(),
+                source: unit.target.src_path.clone(),
+                platform,
+            },
+            profile: serde_json::json!({
+                "name": profile.name,
+                "opt_level": profile.opt_level,
+                "debuginfo": profile.debuginfo,
+                "codegen_units": profile.codegen_units,
+                "debug_assertions": profile.debug_assertions,
+                "overflow_checks": profile.overflow_checks,
+                "panic": profile.panic,
+                "lto": profile.lto,
+                "split_debuginfo": profile.split_debuginfo,
+                "incremental": profile.incremental,
+                "strip": profile.strip,
+                "rpath": profile.rpath,
+            }),
+            features,
+            dependencies,
+            outcome: crate::report::UnitOutcome {
+                status: crate::report::UnitStatus::Skipped,
+                message: None,
+            },
+            cache: crate::report::UnitCache {
+                result: crate::report::UnitCacheResult::NotChecked,
+                probe: None,
+            },
+            key: None,
+            timings: None,
+            outputs: Vec::new(),
+        };
+        ctx.report.update(|report| report.units.push(report_unit));
+    }
 }
 
 struct SchedState {
@@ -3783,13 +4407,18 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     // Per-unit wall-clock samples (ns since scheduling began); cheap
     // enough to collect always, reported only under --timings.
     let t_sched = Instant::now();
+    let report_schedule_start = ctx.report.elapsed_ns();
     use std::sync::atomic::{AtomicBool as TBool, AtomicU64 as TNs, Ordering::Relaxed};
+    let t_ready: Vec<TNs> = (0..n).map(|_| TNs::new(u64::MAX)).collect();
     let t_start: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_meta: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_end: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
     let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    for &index in &ready {
+        t_ready[index].store(0, Relaxed);
+    }
     let state = Mutex::new(SchedState {
         ready,
         indeg,
@@ -3814,6 +4443,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         for &j in &rdeps_meta[idx] {
             st.indeg[j] -= 1;
             if st.indeg[j] == 0 {
+                t_ready[j].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
                 st.ready.push(j);
             }
         }
@@ -3880,6 +4510,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                             for &j in &rdeps_meta[idx] {
                                 st.indeg[j] -= 1;
                                 if st.indeg[j] == 0 {
+                                    t_ready[j].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
                                     st.ready.push(j);
                                 }
                             }
@@ -3889,12 +4520,19 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                         for &j in &rdeps_full[idx] {
                             st.indeg[j] -= 1;
                             if st.indeg[j] == 0 {
+                                t_ready[j].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
                                 st.ready.push(j);
                             }
                         }
                     }
                     Err(e) => {
                         status!("Failed", "{} — dependents skipped", describe(ctx, idx));
+                        ctx.report.update(|report| {
+                            report.units[idx].outcome = crate::report::UnitOutcome {
+                                status: crate::report::UnitStatus::Failed,
+                                message: Some(format!("{e:#}")),
+                            };
+                        });
                         st.errors.push(format!("[{}] {e:#}", describe(ctx, idx)));
                         st.done += 1;
                     }
@@ -3906,6 +4544,48 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     });
 
     let st = state.into_inner().unwrap();
+    ctx.report.update(|report| {
+        for index in 0..n {
+            let end = t_end[index].load(Relaxed);
+            if end > 0 {
+                let ready = t_ready[index].load(Relaxed);
+                let start = t_start[index].load(Relaxed);
+                let metadata = t_meta[index].load(Relaxed);
+                let phases = phase_slots[index].get().copied().unwrap_or_default();
+                report.units[index].timings = Some(crate::report::UnitTimings {
+                    ready_ns: (ready != u64::MAX).then_some(report_schedule_start + ready),
+                    start_ns: Some(report_schedule_start + start),
+                    metadata_ns: (metadata > 0).then_some(report_schedule_start + metadata),
+                    end_ns: Some(report_schedule_start + end),
+                    key_ns: phases.key_ns,
+                    cache_ns: phases.cache_ns,
+                    compiler_ns: phases.rustc_ns,
+                    validate_ns: phases.validate_ns,
+                    ingest_ns: phases.ingest_ns,
+                    ingest_bytes: phases.ingest_bytes,
+                    finish_ns: phases.finish_ns,
+                });
+            }
+            if let Some(result) = results[index].get() {
+                report.units[index].outcome = crate::report::UnitOutcome {
+                    status: crate::report::UnitStatus::Success,
+                    message: None,
+                };
+                report.units[index].outputs = result
+                    .res
+                    .outputs
+                    .iter()
+                    .map(|output| crate::report::Output {
+                        name: output.name.clone(),
+                        hash: output.hash.clone(),
+                        bytes: fs::metadata(ctx.store.cache_path(&output.hash))
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0),
+                    })
+                    .collect();
+            }
+        }
+    });
     if !st.errors.is_empty() {
         eprintln!("\ncorgi error: {} units failed", st.errors.len());
         for (i, e) in st.errors.iter().enumerate() {
@@ -4534,6 +5214,51 @@ fn finish_compile(
     })
 }
 
+/// Returns the package binaries Cargo exposes while compiling and running an
+/// integration test or benchmark.
+fn binary_executable_environment(
+    ctx: &Ctx,
+    unit: &Unit,
+    results: &[OnceLock<UnitResult>],
+) -> Result<Vec<(String, String)>> {
+    if !matches!(unit.kind, Kind::Test)
+        || !unit
+            .target
+            .kind
+            .iter()
+            .any(|kind| kind == "test" || kind == "bench")
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut environment = Vec::new();
+    for dependency in &unit.deps {
+        let binary = &ctx.units[dependency.unit];
+        if binary.pkg != unit.pkg
+            || !matches!(binary.kind, Kind::Bin)
+            || !binary.target.kind.iter().any(|kind| kind == "bin")
+        {
+            continue;
+        }
+        let result = results[dependency.unit]
+            .get()
+            .context("binary dependency result missing")?;
+        let output = result
+            .main
+            .as_ref()
+            .context("binary dependency artifact missing")?;
+        let path = ctx
+            .pool_logical
+            .join(Store::pool_file_name(&output.name, &result.key));
+        environment.push((
+            format!("CARGO_BIN_EXE_{}", binary.target.name),
+            path.display().to_string(),
+        ));
+    }
+    environment.sort();
+    Ok(environment)
+}
+
 fn compile(
     ctx: &Ctx,
     uidx: usize,
@@ -4581,6 +5306,7 @@ fn compile(
     let mut bs: &BuildScriptOut = &default_bs;
     let mut out_key = String::new();
     let mut externs: Vec<(String, String, String)> = Vec::new();
+    let mut build_script_unit_id = None;
     for d in &unit.deps {
         if let Some(name) = &d.extern_name {
             if self_pipelined && is_pipelined(ctx, d.unit) {
@@ -4591,17 +5317,15 @@ fn compile(
             } else {
                 let r = results[d.unit].get().context("dependency result missing")?;
                 let m = r.main.as_ref().context("dependency artifact missing")?;
-                externs.push((
-                    name.clone(),
-                    Store::pool_file_name(&m.name, &r.key),
-                    m.hash.clone(),
-                ));
+                let file = Store::pool_file_name(&m.name, &r.key);
+                externs.push((name.clone(), file, m.hash.clone()));
             }
         } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
             let r = results[d.unit].get().context("dependency result missing")?;
             if let Some(b) = &r.res.bs {
                 bs = b;
                 out_key = r.key.clone();
+                build_script_unit_id = Some(d.unit);
             }
         }
     }
@@ -4611,6 +5335,7 @@ fn compile(
     // artifacts into the key (the interface chain is cut by rmeta keying,
     // so implementations must be pinned flat, at the link).
     let mut link_closure: Vec<(String, String)> = Vec::new();
+    let mut report_link_dependencies = Vec::new();
     if is_linking(ctx, uidx) {
         let mut seen = vec![false; ctx.units.len()];
         let mut stack: Vec<usize> = unit.deps.iter().map(|d| d.unit).collect();
@@ -4622,6 +5347,7 @@ fn compile(
             if let Some(r) = results[i].get() {
                 if let Some(m) = &r.main {
                     link_closure.push((m.name.clone(), m.hash.clone()));
+                    report_link_dependencies.push(ctx.report_unit_keys[i].clone());
                 }
             }
             for d in &ctx.units[i].deps {
@@ -4630,6 +5356,8 @@ fn compile(
         }
         link_closure.sort();
         link_closure.dedup();
+        report_link_dependencies.sort();
+        report_link_dependencies.dedup();
     }
 
     let mut link_search: Vec<String> = bs.link_search.clone();
@@ -4662,6 +5390,7 @@ fn compile(
 
     let mut env = ctx.pkg_env(pkg);
     env.extend(ctx.config_env.iter().cloned());
+    env.extend(binary_executable_environment(ctx, unit, results)?);
     if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
     }
@@ -4752,7 +5481,7 @@ fn compile(
     } else {
         String::new()
     };
-    let key_json = serde_json::to_string(&CompileKey {
+    let key_inputs = CompileKey {
         kind: if clippy_action {
             if self_checked {
                 "clippy"
@@ -4807,8 +5536,39 @@ fn compile(
         } else {
             ctx.target.as_deref().unwrap_or("")
         },
-    })?;
+    };
+    let key_json = serde_json::to_string(&key_inputs)?;
     let key = sha256_hex(key_json.as_bytes());
+    let effective_environment_hash = sha256_hex(serde_json::to_string(key_inputs.env)?.as_bytes());
+    let report_key_inputs =
+        crate::report::ActionKeyInputs::Compile(Box::new(crate::report::CompileKeyInputs {
+            source_hash: key_inputs.src_hash.to_string(),
+            declared_environment: ctx
+                .config_env
+                .iter()
+                .map(|(name, value)| crate::report::EnvironmentInput {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            effective_environment_hash,
+            link_dependencies: report_link_dependencies,
+            build_script: build_script_unit_id.map(|unit_id| ctx.report_unit_keys[unit_id].clone()),
+            lints: key_inputs.lints.to_vec(),
+            clippy: (!key_inputs.clippy.is_empty()).then(|| key_inputs.clippy.to_string()),
+            cap_lints: key_inputs.cap_lints,
+            uses_toolchain: !key_inputs.toolchain.is_empty(),
+            compiler_identity: key_inputs.ident.to_string(),
+            debug_prefix: key_inputs.oso.to_string(),
+        }));
+    ctx.report.update(|report| {
+        let unit = &mut report.units[uidx];
+        unit.action.kind = key_inputs.kind.replace('-', "_");
+        unit.key = Some(crate::report::UnitKey {
+            hash: key.clone(),
+            inputs: report_key_inputs,
+        });
+    });
     let k16: String = key[..16].to_string();
     // Incremental units use the identity hash, not the action key, in
     // -Cextra-filename: rustc's dep graph embeds the output file names,
@@ -4822,7 +5582,18 @@ fn compile(
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
     let t_cache = Instant::now();
-    let hit = ctx.try_cache_hit(&key)?;
+    let (hit, cache_miss) = match ctx.try_cache_hit(&key)? {
+        Ok(result) => (Some(result), None),
+        Err(miss) => {
+            ctx.report.update(|report| {
+                report.units[uidx].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Miss,
+                    probe: Some(miss.name().to_string()),
+                };
+            });
+            (None, Some(miss))
+        }
+    };
     phases.cache_ns = t_cache.elapsed().as_nanos() as u64;
     if let Some(res) = hit {
         let expected: Vec<String> = if self_checked {
@@ -4834,6 +5605,12 @@ fn compile(
             .iter()
             .all(|e| res.outputs.iter().any(|o| &o.name == e))
         {
+            ctx.report.update(|report| {
+                report.units[uidx].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Hit,
+                    probe: Some("found".to_string()),
+                };
+            });
             if !res.stderr.is_empty() && pkg.source.is_none() {
                 eprint!("{}", res.stderr);
             }
@@ -4845,8 +5622,15 @@ fn compile(
             "{:>12} corrupt action record for {} ({crate_name})",
             "Discarding", pkg.name
         );
+        ctx.report.update(|report| {
+            report.units[uidx].cache = crate::report::UnitCache {
+                result: crate::report::UnitCacheResult::Miss,
+                probe: Some(CacheMiss::OutputMismatch.name().to_string()),
+            };
+        });
         fs::remove_file(ctx.store.action_path(&key)).ok();
     }
+    let _ = cache_miss;
 
     // Incremental state: store-managed, scoped per (checkout, crate,
     // crate-type, mode, platform, profile) so histories never cross;
@@ -5252,6 +6036,7 @@ fn run_build_script(
 
     let mut script: Option<OutputFile> = None;
     let mut script_key = String::new();
+    let mut script_unit_id = None;
     let mut dep_env: Vec<(String, String)> = Vec::new();
     for d in &unit.deps {
         let r = results[d.unit].get().context("dep result missing")?;
@@ -5259,6 +6044,7 @@ fn run_build_script(
             Kind::Bsc => {
                 script = r.main.clone();
                 script_key = r.key.clone();
+                script_unit_id = Some(d.unit);
             }
             Kind::Bsr => {
                 let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
@@ -5278,6 +6064,7 @@ fn run_build_script(
     let script = script.context("build script binary missing")?;
 
     let mut env = ctx.pkg_env(pkg);
+    let mut declared_environment = ctx.config_env.clone();
     let plat_triple = if unit.host {
         ctx.host.clone()
     } else {
@@ -5331,6 +6118,7 @@ fn run_build_script(
             && (profiles.is_empty() || profiles.iter().any(|pr| pr == &unit.profile.name))
         {
             env.push((name.clone(), value.clone())); // keyed via the env vec
+            declared_environment.push((name.clone(), value.clone()));
         }
     }
     let mut tool_ids: Vec<String> = visible_tools.iter().map(|t| t.id.clone()).collect();
@@ -5353,9 +6141,12 @@ fn run_build_script(
     }
     env.sort();
     dep_env.sort();
+    declared_environment.sort();
 
+    let key_started = Instant::now();
+    let mut phases = Phases::default();
     let src_hash = ctx.pkg_src_hash(unit.pkg)?;
-    let key_json = serde_json::to_string(&RunKey {
+    let key_inputs = RunKey {
         kind: "run-build-script",
         tool: TOOL_VERSION,
         rustc: &ctx.rustc_version,
@@ -5371,17 +6162,72 @@ fn run_build_script(
         dep_env: &dep_env,
         toolchain: &ctx.toolchain,
         tools: &tool_ids,
-    })?;
+    };
+    let key_json = serde_json::to_string(&key_inputs)?;
     let key = sha256_hex(key_json.as_bytes());
-
-    if let Some(res) = ctx.try_cache_hit(&key)? {
-        return Ok(UnitResult {
-            key,
-            cached: true,
-            res,
-            main: None,
-            phases: Phases::default(),
+    let effective_environment_hash = sha256_hex(serde_json::to_string(key_inputs.env)?.as_bytes());
+    let report_key_inputs = crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
+        crate::report::BuildScriptRunKeyInputs {
+            source_hash: key_inputs.src_hash.to_string(),
+            script: ctx.report_unit_keys
+                [script_unit_id.context("build script compile dependency missing")?]
+            .clone(),
+            declared_environment: declared_environment
+                .iter()
+                .map(|(name, value)| crate::report::EnvironmentInput {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            effective_environment_hash,
+            tools: visible_tools
+                .iter()
+                .map(|tool| crate::report::ToolInput {
+                    name: tool.name.clone(),
+                    version: tool.version.clone(),
+                    identity: tool.id.clone(),
+                    environment_name: tool.env.clone(),
+                    environment_value: tool.value.clone(),
+                })
+                .collect(),
+            uses_toolchain: true,
+        },
+    ));
+    ctx.report.update(|report| {
+        report.units[uidx].key = Some(crate::report::UnitKey {
+            hash: key.clone(),
+            inputs: report_key_inputs,
         });
+    });
+    phases.key_ns = key_started.elapsed().as_nanos() as u64;
+
+    let cache_started = Instant::now();
+    let initial_probe = ctx.try_cache_hit(&key)?;
+    phases.cache_ns = cache_started.elapsed().as_nanos() as u64;
+    match initial_probe {
+        Ok(res) => {
+            ctx.report.update(|report| {
+                report.units[uidx].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Hit,
+                    probe: Some("found".to_string()),
+                };
+            });
+            return Ok(UnitResult {
+                key,
+                cached: true,
+                res,
+                main: None,
+                phases,
+            });
+        }
+        Err(miss) => {
+            ctx.report.update(|report| {
+                report.units[uidx].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Miss,
+                    probe: Some(miss.name().to_string()),
+                };
+            });
+        }
     }
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
@@ -5399,13 +6245,19 @@ fn run_build_script(
         .lock()
         .with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
     // While we waited: a concurrent winner may have finished the work.
-    if let Some(res) = ctx.try_cache_hit(&key)? {
+    if let Ok(res) = ctx.try_cache_hit(&key)? {
+        ctx.report.update(|report| {
+            report.units[uidx].cache = crate::report::UnitCache {
+                result: crate::report::UnitCacheResult::Hit,
+                probe: Some("found_after_wait".to_string()),
+            };
+        });
         return Ok(UnitResult {
             key,
             cached: true,
             res,
             main: None,
-            phases: Phases::default(),
+            phases,
         });
     }
     if final_parent.exists() {
@@ -5462,9 +6314,11 @@ fn run_build_script(
     if ctx.verbose {
         status!("Exec", "{cmd:?}");
     }
+    let execution_started = Instant::now();
     let out = cmd
         .output()
         .with_context(|| format!("running build script for {}", pkg.name))?;
+    phases.rustc_ns = execution_started.elapsed().as_nanos() as u64;
     fs::remove_dir_all(&scratch).ok();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -5501,7 +6355,7 @@ fn run_build_script(
         cached: false,
         res,
         main: None,
-        phases: Phases::default(),
+        phases,
     })
 }
 
@@ -5831,5 +6685,60 @@ mod feature_selection_tests {
             select_features(&["tls".to_string(), "dependency/tracing".to_string()], None);
 
         assert_eq!(selected, ["dependency/tracing", "tls"]);
+    }
+}
+
+#[cfg(test)]
+mod unit_graph_tests {
+    use super::translate_unit_graph;
+    use crate::meta::UnitGraph;
+    use std::collections::HashMap;
+
+    #[test]
+    fn integration_tests_depend_on_package_binaries() {
+        let graph: UnitGraph = serde_json::from_value(serde_json::json!({
+            "roots": [0, 1],
+            "units": [
+                {
+                    "pkg_id": "corgi",
+                    "target": {
+                        "name": "end_to_end",
+                        "kind": ["test"],
+                        "crate_types": ["bin"],
+                        "src_path": "tests/end_to_end.rs",
+                        "edition": "2021"
+                    },
+                    "platform": null,
+                    "mode": "test",
+                    "features": [],
+                    "dependencies": []
+                },
+                {
+                    "pkg_id": "corgi",
+                    "target": {
+                        "name": "corgi",
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "src_path": "src/main.rs",
+                        "edition": "2021"
+                    },
+                    "platform": null,
+                    "mode": "build",
+                    "features": [],
+                    "dependencies": []
+                }
+            ]
+        }))
+        .unwrap();
+        let packages = HashMap::from([("corgi".to_string(), 0)]);
+
+        let units = translate_unit_graph(&graph, &packages, None).unwrap();
+
+        let integration_test = units
+            .iter()
+            .find(|unit| unit.target.name == "end_to_end")
+            .unwrap();
+        assert_eq!(integration_test.deps.len(), 1);
+        assert_eq!(units[integration_test.deps[0].unit].target.name, "corgi");
     }
 }
