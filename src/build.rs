@@ -333,6 +333,7 @@ pub struct Ctx {
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
+    zig: Option<ZigRuntime>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
@@ -376,6 +377,16 @@ pub struct Ctx {
     /// outside the package, granted to its actions and hashed as inputs.
     extra_inputs: ExtraInputs,
     report: Arc<crate::report::Recorder>,
+}
+
+#[derive(Clone)]
+struct ZigRuntime {
+    cc: PathBuf,
+    cxx: PathBuf,
+    ar: PathBuf,
+    ranlib: PathBuf,
+    cmake_toolchain: PathBuf,
+    identity: String,
 }
 
 impl Ctx {
@@ -978,6 +989,110 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
+}
+
+fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
+    let target = crate::zig::target(target)?
+        .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
+    let asset = crate::zig::asset(host)?;
+    let archive_root = crate::zig::archive_root(&asset);
+    let spec = ToolSpec {
+        name: "zig".to_string(),
+        version: crate::zig::VERSION.to_string(),
+        url: crate::zig::url(&asset),
+        sha256: asset.sha256.to_string(),
+        bin: format!("{archive_root}/zig"),
+        path: String::new(),
+        env: String::new(),
+        packages: Vec::new(),
+        auth: String::new(),
+    };
+    let installed = ensure_tool(store, &spec)?;
+    let logical_executable = store
+        .logical_root()
+        .join("tools")
+        .join(format!("zig-{}", crate::zig::VERSION))
+        .join(&spec.bin);
+    let driver_source = std::env::current_exe()?.canonicalize()?;
+    let driver_hash = crate::store::sha256_file(&driver_source)?;
+    let wrapper_identity = sha256_hex(
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            crate::zig::VERSION,
+            crate::zig::DRIVER_VERSION,
+            asset.platform,
+            asset.sha256,
+            target.zig,
+            driver_hash,
+        )
+        .as_bytes(),
+    );
+    let wrapper_dir = store
+        .root
+        .join("tools")
+        .join(format!("zig-wrappers-{}", &wrapper_identity[..16]));
+    let logical_wrapper_dir = store
+        .logical_root()
+        .join("tools")
+        .join(format!("zig-wrappers-{}", &wrapper_identity[..16]));
+    let cmake_contents = format!(
+        "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR {})\nset(CMAKE_C_COMPILER \"{}\")\nset(CMAKE_CXX_COMPILER \"{}\")\nset(CMAKE_AR \"{}\")\nset(CMAKE_RANLIB \"{}\")\n",
+        target.cmake_processor,
+        logical_wrapper_dir.join("cc").display(),
+        logical_wrapper_dir.join("c++").display(),
+        logical_wrapper_dir.join("ar").display(),
+        logical_wrapper_dir.join("ranlib").display(),
+    );
+    let wrapper_is_complete = |directory: &Path| {
+        [
+            "driver",
+            "cc",
+            "c++",
+            "ar",
+            "ranlib",
+            "target",
+            "zig-path",
+            "toolchain.cmake",
+        ]
+        .iter()
+        .all(|name| directory.join(name).exists())
+    };
+    if !wrapper_is_complete(&wrapper_dir) {
+        let staging_dir = store.tmp_path("zig-wrappers");
+        fs::create_dir_all(&staging_dir)?;
+        fs::copy(&driver_source, staging_dir.join("driver"))?;
+        for name in ["cc", "c++", "ar", "ranlib"] {
+            std::os::unix::fs::symlink("driver", staging_dir.join(name))?;
+        }
+        fs::write(staging_dir.join("target"), &target.zig)?;
+        fs::write(
+            staging_dir.join("zig-path"),
+            logical_executable.as_os_str().as_encoded_bytes(),
+        )?;
+        fs::write(staging_dir.join("toolchain.cmake"), &cmake_contents)?;
+        match fs::rename(&staging_dir, &wrapper_dir) {
+            Ok(()) => {}
+            Err(_) if wrapper_is_complete(&wrapper_dir) => {
+                fs::remove_dir_all(&staging_dir).ok();
+            }
+            Err(error) => return Err(error).context("publishing Zig linker wrappers"),
+        }
+    }
+    touch_tool_marker(&wrapper_dir);
+    Store::touch_used(
+        installed
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(installed.as_path()),
+    );
+    Ok(ZigRuntime {
+        cc: logical_wrapper_dir.join("cc"),
+        cxx: logical_wrapper_dir.join("c++"),
+        ar: logical_wrapper_dir.join("ar"),
+        ranlib: logical_wrapper_dir.join("ranlib"),
+        cmake_toolchain: logical_wrapper_dir.join("toolchain.cmake"),
+        identity: wrapper_identity,
+    })
 }
 
 /// Split a GitHub release-asset url into (owner/repo, tag, asset name):
@@ -2060,7 +2175,7 @@ fn build_inner(
         package,
         bin,
         features,
-        target,
+        target: requested_target,
         root,
         mode,
         all_targets,
@@ -2100,6 +2215,21 @@ fn build_inner(
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
+    let zig_target = requested_target
+        .as_deref()
+        .map(|target| {
+            crate::zig::target_requires_zig(&host_guess, target)
+                .map(|required| required.then(|| target.to_string()))
+        })
+        .transpose()?
+        .flatten();
+    if zig_target.is_some() {
+        crate::zig::raise_file_descriptor_limit()?;
+    }
+    let target = match zig_target.as_deref() {
+        Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
+        None => requested_target,
+    };
     ensure_toolchain(&store, &channel, &host_guess)?;
     // Debugger convenience, deliberately outside the sysroot (see
     // ensure_rust_src). Failure is non-fatal: builds don't need sources.
@@ -2621,7 +2751,16 @@ fn build_inner(
     } else {
         String::new()
     };
-    let toolchain = format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}");
+    let zig_runtime = zig_target
+        .as_deref()
+        .map(|target| ensure_zig(&store, &host_guess, target))
+        .transpose()?;
+    let zig_identity = zig_runtime
+        .as_ref()
+        .map(|runtime| runtime.identity.as_str())
+        .unwrap_or("");
+    let toolchain =
+        format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nzig: {zig_identity}");
     let report_toolchain = crate::report::ToolchainInput {
         cc: cc_v,
         ld: ld_v,
@@ -2863,6 +3002,7 @@ fn build_inner(
         tools: tools_rt,
         env_probes,
         target,
+        zig: zig_runtime,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -2907,7 +3047,11 @@ fn build_inner(
 
     // Exports anchor at the WORKSPACE root (cargo's target/ convention):
     // building any member from any directory lands artifacts in one place.
-    let dtarget = Path::new(&ctx.workspace_root).join("target");
+    let target_dir = Path::new(&ctx.workspace_root).join("target");
+    let dtarget = ctx
+        .target
+        .as_ref()
+        .map_or_else(|| target_dir.clone(), |target| target_dir.join(target));
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
 
@@ -2972,7 +3116,7 @@ fn build_inner(
             }
         }
         if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
-            if let (Some(tgt), Some(r)) = (ctx.target.as_deref(), results[i].get()) {
+            if let Some(r) = results[i].get() {
                 let k16 = &r.key[..16];
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm")
@@ -2980,7 +3124,7 @@ fn build_inner(
                         || o.name.ends_with(".so")
                     {
                         let clean = o.name.replace(&format!("-{k16}"), "");
-                        let dest = dtarget.join(tgt).join(&ctx.profile_name).join(&clean);
+                        let dest = dtarget.join(&ctx.profile_name).join(&clean);
                         ctx.store.export(&o.hash, &dest, true)?;
                         written.push(dest);
                     }
@@ -5864,6 +6008,21 @@ fn compile(
     cmd.current_dir(compile_dir);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
+    if ctx.zig.is_some() {
+        let zig_global_cache = scratch.join("zig-global-cache");
+        let zig_local_cache = scratch.join("zig-local-cache");
+        fs::create_dir_all(&zig_global_cache)?;
+        fs::create_dir_all(&zig_local_cache)?;
+        if let Some(version) = ctx
+            .rustc_version
+            .lines()
+            .find_map(|line| line.strip_prefix("release: "))
+        {
+            cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", version);
+        }
+        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
+        cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    }
     if !ctx.sdkroot.is_empty() {
         cmd.env("SDKROOT", &ctx.sdkroot);
     }
@@ -5889,7 +6048,15 @@ fn compile(
         cmd.env("OUT_DIR", ctx.out_dir_logical(&out_key));
     }
 
-    cmd.arg("--sysroot").arg(&ctx.sysroot);
+    let target_sysroot = (!unit.host)
+        .then(|| {
+            ctx.target_std_libdir
+                .as_deref()
+                .and_then(|path| Path::new(path).ancestors().nth(4))
+        })
+        .flatten();
+    cmd.arg("--sysroot")
+        .arg(target_sysroot.unwrap_or_else(|| Path::new(&ctx.sysroot)));
     cmd.arg("--crate-name").arg(&crate_name);
     cmd.arg("--edition").arg(&target.edition);
     cmd.arg(&src_rel);
@@ -5911,6 +6078,9 @@ fn compile(
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
+            if let Some(zig) = &ctx.zig {
+                cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
+            }
             if let Some(libdir) = &ctx.target_std_libdir {
                 cmd.arg("-L").arg(libdir);
             }
@@ -6197,7 +6367,8 @@ fn run_build_script(
     } else {
         ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
     };
-    env.push(("TARGET".into(), plat_triple));
+    let cross_compiling = plat_triple != ctx.host;
+    env.push(("TARGET".into(), plat_triple.clone()));
     env.push(("HOST".into(), ctx.host.clone()));
     env.push(("PROFILE".into(), unit.profile.env_name().into()));
     env.push((
@@ -6215,6 +6386,26 @@ fn run_build_script(
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
+    if cross_compiling {
+        if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
+            let target_environment = target.replace('-', "_");
+            for (name, value) in [
+                (format!("CC_{target_environment}"), &zig.cc),
+                (format!("CXX_{target_environment}"), &zig.cxx),
+                (format!("AR_{target_environment}"), &zig.ar),
+                (format!("RANLIB_{target_environment}"), &zig.ranlib),
+            ] {
+                env.push((name, value.display().to_string()));
+            }
+            for name in [
+                "CMAKE_TOOLCHAIN_FILE",
+                "TARGET_CMAKE_TOOLCHAIN_FILE",
+                &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
+            ] {
+                env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
+            }
+        }
+    }
     // Cargo hands build scripts the rustflags of the unit they configure,
     // joined with the 0x1f separator.
     env.push((
@@ -6411,6 +6602,21 @@ fn run_build_script(
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
+    if ctx.zig.is_some() {
+        let zig_global_cache = scratch.join("zig-global-cache");
+        let zig_local_cache = scratch.join("zig-local-cache");
+        fs::create_dir_all(&zig_global_cache)?;
+        fs::create_dir_all(&zig_local_cache)?;
+        if let Some(version) = ctx
+            .rustc_version
+            .lines()
+            .find_map(|line| line.strip_prefix("release: "))
+        {
+            cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", version);
+        }
+        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
+        cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    }
     if !ctx.sdkroot.is_empty() {
         cmd.env("SDKROOT", &ctx.sdkroot);
     }

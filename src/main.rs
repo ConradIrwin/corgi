@@ -5,6 +5,7 @@ mod config;
 mod meta;
 mod report;
 mod store;
+mod zig;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -22,6 +23,9 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let argv: Vec<_> = std::env::args_os().collect();
+    if zig::is_linker_invocation(&argv) {
+        return zig::run_linker_invocation(&argv);
+    }
     let had_argument_delimiter = argv.iter().any(|arg| arg == "--");
     let cli::Cli {
         dir,

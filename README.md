@@ -41,6 +41,14 @@ corgi [ build | run | test | check | clippy | fmt | audit | clean ] ...
 There are definitely sub-options and commands missing; please file reports or
 send PRs.
 
+When `corgi build --target x86_64-unknown-linux-gnu.2.31` requests a target the
+host linker cannot produce, Corgi automatically cross-compiles through Zig.
+Corgi installs its own SHA-256-pinned Zig 0.15.2 toolchain rather than using an
+ambient `zig`, and runs Zig and its linker compatibility driver inside the same
+no-network action sandbox as Rust compilation. It supports x86-64 and AArch64
+GNU/Linux targets, including an explicit minimum glibc version, and x86-64 and
+AArch64 musl targets from pinned macOS and GNU/Linux hosts.
+
 # Migrating
 
 Corgi already works to compile [Zed](https://zed.dev) and
