@@ -51,12 +51,20 @@ pub enum Command {
 #[derive(Debug, Args, Default)]
 pub struct BuildArgs {
     /// Use the release profile
-    #[arg(long)]
+    #[arg(long, conflicts_with = "profile")]
     pub release: bool,
+
+    /// Build with the named profile
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<String>,
 
     /// Determine the execution package
     #[arg(short = 'p', long, value_name = "PACKAGE")]
     pub package: Option<String>,
+
+    /// Build only the named binary
+    #[arg(long, value_name = "NAME")]
+    pub bin: Option<String>,
 
     /// Enable the given features
     #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
@@ -248,6 +256,25 @@ mod tests {
         };
 
         assert_eq!(args.build.features, ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn build_accepts_profile_and_binary_selection() {
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "build",
+            "--profile",
+            "runner-dev",
+            "--bin",
+            "runner",
+        ])
+        .unwrap();
+        let Some(Command::Build(args)) = cli.command else {
+            panic!("build command not parsed");
+        };
+
+        assert_eq!(args.build.profile.as_deref(), Some("runner-dev"));
+        assert_eq!(args.build.bin.as_deref(), Some("runner"));
     }
 
     #[test]

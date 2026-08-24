@@ -76,8 +76,10 @@ fn real_main() -> Result<()> {
                     build::BuildOpts {
                         verbose,
                         release: args.release,
+                        profile: args.profile,
                         workspace,
                         package: args.package,
+                        bin: args.bin,
                         features: args.features,
                         target: args.target,
                         root: args.root,
