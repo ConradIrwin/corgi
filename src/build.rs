@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.22";
+const TOOL_VERSION: &str = "corgi/0.23";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! status {
@@ -4562,13 +4562,17 @@ fn compile(
         Kind::Bsr => unreachable!(),
     };
     let crate_type = crate_type.as_str();
-    // Cargo's invocation shape: rustc runs from the workspace root and
-    // workspace sources are spelled relative to it, so Location::file(),
-    // panic messages, and debug info match cargo's byte for byte without
-    // a checkout prefix entering the artifact. Sources outside the
-    // workspace (registry, git) keep their canonical store spelling.
+    let clippy_action = ctx.clippy && pkg.source.is_none();
+    // Clippy resolves and tracks Cargo.toml relative to its working
+    // directory, which Cargo sets to CARGO_MANIFEST_DIR. Plain rustc actions
+    // retain workspace-relative paths so their artifacts match Cargo's.
+    let compile_dir = if clippy_action {
+        &pkg_root
+    } else {
+        Path::new(&ctx.workspace_root)
+    };
     let src_rel = Path::new(&target.src_path)
-        .strip_prefix(&ctx.workspace_root)
+        .strip_prefix(compile_dir)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| target.src_path.clone());
 
@@ -4728,7 +4732,6 @@ fn compile(
     // build scripts), so their own code is linted too. All of it lives
     // in clippy-keyed actions (--cfg clippy is code-visible); the
     // dependency layer stays plain-rustc and is shared with check.
-    let clippy_action = ctx.clippy && pkg.source.is_none();
     let lint_flags: &[String] = if clippy_action {
         &ctx.lints[unit.pkg].with_clippy
     } else {
@@ -4952,7 +4955,7 @@ fn compile(
         writes.push(d.as_path());
     }
     let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
-    cmd.current_dir(&ctx.workspace_root);
+    cmd.current_dir(compile_dir);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if !ctx.sdkroot.is_empty() {
@@ -5167,8 +5170,7 @@ fn compile(
             }
         }
         let t_val = Instant::now();
-        let workspace_relative_pkg = pkg_root.strip_prefix(&ctx.workspace_root).ok();
-        validate_dep_info(&d, &pkg_root, workspace_relative_pkg, &allowed).with_context(|| {
+        validate_dep_info(&d, &pkg_root, compile_dir, &allowed).with_context(|| {
             format!(
                 "hermeticity violation compiling {} v{}",
                 pkg.name, pkg.version
@@ -5532,7 +5534,7 @@ fn scan_dir_for_workspace_path(dir: &Path, workspace_root: &str) -> Result<()> {
 fn validate_dep_info(
     dep: &str,
     pkg_root: &Path,
-    workspace_relative_pkg: Option<&Path>,
+    compile_dir: &Path,
     allowed_abs: &[PathBuf],
 ) -> Result<()> {
     for line in dep.lines() {
@@ -5546,27 +5548,109 @@ fn validate_dep_info(
         for tok in rest.split_whitespace() {
             // NOTE(poc): no handling of backslash-escaped spaces in paths
             let p = Path::new(tok);
-            if p.is_absolute() {
-                if !(p.starts_with(pkg_root)
-                    || allowed_abs.iter().any(|allowed| p.starts_with(allowed)))
-                {
+            let resolved = if p.is_absolute() {
+                normalize_path(p)
+            } else {
+                normalize_path(&compile_dir.join(p))
+            };
+            if !(resolved.starts_with(pkg_root)
+                || allowed_abs
+                    .iter()
+                    .any(|allowed| resolved.starts_with(allowed)))
+            {
+                if p.is_absolute() {
                     bail!(
                         "undeclared input read during compilation: {tok}\n\
                          this file is outside the package and OUT_DIR, so it is not part of\n\
                          the action key; caching it would be unsound"
                     );
-                }
-            } else {
-                // Relative paths resolve against the compile cwd — the
-                // workspace root — and must stay inside this package.
-                match workspace_relative_pkg {
-                    Some(prefix) if p.starts_with(prefix) => {}
-                    _ => bail!("undeclared input outside the package: {tok}"),
+                } else {
+                    bail!("undeclared input outside the package: {tok}");
                 }
             }
         }
     }
     Ok(())
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod dep_info_tests {
+    use super::validate_dep_info;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn relative_inputs_are_resolved_from_the_compile_directory() {
+        validate_dep_info(
+            "output: Cargo.toml src/../RELEASE_CHANNEL src/lib.rs",
+            Path::new("/workspace/crates/app"),
+            Path::new("/workspace/crates/app"),
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn relative_inputs_outside_the_package_must_be_declared() {
+        let dep_info = "output: src/../../../assets/icon.png";
+        let package_root = Path::new("/workspace/crates/app");
+        let compile_dir = Path::new("/workspace/crates/app");
+
+        assert!(validate_dep_info(dep_info, package_root, compile_dir, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("undeclared input outside the package"));
+        validate_dep_info(
+            dep_info,
+            package_root,
+            compile_dir,
+            &[PathBuf::from("/workspace/assets/icon.png")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn absolute_inputs_are_normalized_before_validation() {
+        let dep_info = "output: /workspace/crates/app/../../assets/icon.png";
+
+        assert!(validate_dep_info(
+            dep_info,
+            Path::new("/workspace/crates/app"),
+            Path::new("/workspace/crates/app"),
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("undeclared input read during compilation"));
+    }
+
+    #[test]
+    fn workspace_relative_inputs_cannot_escape_a_matching_package_prefix() {
+        let dep_info = "output: crates/app/src/../../../assets/icon.png";
+
+        assert!(validate_dep_info(
+            dep_info,
+            Path::new("/workspace/crates/app"),
+            Path::new("/workspace"),
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("undeclared input outside the package"));
+    }
 }
 
 fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScriptOut> {

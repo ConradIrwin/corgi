@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -20,6 +20,12 @@ fn features_enable_only_the_selected_packages_feature() {
     );
 }
 
+#[test]
+fn clippy_runs_from_the_selected_packages_directory() {
+    let fixture = fixture_path("clippy-package-directory");
+    run_corgi(&fixture, "clippy", ["-p", "app"]);
+}
+
 fn run_test_compile<const ARGUMENT_COUNT: usize>(
     fixture_name: &str,
     arguments: [&str; ARGUMENT_COUNT],
@@ -28,19 +34,28 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     let target = fixture.join("target");
     let _ = std::fs::remove_dir_all(&target);
 
-    let output = Command::new(corgi_executable())
-        .arg("build")
-        .args(arguments)
-        .arg("-C")
-        .arg(&fixture)
-        .output()
-        .expect("failed to invoke corgi");
-    assert_success(&output, "corgi build");
+    run_corgi(&fixture, "build", arguments);
 
     let output = Command::new(target.join("debug").join(executable_name("app")))
         .output()
         .expect("failed to run app");
     assert_success(&output, "app");
+    output
+}
+
+fn run_corgi<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+) -> Output {
+    let output = Command::new(corgi_executable())
+        .arg(command)
+        .args(arguments)
+        .arg("-C")
+        .arg(fixture)
+        .output()
+        .expect("failed to invoke corgi");
+    assert_success(&output, &format!("corgi {command}"));
     output
 }
 
