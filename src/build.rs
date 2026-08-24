@@ -1772,11 +1772,13 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
 pub struct BuildOpts {
     pub verbose: bool,
     pub release: bool,
+    pub profile: Option<String>,
     /// Take every workspace member's units as roots instead of the
     /// package at the build dir (cargo's --workspace).
     pub workspace: bool,
     /// Cargo package name selected by `-p` or `--package`.
     pub package: Option<String>,
+    pub bin: Option<String>,
     pub features: Vec<String>,
     pub target: Option<String>,
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
@@ -1844,7 +1846,10 @@ fn report_run(
             workspace: opts.workspace,
             package: opts.package.clone(),
             root_set: opts.root.clone(),
-            profile: if opts.release { "release" } else { "dev" }.to_string(),
+            profile: opts
+                .profile
+                .clone()
+                .unwrap_or_else(|| if opts.release { "release" } else { "dev" }.to_string()),
             target: opts.target.clone(),
             features: selected_features,
             incremental: !opts.no_incremental,
@@ -2050,8 +2055,10 @@ fn build_inner(
     let BuildOpts {
         verbose,
         release,
+        profile,
         workspace,
         package,
+        bin,
         features,
         target,
         root,
@@ -2227,6 +2234,9 @@ fn build_inner(
     } else {
         "default-targets"
     };
+    let requested_profile = profile
+        .as_deref()
+        .unwrap_or(if release { "release" } else { "dev" });
     // check shares build's plan; test resolves a different unit graph
     let plan_kind = if matches!(mode, Mode::Test) {
         "cargo-test"
@@ -2235,11 +2245,12 @@ fn build_inner(
     };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{release}\0{}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
             features_id,
+            bin.as_deref().unwrap_or(""),
         )
         .as_bytes(),
     );
@@ -2341,11 +2352,16 @@ fn build_inner(
             if all_targets {
                 ug_cmd.arg("--all-targets");
             }
-            if release {
+            if let Some(profile) = &profile {
+                ug_cmd.args(["--profile", profile]);
+            } else if release {
                 ug_cmd.arg("--release");
             }
             if let Some(t) = &target {
                 ug_cmd.args(["--target", t]);
+            }
+            if let Some(bin) = &bin {
+                ug_cmd.args(["--bin", bin]);
             }
             match &resolution_roots {
                 Some(members) => {
