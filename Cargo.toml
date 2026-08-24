@@ -18,6 +18,7 @@ path = "tests/end_to_end.rs"
 
 [dependencies]
 anyhow = "1"
+cargo-zigbuild = { version = "=0.23.0", default-features = false }
 clap = { version = "4.5", default-features = false, features = [
     "derive",
     "error-context",
@@ -26,6 +27,7 @@ clap = { version = "4.5", default-features = false, features = [
     "usage",
 ] }
 jobserver = "0.1.35"
+libc = "0.2"
 memchr = "2.8.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
