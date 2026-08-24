@@ -93,11 +93,22 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
         "clippy",
         ["-p", "all_targets_app", "--", "-D", "warnings"],
     );
-    run_corgi(
+    let checked = run_corgi(
         &fixture,
         "clippy",
         ["-p", "all_targets_app", "--all-targets"],
     );
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    for target_warning in [
+        "example_warning",
+        "integration_warning",
+        "benchmark_warning",
+    ] {
+        assert!(
+            stderr.contains(target_warning),
+            "missing diagnostic for {target_warning}:\n{stderr}"
+        );
+    }
 
     let denied = invoke_corgi(
         &fixture,
@@ -112,17 +123,6 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
         ],
     );
     assert_failure(&denied, "corgi clippy --all-targets");
-    let stderr = String::from_utf8_lossy(&denied.stderr);
-    for target_warning in [
-        "example_warning",
-        "integration_warning",
-        "benchmark_warning",
-    ] {
-        assert!(
-            stderr.contains(target_warning),
-            "missing diagnostic for {target_warning}:\n{stderr}"
-        );
-    }
 }
 
 fn run_test_compile<const ARGUMENT_COUNT: usize>(

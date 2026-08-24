@@ -6886,7 +6886,7 @@ mod feature_selection_tests {
 mod unit_graph_tests {
     use super::translate_unit_graph;
     use crate::meta::UnitGraph;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn integration_tests_depend_on_package_binaries() {
@@ -6926,7 +6926,7 @@ mod unit_graph_tests {
         .unwrap();
         let packages = HashMap::from([("corgi".to_string(), 0)]);
 
-        let units = translate_unit_graph(&graph, &packages, None).unwrap();
+        let units = translate_unit_graph(&graph, &packages, None, &HashSet::new()).unwrap();
 
         let integration_test = units
             .iter()
