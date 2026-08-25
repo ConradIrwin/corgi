@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.23";
+const TOOL_VERSION: &str = "corgi/0.25";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! status {
@@ -358,6 +358,10 @@ pub struct Ctx {
     /// incremental state stays valid. -Cextra-filename keeps the full
     /// key16, so pool file names remain globally unique.
     idents: Vec<String>,
+    /// Location-independent package identities. Local Git packages use the
+    /// repository remote plus manifest path; other local packages use their
+    /// manifest contents. Registry and Git dependencies retain Cargo's ID.
+    logical_pkg_ids: Vec<String>,
     report_unit_keys: Vec<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
@@ -2420,28 +2424,25 @@ fn build_inner(
     if let Some(bytes) = store.load_action(&plan_ptr) {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
             if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
-                if plan_fingerprint(
-                    &ws_root,
-                    &entry.files,
-                    &entry.glob_dirs,
-                    &entry.package_roots,
-                ) == entry.fingerprint
-                {
-                    let meta_text = fs::read(store.cache_path(&entry.meta_blob))
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok());
-                    let ug_text = fs::read(store.cache_path(&entry.ug_blob))
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok());
-                    if let (Some(mut m), Some(mut u)) = (meta_text, ug_text) {
-                        // cargo output embeds absolute paths; re-root them so
-                        // bit-identical checkouts elsewhere can share plans
-                        let new_root = ws_root.display().to_string();
-                        if entry.ws_root_abs != new_root {
-                            m = m.replace(&entry.ws_root_abs, &new_root);
-                            u = u.replace(&entry.ws_root_abs, &new_root);
+                if let Some(source_roots) = resolve_plan_sources(&ws_root, &entry.local_sources) {
+                    if plan_fingerprint(
+                        &ws_root,
+                        &entry.files,
+                        &entry.glob_dirs,
+                        &entry.package_roots,
+                    ) == entry.fingerprint
+                    {
+                        let meta_text = fs::read(store.cache_path(&entry.meta_blob))
+                            .ok()
+                            .and_then(|b| String::from_utf8(b).ok());
+                        let ug_text = fs::read(store.cache_path(&entry.ug_blob))
+                            .ok()
+                            .and_then(|b| String::from_utf8(b).ok());
+                        if let (Some(m), Some(u)) = (meta_text, ug_text) {
+                            let m = expand_plan_sources(m, &source_roots);
+                            let u = expand_plan_sources(u, &source_roots);
+                            plan = Some((m, u));
                         }
-                        plan = Some((m, u));
                     }
                 }
             }
@@ -2655,13 +2656,14 @@ fn build_inner(
                 "debug".into()
             }
         });
+    let logical_pkg_ids = logical_package_ids(&meta)?;
     // Source-free unit identities (memoized DFS over dep edges).
     let idents: Vec<String> = {
         let mut memo: Vec<Option<String>> = vec![None; units.len()];
         fn ident_of(
             i: usize,
             units: &[Unit],
-            meta: &Metadata,
+            logical_pkg_ids: &[String],
             memo: &mut Vec<Option<String>>,
         ) -> String {
             if let Some(v) = &memo[i] {
@@ -2671,7 +2673,7 @@ fn build_inner(
             let mut dep_ids: Vec<String> = u
                 .deps
                 .iter()
-                .map(|d| ident_of(d.unit, units, meta, memo))
+                .map(|d| ident_of(d.unit, units, logical_pkg_ids, memo))
                 .collect();
             dep_ids.sort();
             let mut features = u.features.clone();
@@ -2680,7 +2682,7 @@ fn build_inner(
             let mut ident_input = format!(
                 "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
                 TOOL_VERSION,
-                ws_relative_pkg_id(&meta.packages[u.pkg].id, &meta.workspace_root),
+                logical_pkg_ids[u.pkg],
                 u.target.name,
                 u.target.kind,
                 u.host,
@@ -2702,7 +2704,7 @@ fn build_inner(
             ident
         }
         (0..units.len())
-            .map(|i| ident_of(i, &units, &meta, &mut memo))
+            .map(|i| ident_of(i, &units, &logical_pkg_ids, &mut memo))
             .collect()
     };
     // One-shot warnings for profile settings we deliberately don't honor.
@@ -3042,7 +3044,7 @@ fn build_inner(
             );
         }
     }
-    let report_unit_keys = report_unit_keys(&meta, &units);
+    let report_unit_keys = report_unit_keys(&meta, &units, &logical_pkg_ids);
     let ctx = Ctx {
         store,
         verbose,
@@ -3082,6 +3084,7 @@ fn build_inner(
         )
         .context("creating jobserver")?,
         idents,
+        logical_pkg_ids,
         report_unit_keys,
         check_mode,
         lints,
@@ -3296,10 +3299,10 @@ fn build_inner(
 struct PlanEntry {
     /// Build dir -> workspace root, relative (validates from any checkout).
     ws_root_rel: String,
-    /// Workspace root as cargo spelled it at save time; cached JSON embeds
-    /// this prefix in absolute paths, so loads from a different checkout
-    /// re-root by string replacement.
-    ws_root_abs: String,
+    /// Local source roots referenced by the tokenized metadata and unit graph.
+    /// Their locators are relative to the workspace, while their identities
+    /// ensure a locator cannot silently resolve to a different repository.
+    local_sources: Vec<PlanLocalSource>,
     /// Workspace-root-relative files whose content shapes the plan.
     files: Vec<String>,
     /// Workspace-root-relative dirs whose set of crate subdirs shapes the
@@ -3311,6 +3314,12 @@ struct PlanEntry {
     fingerprint: String,
     meta_blob: String,
     ug_blob: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PlanLocalSource {
+    identity: String,
+    locator: String,
 }
 
 /// Hash every plan input: file contents, plus (for glob dirs) the sorted
@@ -3419,6 +3428,109 @@ fn rel_path(from: &Path, to: &Path) -> String {
     }
 }
 
+fn plan_source_token(index: usize) -> String {
+    format!("$CORGI_LOCAL_SOURCE_{index}$")
+}
+
+fn plan_local_sources(meta: &Metadata, ws_root: &Path) -> Result<Vec<(PlanLocalSource, PathBuf)>> {
+    let mut repositories = HashMap::new();
+    let mut roots: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for package in &meta.packages {
+        if package.source.is_some() {
+            continue;
+        }
+        let package_root = package.root().canonicalize().with_context(|| {
+            format!(
+                "canonicalizing local package root {}",
+                package.root().display()
+            )
+        })?;
+        let (root, identity) = if let Some((repository_root, remote)) =
+            git_repository(&package_root, &mut repositories)
+        {
+            (repository_root.clone(), format!("git+{remote}"))
+        } else {
+            let root = if package_root.starts_with(ws_root) {
+                ws_root.to_path_buf()
+            } else {
+                package_root
+            };
+            let manifest = fs::read(root.join("Cargo.toml"))
+                .with_context(|| format!("reading {}/Cargo.toml", root.display()))?;
+            (root, format!("manifest+{}", sha256_hex(&manifest)))
+        };
+        if let Some(previous) = roots.insert(root.clone(), identity.clone()) {
+            if previous != identity {
+                bail!(
+                    "local source {} has conflicting identities {previous} and {identity}",
+                    root.display()
+                );
+            }
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|(root, identity)| {
+            (
+                PlanLocalSource {
+                    identity,
+                    locator: rel_path(ws_root, &root),
+                },
+                root,
+            )
+        })
+        .collect())
+}
+
+fn tokenize_plan_sources(
+    mut text: String,
+    sources: &[(PlanLocalSource, PathBuf)],
+) -> Result<String> {
+    let mut replacements = sources
+        .iter()
+        .enumerate()
+        .map(|(index, (_, root))| (root.display().to_string(), plan_source_token(index)))
+        .collect::<Vec<_>>();
+    replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.len()));
+    for (root, token) in &replacements {
+        text = text.replace(root, token);
+    }
+    if let Some((root, _)) = replacements.iter().find(|(root, _)| text.contains(root)) {
+        bail!("failed to remove local source path {root} from cached plan");
+    }
+    Ok(text)
+}
+
+fn resolve_plan_sources(ws_root: &Path, sources: &[PlanLocalSource]) -> Option<Vec<PathBuf>> {
+    sources
+        .iter()
+        .map(|source| {
+            let root = ws_root.join(&source.locator).canonicalize().ok()?;
+            plan_source_identity(&root)
+                .is_some_and(|identity| identity == source.identity)
+                .then_some(root)
+        })
+        .collect()
+}
+
+fn plan_source_identity(root: &Path) -> Option<String> {
+    let mut repositories = HashMap::new();
+    if let Some((repository_root, remote)) = git_repository(root, &mut repositories) {
+        if repository_root == root {
+            return Some(format!("git+{remote}"));
+        }
+    }
+    let manifest = fs::read(root.join("Cargo.toml")).ok()?;
+    Some(format!("manifest+{}", sha256_hex(&manifest)))
+}
+
+fn expand_plan_sources(mut text: String, sources: &[PathBuf]) -> String {
+    for (index, root) in sources.iter().enumerate() {
+        text = text.replace(&plan_source_token(index), &root.display().to_string());
+    }
+    text
+}
+
 /// Record the resolve outputs so an unchanged workspace skips cargo
 /// entirely next time.
 fn save_plan(
@@ -3464,15 +3576,24 @@ fn save_plan(
     let files: Vec<String> = files.into_iter().collect();
     let glob_dirs: Vec<String> = glob_dirs.into_iter().collect();
     let package_roots: Vec<String> = package_roots.into_iter().collect();
+    let local_sources = plan_local_sources(meta, &ws_root)?;
+    let normalized_meta_json = tokenize_plan_sources(meta_json.to_string(), &local_sources)?;
+    let normalized_ug_json = tokenize_plan_sources(ug_json.to_string(), &local_sources)?;
     let entry = PlanEntry {
         ws_root_rel: rel_path(dir, &ws_root),
-        ws_root_abs: meta.workspace_root.clone(),
         fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs, &package_roots),
         files,
         glob_dirs,
         package_roots,
-        meta_blob: store.insert_bytes(meta_json.as_bytes())?,
-        ug_blob: store.insert_bytes(ug_json.as_bytes())?,
+        local_sources: local_sources
+            .iter()
+            .map(|(source, _)| PlanLocalSource {
+                identity: source.identity.clone(),
+                locator: source.locator.clone(),
+            })
+            .collect(),
+        meta_blob: store.insert_bytes(normalized_meta_json.as_bytes())?,
+        ug_blob: store.insert_bytes(normalized_ug_json.as_bytes())?,
     };
     store.save_action(plan_ptr, serde_json::to_string(&entry)?.as_bytes())
 }
@@ -4575,7 +4696,7 @@ fn report_action_kind(kind: Kind) -> &'static str {
     }
 }
 
-fn report_unit_keys(meta: &Metadata, units: &[Unit]) -> Vec<String> {
+fn report_unit_keys(meta: &Metadata, units: &[Unit], logical_pkg_ids: &[String]) -> Vec<String> {
     units
         .iter()
         .map(|unit| {
@@ -4587,7 +4708,7 @@ fn report_unit_keys(meta: &Metadata, units: &[Unit]) -> Vec<String> {
             let mut crate_types = unit.target.crate_types.clone();
             crate_types.sort();
             let variant = serde_json::json!({
-                "package": ws_relative_pkg_id(&package.id, &meta.workspace_root),
+                "package": logical_pkg_ids[unit.pkg],
                 "target": unit.target.name,
                 "target_kinds": target_kinds,
                 "crate_types": crate_types,
@@ -4628,7 +4749,7 @@ fn register_report_units(ctx: &Ctx) {
         .collect();
     for (id, unit) in ctx.units.iter().enumerate() {
         let package = &ctx.meta.packages[unit.pkg];
-        let package_id = ws_relative_pkg_id(&package.id, &ctx.workspace_root);
+        let package_id = &ctx.logical_pkg_ids[unit.pkg];
         let action_kind = report_action_kind(unit.kind);
         let mut target_kinds = unit.target.kind.clone();
         target_kinds.sort();
@@ -4690,7 +4811,7 @@ fn register_report_units(ctx: &Ctx) {
             id: ctx.report_unit_keys[id].clone(),
             logical_id,
             package: crate::report::Package {
-                id: package_id,
+                id: package_id.clone(),
                 name: package.name.clone(),
                 version: package.version.clone(),
                 scope: scope.to_string(),
@@ -5323,20 +5444,105 @@ fn run_rustc_streaming(
     Ok((status.success(), rendered))
 }
 
-/// A location-independent spelling of cargo's package id. Path packages
-/// carry a `file://` URL of their absolute directory, which would make
-/// unit identities (and so -Cmetadata, symbols, and every action key)
-/// specific to one checkout; identical worktrees must share all of them.
-/// Path packages outside the workspace keep their absolute identity —
-/// they really are machine-local.
-fn ws_relative_pkg_id(id: &str, workspace_root: &str) -> String {
-    if let Some(rest) = id.strip_prefix("path+file://") {
-        let (dir, suffix) = rest.split_once('#').unwrap_or((rest, ""));
-        if let Ok(rel) = Path::new(dir).strip_prefix(workspace_root) {
-            return format!("path+{}#{suffix}", rel.display());
-        }
+/// Location-independent package identities. Cargo identifies path packages
+/// with their absolute directory, which prevents the same crate from sharing
+/// artifacts when reached from another workspace or checkout.
+fn logical_package_ids(metadata: &Metadata) -> Result<Vec<String>> {
+    let mut repositories: HashMap<PathBuf, Option<(PathBuf, String)>> = HashMap::new();
+    metadata
+        .packages
+        .iter()
+        .map(|package| {
+            if package.source.is_some() {
+                return Ok(package.id.clone());
+            }
+            if let Some((repository, manifest)) = git_package_identity(package, &mut repositories) {
+                return Ok(format!(
+                    "git+{repository}#{manifest}#{}@{}",
+                    package.name, package.version
+                ));
+            }
+            let manifest = fs::read(&package.manifest_path)
+                .with_context(|| format!("reading {}", package.manifest_path))?;
+            Ok(format!(
+                "manifest+{}#{}@{}",
+                sha256_hex(&manifest),
+                package.name,
+                package.version
+            ))
+        })
+        .collect()
+}
+
+fn git_package_identity(
+    package: &Package,
+    repositories: &mut HashMap<PathBuf, Option<(PathBuf, String)>>,
+) -> Option<(String, String)> {
+    let package_root = package.root();
+    let (repository_root, remote) = git_repository(&package_root, repositories)?;
+    let manifest = Path::new(&package.manifest_path)
+        .strip_prefix(repository_root)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    Some((remote.clone(), manifest))
+}
+
+fn git_repository<'a>(
+    package_root: &Path,
+    repositories: &'a mut HashMap<PathBuf, Option<(PathBuf, String)>>,
+) -> Option<&'a (PathBuf, String)> {
+    let repository_hint = package_root
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())?
+        .to_path_buf();
+    repositories
+        .entry(repository_hint.clone())
+        .or_insert_with(|| {
+            let repository_root = command_stdout(Command::new("git").args([
+                "-C",
+                repository_hint.to_str()?,
+                "rev-parse",
+                "--show-toplevel",
+            ]))?;
+            let repository_root = PathBuf::from(repository_root);
+            let remote = command_stdout(Command::new("git").args([
+                "-C",
+                repository_root.to_str()?,
+                "config",
+                "--get",
+                "remote.origin.url",
+            ]))
+            .and_then(|remote| normalize_git_remote(&remote))?;
+            Some((repository_root, remote))
+        })
+        .as_ref()
+}
+
+fn command_stdout(command: &mut Command) -> Option<String> {
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
     }
-    id.to_string()
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = stdout.trim();
+    (!stdout.is_empty()).then(|| stdout.to_string())
+}
+
+fn normalize_git_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let host_and_path = if let Some((_, rest)) = remote.split_once("://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        rest.to_string()
+    } else {
+        let rest = remote.strip_prefix("git@")?;
+        let (host, path) = rest.split_once(':')?;
+        format!("{host}/{path}")
+    };
+    let (host, path) = host_and_path.split_once('/')?;
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    (!host.is_empty() && !path.is_empty()).then(|| format!("{}/{path}", host.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -5601,25 +5807,24 @@ mod toolchain_pin_tests {
 
 #[cfg(test)]
 mod ident_tests {
-    use super::ws_relative_pkg_id;
+    use super::normalize_git_remote;
 
     #[test]
-    fn path_package_ids_are_workspace_relative() {
-        // Two checkouts of the same repo must produce one identity.
-        let a = ws_relative_pkg_id("path+file:///w/one/crates/editor#0.1.0", "/w/one");
-        let b = ws_relative_pkg_id("path+file:///w/two/crates/editor#0.1.0", "/w/two");
-        assert_eq!(a, "path+crates/editor#0.1.0");
-        assert_eq!(a, b);
-        // Name-carrying suffixes survive.
+    fn git_remote_identity_ignores_transport_spelling() {
+        let expected = Some("github.com/zed-industries/zed".to_string());
         assert_eq!(
-            ws_relative_pkg_id("path+file:///w/crates/foo#bar@1.2.3", "/w"),
-            "path+crates/foo#bar@1.2.3"
+            normalize_git_remote("https://github.com/zed-industries/zed.git"),
+            expected
         );
-        // Registry ids and out-of-workspace path deps are untouched.
-        let registry = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0";
-        assert_eq!(ws_relative_pkg_id(registry, "/w"), registry);
-        let outside = "path+file:///elsewhere/dep#0.1.0";
-        assert_eq!(ws_relative_pkg_id(outside, "/w"), outside);
+        assert_eq!(
+            normalize_git_remote("git@github.com:zed-industries/zed.git"),
+            expected
+        );
+        assert_eq!(
+            normalize_git_remote("ssh://git@github.com/zed-industries/zed.git"),
+            expected
+        );
+        assert_eq!(normalize_git_remote("/local/checkout"), None);
     }
 }
 
@@ -5730,14 +5935,12 @@ fn compile(
     };
     let crate_type = crate_type.as_str();
     let clippy_action = ctx.clippy && pkg.source.is_none();
-    // Clippy resolves and tracks Cargo.toml relative to its working
-    // directory, which Cargo sets to CARGO_MANIFEST_DIR. Plain rustc actions
-    // retain workspace-relative paths so their artifacts match Cargo's.
-    let compile_dir = if clippy_action {
-        &pkg_root
-    } else {
-        Path::new(&ctx.workspace_root)
-    };
+    // Every invocation spells its source relative to the package root. Using
+    // the invoking workspace as cwd would make the same package's rustc input
+    // `src/lib.rs` when built directly but an absolute path when reached as a
+    // dependency of another workspace, producing different artifacts and
+    // defeating the location-independent action key.
+    let compile_dir = &pkg_root;
     let src_rel = Path::new(&target.src_path)
         .strip_prefix(compile_dir)
         .map(|p| p.to_string_lossy().into_owned())

@@ -43,6 +43,15 @@ pub fn audit(
             s.display()
         );
         if s.exists() {
+            // The pool is a materialized view of action outputs, not the
+            // cache itself. Rebuild that view for this audit so artifacts
+            // retained from older corgi action-key schemes are not compared
+            // as though the current pair of builds had produced them.
+            let pool = s.join("pool");
+            if pool.exists() {
+                fs::remove_dir_all(&pool).context("clearing audit artifact pool")?;
+            }
+            fs::create_dir_all(&pool).context("recreating audit artifact pool")?;
             fs::rename(s, &canonical).context("unparking audit store")?;
         }
         let mut c = Command::new(&exe);

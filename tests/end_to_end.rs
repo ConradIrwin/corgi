@@ -207,6 +207,198 @@ fn adding_an_implicit_test_invalidates_the_cached_plan() {
     assert_eq!(fs::read_to_string(marker).unwrap(), "ran");
 }
 
+#[test]
+fn local_package_artifacts_are_shared_across_repository_workspaces() {
+    let directory = TestDirectory::new("cross-repository-cache");
+    let store = directory.path.join("store");
+    let dependency = directory.path.join("zed");
+    let application = directory.path.join("delta");
+
+    fs::create_dir_all(dependency.join("src")).unwrap();
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"cross-repository-dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn message() -> &'static str { \"shared artifact\" }\n",
+    )
+    .unwrap();
+    initialize_git_repository(
+        &dependency,
+        "https://example.invalid/corgi/cross-repository-dependency.git",
+    );
+
+    fs::create_dir_all(application.join("src")).unwrap();
+    fs::write(
+        application.join("Cargo.toml"),
+        "[package]\nname = \"cross-repository-application\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ncross-repository-dependency = { path = \"../zed\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        application.join("src/main.rs"),
+        "fn main() { println!(\"{}\", cross_repository_dependency::message()); }\n",
+    )
+    .unwrap();
+    initialize_git_repository(
+        &application,
+        "https://example.invalid/corgi/cross-repository-application.git",
+    );
+
+    let dependency_build = invoke_corgi_with_store(&dependency, "build", [], &store);
+    assert_success(
+        &dependency_build,
+        "building the dependency from its own workspace",
+    );
+    let dependency_report = report_for_workspace(&store, &dependency);
+    let original_dependency_units = dependency_report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "cross-repository-dependency")
+        .collect::<Vec<_>>();
+
+    let application_build = invoke_corgi_with_store(&application, "build", [], &store);
+    assert_success(
+        &application_build,
+        "building the dependency from the application workspace",
+    );
+
+    let report = report_for_workspace(&store, &application);
+    let dependency_units = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "cross-repository-dependency")
+        .collect::<Vec<_>>();
+    assert!(!dependency_units.is_empty());
+    assert!(
+        dependency_units
+            .iter()
+            .all(|unit| unit["cache"]["result"] == "hit"),
+        "the same local package should reuse artifacts built from its own workspace:\noriginal:\n{}\nreused:\n{}",
+        serde_json::to_string_pretty(&original_dependency_units).unwrap(),
+        serde_json::to_string_pretty(&dependency_units).unwrap()
+    );
+}
+
+#[test]
+fn non_git_packages_use_manifest_and_source_fallback_across_checkouts() {
+    let directory = TestDirectory::new("non-git-package-cache");
+    let store = directory.path.join("store");
+    let first = directory.path.join("first");
+    let second = directory.path.join("second");
+    write_non_git_package_fixture(&first, "first");
+    write_non_git_package_fixture(&second, "second");
+    for package in ["shared", "changed"] {
+        assert_eq!(
+            fs::read(first.join(package).join("Cargo.toml")).unwrap(),
+            fs::read(second.join(package).join("Cargo.toml")).unwrap(),
+            "the fallback must handle duplicate manifests in separate checkouts"
+        );
+    }
+
+    let first_build = invoke_corgi_with_store(&first.join("application"), "build", [], &store);
+    assert_success(&first_build, "building the first non-Git checkout");
+
+    let second_build = invoke_corgi_with_store(&second.join("application"), "build", [], &store);
+    assert_success(&second_build, "building the second non-Git checkout");
+
+    let report = report_for_workspace(&store, &second.join("application"));
+    let shared_units = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "non-git-shared")
+        .collect::<Vec<_>>();
+    assert_eq!(shared_units.len(), 1);
+    assert!(
+        shared_units
+            .iter()
+            .all(|unit| unit["cache"]["result"] == "hit"),
+        "an unchanged non-Git package should reuse its artifact across checkouts:\n{}",
+        serde_json::to_string_pretty(&shared_units).unwrap()
+    );
+    let changed_units = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "non-git-changed")
+        .collect::<Vec<_>>();
+    assert_eq!(changed_units.len(), 1);
+    assert!(
+        changed_units
+            .iter()
+            .all(|unit| unit["cache"]["result"] == "miss"),
+        "source changes beneath a duplicate manifest must still invalidate artifacts:\n{}",
+        serde_json::to_string_pretty(&changed_units).unwrap()
+    );
+
+    let application = Command::new(
+        second
+            .join("application/target/debug")
+            .join(executable_name("non-git-application")),
+    )
+    .output()
+    .expect("failed to run non-Git fixture");
+    assert_success(&application, "running the non-Git fixture");
+    assert_eq!(
+        String::from_utf8(application.stdout).unwrap(),
+        "shared second\n"
+    );
+}
+
+#[test]
+fn cached_plan_relocates_external_repository_sources_to_the_current_checkout() {
+    let directory = TestDirectory::new("relocated-plan-sources");
+    let store = directory.path.join("store");
+    let first = directory.path.join("first");
+    let second = directory.path.join("second");
+    write_relocated_repository_fixture(&first, "first checkout");
+    write_relocated_repository_fixture(&second, "second checkout");
+
+    let first_build = invoke_corgi_with_store(&first.join("delta"), "build", [], &store);
+    assert_success(&first_build, "building the first repository pair");
+    fs::copy(
+        first.join("delta/Cargo.lock"),
+        second.join("delta/Cargo.lock"),
+    )
+    .unwrap();
+
+    let second_build = invoke_corgi_with_store(&second.join("delta"), "build", [], &store);
+    assert_success(&second_build, "building the relocated repository pair");
+    let report = report_for_workspace(&store, &second.join("delta"));
+    assert_eq!(
+        report["cache"]["plan"]["result"], "hit",
+        "the second checkout should reuse the location-independent plan"
+    );
+    let dependency_units = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "relocated-plan-dependency")
+        .collect::<Vec<_>>();
+    assert_eq!(dependency_units.len(), 1);
+    assert_eq!(
+        dependency_units[0]["cache"]["result"], "miss",
+        "the relocated dependency's changed source must invalidate its artifact"
+    );
+
+    let application = Command::new(
+        second
+            .join("delta/target/debug")
+            .join(executable_name("relocated-plan-application")),
+    )
+    .output()
+    .expect("failed to run relocated-plan fixture");
+    assert_success(&application, "running the relocated-plan fixture");
+    assert_eq!(
+        String::from_utf8(application.stdout).unwrap(),
+        "second checkout\n"
+    );
+}
+
 fn run_test_compile<const ARGUMENT_COUNT: usize>(
     fixture_name: &str,
     arguments: [&str; ARGUMENT_COUNT],
@@ -256,6 +448,22 @@ fn invoke_corgi<const ARGUMENT_COUNT: usize>(
     output
 }
 
+fn invoke_corgi_with_store<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+    store: &Path,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg(command)
+        .arg("-C")
+        .arg(fixture)
+        .args(arguments)
+        .env("CORGI_STORE", store)
+        .output()
+        .expect("failed to invoke corgi")
+}
+
 fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
     command.arg("test").arg("-C").arg(fixture).arg("--force");
@@ -293,6 +501,120 @@ fn assert_failure(output: &Output, command: &str) {
         "{command} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn initialize_git_repository(path: &Path, remote: &str) {
+    for arguments in [
+        vec!["init", "--quiet"],
+        vec!["remote", "add", "origin", remote],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Corgi Tests",
+            "-c",
+            "user.email=corgi@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(path)
+            .output()
+            .expect("failed to invoke git");
+        assert_success(&output, "initializing fixture git repository");
+    }
+}
+
+fn report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
+    let canonical_workspace = workspace.canonicalize().unwrap();
+    fs::read_dir(store.join("reports"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .then(|| serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap())
+        })
+        .find(|report| {
+            report["run"]["workspace"]["root"].as_str()
+                == Some(canonical_workspace.to_string_lossy().as_ref())
+        })
+        .expect("missing build report for workspace")
+}
+
+fn write_non_git_package_fixture(root: &Path, checkout: &str) {
+    for (directory, name, message) in [
+        ("shared", "non-git-shared", "shared"),
+        ("changed", "non-git-changed", checkout),
+    ] {
+        let package = root.join(directory);
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(
+            package.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+        fs::write(
+            package.join("src/lib.rs"),
+            format!("pub fn message() -> &'static str {{ \"{message}\" }}\n"),
+        )
+        .unwrap();
+    }
+
+    let application = root.join("application");
+    fs::create_dir_all(application.join("src")).unwrap();
+    fs::write(
+        application.join("Cargo.toml"),
+        format!(
+            "# Distinct plan pointer for checkout {checkout}.\n[package]\nname = \"non-git-application\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nnon-git-shared = {{ path = \"../shared\" }}\nnon-git-changed = {{ path = \"../changed\" }}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        application.join("src/main.rs"),
+        "fn main() { println!(\"{} {}\", non_git_shared::message(), non_git_changed::message()); }\n",
+    )
+    .unwrap();
+}
+
+fn write_relocated_repository_fixture(root: &Path, message: &str) {
+    let dependency = root.join("zed");
+    fs::create_dir_all(dependency.join("src")).unwrap();
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"relocated-plan-dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("src/lib.rs"),
+        format!("pub fn message() -> &'static str {{ \"{message}\" }}\n"),
+    )
+    .unwrap();
+    initialize_git_repository(
+        &dependency,
+        "https://example.invalid/corgi/relocated-plan-dependency.git",
+    );
+
+    let application = root.join("delta");
+    fs::create_dir_all(application.join("src")).unwrap();
+    fs::write(
+        application.join("Cargo.toml"),
+        "[package]\nname = \"relocated-plan-application\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nrelocated-plan-dependency = { path = \"../zed\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        application.join("src/main.rs"),
+        "fn main() { println!(\"{}\", relocated_plan_dependency::message()); }\n",
+    )
+    .unwrap();
+    initialize_git_repository(
+        &application,
+        "https://example.invalid/corgi/relocated-plan-application.git",
     );
 }
 
