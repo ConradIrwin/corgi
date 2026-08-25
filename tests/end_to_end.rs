@@ -125,6 +125,46 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
     assert_failure(&denied, "corgi clippy --all-targets");
 }
 
+#[test]
+fn adding_an_implicit_test_invalidates_the_cached_plan() {
+    let directory = TestDirectory::new("implicit-test");
+    let marker = directory.path.join("new-test-ran");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/lib.rs"),
+        "#[test]\nfn existing_test() {}\n",
+    )
+    .unwrap();
+
+    let initial = invoke_corgi_test(&directory.path, None);
+    assert_success(&initial, "initial corgi test");
+    assert!(String::from_utf8_lossy(&initial.stderr).contains("Resolving"));
+
+    let cached = invoke_corgi_test(&directory.path, None);
+    assert_success(&cached, "cached corgi test");
+    assert!(String::from_utf8_lossy(&cached.stderr).contains("plan unchanged"));
+
+    fs::create_dir_all(directory.path.join("tests")).unwrap();
+    fs::write(
+        directory.path.join("tests/added.rs"),
+        "#[test]\nfn added_after_planning() {\n    std::fs::write(std::env::var(\"CORGI_TEST_MARKER\").unwrap(), \"ran\").unwrap();\n}\n",
+    )
+    .unwrap();
+
+    let updated = invoke_corgi_test(&directory.path, Some(&marker));
+    assert_success(&updated, "corgi test after adding an implicit target");
+    assert!(String::from_utf8_lossy(&updated.stderr).contains("Resolving"));
+    assert_eq!(fs::read_to_string(marker).unwrap(), "ran");
+}
+
 fn run_test_compile<const ARGUMENT_COUNT: usize>(
     fixture_name: &str,
     arguments: [&str; ARGUMENT_COUNT],
@@ -167,6 +207,15 @@ fn invoke_corgi<const ARGUMENT_COUNT: usize>(
     output
 }
 
+fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
+    command.arg("test").arg("-C").arg(fixture).arg("--force");
+    if let Some(marker) = marker {
+        command.env("CORGI_TEST_MARKER", marker);
+    }
+    command.output().expect("failed to invoke corgi")
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     std::env::current_dir()
         .expect("failed to determine test working directory")
@@ -196,4 +245,27 @@ fn assert_failure(output: &Output, command: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+struct TestDirectory {
+    path: PathBuf,
+    package_name: String,
+}
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let package_name = format!("{name}-{id}");
+        let path = std::env::temp_dir().join(format!("corgi-{name}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        let path = path.canonicalize().unwrap();
+        Self { path, package_name }
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.path).unwrap();
+    }
 }

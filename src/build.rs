@@ -205,6 +205,14 @@ struct ToolRt {
     id: String,
     bin: String,
     packages: Vec<String>,
+    targets: Vec<String>,
+}
+
+impl ToolRt {
+    fn is_visible_to(&self, package: &str, target: &str) -> bool {
+        (self.packages.is_empty() || self.packages.iter().any(|candidate| candidate == package))
+            && (self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target))
+    }
 }
 
 /// Where an action's wall time went (ns), for the timings report.
@@ -491,6 +499,9 @@ struct ToolSpec {
     /// build script (right for graph-wide tools like a wasm C compiler).
     #[serde(default)]
     packages: Vec<String>,
+    /// Compilation targets whose build scripts see this tool; empty = all.
+    #[serde(default)]
+    targets: Vec<String>,
     /// How the archive is fetched. Empty = plain unauthenticated download.
     /// "github": a GitHub release asset of a private repo, downloaded via
     /// the gh CLI's stored credentials. Auth affects transport only — the
@@ -1006,6 +1017,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         path: String::new(),
         env: String::new(),
         packages: Vec::new(),
+        targets: Vec::new(),
         auth: String::new(),
     };
     let installed = ensure_tool(store, &spec)?;
@@ -2391,7 +2403,13 @@ fn build_inner(
     if let Some(bytes) = store.load_action(&plan_ptr) {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
             if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
-                if plan_fingerprint(&ws_root, &entry.files, &entry.glob_dirs) == entry.fingerprint {
+                if plan_fingerprint(
+                    &ws_root,
+                    &entry.files,
+                    &entry.glob_dirs,
+                    &entry.package_roots,
+                ) == entry.fingerprint
+                {
                     let meta_text = fs::read(store.cache_path(&entry.meta_blob))
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok());
@@ -2831,6 +2849,21 @@ fn build_inner(
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
     if let Some((specs, probes, _, _)) = read_corgi_toml(&dir)? {
         for t in &specs {
+            let active = units.iter().any(|unit| {
+                let package_name = &meta.packages[unit.pkg].name;
+                let platform = if unit.host {
+                    &host
+                } else {
+                    target.as_deref().unwrap_or(&host)
+                };
+                matches!(unit.kind, Kind::Bsr)
+                    && (t.packages.is_empty()
+                        || t.packages.iter().any(|package| package == package_name))
+                    && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
+            });
+            if !active {
+                continue;
+            }
             ensure_tool(&store, t)?;
             let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
             let logical = store
@@ -2867,6 +2900,7 @@ fn build_inner(
                 id,
                 bin: t.bin.clone(),
                 packages: t.packages.clone(),
+                targets: t.targets.clone(),
             });
         }
         // Plan-time probes: ambient reads happen HERE, outside the
@@ -3237,15 +3271,24 @@ struct PlanEntry {
     /// Workspace-root-relative dirs whose set of crate subdirs shapes the
     /// plan (member globs like `crates/*` pick up new directories).
     glob_dirs: Vec<String>,
+    /// Workspace-root-relative local package directories whose conventional
+    /// Cargo target layout shapes the plan.
+    package_roots: Vec<String>,
     fingerprint: String,
     meta_blob: String,
     ug_blob: String,
 }
 
 /// Hash every plan input: file contents, plus (for glob dirs) the sorted
-/// child directory names that contain a Cargo.toml. Missing files hash as
-/// absent, so their later appearance invalidates too.
-fn plan_fingerprint(ws_root: &Path, files: &[String], glob_dirs: &[String]) -> String {
+/// child directory names that contain a Cargo.toml, and each local package's
+/// implicitly discovered Cargo targets. Missing files hash as absent, so their
+/// later appearance invalidates too.
+fn plan_fingerprint(
+    ws_root: &Path,
+    files: &[String],
+    glob_dirs: &[String],
+    package_roots: &[String],
+) -> String {
     let mut buf: Vec<u8> = Vec::new();
     for f in files {
         buf.extend_from_slice(f.as_bytes());
@@ -3272,6 +3315,40 @@ fn plan_fingerprint(ws_root: &Path, files: &[String], glob_dirs: &[String]) -> S
         for n in &names {
             buf.extend_from_slice(n.as_bytes());
             buf.push(0);
+        }
+        buf.push(0xff);
+    }
+    for package_root in package_roots {
+        buf.extend_from_slice(package_root.as_bytes());
+        buf.push(0);
+        let package_root = plan_abs(ws_root, package_root);
+        for path in ["build.rs", "src/lib.rs", "src/main.rs"] {
+            if package_root.join(path).is_file() {
+                buf.extend_from_slice(path.as_bytes());
+                buf.push(0);
+            }
+        }
+        for directory in ["src/bin", "tests", "examples", "benches"] {
+            let mut targets = Vec::new();
+            if let Ok(entries) = fs::read_dir(package_root.join(directory)) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+                    {
+                        targets.push(name);
+                    } else if path.is_dir() && path.join("main.rs").is_file() {
+                        targets.push(format!("{name}/main.rs"));
+                    }
+                }
+            }
+            targets.sort();
+            for target in targets {
+                buf.extend_from_slice(directory.as_bytes());
+                buf.push(b'/');
+                buf.extend_from_slice(target.as_bytes());
+                buf.push(0);
+            }
         }
         buf.push(0xff);
     }
@@ -3332,12 +3409,16 @@ fn save_plan(
         files.insert(rel_path(&ws_root, &dir.join(name)));
     }
     let mut glob_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut package_roots: BTreeSet<String> = BTreeSet::new();
     for p in &meta.packages {
         if p.source.is_some() {
             continue; // registry/git packages are pinned by the lockfile
         }
         let mp = Path::new(&p.manifest_path);
         files.insert(rel_path(&ws_root, mp));
+        if let Some(package_root) = mp.parent() {
+            package_roots.insert(rel_path(&ws_root, package_root));
+        }
         // the dir *containing* crate dirs: a new subdir with a Cargo.toml
         // may enter a `crates/*` members glob
         if let Some(container) = mp.parent().and_then(Path::parent) {
@@ -3348,12 +3429,14 @@ fn save_plan(
     }
     let files: Vec<String> = files.into_iter().collect();
     let glob_dirs: Vec<String> = glob_dirs.into_iter().collect();
+    let package_roots: Vec<String> = package_roots.into_iter().collect();
     let entry = PlanEntry {
         ws_root_rel: rel_path(dir, &ws_root),
         ws_root_abs: meta.workspace_root.clone(),
-        fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs),
+        fingerprint: plan_fingerprint(&ws_root, &files, &glob_dirs, &package_roots),
         files,
         glob_dirs,
+        package_roots,
         meta_blob: store.insert_bytes(meta_json.as_bytes())?,
         ug_blob: store.insert_bytes(ug_json.as_bytes())?,
     };
@@ -5364,6 +5447,29 @@ mod tool_url_tests {
 }
 
 #[cfg(test)]
+mod tool_scope_tests {
+    use super::ToolRt;
+
+    #[test]
+    fn target_scoped_tool_is_visible_only_to_matching_package_and_target() {
+        let tool = ToolRt {
+            name: "ghostty".into(),
+            version: "1".into(),
+            env: "GHOSTTY_PREFIX".into(),
+            value: "/tools/ghostty".into(),
+            id: "pin".into(),
+            bin: String::new(),
+            packages: vec!["terminal".into()],
+            targets: vec!["x86_64-unknown-linux-gnu".into()],
+        };
+
+        assert!(tool.is_visible_to("terminal", "x86_64-unknown-linux-gnu"));
+        assert!(!tool.is_visible_to("terminal", "aarch64-apple-darwin"));
+        assert!(!tool.is_visible_to("other", "x86_64-unknown-linux-gnu"));
+    }
+}
+
+#[cfg(test)]
 mod toolchain_pin_tests {
     use super::{read_toolchain_pin_with, toolchain_channel_from_rustc_version};
     use std::fs;
@@ -6428,7 +6534,7 @@ fn run_build_script(
     let visible_tools: Vec<&ToolRt> = ctx
         .tools
         .iter()
-        .filter(|t| t.packages.is_empty() || t.packages.iter().any(|p| p == &pkg.name))
+        .filter(|tool| tool.is_visible_to(&pkg.name, &plat_triple))
         .collect();
     for t in &visible_tools {
         env.push((t.env.clone(), t.value.clone()));
