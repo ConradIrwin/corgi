@@ -386,6 +386,7 @@ struct ZigRuntime {
     ar: PathBuf,
     ranlib: PathBuf,
     cmake_toolchain: PathBuf,
+    use_zig_as_rust_linker: bool,
     identity: String,
 }
 
@@ -1091,6 +1092,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         ar: logical_wrapper_dir.join("ar"),
         ranlib: logical_wrapper_dir.join("ranlib"),
         cmake_toolchain: logical_wrapper_dir.join("toolchain.cmake"),
+        use_zig_as_rust_linker: target.use_zig_as_rust_linker,
         identity: wrapper_identity,
     })
 }
@@ -6078,7 +6080,7 @@ fn compile(
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
-            if let Some(zig) = &ctx.zig {
+            if let Some(zig) = ctx.zig.as_ref().filter(|zig| zig.use_zig_as_rust_linker) {
                 cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
             }
             if let Some(libdir) = &ctx.target_std_libdir {

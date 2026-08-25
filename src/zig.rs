@@ -21,6 +21,7 @@ pub struct Target<'a> {
     pub rust: &'a str,
     pub zig: String,
     pub cmake_processor: &'static str,
+    pub use_zig_as_rust_linker: bool,
 }
 
 pub fn asset(host: &str) -> Result<Asset> {
@@ -62,15 +63,16 @@ pub fn target(target: &str) -> Result<Option<Target<'_>>> {
         Some((rust_target, suffix)) => (rust_target, Some(suffix)),
         None => (target, None),
     };
-    let (zig_architecture, libc, cmake_processor) = match rust_target {
-        "x86_64-unknown-linux-gnu" => ("x86_64", "gnu", "x86_64"),
-        "aarch64-unknown-linux-gnu" => ("aarch64", "gnu", "aarch64"),
-        "x86_64-unknown-linux-musl" => ("x86_64", "musl", "x86_64"),
-        "aarch64-unknown-linux-musl" => ("aarch64", "musl", "aarch64"),
+    let (zig_target, libc, cmake_processor, use_zig_as_rust_linker) = match rust_target {
+        "x86_64-unknown-linux-gnu" => ("x86_64-linux-gnu", Some("gnu"), "x86_64", true),
+        "aarch64-unknown-linux-gnu" => ("aarch64-linux-gnu", Some("gnu"), "aarch64", true),
+        "x86_64-unknown-linux-musl" => ("x86_64-linux-musl", Some("musl"), "x86_64", true),
+        "aarch64-unknown-linux-musl" => ("aarch64-linux-musl", Some("musl"), "aarch64", true),
+        "wasm32-unknown-unknown" => ("wasm32-freestanding", None, "wasm32", false),
         _ => return Ok(None),
     };
     if let Some(suffix) = suffix {
-        if libc != "gnu" {
+        if libc != Some("gnu") {
             bail!("Zig target ABI suffixes are only supported for glibc targets: `{target}`");
         }
         let mut components = suffix.split('.');
@@ -90,13 +92,14 @@ pub fn target(target: &str) -> Result<Option<Target<'_>>> {
         }
     }
     let zig = format!(
-        "{zig_architecture}-linux-{libc}{}",
+        "{zig_target}{}",
         suffix.map_or(String::new(), |suffix| format!(".{suffix}"))
     );
     Ok(Some(Target {
         rust: rust_target,
         zig,
         cmake_processor,
+        use_zig_as_rust_linker,
     }))
 }
 
@@ -296,7 +299,18 @@ mod tests {
             let target = target(rust).unwrap().unwrap();
             assert_eq!(target.zig, zig);
             assert_eq!(target.cmake_processor, processor);
+            assert!(target.use_zig_as_rust_linker);
         }
+    }
+
+    #[test]
+    fn wasm_target_maps_to_zig_freestanding() {
+        let target = target("wasm32-unknown-unknown").unwrap().unwrap();
+
+        assert_eq!(target.rust, "wasm32-unknown-unknown");
+        assert_eq!(target.zig, "wasm32-freestanding");
+        assert_eq!(target.cmake_processor, "wasm32");
+        assert!(!target.use_zig_as_rust_linker);
     }
 
     #[test]
