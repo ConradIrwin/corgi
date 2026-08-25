@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -66,8 +66,8 @@ pub struct Workspace {
 pub struct Command {
     pub name: String,
     pub workspace: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub package: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_set: Option<String>,
     pub profile: String,
@@ -571,7 +571,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 1);
+        assert_eq!(persisted["schema_version"], 2);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }
@@ -624,7 +624,7 @@ mod tests {
             command: Command {
                 name: "build".into(),
                 workspace: true,
-                package: None,
+                packages: vec![],
                 root_set: None,
                 profile: "dev".into(),
                 target: None,

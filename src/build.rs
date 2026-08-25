@@ -561,13 +561,13 @@ type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, RootSets, ExtraInputs);
 
 /// Selects the fixed package set used for feature resolution.
 ///
-/// An explicit root takes precedence. Otherwise, selecting a package implicitly
-/// selects the one named root that lists it. Packages not listed in any root
-/// continue to resolve against the workspace.
+/// An explicit root takes precedence. Otherwise, packages listed by one named
+/// root select that exact root. Selecting packages listed by different roots is
+/// ambiguous, while packages not listed by any root do not affect inference.
 fn select_resolution_roots(
     root_sets: &RootSets,
     root: Option<&str>,
-    package: Option<&str>,
+    selected_packages: &[String],
 ) -> Result<Option<Vec<String>>> {
     if let Some(name) = root {
         return root_sets.get(name).cloned().map(Some).with_context(|| {
@@ -580,15 +580,15 @@ fn select_resolution_roots(
         });
     }
 
-    let Some(package) = package else {
+    if selected_packages.is_empty() {
         return Ok(None);
-    };
+    }
     let matching_roots = root_sets
         .iter()
         .filter_map(|(name, packages)| {
-            packages
+            selected_packages
                 .iter()
-                .any(|candidate| candidate == package)
+                .any(|package| packages.iter().any(|candidate| candidate == package))
                 .then_some(name)
         })
         .collect::<Vec<_>>();
@@ -596,7 +596,7 @@ fn select_resolution_roots(
         [] => Ok(None),
         [name] => Ok(root_sets.get(*name).cloned()),
         names => bail!(
-            "package `{package}` belongs to multiple roots: {}; pass --root to select one",
+            "selected packages belong to multiple roots: {}; pass --root to select one",
             names
                 .iter()
                 .map(|name| name.as_str())
@@ -1905,8 +1905,8 @@ pub struct BuildOpts {
     /// Take every workspace member's units as roots instead of the
     /// package at the build dir (cargo's --workspace).
     pub workspace: bool,
-    /// Cargo package name selected by `-p` or `--package`.
-    pub package: Option<String>,
+    /// Cargo package names selected by `-p` or `--package`.
+    pub packages: Vec<String>,
     pub bin: Option<String>,
     pub features: Vec<String>,
     pub target: Option<String>,
@@ -1929,17 +1929,22 @@ pub struct BuildOpts {
 
 /// Normalizes requested features and preserves Cargo's `-p` scoping even when
 /// Corgi resolves a broader fixed package set.
-fn select_features(features: &[String], package: Option<&str>) -> Vec<String> {
+fn select_features(features: &[String], packages: &[String]) -> Vec<String> {
     let mut selected = features
         .iter()
         .flat_map(|features| {
             features.split(|character: char| character == ',' || character.is_whitespace())
         })
         .filter(|feature| !feature.is_empty())
-        .map(|feature| match package {
-            Some(package) if !feature.contains('/') => format!("{package}/{feature}"),
-            _ => feature.to_string(),
-        })
+        .flat_map(
+            |feature| match (feature.contains('/'), packages.is_empty()) {
+                (false, false) => packages
+                    .iter()
+                    .map(|package| format!("{package}/{feature}"))
+                    .collect(),
+                _ => vec![feature.to_string()],
+            },
+        )
         .collect::<Vec<_>>();
     selected.sort();
     selected.dedup();
@@ -1958,7 +1963,7 @@ fn report_run(
         Mode::Clippy => "clippy",
         Mode::Test => "test",
     };
-    let selected_features = select_features(&opts.features, opts.package.as_deref());
+    let selected_features = select_features(&opts.features, &opts.packages);
     let unix_nanos = started_at
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1973,7 +1978,7 @@ fn report_run(
         command: crate::report::Command {
             name: command_name.to_string(),
             workspace: opts.workspace,
-            package: opts.package.clone(),
+            packages: opts.packages.clone(),
             root_set: opts.root.clone(),
             profile: opts
                 .profile
@@ -2041,7 +2046,7 @@ pub fn fmt(
     store: Store,
     dir: &Path,
     workspace: bool,
-    package: Option<&str>,
+    packages: &[String],
     verbose: bool,
     args: &[String],
 ) -> Result<()> {
@@ -2080,7 +2085,7 @@ pub fn fmt(
     if workspace {
         command.arg("--all");
     }
-    if let Some(package) = package {
+    for package in packages {
         command.args(["--package", package]);
     }
     if verbose {
@@ -2098,7 +2103,9 @@ pub fn fmt(
     Ok(())
 }
 
-pub fn build(store: Store, dir: &Path, opts: BuildOpts) -> Result<()> {
+pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
+    opts.packages.sort();
+    opts.packages.dedup();
     let store_root = store.root.clone();
     let started_at = std::time::SystemTime::now();
     let monotonic_started_at = Instant::now();
@@ -2186,7 +2193,7 @@ fn build_inner(
         release,
         profile,
         workspace,
-        package,
+        packages,
         bin,
         features,
         target: requested_target,
@@ -2200,7 +2207,10 @@ fn build_inner(
         test_filter,
         exec_args,
     } = opts;
-    let selected_features = select_features(&features, package.as_deref());
+    if matches!(mode, Mode::Run) && packages.len() > 1 {
+        bail!("`corgi run` accepts only one package");
+    }
+    let selected_features = select_features(&features, &packages);
     let t0 = Instant::now();
     let mut report_stage_start = begin_report_stage(&recorder, "setup");
     let dir = dir
@@ -2366,8 +2376,15 @@ fn build_inner(
         Some((_, _, root_sets, extra_inputs)) => (root_sets, extra_inputs),
         None => (RootSets::new(), ExtraInputs::new()),
     };
-    let resolution_roots =
-        select_resolution_roots(&root_sets, root.as_deref(), package.as_deref())?;
+    let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
+    let resolution_root_name = root.clone().or_else(|| {
+        resolution_roots.as_ref().and_then(|selected_root| {
+            root_sets
+                .iter()
+                .find(|(_, packages)| *packages == selected_root)
+                .map(|(name, _)| name.clone())
+        })
+    });
     // Only the selected roots and requested features shape this plan; unrelated
     // root definitions, tools, env probes, and comments must not even cost a
     // replan.
@@ -2599,23 +2616,32 @@ fn build_inner(
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let root_packages = if root.is_some() && package.is_none() {
+    let root_packages = if root.is_some() && packages.is_empty() {
         None
     } else {
-        select_root_packages(&meta, &pkgs, workspace, package.as_deref(), mode)?
+        select_root_packages(&meta, &pkgs, workspace, &packages, mode)?
     };
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let targets_without_harness = targets_without_harness(&meta)?;
     let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref(), &targets_without_harness)?;
-    if matches!(mode, Mode::Test)
-        && package.is_some()
-        && !units
-            .iter()
-            .any(|unit| unit.is_root && matches!(unit.kind, Kind::Test))
-    {
+    let missing_root_packages = root_packages
+        .iter()
+        .flat_map(|packages| packages.iter())
+        .filter(|package| {
+            !units
+                .iter()
+                .any(|unit| unit.is_root && unit.pkg == **package)
+        })
+        .map(|package| meta.packages[*package].name.as_str())
+        .collect::<Vec<_>>();
+    if !missing_root_packages.is_empty() {
+        let root_name = resolution_root_name
+            .as_deref()
+            .map(|name| format!("root `{name}`"))
+            .unwrap_or_else(|| "the workspace root".to_string());
         bail!(
-            "package `{}` has no test targets in the selected root graph",
-            package.as_deref().unwrap_or_default()
+            "selected packages [{}] are not part of {root_name}",
+            missing_root_packages.join(", "),
         );
     }
     let profile_name = units
@@ -2984,6 +3010,14 @@ fn build_inner(
                 let root_pkg = &meta.packages[pi];
                 format!("{} v{}", root_pkg.name, root_pkg.version)
             }
+            Some(selected) if !packages.is_empty() => format!(
+                "packages {}",
+                selected
+                    .iter()
+                    .map(|package| meta.packages[*package].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Some(_) => "default workspace members".to_string(),
             None => "workspace".to_string(),
         };
@@ -3505,32 +3539,38 @@ fn select_root_packages(
     metadata: &Metadata,
     package_indices: &HashMap<String, usize>,
     workspace: bool,
-    package: Option<&str>,
+    selected_packages: &[String],
     mode: Mode,
 ) -> Result<Option<BTreeSet<usize>>> {
     if workspace {
         return Ok(None);
     }
-    if let Some(package) = package {
+    if !selected_packages.is_empty() {
         let workspace_members: BTreeSet<&str> = metadata
             .workspace_members
             .iter()
             .map(String::as_str)
             .collect();
-        let matches: Vec<usize> = metadata
-            .packages
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| {
-                workspace_members.contains(candidate.id.as_str()) && candidate.name == package
-            })
-            .map(|(index, _)| index)
-            .collect();
-        return match matches.as_slice() {
-            [index] => Ok(Some(BTreeSet::from([*index]))),
-            [] => bail!("package `{package}` is not a workspace member"),
-            _ => bail!("package specification `{package}` is ambiguous"),
-        };
+        let mut selected_indices = BTreeSet::new();
+        for package in selected_packages {
+            let matches: Vec<usize> = metadata
+                .packages
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    workspace_members.contains(candidate.id.as_str()) && candidate.name == *package
+                })
+                .map(|(index, _)| index)
+                .collect();
+            match matches.as_slice() {
+                [index] => {
+                    selected_indices.insert(*index);
+                }
+                [] => bail!("package `{package}` is not a workspace member"),
+                _ => bail!("package specification `{package}` is ambiguous"),
+            }
+        }
+        return Ok(Some(selected_indices));
     }
     if let Some(root_id) = &metadata.resolve.root {
         return package_indices
@@ -3703,30 +3743,32 @@ fn translate_unit_graph(
             }
         }
     }
-    // Cargo's roots establish feature resolution. Prefer the requested
-    // package's Cargo roots when it has them; otherwise select its existing
-    // non-build-script units from the resolved graph without promoting it to
-    // a Cargo root (which would change default features).
-    let cargo_roots: Vec<usize> = g
+    // Cargo's roots establish feature resolution. Selected packages that are
+    // already dependencies in that graph become output roots without changing
+    // Cargo's root set or their resolved features.
+    let mut stack: Vec<usize> = g
         .roots
         .iter()
         .copied()
         .filter(|&r| root_packages.is_none_or(|packages| packages.contains(&units[r].pkg)))
         .collect();
-    let mut stack = cargo_roots;
-    if stack.is_empty() {
-        if let Some(packages) = root_packages {
-            stack = units
-                .iter()
-                .enumerate()
-                .filter(|(_, unit)| {
-                    packages.contains(&unit.pkg) && !matches!(unit.kind, Kind::Bsc | Kind::Bsr)
-                })
-                .map(|(index, _)| index)
-                .collect();
+    if let Some(packages) = root_packages {
+        for package in packages {
+            if stack.iter().any(|root| units[*root].pkg == *package) {
+                continue;
+            }
+            stack.extend(
+                units
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, unit)| {
+                        unit.pkg == *package && !matches!(unit.kind, Kind::Bsc | Kind::Bsr)
+                    })
+                    .map(|(index, _)| index),
+            );
         }
     }
-    if stack.is_empty() {
+    if stack.is_empty() && root_packages.is_none() {
         bail!("requested package is not present in the selected root graph");
     }
     for &r in &stack {
@@ -5314,7 +5356,7 @@ mod run_selection_tests {
             .collect::<HashMap<_, _>>();
 
         let selected =
-            select_root_packages(&metadata, &package_indices, false, None, Mode::Run).unwrap();
+            select_root_packages(&metadata, &package_indices, false, &[], Mode::Run).unwrap();
 
         assert_eq!(
             selected
@@ -5345,7 +5387,7 @@ mod run_selection_tests {
             &metadata,
             &package_indices,
             false,
-            Some("helper"),
+            &["helper".to_string()],
             Mode::Run,
         )
         .unwrap();
@@ -5353,6 +5395,35 @@ mod run_selection_tests {
         assert_eq!(
             selected.unwrap().iter().copied().collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn explicit_packages_select_multiple_workspace_members() {
+        let metadata = metadata();
+        let package_indices = metadata
+            .packages
+            .iter()
+            .enumerate()
+            .map(|(index, package)| (package.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+
+        let selected = select_root_packages(
+            &metadata,
+            &package_indices,
+            false,
+            &[
+                "helper".to_string(),
+                "delta".to_string(),
+                "helper".to_string(),
+            ],
+            Mode::Build,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected.unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![0, 1]
         );
     }
 
@@ -5371,7 +5442,7 @@ mod run_selection_tests {
 
         for mode in [Mode::Build, Mode::Test] {
             let selected =
-                select_root_packages(&metadata, &package_indices, false, None, mode).unwrap();
+                select_root_packages(&metadata, &package_indices, false, &[], mode).unwrap();
 
             assert_eq!(
                 selected.unwrap().iter().copied().collect::<Vec<_>>(),
@@ -7045,7 +7116,8 @@ mod named_root_tests {
             ),
         ]);
 
-        let selected = select_resolution_roots(&roots, None, Some("cloud_worker")).unwrap();
+        let selected =
+            select_resolution_roots(&roots, None, &["cloud_worker".to_string()]).unwrap();
 
         assert_eq!(
             selected,
@@ -7063,9 +7135,78 @@ mod named_root_tests {
             vec!["cloud_worker".to_string(), "github_worker".to_string()],
         )]);
 
-        let selected = select_resolution_roots(&roots, None, Some("shared")).unwrap();
+        let selected = select_resolution_roots(&roots, None, &["shared".to_string()]).unwrap();
 
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn package_selection_infers_a_shared_named_root() {
+        let roots = RootSets::from([
+            (
+                "native".to_string(),
+                vec!["api_server".to_string(), "scheduler".to_string()],
+            ),
+            (
+                "web".to_string(),
+                vec!["cloud_worker".to_string(), "github_worker".to_string()],
+            ),
+        ]);
+
+        let selected = select_resolution_roots(
+            &roots,
+            None,
+            &["github_worker".to_string(), "cloud_worker".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            Some(vec![
+                "cloud_worker".to_string(),
+                "github_worker".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn package_selection_across_named_roots_requires_an_explicit_root() {
+        let roots = RootSets::from([
+            ("native".to_string(), vec!["api_server".to_string()]),
+            ("web".to_string(), vec!["cloud_worker".to_string()]),
+        ]);
+
+        let error = select_resolution_roots(
+            &roots,
+            None,
+            &["api_server".to_string(), "cloud_worker".to_string()],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "selected packages belong to multiple roots: native, web; pass --root to select one"
+        );
+    }
+
+    #[test]
+    fn unlisted_packages_do_not_change_inferred_root() {
+        let roots = RootSets::from([(
+            "native".to_string(),
+            vec!["api_server".to_string(), "scheduler".to_string()],
+        )]);
+
+        let selected = select_resolution_roots(
+            &roots,
+            None,
+            &["api_server".to_string(), "shared".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            Some(vec!["api_server".to_string(), "scheduler".to_string()])
+        );
     }
 
     #[test]
@@ -7082,7 +7223,7 @@ mod named_root_tests {
         ]);
 
         let selected =
-            select_resolution_roots(&roots, Some("native"), Some("cloud_worker")).unwrap();
+            select_resolution_roots(&roots, Some("native"), &["cloud_worker".to_string()]).unwrap();
 
         assert_eq!(
             selected,
@@ -7103,11 +7244,11 @@ mod named_root_tests {
             ),
         ]);
 
-        let error = select_resolution_roots(&roots, None, Some("shared")).unwrap_err();
+        let error = select_resolution_roots(&roots, None, &["shared".to_string()]).unwrap_err();
 
         assert_eq!(
             error.to_string(),
-            "package `shared` belongs to multiple roots: native, web; pass --root to select one"
+            "selected packages belong to multiple roots: native, web; pass --root to select one"
         );
     }
 
@@ -7131,7 +7272,7 @@ mod named_root_tests {
     }
 
     #[test]
-    fn a_reachable_non_root_keeps_the_features_from_the_root_graph() {
+    fn a_reachable_selected_dependency_keeps_the_features_from_the_root_graph() {
         let graph: UnitGraph = serde_json::from_value(serde_json::json!({
             "roots": [0],
             "units": [
@@ -7169,15 +7310,15 @@ mod named_root_tests {
         }))
         .unwrap();
         let packages = HashMap::from([("cloud".to_string(), 0), ("shared".to_string(), 1)]);
-        let selected = BTreeSet::from([1]);
+        let selected = BTreeSet::from([0, 1]);
 
         let units =
             translate_unit_graph(&graph, &packages, Some(&selected), &HashSet::new()).unwrap();
 
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].pkg, 1);
-        assert!(units[0].is_root);
-        assert_eq!(units[0].features, ["git", "http"]);
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|unit| unit.is_root));
+        let shared = units.iter().find(|unit| unit.pkg == 1).unwrap();
+        assert_eq!(shared.features, ["git", "http"]);
     }
 }
 
@@ -7194,7 +7335,7 @@ mod feature_selection_tests {
                 "json gzip".to_string(),
                 "tls".to_string(),
             ],
-            Some("app"),
+            &["app".to_string()],
         );
 
         assert_eq!(
@@ -7205,10 +7346,19 @@ mod feature_selection_tests {
 
     #[test]
     fn workspace_selection_preserves_unqualified_features() {
-        let selected =
-            select_features(&["tls".to_string(), "dependency/tracing".to_string()], None);
+        let selected = select_features(&["tls".to_string(), "dependency/tracing".to_string()], &[]);
 
         assert_eq!(selected, ["dependency/tracing", "tls"]);
+    }
+
+    #[test]
+    fn package_selection_qualifies_features_for_every_package() {
+        let selected = select_features(
+            &["tls".to_string(), "dependency/tracing".to_string()],
+            &["server".to_string(), "client".to_string()],
+        );
+
+        assert_eq!(selected, ["client/tls", "dependency/tracing", "server/tls"]);
     }
 }
 

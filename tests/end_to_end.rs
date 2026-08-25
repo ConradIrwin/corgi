@@ -13,12 +13,54 @@ fn package_selection_infers_its_feature_unification_root() {
 }
 
 #[test]
+fn selected_package_must_be_part_of_the_named_root() {
+    let fixture = fixture_path("root-inference");
+    let output = invoke_corgi(&fixture, "check", ["--root", "app", "--package", "sibling"]);
+
+    assert_failure(&output, "corgi check");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("selected packages [sibling] are not part of root `app`"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn features_enable_only_the_selected_packages_feature() {
     let output = run_test_compile("feature-selection", ["-p", "app", "--features", "special"]);
 
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "app special; sibling plain\n"
+    );
+}
+
+#[test]
+fn repeated_packages_build_with_package_scoped_features() {
+    let directory = TestDirectory::new("multiple-packages");
+    copy_directory(&fixture_path("feature-selection"), &directory.path);
+    let output = run_test_compile_in(
+        &directory.path,
+        ["-p", "app", "--package", "sibling", "--features", "special"],
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "app special; sibling special\n"
+    );
+    let sibling = Command::new(
+        directory
+            .path
+            .join("target/debug")
+            .join(executable_name("sibling")),
+    )
+    .output()
+    .expect("failed to run sibling");
+    assert_success(&sibling, "sibling");
+    assert_eq!(
+        String::from_utf8(sibling.stdout).unwrap(),
+        "sibling special\n"
     );
 }
 
@@ -170,10 +212,17 @@ fn run_test_compile<const ARGUMENT_COUNT: usize>(
     arguments: [&str; ARGUMENT_COUNT],
 ) -> Output {
     let fixture = fixture_path(fixture_name);
+    run_test_compile_in(&fixture, arguments)
+}
+
+fn run_test_compile_in<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    arguments: [&str; ARGUMENT_COUNT],
+) -> Output {
     let target = fixture.join("target");
     let _ = std::fs::remove_dir_all(&target);
 
-    run_corgi(&fixture, "build", arguments);
+    run_corgi(fixture, "build", arguments);
 
     let output = Command::new(target.join("debug").join(executable_name("app")))
         .output()
@@ -245,6 +294,22 @@ fn assert_failure(output: &Output, command: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == "target" {
+            continue;
+        }
+        let destination = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&entry.path(), &destination);
+        } else {
+            fs::copy(entry.path(), destination).unwrap();
+        }
+    }
 }
 
 struct TestDirectory {

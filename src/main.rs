@@ -82,7 +82,7 @@ fn real_main() -> Result<()> {
                         release: args.release,
                         profile: args.profile,
                         workspace,
-                        package: args.package,
+                        packages: args.packages,
                         bin: args.bin,
                         features: args.features,
                         target: args.target,
@@ -162,7 +162,7 @@ fn real_main() -> Result<()> {
                         store,
                         &dir,
                         args.workspace,
-                        args.package.as_deref(),
+                        &args.packages,
                         verbose,
                         &args.args,
                     )

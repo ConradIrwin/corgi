@@ -58,9 +58,9 @@ pub struct BuildArgs {
     #[arg(long, value_name = "PROFILE")]
     pub profile: Option<String>,
 
-    /// Determine the execution package
-    #[arg(short = 'p', long, value_name = "PACKAGE")]
-    pub package: Option<String>,
+    /// Select a package; may be repeated
+    #[arg(short = 'p', long = "package", value_name = "PACKAGE")]
+    pub packages: Vec<String>,
 
     /// Build only the named binary
     #[arg(long, value_name = "NAME")]
@@ -93,7 +93,7 @@ pub struct WorkspaceBuildArgs {
     pub build: BuildArgs,
 
     /// Select every workspace member
-    #[arg(long, conflicts_with_all = ["package", "root"])]
+    #[arg(long, conflicts_with_all = ["packages", "root"])]
     pub workspace: bool,
 }
 
@@ -142,12 +142,12 @@ pub struct TestArgs {
 #[derive(Debug, Args)]
 pub struct FmtArgs {
     /// Format every workspace member
-    #[arg(long, conflicts_with = "package")]
+    #[arg(long, conflicts_with = "packages")]
     pub workspace: bool,
 
-    /// Format one package
-    #[arg(short = 'p', long, value_name = "PACKAGE")]
-    pub package: Option<String>,
+    /// Format a package; may be repeated
+    #[arg(short = 'p', long = "package", value_name = "PACKAGE")]
+    pub packages: Vec<String>,
 
     /// Arguments passed to cargo fmt
     #[arg(
@@ -259,6 +259,17 @@ mod tests {
     }
 
     #[test]
+    fn package_selection_accepts_repeated_values() {
+        let cli =
+            Cli::try_parse_from(["corgi", "check", "-p", "app", "--package", "server"]).unwrap();
+        let Some(Command::Check(args)) = cli.command else {
+            panic!("check command not parsed");
+        };
+
+        assert_eq!(args.build.packages, ["app", "server"]);
+    }
+
+    #[test]
     fn build_accepts_profile_and_binary_selection() {
         let cli = Cli::try_parse_from([
             "corgi",
@@ -305,7 +316,7 @@ mod tests {
             panic!("clippy command not parsed");
         };
 
-        assert_eq!(args.build.build.package.as_deref(), Some("app"));
+        assert_eq!(args.build.build.packages, ["app"]);
         assert!(args.all_targets);
         assert_eq!(args.clippy_args, ["-D", "warnings"]);
         assert!(Cli::try_parse_from(["corgi", "clippy", "-D", "warnings"]).is_err());
