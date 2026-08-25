@@ -1347,7 +1347,7 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
         }
         let ok = p.join(".ok");
         let verdict = if ok.exists() { stale(&ok) } else { stale(&p) };
-        if verdict && fs::remove_dir_all(&p).is_ok() {
+        if verdict && retire_dir(store, &p) {
             dirs += 1;
         }
     }
@@ -1382,13 +1382,13 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
             let _ = fs::write(&marker, b"used\n");
             continue;
         }
-        if stale(&marker) && fs::remove_dir_all(&p).is_ok() {
+        if stale(&marker) && retire_dir(store, &p) {
             dirs += 1;
         }
     }
     // toolsets/: shim dirs, cheap to rebuild; judged by use-touched mtime.
     for p in read_dir_paths(&store.root.join("toolsets"))? {
-        if p.is_dir() && stale(&p) && fs::remove_dir_all(&p).is_ok() {
+        if p.is_dir() && stale(&p) && retire_dir(store, &p) {
             dirs += 1;
         }
     }
@@ -1396,7 +1396,7 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
     // dir mtime (rustc session writes refresh it on every use).
     for p in read_dir_paths(&store.root.join("incr"))? {
         if p.is_dir() {
-            if stale(&p) && fs::remove_dir_all(&p).is_ok() {
+            if stale(&p) && retire_dir(store, &p) {
                 dirs += 1;
             }
         } else if stale(&p) && fs::remove_file(&p).is_ok() {
@@ -1420,7 +1420,7 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
             } else {
                 stale(&pkg_dir)
             };
-            if verdict && fs::remove_dir_all(&pkg_dir).is_ok() {
+            if verdict && retire_dir(store, &pkg_dir) {
                 dirs += 1;
             }
         }
@@ -1447,13 +1447,13 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
             } else {
                 stale(&checkout_dir)
             };
-            if verdict && fs::remove_dir_all(&checkout_dir).is_ok() {
+            if verdict && retire_dir(store, &checkout_dir) {
                 dirs += 1;
             }
         }
     }
     for db_dir in read_dir_paths(&cargo_home.join("git/db"))? {
-        if db_dir.is_dir() && stale(&db_dir) && fs::remove_dir_all(&db_dir).is_ok() {
+        if db_dir.is_dir() && stale(&db_dir) && retire_dir(store, &db_dir) {
             dirs += 1;
         }
     }
@@ -1477,6 +1477,20 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
         }
     }
     Ok((files, dirs, bytes))
+}
+
+/// Remove a directory from its validity-bearing namespace in one operation,
+/// then reclaim its contents. A failed recursive deletion can leave garbage
+/// in `tmp`, but never a partial toolchain, OUT_DIR, or source checkout that
+/// another process could mistake for a valid cache entry.
+fn retire_dir(store: &Store, path: &Path) -> bool {
+    let retired = store.tmp_path("gc");
+    if fs::create_dir_all(retired.parent().unwrap()).is_err() || fs::rename(path, &retired).is_err()
+    {
+        return false;
+    }
+    fs::remove_dir_all(&retired).ok();
+    true
 }
 
 fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
