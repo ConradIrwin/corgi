@@ -26,6 +26,9 @@ pub enum Command {
     /// Build the selected package
     Build(WorkspaceBuildArgs),
 
+    /// Build and run benchmarks
+    Bench(BenchArgs),
+
     /// Type-check the selected package
     Check(WorkspaceBuildArgs),
 
@@ -95,6 +98,10 @@ pub struct WorkspaceBuildArgs {
     /// Select every workspace member
     #[arg(long, conflicts_with_all = ["packages", "root"])]
     pub workspace: bool,
+
+    /// Build only the named benchmark
+    #[arg(long = "bench", value_name = "NAME")]
+    pub benches: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -124,7 +131,11 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 pub struct TestArgs {
     #[command(flatten)]
-    pub build: WorkspaceBuildArgs,
+    pub build: BuildArgs,
+
+    /// Select every workspace member
+    #[arg(long, conflicts_with_all = ["packages", "root"])]
+    pub workspace: bool,
 
     /// Run tests even if a successful result is cached
     #[arg(short = 'f', long)]
@@ -135,6 +146,20 @@ pub struct TestArgs {
     pub filter: Option<String>,
 
     /// Arguments passed to every test harness
+    #[arg(last = true, value_name = "ARGS")]
+    pub exec_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    #[command(flatten)]
+    pub build: WorkspaceBuildArgs,
+
+    /// Run only benchmarks containing this string in their names
+    #[arg(value_name = "BENCHNAME")]
+    pub filter: Option<String>,
+
+    /// Arguments passed to every benchmark executable
     #[arg(last = true, value_name = "ARGS")]
     pub exec_args: Vec<String>,
 }
@@ -193,6 +218,7 @@ mod tests {
         let help = String::from_utf8(output).unwrap();
         for expected in [
             "corgi build:",
+            "corgi bench:",
             "corgi check:",
             "corgi clippy:",
             "corgi run:",
@@ -286,6 +312,52 @@ mod tests {
 
         assert_eq!(args.build.profile.as_deref(), Some("runner-dev"));
         assert_eq!(args.build.bin.as_deref(), Some("runner"));
+    }
+
+    #[test]
+    fn check_and_bench_accept_benchmark_selection() {
+        let cli =
+            Cli::try_parse_from(["corgi", "check", "-p", "app", "--bench", "throughput"]).unwrap();
+        let Some(Command::Check(args)) = cli.command else {
+            panic!("check command not parsed");
+        };
+        assert_eq!(args.benches, ["throughput"]);
+
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "bench",
+            "-p",
+            "app",
+            "--bench",
+            "throughput",
+            "--bench",
+            "latency",
+            "parse",
+            "--",
+            "--sample-size",
+            "10",
+        ])
+        .unwrap();
+        let Some(Command::Bench(args)) = cli.command else {
+            panic!("bench command not parsed");
+        };
+        assert_eq!(args.build.benches, ["throughput", "latency"]);
+        assert_eq!(args.filter.as_deref(), Some("parse"));
+        assert_eq!(args.exec_args, ["--sample-size", "10"]);
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "bench",
+            "--bin",
+            "application",
+            "--bench",
+            "throughput",
+        ])
+        .unwrap();
+        let Some(Command::Bench(args)) = cli.command else {
+            panic!("bench command not parsed");
+        };
+        assert_eq!(args.build.build.bin.as_deref(), Some("application"));
+        assert_eq!(args.build.benches, ["throughput"]);
     }
 
     #[test]

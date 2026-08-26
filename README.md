@@ -37,7 +37,31 @@ machines.
 ```
 cargo install corgi-build
 
-corgi [ build | run | test | check | clippy | fmt | audit | clean ] ...
+corgi [ build | bench | run | test | check | clippy | fmt | audit | clean ] ...
+```
+
+Benchmarks use the same target declarations as Cargo. A benchmark using Rust's
+built-in harness needs no additional configuration:
+
+```toml
+[[bench]]
+name = "built_in"
+```
+
+A benchmark framework that provides its own `main`, such as Criterion, disables
+the built-in harness:
+
+```toml
+[[bench]]
+name = "criterion"
+harness = false
+```
+
+Both forms can be selected when checking or running:
+
+```sh
+corgi check --bench criterion
+corgi bench --bench criterion -- --sample-size 50
 ```
 
 There are definitely sub-options and commands missing; please file reports or

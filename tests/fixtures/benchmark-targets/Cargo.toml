@@ -1,0 +1,12 @@
+[package]
+name = "benchmark-targets"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "built_in"
+harness = true
+
+[[bench]]
+name = "custom"
+harness = false

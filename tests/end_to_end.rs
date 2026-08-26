@@ -168,6 +168,98 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
 }
 
 #[test]
+fn benchmark_targets_support_built_in_and_custom_harnesses() {
+    let directory = TestDirectory::new("benchmark-targets");
+    copy_directory(&fixture_path("benchmark-targets"), &directory.path);
+    let marker = directory.path.join("custom-benchmark-ran");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("check")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "custom"])
+        .env("CORGI_BENCHMARK_MARKER", &marker)
+        .output()
+        .expect("failed to check custom benchmark");
+    assert_success(&checked, "corgi check --bench custom");
+    assert!(!marker.exists(), "check executed the benchmark");
+
+    let release_store = TestDirectory::new("benchmark-release-store");
+    let assert_release_rejected = || {
+        let released = invoke_corgi_with_store(
+            &directory.path,
+            "bench",
+            ["--bench", "custom", "--release"],
+            &release_store.path,
+        );
+        assert_failure(&released, "corgi bench --release");
+        assert!(
+            String::from_utf8_lossy(&released.stderr)
+                .contains("`corgi bench` does not accept `--release`"),
+            "{}",
+            String::from_utf8_lossy(&released.stderr)
+        );
+    };
+    assert_release_rejected();
+
+    let custom = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("bench")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "custom", "--", "selected"])
+        .env("CORGI_BENCHMARK_MARKER", &marker)
+        .output()
+        .expect("failed to run custom benchmark");
+    assert_success(&custom, "corgi bench --bench custom");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "selected\n--bench\n");
+
+    let built_in = invoke_corgi(
+        &directory.path,
+        "bench",
+        [
+            "--bench",
+            "built_in",
+            "built_in_harness",
+            "--",
+            "--nocapture",
+        ],
+    );
+    assert_success(&built_in, "corgi bench --bench built_in");
+    let stdout = String::from_utf8_lossy(&built_in.stdout);
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("built_in_harness"),
+        "built-in harness did not run:\n{stdout}"
+    );
+
+    fs::remove_file(&marker).unwrap();
+    let combined = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("bench")
+        .arg("-C")
+        .arg(&directory.path)
+        .args([
+            "--bin",
+            "benchmark-targets",
+            "--bench",
+            "custom",
+            "--bench",
+            "built_in",
+        ])
+        .env("CORGI_BENCHMARK_MARKER", &marker)
+        .output()
+        .expect("failed to run combined benchmark targets");
+    assert_success(&combined, "corgi bench with combined target selectors");
+    let stderr = String::from_utf8_lossy(&combined.stderr);
+    for target in ["benchmark-targets", "built_in", "custom"] {
+        assert!(
+            stderr.contains(&format!("Running benchmark {target}")),
+            "benchmark target {target} did not run:\n{stderr}"
+        );
+    }
+
+    assert_release_rejected();
+}
+
+#[test]
 fn fmt_discovers_targets_in_a_virtual_workspace() {
     let fixture = fixture_path("fmt-virtual-workspace");
 

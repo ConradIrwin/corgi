@@ -34,6 +34,7 @@ macro_rules! status {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
     Build,
+    Bench,
     /// Build, then execute the root binary exactly as a manual run of the
     /// exported artifact: ambient env, the caller's cwd, inherited stdio.
     Run,
@@ -246,6 +247,13 @@ struct TestHarness {
     cache_bypassed: bool,
     discovery_ns: u64,
     tests: Vec<String>,
+}
+
+struct BenchmarkExecutable {
+    name: String,
+    path: PathBuf,
+    cwd: PathBuf,
+    binary_environment: Vec<(String, String)>,
 }
 
 struct TestCase {
@@ -1980,6 +1988,7 @@ pub struct BuildOpts {
     /// Cargo package names selected by `-p` or `--package`.
     pub packages: Vec<String>,
     pub bin: Option<String>,
+    pub benches: Vec<String>,
     pub features: Vec<String>,
     pub target: Option<String>,
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
@@ -2030,6 +2039,7 @@ fn report_run(
 ) -> crate::report::Run {
     let command_name = match opts.mode {
         Mode::Build => "build",
+        Mode::Bench => "bench",
         Mode::Run => "run",
         Mode::Check => "check",
         Mode::Clippy => "clippy",
@@ -2052,10 +2062,16 @@ fn report_run(
             workspace: opts.workspace,
             packages: opts.packages.clone(),
             root_set: opts.root.clone(),
-            profile: opts
-                .profile
-                .clone()
-                .unwrap_or_else(|| if opts.release { "release" } else { "dev" }.to_string()),
+            profile: opts.profile.clone().unwrap_or_else(|| {
+                if matches!(opts.mode, Mode::Bench) {
+                    "bench"
+                } else if opts.release {
+                    "release"
+                } else {
+                    "dev"
+                }
+                .to_string()
+            }),
             target: opts.target.clone(),
             features: selected_features,
             incremental: !opts.no_incremental,
@@ -2269,6 +2285,7 @@ fn build_inner(
         workspace,
         packages,
         bin,
+        benches,
         features,
         target: requested_target,
         root,
@@ -2464,19 +2481,23 @@ fn build_inner(
     // replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
     let features_id = sha256_hex(format!("{selected_features:?}").as_bytes());
-    let target_set = if all_targets {
-        "all-targets"
-    } else {
-        "default-targets"
-    };
+    let mut selected_benches = benches.clone();
+    selected_benches.sort();
+    selected_benches.dedup();
+    let target_set = format!("all-targets={all_targets};bin={bin:?};benches={selected_benches:?}");
     let requested_profile = profile
         .as_deref()
-        .unwrap_or(if release { "release" } else { "dev" });
-    // check shares build's plan; test resolves a different unit graph
-    let plan_kind = if matches!(mode, Mode::Test) {
-        "cargo-test"
-    } else {
-        "build"
+        .unwrap_or(if matches!(mode, Mode::Bench) {
+            "bench"
+        } else if release {
+            "release"
+        } else {
+            "dev"
+        });
+    let plan_kind = match mode {
+        Mode::Test => "cargo-test",
+        Mode::Bench => "cargo-bench",
+        _ => "build",
     };
     let plan_ptr = sha256_hex(
         format!(
@@ -2573,10 +2594,10 @@ fn build_inner(
             ug_cmd.env("CARGO_HOME", &cargo_home);
             ug_cmd.env("RUSTC", &rustc);
             ug_cmd.current_dir(&dir);
-            let unit_graph_command = if matches!(mode, Mode::Test) {
-                "test"
-            } else {
-                "build"
+            let unit_graph_command = match mode {
+                Mode::Test => "test",
+                Mode::Bench => "bench",
+                _ => "build",
             };
             ug_cmd.args([
                 unit_graph_command,
@@ -2600,6 +2621,9 @@ fn build_inner(
             }
             if let Some(bin) = &bin {
                 ug_cmd.args(["--bin", bin]);
+            }
+            for bench in &selected_benches {
+                ug_cmd.args(["--bench", bench]);
             }
             match &resolution_roots {
                 Some(members) => {
@@ -3185,7 +3209,9 @@ fn build_inner(
     finish_report_stage(&recorder, "build", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "export");
 
-    if matches!(mode, Mode::Test) {
+    let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
+        || (matches!(mode, Mode::Build) && !selected_benches.is_empty());
+    if exports_harnesses {
         fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
     }
 
@@ -3198,10 +3224,10 @@ fn build_inner(
         .map_or_else(|| target_dir.clone(), |target| target_dir.join(target));
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
+    let mut benchmark_executables = Vec::new();
 
-    if matches!(mode, Mode::Test) {
+    if exports_harnesses {
         let canonical_run = test_filter.is_none() && exec_args.is_empty();
-        let mut harnesses = Vec::new();
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(u.kind, Kind::Test) || !u.is_root {
                 continue;
@@ -3220,23 +3246,34 @@ fn build_inner(
                     ctx.store.export(&o.hash, &odest, false)?;
                 }
             }
-            let pass_key = test_pass_key(&r.key)?;
-            let cached_pass =
-                canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
-            harnesses.push(TestHarness {
-                unit_id: i,
-                name: u.target.name.clone(),
-                path: dest,
-                cwd: ctx.meta.packages[u.pkg].root(),
-                binary_environment: binary_executable_environment(&ctx, u, &results)?,
-                pass_key,
-                cached_pass,
-                cache_bypassed: !canonical_run || force_tests,
-                discovery_ns: 0,
-                tests: Vec::new(),
-            });
+            let name = u.target.name.clone();
+            let cwd = ctx.meta.packages[u.pkg].root();
+            let binary_environment = binary_executable_environment(&ctx, u, &results)?;
+            if matches!(mode, Mode::Test) {
+                let pass_key = test_pass_key(&r.key)?;
+                let cached_pass =
+                    canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
+                test_harnesses.push(TestHarness {
+                    unit_id: i,
+                    name,
+                    path: dest,
+                    cwd,
+                    binary_environment,
+                    pass_key,
+                    cached_pass,
+                    cache_bypassed: !canonical_run || force_tests,
+                    discovery_ns: 0,
+                    tests: Vec::new(),
+                });
+            } else if matches!(mode, Mode::Bench) {
+                benchmark_executables.push(BenchmarkExecutable {
+                    name,
+                    path: dest,
+                    cwd,
+                    binary_environment,
+                });
+            }
         }
-        test_harnesses = harnesses;
     }
 
     for (i, u) in ctx.units.iter().enumerate() {
@@ -3299,6 +3336,11 @@ fn build_inner(
             canonical_run,
         )?;
         finish_report_stage(&recorder, "test", test_stage_start);
+    }
+    if matches!(mode, Mode::Bench) {
+        let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
+        run_benchmarks(&benchmark_executables, &exec_args)?;
+        finish_report_stage(&recorder, "benchmark", benchmark_stage_start);
     }
     let cleanup_stage_start = begin_report_stage(&recorder, "cleanup");
     maybe_auto_clean(&ctx.store);
@@ -3790,7 +3832,7 @@ fn select_root_packages(
             ),
         };
     }
-    if matches!(mode, Mode::Build | Mode::Test) {
+    if matches!(mode, Mode::Build | Mode::Bench | Mode::Test) {
         if default_members.is_empty() {
             bail!("virtual workspace has no default packages; use `--workspace` or `-p PACKAGE`");
         }
@@ -4360,6 +4402,26 @@ fn configure_test_command(harness: &TestHarness) -> Command {
     command.current_dir(&harness.cwd);
     command.envs(harness.binary_environment.iter().cloned());
     command
+}
+
+fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> Result<()> {
+    if benchmarks.is_empty() {
+        bail!("no benchmarks found");
+    }
+    for benchmark in benchmarks {
+        status!("Running", "benchmark {}", benchmark.name);
+        let status = Command::new(&benchmark.path)
+            .current_dir(&benchmark.cwd)
+            .envs(benchmark.binary_environment.iter().cloned())
+            .args(exec_args)
+            .arg("--bench")
+            .status()
+            .with_context(|| format!("running benchmark {}", benchmark.name))?;
+        if !status.success() {
+            bail!("benchmark {} failed with {status}", benchmark.name);
+        }
+    }
+    Ok(())
 }
 
 fn parse_test_list(stdout: &[u8], harness: &str) -> Result<Vec<String>> {

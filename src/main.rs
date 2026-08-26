@@ -68,6 +68,7 @@ fn real_main() -> Result<()> {
             let run_build = |store: store::Store,
                              args: cli::BuildArgs,
                              workspace: bool,
+                             benches: Vec<String>,
                              mode: build::Mode,
                              all_targets: bool,
                              clippy_args: Vec<String>,
@@ -84,6 +85,7 @@ fn real_main() -> Result<()> {
                         workspace,
                         packages: args.packages,
                         bin: args.bin,
+                        benches,
                         features: args.features,
                         target: args.target,
                         root: args.root,
@@ -103,6 +105,7 @@ fn real_main() -> Result<()> {
                     store,
                     args.build,
                     args.workspace,
+                    args.benches,
                     build::Mode::Build,
                     false,
                     Vec::new(),
@@ -110,10 +113,31 @@ fn real_main() -> Result<()> {
                     None,
                     Vec::new(),
                 ),
+                cli::Command::Bench(mut args) => {
+                    if args.build.build.release {
+                        anyhow::bail!("`corgi bench` does not accept `--release`");
+                    }
+                    if let Some(filter) = args.filter {
+                        args.exec_args.insert(0, filter);
+                    }
+                    run_build(
+                        store,
+                        args.build.build,
+                        args.build.workspace,
+                        args.build.benches,
+                        build::Mode::Bench,
+                        false,
+                        Vec::new(),
+                        false,
+                        None,
+                        args.exec_args,
+                    )
+                }
                 cli::Command::Check(args) => run_build(
                     store,
                     args.build,
                     args.workspace,
+                    args.benches,
                     build::Mode::Check,
                     false,
                     Vec::new(),
@@ -125,6 +149,7 @@ fn real_main() -> Result<()> {
                     store,
                     args.build.build,
                     args.build.workspace,
+                    args.build.benches,
                     build::Mode::Clippy,
                     args.all_targets,
                     args.clippy_args,
@@ -136,6 +161,7 @@ fn real_main() -> Result<()> {
                     store,
                     args.build,
                     false,
+                    Vec::new(),
                     build::Mode::Run,
                     false,
                     Vec::new(),
@@ -145,8 +171,9 @@ fn real_main() -> Result<()> {
                 ),
                 cli::Command::Test(args) => run_build(
                     store,
-                    args.build.build,
-                    args.build.workspace,
+                    args.build,
+                    args.workspace,
+                    Vec::new(),
                     build::Mode::Test,
                     false,
                     Vec::new(),
