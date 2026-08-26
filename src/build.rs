@@ -2093,8 +2093,6 @@ pub fn fmt(
     let mut command = Command::new(&cargo);
     command
         .arg("fmt")
-        .arg("--manifest-path")
-        .arg(&manifest)
         .current_dir(&dir)
         .env("CARGO", &cargo)
         .env("RUSTC", &rustc)

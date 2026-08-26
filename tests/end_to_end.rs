@@ -168,6 +168,13 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
 }
 
 #[test]
+fn fmt_discovers_targets_in_a_virtual_workspace() {
+    let fixture = fixture_path("fmt-virtual-workspace");
+
+    run_corgi(&fixture, "fmt", ["--check"]);
+}
+
+#[test]
 fn adding_an_implicit_test_invalidates_the_cached_plan() {
     let directory = TestDirectory::new("implicit-test");
     let marker = directory.path.join("new-test-ran");
