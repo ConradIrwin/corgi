@@ -5285,15 +5285,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     if !st.errors.is_empty() {
         eprintln!("\ncorgi error: {} units failed", st.errors.len());
         for (i, e) in st.errors.iter().enumerate() {
-            let lines: Vec<&str> = e.lines().collect();
-            let tail = lines.len().saturating_sub(22);
-            let short: String = lines[..2.min(lines.len())]
-                .iter()
-                .chain(lines[tail.max(2.min(lines.len()))..].iter())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n    ");
-            eprintln!("  {}. {short}\n", i + 1);
+            eprintln!("  {}. {e}\n", i + 1);
         }
         bail!(
             "{} units failed (skipped dependents not counted)",
