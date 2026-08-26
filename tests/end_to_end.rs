@@ -215,6 +215,80 @@ fn adding_an_implicit_test_invalidates_the_cached_plan() {
 }
 
 #[test]
+fn generated_non_rust_files_do_not_invalidate_local_packages() {
+    let directory = TestDirectory::new("generated-output");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/main.rs"),
+        "fn main() { println!(\"unchanged\"); }\n",
+    )
+    .unwrap();
+
+    run_corgi(&directory.path, "build", []);
+    fs::create_dir_all(directory.path.join("dist")).unwrap();
+    fs::write(directory.path.join("dist/output.wasm"), "generated").unwrap();
+
+    let rebuilt = run_corgi(&directory.path, "build", []);
+
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stderr).contains("0 executed"),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+}
+
+#[test]
+fn non_rust_inputs_must_be_declared() {
+    let directory = TestDirectory::new("declared-input");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/main.rs"),
+        format!(
+            "const POLICY_REVISION: u32 = {};\nfn main() {{ println!(\"{{}} {{}}\", POLICY_REVISION, include_str!(\"../message.txt\")); }}\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::write(directory.path.join("message.txt"), "declared").unwrap();
+
+    let undeclared = invoke_corgi(&directory.path, "build", []);
+
+    assert_failure(&undeclared, "corgi build with an undeclared input");
+    assert!(
+        String::from_utf8_lossy(&undeclared.stderr).contains("message.txt"),
+        "{}",
+        String::from_utf8_lossy(&undeclared.stderr)
+    );
+
+    fs::write(
+        directory.path.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n\"{}\" = [\"message.txt\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+
+    run_corgi(&directory.path, "build", []);
+}
+
+#[test]
 fn local_package_artifacts_are_shared_across_repository_workspaces() {
     let directory = TestDirectory::new("cross-repository-cache");
     let store = directory.path.join("store");

@@ -329,6 +329,7 @@ pub struct Ctx {
     darwin_dirs: Vec<String>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
+    source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
     src_hash_nanos: std::sync::atomic::AtomicU64,
     file_names_memo: Mutex<HashMap<(String, bool), Vec<String>>>,
     /// target/<dir> layout name from the root units' resolved profile
@@ -408,6 +409,59 @@ impl Ctx {
             .get(&pkg.name)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    fn source_files_for(&self, package_index: usize) -> Result<Vec<PathBuf>> {
+        if let Some(paths) = self.source_files_memo.lock().unwrap().get(&package_index) {
+            return Ok(paths.clone());
+        }
+
+        let root = self.meta.packages[package_index].root();
+        let paths = collect_rust_source_files(&root)?;
+        self.source_files_memo
+            .lock()
+            .unwrap()
+            .insert(package_index, paths.clone());
+        Ok(paths)
+    }
+
+    fn declared_extra_inputs_for(&self, pkg: &Package) -> Result<Vec<PathBuf>> {
+        self.extra_inputs_for(pkg)
+            .iter()
+            .map(|extra_input| {
+                let path = pkg
+                    .root()
+                    .join(extra_input)
+                    .canonicalize()
+                    .with_context(|| {
+                        format!("extra-input `{extra_input}` of {} does not exist", pkg.name)
+                    })?;
+                if !path.starts_with(Path::new(&self.workspace_root)) {
+                    bail!(
+                        "extra-input `{extra_input}` of {} escapes the workspace",
+                        pkg.name
+                    );
+                }
+                Ok(path)
+            })
+            .collect()
+    }
+
+    fn package_read_inputs(&self, package_index: usize) -> Result<Vec<PathBuf>> {
+        let pkg = &self.meta.packages[package_index];
+        let mut inputs = if pkg.source.is_some() {
+            vec![pkg.root().canonicalize()?]
+        } else {
+            self.source_files_for(package_index)?
+                .into_iter()
+                .map(|relative_path| pkg.root().join(relative_path).canonicalize())
+                .collect::<std::io::Result<Vec<_>>>()?
+        };
+        inputs.push(PathBuf::from(&pkg.manifest_path).canonicalize()?);
+        inputs.extend(self.declared_extra_inputs_for(pkg)?);
+        inputs.sort();
+        inputs.dedup();
+        Ok(inputs)
     }
 }
 
@@ -2120,6 +2174,10 @@ pub fn fmt(
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
+    ensure_supported_build_platform(
+        std::env::consts::OS,
+        Path::new("/usr/bin/sandbox-exec").is_file(),
+    )?;
     opts.packages.sort();
     opts.packages.dedup();
     let store_root = store.root.clone();
@@ -2832,8 +2890,8 @@ fn build_inner(
     // mode, and it fails hard. Errors name the missing input (denied exec,
     // undeclared read), and the fix is a pinned tool or extra-inputs
     // stanza — loop until green.
-    let sandbox = host.contains("apple") && Path::new("/usr/bin/sandbox-exec").is_file();
-    if sandbox && verbose {
+    let sandbox = true;
+    if verbose {
         status!("Sandbox", "hermetic mode enabled (seatbelt)");
     }
     // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
@@ -3079,6 +3137,7 @@ fn build_inner(
         darwin_dirs,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
+        source_files_memo: Mutex::new(HashMap::new()),
         src_hash_nanos: std::sync::atomic::AtomicU64::new(0),
         file_names_memo,
         profile_name,
@@ -3997,21 +4056,18 @@ impl Ctx {
             .source
             .as_ref()
             .map(|src| format!("{src}|{}|{}", pkg.name, pkg.version));
-        let mut h = self
-            .store
-            .hash_dir_cached(&pkg.root(), immutable.as_deref())
-            .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
+        let mut h = if immutable.is_some() {
+            self.store
+                .hash_dir_cached(&pkg.root(), immutable.as_deref())
+        } else {
+            self.store
+                .hash_files_cached(&pkg.root(), &self.source_files_for(pi)?)
+        }
+        .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
         let extras = self.extra_inputs_for(pkg);
         if !extras.is_empty() {
             let mut acc = h;
-            for e in extras {
-                let p =
-                    pkg.root().join(e).canonicalize().with_context(|| {
-                        format!("extra-input `{e}` of {} does not exist", pkg.name)
-                    })?;
-                if !p.starts_with(Path::new(&self.workspace_root)) {
-                    bail!("extra-input `{e}` of {} escapes the workspace", pkg.name);
-                }
+            for (e, p) in extras.iter().zip(self.declared_extra_inputs_for(pkg)?) {
                 let eh = if p.is_dir() {
                     self.store.hash_dir_cached(&p, None)?
                 } else {
@@ -4078,9 +4134,46 @@ impl Ctx {
     }
 }
 
+fn collect_rust_source_files(root: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        let directory = root.join(relative);
+        let mut entries = fs::read_dir(&directory)
+            .with_context(|| format!("reading package sources in {}", directory.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let name = entry.file_name();
+            let name_lossy = name.to_string_lossy();
+            if name_lossy == ".git"
+                || (relative.as_os_str().is_empty()
+                    && matches!(name_lossy.as_ref(), "target" | "dtarget"))
+            {
+                continue;
+            }
+
+            let relative_path = relative.join(name);
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() {
+                walk(root, &relative_path, files)?;
+            } else if relative_path
+                .extension()
+                .is_some_and(|extension| extension == "rs")
+            {
+                files.push(relative_path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root, Path::new(""), &mut files)?;
+    Ok(files)
+}
+
 /// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
-/// system dirs + toolchain + store + this package, writes limited to the
-/// action's own output/scratch dirs, no network. Children inherit it.
+/// system dirs, the toolchain, the store, and keyed inputs; writes limited
+/// to the action's output and scratch dirs; no network. Children inherit it.
 fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
     if !ctx.sandbox {
         return Command::new(program);
@@ -4187,11 +4280,27 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     for d in &ctx.darwin_dirs {
         reads.push(d.clone());
     }
-    for r in extra_reads {
-        reads.push(r.display().to_string());
-    }
     for r in reads {
         prof.push_str(&format!("  (subpath \"{r}\")\n"));
+    }
+    let workspace_root = Path::new(&ctx.workspace_root);
+    let mut input_directories = std::collections::BTreeSet::new();
+    for path in extra_reads {
+        let mut ancestor = path.parent();
+        while let Some(directory) = ancestor {
+            if !directory.starts_with(workspace_root) {
+                break;
+            }
+            input_directories.insert(directory);
+            ancestor = directory.parent();
+        }
+    }
+    for directory in input_directories {
+        prof.push_str(&format!("  (literal \"{}\")\n", directory.display()));
+    }
+    for path in extra_reads {
+        let operation = if path.is_dir() { "subpath" } else { "literal" };
+        prof.push_str(&format!("  ({operation} \"{}\")\n", path.display()));
     }
     prof.push_str(")\n");
     // Align the readable set with the hashed set: the source hash deliberately
@@ -4199,8 +4308,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     // be denied or they become unhashed inputs. Later SBPL rules win.
     prof.push_str("(deny file-read* file-read-metadata\n");
     let mut deny_roots: Vec<String> = vec![ctx.workspace_root.clone()];
-    for r in extra_reads {
-        deny_roots.push(r.display().to_string());
+    for path in extra_reads {
+        if path.is_dir() {
+            deny_roots.push(path.display().to_string());
+        }
     }
     deny_roots.sort();
     deny_roots.dedup();
@@ -6377,13 +6488,8 @@ fn compile(
         ctx.store.tmp_path("scratch")
     };
     fs::create_dir_all(&scratch)?;
-    let extra_in: Vec<PathBuf> = ctx
-        .extra_inputs_for(pkg)
-        .iter()
-        .filter_map(|e| pkg_root.join(e).canonicalize().ok())
-        .collect();
-    let mut reads: Vec<&Path> = vec![&pkg_root];
-    reads.extend(extra_in.iter().map(|p| p.as_path()));
+    let package_inputs = ctx.package_read_inputs(unit.pkg)?;
+    let mut reads: Vec<&Path> = package_inputs.iter().map(PathBuf::as_path).collect();
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             reads.push(conf.as_path());
@@ -6637,13 +6743,9 @@ fn compile(
                 allowed.push(conf.clone());
             }
         }
-        for e in ctx.extra_inputs_for(pkg) {
-            if let Ok(p) = pkg_root.join(e).canonicalize() {
-                allowed.push(p); // declared -> hashed -> allowed
-            }
-        }
+        allowed.extend(package_inputs.iter().cloned());
         let t_val = Instant::now();
-        validate_dep_info(&d, &pkg_root, compile_dir, &allowed).with_context(|| {
+        validate_dep_info(&d, compile_dir, &allowed).with_context(|| {
             format!(
                 "hermeticity violation compiling {} v{}",
                 pkg.name, pkg.version
@@ -6984,13 +7086,8 @@ fn run_build_script(
         .join(Store::pool_file_name(&script.name, &script_key));
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let extra_in: Vec<PathBuf> = ctx
-        .extra_inputs_for(pkg)
-        .iter()
-        .filter_map(|e| pkg_root.join(e).canonicalize().ok())
-        .collect();
-    let mut reads: Vec<&Path> = vec![&pkg_root];
-    reads.extend(extra_in.iter().map(|p| p.as_path()));
+    let package_inputs = ctx.package_read_inputs(unit.pkg)?;
+    let reads: Vec<&Path> = package_inputs.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
     let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
     cmd.current_dir(&pkg_root);
@@ -7110,12 +7207,7 @@ fn scan_dir_for_workspace_path(dir: &Path, workspace_root: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_dep_info(
-    dep: &str,
-    pkg_root: &Path,
-    compile_dir: &Path,
-    allowed_abs: &[PathBuf],
-) -> Result<()> {
+fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> Result<()> {
     for line in dep.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -7132,19 +7224,18 @@ fn validate_dep_info(
             } else {
                 normalize_path(&compile_dir.join(p))
             };
-            if !(resolved.starts_with(pkg_root)
-                || allowed_abs
-                    .iter()
-                    .any(|allowed| resolved.starts_with(allowed)))
+            if !allowed_abs
+                .iter()
+                .any(|allowed| resolved.starts_with(allowed))
             {
                 if p.is_absolute() {
                     bail!(
                         "undeclared input read during compilation: {tok}\n\
-                         this file is outside the package and OUT_DIR, so it is not part of\n\
-                         the action key; caching it would be unsound"
+                         this file is not a declared package input or OUT_DIR output, so it is\n\
+                         not part of the action key; caching it would be unsound"
                     );
                 } else {
-                    bail!("undeclared input outside the package: {tok}");
+                    bail!("undeclared input read during compilation: {tok}");
                 }
             }
         }
@@ -7176,8 +7267,11 @@ mod dep_info_tests {
         validate_dep_info(
             "output: Cargo.toml src/../RELEASE_CHANNEL src/lib.rs",
             Path::new("/workspace/crates/app"),
-            Path::new("/workspace/crates/app"),
-            &[],
+            &[
+                PathBuf::from("/workspace/crates/app/Cargo.toml"),
+                PathBuf::from("/workspace/crates/app/RELEASE_CHANNEL"),
+                PathBuf::from("/workspace/crates/app/src/lib.rs"),
+            ],
         )
         .unwrap();
     }
@@ -7188,13 +7282,14 @@ mod dep_info_tests {
         let package_root = Path::new("/workspace/crates/app");
         let compile_dir = Path::new("/workspace/crates/app");
 
-        assert!(validate_dep_info(dep_info, package_root, compile_dir, &[])
-            .unwrap_err()
-            .to_string()
-            .contains("undeclared input outside the package"));
+        assert!(
+            validate_dep_info(dep_info, compile_dir, &[package_root.join("src/lib.rs")])
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared input read during compilation")
+        );
         validate_dep_info(
             dep_info,
-            package_root,
             compile_dir,
             &[PathBuf::from("/workspace/assets/icon.png")],
         )
@@ -7205,30 +7300,57 @@ mod dep_info_tests {
     fn absolute_inputs_are_normalized_before_validation() {
         let dep_info = "output: /workspace/crates/app/../../assets/icon.png";
 
-        assert!(validate_dep_info(
-            dep_info,
-            Path::new("/workspace/crates/app"),
-            Path::new("/workspace/crates/app"),
-            &[],
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("undeclared input read during compilation"));
+        assert!(
+            validate_dep_info(dep_info, Path::new("/workspace/crates/app"), &[],)
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared input read during compilation")
+        );
     }
 
     #[test]
     fn workspace_relative_inputs_cannot_escape_a_matching_package_prefix() {
         let dep_info = "output: crates/app/src/../../../assets/icon.png";
 
-        assert!(validate_dep_info(
-            dep_info,
-            Path::new("/workspace/crates/app"),
-            Path::new("/workspace"),
-            &[],
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("undeclared input outside the package"));
+        assert!(validate_dep_info(dep_info, Path::new("/workspace"), &[],)
+            .unwrap_err()
+            .to_string()
+            .contains("undeclared input read during compilation"));
+    }
+}
+
+fn ensure_supported_build_platform(host_os: &str, sandbox_available: bool) -> Result<()> {
+    if host_os != "macos" {
+        bail!("corgi builds require macOS");
+    }
+    if !sandbox_available {
+        bail!("corgi builds require /usr/bin/sandbox-exec");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod build_platform_tests {
+    use super::ensure_supported_build_platform;
+
+    #[test]
+    fn builds_reject_non_macos_hosts() {
+        assert_eq!(
+            ensure_supported_build_platform("linux", true)
+                .unwrap_err()
+                .to_string(),
+            "corgi builds require macOS"
+        );
+    }
+
+    #[test]
+    fn builds_require_the_macos_sandbox() {
+        assert_eq!(
+            ensure_supported_build_platform("macos", false)
+                .unwrap_err()
+                .to_string(),
+            "corgi builds require /usr/bin/sandbox-exec"
+        );
     }
 }
 

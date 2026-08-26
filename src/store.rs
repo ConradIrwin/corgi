@@ -147,6 +147,60 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
     Ok(hex(&h.finalize()))
 }
 
+fn hash_files_hinted(
+    root: &Path,
+    relative_paths: &[PathBuf],
+    hints: &Hints,
+    fresh: &mut Hints,
+) -> Result<String> {
+    let mut relative_paths = relative_paths.to_vec();
+    relative_paths.sort();
+    relative_paths.dedup();
+
+    let mut hasher = Sha256::new();
+    for relative_path in relative_paths {
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(anyhow!(
+                "source path {} is not relative to {}",
+                relative_path.display(),
+                root.display()
+            ));
+        }
+
+        let path = root.join(&relative_path);
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("stat source {}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("source {} is not a file", path.display()));
+        }
+
+        let relative = relative_path.to_string_lossy().into_owned();
+        let key = stat_key(&metadata);
+        STAT_FILES.fetch_add(1, Ordering::Relaxed);
+        let content = match hints.get(&relative) {
+            Some((size, modified, inode, hash)) if (*size, *modified, *inode) == key => {
+                hash.clone()
+            }
+            _ => {
+                REHASHED_FILES.fetch_add(1, Ordering::Relaxed);
+                sha256_file(&path)?
+            }
+        };
+        fresh.insert(relative.clone(), (key.0, key.1, key.2, content.clone()));
+        hasher.update(b"F");
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(content.as_bytes());
+        hasher.update([0]);
+    }
+
+    Ok(hex(&hasher.finalize()))
+}
+
 /// Central machine-wide store. All mutations are write-to-temp + atomic
 /// rename, so any number of concurrent builds can share it without locks.
 pub struct Store {
@@ -408,6 +462,26 @@ impl Store {
             self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
         }
         Ok(h)
+    }
+
+    /// Content hash of a selected set of files with store-persisted caching.
+    pub fn hash_files_cached(&self, root: &Path, relative_paths: &[PathBuf]) -> Result<String> {
+        let hint_path = self.root.join("hints").join(format!(
+            "{}.json",
+            sha256_hex(format!("files:{}", root.display()).as_bytes())
+        ));
+        let hints: Hints = fs::read(&hint_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Store::touch_used(&hint_path);
+        let mut fresh = Hints::new();
+        HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
+        let hash = hash_files_hinted(root, relative_paths, &hints, &mut fresh)?;
+        if fresh != hints {
+            self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
+        }
+        Ok(hash)
     }
 
     /// Copy a CAS blob out to a destination in the worktree.
