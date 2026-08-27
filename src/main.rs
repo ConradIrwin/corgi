@@ -11,6 +11,19 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 
+impl From<cli::TargetSelectionArgs> for build::TargetSelection {
+    fn from(args: cli::TargetSelectionArgs) -> Self {
+        Self {
+            lib: args.lib,
+            bins: args.bins,
+            tests: args.tests,
+            benches: args.all_benches,
+            examples: args.examples,
+            all_targets: args.all_targets,
+        }
+    }
+}
+
 fn main() {
     if let Err(e) = real_main() {
         if let Some(exit) = e.downcast_ref::<build::RunExit>() {
@@ -70,11 +83,16 @@ fn real_main() -> Result<()> {
                              workspace: bool,
                              benches: Vec<String>,
                              mode: build::Mode,
-                             all_targets: bool,
+                             targets: cli::TargetSelectionArgs,
                              clippy_args: Vec<String>,
                              force_tests: bool,
                              test_filter: Option<String>,
                              exec_args: Vec<String>| {
+                if args.all_features {
+                    anyhow::bail!(
+                        "--all-features is not supported. Use corgi roots and explicitly test the feature combinations you care about."
+                    );
+                }
                 build::build(
                     store,
                     &dir,
@@ -90,7 +108,7 @@ fn real_main() -> Result<()> {
                         target: args.target,
                         root: args.root,
                         mode,
-                        all_targets,
+                        targets: targets.into(),
                         clippy_args,
                         timings: args.timings,
                         no_incremental: args.no_incremental,
@@ -107,7 +125,7 @@ fn real_main() -> Result<()> {
                     args.workspace,
                     args.benches,
                     build::Mode::Build,
-                    false,
+                    args.targets,
                     Vec::new(),
                     false,
                     None,
@@ -126,7 +144,7 @@ fn real_main() -> Result<()> {
                         args.build.workspace,
                         args.build.benches,
                         build::Mode::Bench,
-                        false,
+                        args.build.targets,
                         Vec::new(),
                         false,
                         None,
@@ -139,7 +157,7 @@ fn real_main() -> Result<()> {
                     args.workspace,
                     args.benches,
                     build::Mode::Check,
-                    false,
+                    args.targets,
                     Vec::new(),
                     false,
                     None,
@@ -151,7 +169,7 @@ fn real_main() -> Result<()> {
                     args.build.workspace,
                     args.build.benches,
                     build::Mode::Clippy,
-                    args.all_targets,
+                    args.build.targets,
                     args.clippy_args,
                     false,
                     None,
@@ -163,7 +181,7 @@ fn real_main() -> Result<()> {
                     false,
                     Vec::new(),
                     build::Mode::Run,
-                    false,
+                    cli::TargetSelectionArgs::default(),
                     Vec::new(),
                     false,
                     None,
@@ -175,7 +193,7 @@ fn real_main() -> Result<()> {
                     args.workspace,
                     Vec::new(),
                     build::Mode::Test,
-                    false,
+                    args.targets,
                     Vec::new(),
                     args.force,
                     args.filter,

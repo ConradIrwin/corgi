@@ -165,6 +165,121 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
         ],
     );
     assert_failure(&denied, "corgi clippy --all-targets");
+
+    let tests_only = run_corgi(&fixture, "clippy", ["-p", "all_targets_app", "--tests"]);
+    let stderr = String::from_utf8_lossy(&tests_only.stderr);
+    assert!(stderr.contains("integration_warning"), "{stderr}");
+    assert!(!stderr.contains("example_warning"), "{stderr}");
+    assert!(!stderr.contains("benchmark_warning"), "{stderr}");
+}
+
+#[test]
+fn package_target_selectors_reach_cargo_planning() {
+    let directory = TestDirectory::new("target-selectors");
+    copy_directory(&fixture_path("benchmark-targets"), &directory.path);
+
+    for selector in [
+        "--lib",
+        "--bins",
+        "--tests",
+        "--benches",
+        "--examples",
+        "--all-targets",
+    ] {
+        run_corgi(&directory.path, "check", [selector]);
+    }
+
+    let integration_marker = directory.path.join("integration-test-ran");
+    let library_test = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--lib", "--force"])
+        .env("CORGI_INTEGRATION_MARKER", &integration_marker)
+        .output()
+        .expect("failed to test the selected library");
+    assert_success(&library_test, "corgi test --lib");
+    assert!(
+        !integration_marker.exists(),
+        "`--lib` executed an integration test"
+    );
+
+    let selected_integration_marker = directory.path.join("selected-integration-test-ran");
+    let integration_tests = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--tests", "--force"])
+        .env("CORGI_INTEGRATION_MARKER", &selected_integration_marker)
+        .output()
+        .expect("failed to test integration targets");
+    assert_success(&integration_tests, "corgi test --tests");
+    assert!(
+        selected_integration_marker.exists(),
+        "`--tests` did not execute the integration test"
+    );
+
+    run_corgi(&directory.path, "test", ["--bins", "--force"]);
+    run_corgi(&directory.path, "test", ["--examples", "--force"]);
+
+    for selector in ["--benches", "--all-targets"] {
+        let custom_benchmark_marker = directory
+            .path
+            .join(format!("custom-benchmark-{}.ran", &selector[2..]));
+        let selected_tests = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .arg("test")
+            .arg("-C")
+            .arg(&directory.path)
+            .args([selector, "--force"])
+            .env("CORGI_TEST_BENCH_MARKER", &custom_benchmark_marker)
+            .output()
+            .expect("failed to test selected targets");
+        assert_success(&selected_tests, &format!("corgi test {selector}"));
+        assert_eq!(
+            fs::read_to_string(custom_benchmark_marker).unwrap(),
+            "",
+            "custom test executable received libtest or benchmark arguments"
+        );
+    }
+
+    run_corgi(&directory.path, "build", ["--examples"]);
+    let example = Command::new(
+        directory
+            .path
+            .join("target/debug/examples")
+            .join(executable_name("example")),
+    )
+    .output()
+    .expect("failed to run selected example");
+    assert_success(&example, "selected example");
+    assert_eq!(
+        String::from_utf8(example.stdout).unwrap(),
+        "example selected\n"
+    );
+}
+
+#[test]
+fn all_features_explains_the_corgi_alternative() {
+    for command in ["build", "bench", "check", "clippy", "run", "test"] {
+        let output = invoke_corgi(
+            &fixture_path("benchmark-targets"),
+            command,
+            ["--all-features"],
+        );
+
+        assert_failure(&output, &format!("corgi {command} --all-features"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(
+                "--all-features is not supported. Use corgi roots and explicitly test the feature combinations you care about."
+            ),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("Resolving") && !stderr.contains("Building"),
+            "`--all-features` reached build planning:\n{stderr}"
+        );
+    }
 }
 
 #[test]

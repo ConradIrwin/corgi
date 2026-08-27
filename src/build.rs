@@ -1976,6 +1976,42 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cargo package targets selected as roots of the resolved unit graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TargetSelection {
+    pub lib: bool,
+    pub bins: bool,
+    pub tests: bool,
+    pub benches: bool,
+    pub examples: bool,
+    pub all_targets: bool,
+}
+
+impl TargetSelection {
+    fn is_explicit(self) -> bool {
+        self.lib || self.bins || self.tests || self.benches || self.examples || self.all_targets
+    }
+
+    fn includes_harnesses(self) -> bool {
+        self.tests || self.benches || self.all_targets
+    }
+
+    fn apply_to(self, command: &mut Command) {
+        for (selected, argument) in [
+            (self.lib, "--lib"),
+            (self.bins, "--bins"),
+            (self.tests, "--tests"),
+            (self.benches, "--benches"),
+            (self.examples, "--examples"),
+            (self.all_targets, "--all-targets"),
+        ] {
+            if selected {
+                command.arg(argument);
+            }
+        }
+    }
+}
+
 /// Invocation options beyond the store and directory.
 #[derive(Clone)]
 pub struct BuildOpts {
@@ -1994,7 +2030,7 @@ pub struct BuildOpts {
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
     pub root: Option<String>,
     pub mode: Mode,
-    pub all_targets: bool,
+    pub targets: TargetSelection,
     pub clippy_args: Vec<String>,
     pub timings: bool,
     pub no_incremental: bool,
@@ -2290,7 +2326,7 @@ fn build_inner(
         target: requested_target,
         root,
         mode,
-        all_targets,
+        targets,
         clippy_args,
         timings,
         no_incremental,
@@ -2484,7 +2520,7 @@ fn build_inner(
     let mut selected_benches = benches.clone();
     selected_benches.sort();
     selected_benches.dedup();
-    let target_set = format!("all-targets={all_targets};bin={bin:?};benches={selected_benches:?}");
+    let target_set = format!("{targets:?};bin={bin:?};benches={selected_benches:?}");
     let requested_profile = profile
         .as_deref()
         .unwrap_or(if matches!(mode, Mode::Bench) {
@@ -2605,12 +2641,13 @@ fn build_inner(
                 "-Zunstable-options",
                 "--locked",
             ]);
-            if matches!(mode, Mode::Test) {
+            // Corgi does not support rustdoc tests yet. Preserve its existing
+            // default of Rust test targets instead of asking Cargo for the
+            // unqualified graph, which would also contain doctest roots.
+            if matches!(mode, Mode::Test) && !targets.is_explicit() && bin.is_none() {
                 ug_cmd.arg("--tests");
             }
-            if all_targets {
-                ug_cmd.arg("--all-targets");
-            }
+            targets.apply_to(&mut ug_cmd);
             if let Some(profile) = &profile {
                 ug_cmd.args(["--profile", profile]);
             } else if release {
@@ -3210,7 +3247,8 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "export");
 
     let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
-        || (matches!(mode, Mode::Build) && !selected_benches.is_empty());
+        || (matches!(mode, Mode::Build)
+            && (!selected_benches.is_empty() || targets.includes_harnesses()));
     if exports_harnesses {
         fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
     }
@@ -3224,6 +3262,7 @@ fn build_inner(
         .map_or_else(|| target_dir.clone(), |target| target_dir.join(target));
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
+    let mut opaque_test_executables = Vec::new();
     let mut benchmark_executables = Vec::new();
 
     if exports_harnesses {
@@ -3250,21 +3289,30 @@ fn build_inner(
             let cwd = ctx.meta.packages[u.pkg].root();
             let binary_environment = binary_executable_environment(&ctx, u, &results)?;
             if matches!(mode, Mode::Test) {
-                let pass_key = test_pass_key(&r.key)?;
-                let cached_pass =
-                    canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
-                test_harnesses.push(TestHarness {
-                    unit_id: i,
-                    name,
-                    path: dest,
-                    cwd,
-                    binary_environment,
-                    pass_key,
-                    cached_pass,
-                    cache_bypassed: !canonical_run || force_tests,
-                    discovery_ns: 0,
-                    tests: Vec::new(),
-                });
+                if u.test_harness {
+                    let pass_key = test_pass_key(&r.key)?;
+                    let cached_pass =
+                        canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
+                    test_harnesses.push(TestHarness {
+                        unit_id: i,
+                        name,
+                        path: dest,
+                        cwd,
+                        binary_environment,
+                        pass_key,
+                        cached_pass,
+                        cache_bypassed: !canonical_run || force_tests,
+                        discovery_ns: 0,
+                        tests: Vec::new(),
+                    });
+                } else {
+                    opaque_test_executables.push(BenchmarkExecutable {
+                        name,
+                        path: dest,
+                        cwd,
+                        binary_environment,
+                    });
+                }
             } else if matches!(mode, Mode::Bench) {
                 benchmark_executables.push(BenchmarkExecutable {
                     name,
@@ -3284,7 +3332,16 @@ fn build_inner(
             let t = &u.target;
             let r = results[i].get().context("bin not built")?;
             let m = r.main.as_ref().context("bin artifact missing")?;
-            let dest = dtarget.join(&ctx.profile_name).join(&t.name);
+            let mut dest = dtarget.join(&ctx.profile_name);
+            if t.kind.iter().any(|kind| kind == "example") {
+                dest.push("examples");
+            }
+            let executable_name = if m.name.ends_with(".exe") {
+                format!("{}.exe", t.name)
+            } else {
+                t.name.clone()
+            };
+            let dest = dest.join(executable_name);
             ctx.store.export(&m.hash, &dest, true)?;
             written.push(dest);
             for o in &r.res.outputs {
@@ -3328,13 +3385,19 @@ fn build_inner(
     if matches!(mode, Mode::Test) {
         let test_stage_start = begin_report_stage(&recorder, "test");
         let canonical_run = test_filter.is_none() && exec_args.is_empty();
-        run_tests(
-            &ctx,
-            &mut test_harnesses,
-            test_filter.as_deref(),
-            &exec_args,
-            canonical_run,
-        )?;
+        if test_harnesses.is_empty() && opaque_test_executables.is_empty() {
+            bail!("no tests found");
+        }
+        if !test_harnesses.is_empty() {
+            run_tests(
+                &ctx,
+                &mut test_harnesses,
+                test_filter.as_deref(),
+                &exec_args,
+                canonical_run,
+            )?;
+        }
+        run_opaque_tests(&opaque_test_executables, test_filter.as_deref(), &exec_args)?;
         finish_report_stage(&recorder, "test", test_stage_start);
     }
     if matches!(mode, Mode::Bench) {
@@ -4424,6 +4487,31 @@ fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> R
     Ok(())
 }
 
+fn run_opaque_tests(
+    executables: &[BenchmarkExecutable],
+    filter: Option<&str>,
+    exec_args: &[String],
+) -> Result<()> {
+    for executable in executables {
+        status!("Running", "test {}", executable.name);
+        let mut command = Command::new(&executable.path);
+        command
+            .current_dir(&executable.cwd)
+            .envs(executable.binary_environment.iter().cloned());
+        if let Some(filter) = filter {
+            command.arg(filter);
+        }
+        let status = command
+            .args(exec_args)
+            .status()
+            .with_context(|| format!("running test {}", executable.name))?;
+        if !status.success() {
+            bail!("test {} failed with {status}", executable.name);
+        }
+    }
+    Ok(())
+}
+
 fn parse_test_list(stdout: &[u8], harness: &str) -> Result<Vec<String>> {
     let text = std::str::from_utf8(stdout)
         .with_context(|| format!("test harness {harness} produced a non-UTF-8 test list"))?;
@@ -4609,9 +4697,6 @@ fn run_tests_inner(
         }
     }
     let test_count = queue.len();
-    if cached_harnesses == 0 && test_count == 0 {
-        bail!("no tests found");
-    }
     status!(
         "Running",
         "{test_count} tests ({} harnesses cached)",

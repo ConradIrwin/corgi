@@ -73,6 +73,10 @@ pub struct BuildArgs {
     #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
     pub features: Vec<String>,
 
+    /// Unsupported; use corgi roots and test intentional feature combinations
+    #[arg(long)]
+    pub all_features: bool,
+
     /// Build for TRIPLE
     #[arg(long, value_name = "TRIPLE")]
     pub target: Option<String>,
@@ -91,9 +95,39 @@ pub struct BuildArgs {
 }
 
 #[derive(Debug, Args, Default)]
+pub struct TargetSelectionArgs {
+    /// Select the package's library target
+    #[arg(long)]
+    pub lib: bool,
+
+    /// Select every binary target
+    #[arg(long)]
+    pub bins: bool,
+
+    /// Select every test target
+    #[arg(long)]
+    pub tests: bool,
+
+    /// Select every benchmark target
+    #[arg(long = "benches")]
+    pub all_benches: bool,
+
+    /// Select every example target
+    #[arg(long)]
+    pub examples: bool,
+
+    /// Select every library, binary, example, test, and benchmark target
+    #[arg(long)]
+    pub all_targets: bool,
+}
+
+#[derive(Debug, Args, Default)]
 pub struct WorkspaceBuildArgs {
     #[command(flatten)]
     pub build: BuildArgs,
+
+    #[command(flatten)]
+    pub targets: TargetSelectionArgs,
 
     /// Select every workspace member
     #[arg(long, conflicts_with_all = ["packages", "root"])]
@@ -108,10 +142,6 @@ pub struct WorkspaceBuildArgs {
 pub struct ClippyArgs {
     #[command(flatten)]
     pub build: WorkspaceBuildArgs,
-
-    /// Check every library, binary, example, test, and benchmark target
-    #[arg(long)]
-    pub all_targets: bool,
 
     /// Arguments passed to clippy-driver
     #[arg(last = true, value_name = "CLIPPY_ARGS")]
@@ -132,6 +162,9 @@ pub struct RunArgs {
 pub struct TestArgs {
     #[command(flatten)]
     pub build: BuildArgs,
+
+    #[command(flatten)]
+    pub targets: TargetSelectionArgs,
 
     /// Select every workspace member
     #[arg(long, conflicts_with_all = ["packages", "root"])]
@@ -228,6 +261,12 @@ mod tests {
             "corgi clean:",
             "--no-incremental",
             "--all-targets",
+            "--all-features",
+            "--lib",
+            "--bins",
+            "--tests",
+            "--benches",
+            "--examples",
             "--features",
             "--cache",
         ] {
@@ -315,6 +354,57 @@ mod tests {
     }
 
     #[test]
+    fn target_selection_is_shared_by_build_check_clippy_and_test() {
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "check",
+            "--lib",
+            "--bins",
+            "--tests",
+            "--benches",
+            "--examples",
+            "--all-targets",
+        ])
+        .unwrap();
+        let Some(Command::Check(args)) = cli.command else {
+            panic!("check command not parsed");
+        };
+        assert!(args.targets.lib);
+        assert!(args.targets.bins);
+        assert!(args.targets.tests);
+        assert!(args.targets.all_benches);
+        assert!(args.targets.examples);
+        assert!(args.targets.all_targets);
+
+        let cli = Cli::try_parse_from(["corgi", "build", "--examples"]).unwrap();
+        let Some(Command::Build(args)) = cli.command else {
+            panic!("build command not parsed");
+        };
+        assert!(args.targets.examples);
+
+        let cli = Cli::try_parse_from(["corgi", "clippy", "--tests"]).unwrap();
+        let Some(Command::Clippy(args)) = cli.command else {
+            panic!("clippy command not parsed");
+        };
+        assert!(args.build.targets.tests);
+
+        let cli = Cli::try_parse_from(["corgi", "test", "--lib"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert!(args.targets.lib);
+    }
+
+    #[test]
+    fn all_features_is_parsed_for_the_actionable_runtime_error() {
+        let cli = Cli::try_parse_from(["corgi", "clippy", "--all-features"]).unwrap();
+        let Some(Command::Clippy(args)) = cli.command else {
+            panic!("clippy command not parsed");
+        };
+        assert!(args.build.build.all_features);
+    }
+
+    #[test]
     fn check_and_bench_accept_benchmark_selection() {
         let cli =
             Cli::try_parse_from(["corgi", "check", "-p", "app", "--bench", "throughput"]).unwrap();
@@ -389,7 +479,7 @@ mod tests {
         };
 
         assert_eq!(args.build.build.packages, ["app"]);
-        assert!(args.all_targets);
+        assert!(args.build.targets.all_targets);
         assert_eq!(args.clippy_args, ["-D", "warnings"]);
         assert!(Cli::try_parse_from(["corgi", "clippy", "-D", "warnings"]).is_err());
     }
