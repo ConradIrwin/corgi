@@ -7355,8 +7355,8 @@ fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> 
         let Some((_, rest)) = line.split_once(':') else {
             continue;
         };
-        for tok in rest.split_whitespace() {
-            // NOTE(poc): no handling of backslash-escaped spaces in paths
+        for token in dep_info_prerequisites(rest) {
+            let tok = token.as_str();
             let p = Path::new(tok);
             let resolved = if p.is_absolute() {
                 normalize_path(p)
@@ -7380,6 +7380,33 @@ fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> 
         }
     }
     Ok(())
+}
+
+/// Split one dep-info rule into the paths it lists. rustc writes these in
+/// Make's format, where a space inside a path is escaped as `\ `; every
+/// other backslash is literal, so Windows paths survive unchanged.
+fn dep_info_prerequisites(rest: &str) -> Vec<String> {
+    let mut prerequisites = Vec::new();
+    let mut current = String::new();
+    let mut characters = rest.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&' ') => {
+                characters.next();
+                current.push(' ');
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    prerequisites.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        prerequisites.push(current);
+    }
+    prerequisites
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -7455,6 +7482,25 @@ mod dep_info_tests {
             .unwrap_err()
             .to_string()
             .contains("undeclared input read during compilation"));
+    }
+
+    #[test]
+    fn spaces_in_paths_are_read_as_rustc_escapes_them() {
+        validate_dep_info(
+            "output: /Application\\ Support/workspace/src/lib.rs /Application\\ Support/workspace/icon.png",
+            Path::new("/Application Support/workspace"),
+            &[PathBuf::from("/Application Support/workspace")],
+        )
+        .unwrap();
+
+        assert!(validate_dep_info(
+            "output: /Application\\ Support/elsewhere/icon.png",
+            Path::new("/Application Support/workspace"),
+            &[PathBuf::from("/Application Support/workspace")],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("/Application Support/elsewhere/icon.png"));
     }
 }
 
