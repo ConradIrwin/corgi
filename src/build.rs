@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.25";
+const TOOL_VERSION: &str = "corgi/0.26";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! status {
@@ -26,9 +26,9 @@ macro_rules! status {
 // of every action key, and the store is append-only, so profiles
 // coexist and never evict each other. Deliberate divergences:
 // - lto is not supported yet (warned once, built without);
-// - darwin linking units always get split-debuginfo=unpacked with
-//   -oso_prefix, whatever the profile says: determinism requires it
-//   (staging paths would otherwise leak into debug-map stabs);
+// - darwin linking units always get split-debuginfo=unpacked, whatever
+//   the profile says: their DWARF stays in store-owned object files that
+//   the debug map names (see debug_objects_dir);
 // - incremental and rpath are ignored.
 
 #[derive(Clone, Copy, PartialEq)]
@@ -179,6 +179,13 @@ fn unit_links(unit: &Unit) -> bool {
         Kind::Lib => unit_crate_type(unit) != "lib",
         Kind::Bsr => false,
     }
+}
+
+/// An object file the compiler kept for the debug info it carries. Nothing
+/// links against these: only the image that already linked them names them,
+/// by path, in its debug map.
+fn is_debug_object(name: &str) -> bool {
+    name.ends_with(".o")
 }
 
 /// Under `check`, units outside every execution closure (build scripts,
@@ -506,8 +513,6 @@ struct CompileKey<'a> {
     incr: bool,
     /// -Cmetadata value (source-free unit identity).
     ident: &'a str,
-    /// debug-map prefix recorded relative to the workspace root ("" = none)
-    oso: &'a str,
     env: &'a [(String, String)],
     cap_lints: bool,
     /// Resolved .cargo/config.toml rustflags applied to this unit.
@@ -1451,6 +1456,20 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
     // toolsets/: shim dirs, cheap to rebuild; judged by use-touched mtime.
     for p in read_dir_paths(&store.root.join("toolsets"))? {
         if p.is_dir() && stale(&p) && retire_dir(store, &p) {
+            dirs += 1;
+        }
+    }
+    // debug/: split debug-info objects of linked images, judged by dir
+    // mtime (materializing an action refreshes it). Lock files go once
+    // their directory has been reclaimed. Losing a directory costs only
+    // source-level debugging of an image that a rebuild restores.
+    for p in read_dir_paths(&store.root.join("debug"))? {
+        if p.extension().is_some_and(|e| e == "lock") {
+            let entry = p.with_extension("");
+            if !entry.exists() && stale(&p) && fs::remove_file(&p).is_ok() {
+                files += 1;
+            }
+        } else if p.is_dir() && stale(&p) && retire_dir(store, &p) {
             dirs += 1;
         }
     }
@@ -2853,7 +2872,7 @@ fn build_inner(
             )
     }) {
         eprintln!(
-            "corgi warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (determinism requires it)"
+            "corgi warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (their debug objects live in the cache)"
         );
     }
     // Under check, everything needed for *execution* (build scripts, their
@@ -3273,18 +3292,10 @@ fn build_inner(
             }
             let r = results[i].get().context("test harness not built")?;
             let m = r.main.as_ref().context("test artifact missing")?;
-            // Export the harness and its CGU objects (debug-map targets)
-            // before running, so even a failing test leaves a debuggable
-            // binary behind: `lldb target/<profile>/deps/<name>` from the
-            // workspace root needs no configuration.
+            // Export the harness before running it, so even a failing test
+            // leaves a debuggable binary behind.
             let dest = dtarget.join(&ctx.profile_name).join("deps").join(&m.name);
             ctx.store.export(&m.hash, &dest, true)?;
-            for o in &r.res.outputs {
-                if o.name.ends_with(".rcgu.o") {
-                    let odest = dtarget.join(&ctx.profile_name).join(&o.name);
-                    ctx.store.export(&o.hash, &odest, false)?;
-                }
-            }
             let name = u.target.name.clone();
             let cwd = ctx.meta.packages[u.pkg].root();
             let binary_environment = binary_executable_environment(&ctx, u, &results)?;
@@ -3344,14 +3355,6 @@ fn build_inner(
             let dest = dest.join(executable_name);
             ctx.store.export(&m.hash, &dest, true)?;
             written.push(dest);
-            for o in &r.res.outputs {
-                if o.name.ends_with(".rcgu.o") {
-                    // The binary's debug map references these objects
-                    // relative to the workspace root.
-                    let odest = dtarget.join(&ctx.profile_name).join(&o.name);
-                    ctx.store.export(&o.hash, &odest, false)?;
-                }
-            }
         }
         if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
             if let Some(r) = results[i].get() {
@@ -4109,10 +4112,19 @@ impl Ctx {
             .join("out")
     }
 
+    /// Lay out an action's cached outputs where consumers expect them: the
+    /// artifacts rustc links against go in the shared pool, and the debug
+    /// objects of a linked image go in that image's debug directory, under
+    /// the exact names its debug map records.
     fn materialize(&self, action_key: &str, res: &ActionResult) -> Result<()> {
         for o in &res.outputs {
-            let pool_name = Store::pool_file_name(&o.name, action_key);
-            self.store.materialize_pool(&o.hash, &pool_name, o.exe)?;
+            if is_debug_object(&o.name) {
+                self.store
+                    .materialize_debug_object(action_key, &o.name, &o.hash)?;
+            } else {
+                let pool_name = Store::pool_file_name(&o.name, action_key);
+                self.store.materialize_pool(&o.hash, &pool_name, o.exe)?;
+            }
         }
         Ok(())
     }
@@ -6382,15 +6394,13 @@ fn compile(
     // incrementally (local packages under dev); we honor exactly that,
     // in a separate key namespace.
     let incr_action = ctx.incremental && prof.incremental;
-    // Determinism forces the darwin debug-map treatment on every linking
-    // unit with debug info, whatever split-debuginfo the profile asked
-    // for: without -oso_prefix the staging path would leak into stabs.
-    let oso_split = debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
-    let oso_rel = if oso_split {
-        format!("target/{}/", ctx.profile_name)
-    } else {
-        String::new()
-    };
+    // On darwin, a linking unit with debug info keeps its DWARF in the
+    // per-codegen-unit object files rather than in the linked image, and
+    // the image's debug map names them by path. This holds whatever
+    // split-debuginfo the profile asked for: the objects have to outlive
+    // the compile either way, so they are always the unpacked kind.
+    let unpacked_debug_objects =
+        debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
     let key_inputs = CompileKey {
         kind: if clippy_action {
             if self_checked {
@@ -6435,7 +6445,6 @@ fn compile(
             .filter(|args| !args.is_empty()),
         incr: incr_action,
         ident: &ctx.idents[uidx],
-        oso: &oso_rel,
         env: &env,
         cap_lints,
         rustflags: unit_rustflags,
@@ -6472,7 +6481,6 @@ fn compile(
             cap_lints: key_inputs.cap_lints,
             uses_toolchain: !key_inputs.toolchain.is_empty(),
             compiler_identity: key_inputs.ident.to_string(),
-            debug_prefix: key_inputs.oso.to_string(),
         }));
     ctx.report.update(|report| {
         let unit = &mut report.units[uidx];
@@ -6594,33 +6602,66 @@ fn compile(
         )?;
         lock.lock()
             .with_context(|| format!("locking incremental state for {crate_name}"))?;
+        // Reclaim the artifacts an older corgi emitted beside the session
+        // state, back when this directory doubled as an output directory.
+        fs::remove_dir_all(dir.join("out")).ok();
         incr_lock = Some(lock);
         Some(dir)
     } else {
         None
     };
-    // Incremental units compile with a pinned output context: rustc's
-    // dep graph embeds the output directory path, so a per-run tmp dir
-    // marks every saved session red. The stable dir is wiped first —
-    // artifacts are re-emitted from session state, and ingestion scans
-    // the whole dir so it must never see stale files. Clean-namespace
-    // units keep per-run tmp dirs.
-    let stage_root = if let Some(d) = &incr_dir {
-        let out = d.join("out");
-        fs::remove_dir_all(&out).ok();
-        out
+    // Split debug info makes the codegen-unit objects part of the linked
+    // image's debug information, and the image names them by path, so they
+    // are written where they will stay: a store directory addressed by this
+    // action, rather than by this invocation, so that repeating the action
+    // reproduces the image byte for byte. The directory is wiped before use
+    // — ingestion scans all of it, and an earlier execution's objects carry
+    // different names — which would tear down the objects a concurrent
+    // build of the same action is about to link, hence the lock. It is only
+    // ever contended by a build doing this exact work, so the loser takes
+    // the winner's result rather than repeating it.
+    let debug_objects: Option<(PathBuf, fs::File)> = if unpacked_debug_objects {
+        let dir = ctx.store.debug_objects_dir(&key);
+        fs::create_dir_all(dir.parent().unwrap())?;
+        let lock = fs::File::create(dir.with_extension("lock"))?;
+        lock.lock()
+            .with_context(|| format!("locking debug objects for {crate_name}"))?;
+        if let Ok(res) = ctx.try_cache_hit(&key)? {
+            let expected = expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?;
+            if expected
+                .iter()
+                .all(|e| res.outputs.iter().any(|o| &o.name == e))
+            {
+                ctx.report.update(|report| {
+                    report.units[uidx].cache = crate::report::UnitCache {
+                        result: crate::report::UnitCacheResult::Hit,
+                        probe: Some("found_after_wait".to_string()),
+                    };
+                });
+                if !res.stderr.is_empty() && pkg.source.is_none() {
+                    eprint!("{}", res.stderr);
+                }
+                return finish_compile(&expected, key, true, res, phases);
+            }
+        }
+        fs::remove_dir_all(&dir).ok();
+        Some((dir, lock))
     } else {
-        ctx.store.tmp_path("rustc")
+        None
     };
-    // With -oso_prefix stripping the stage root, recorded debug-map paths
-    // read `target/<profile>/<cgu>.o` — exactly where the objects are
-    // exported relative to the workspace root.
-    let outdir = if oso_split {
-        stage_root.join(&oso_rel)
-    } else {
-        stage_root.clone()
+    // Everything else stages in a throwaway directory.
+    let outdir = match &debug_objects {
+        Some((dir, _)) => dir.clone(),
+        None => ctx.store.tmp_path("rustc"),
     };
     fs::create_dir_all(&outdir)?;
+    // rustc records the output paths it is given, and every machine must
+    // read the same ones: hand it the canonical store spelling, while the
+    // sandbox rule above stays on the physical path the kernel resolves.
+    let outdir_spelling = match &debug_objects {
+        Some(_) => ctx.store.debug_objects_dir_logical(&key),
+        None => outdir.clone(),
+    };
     let scratch = if let Some(d) = &incr_dir {
         d.join("tmp")
     } else {
@@ -6748,16 +6789,12 @@ fn compile(
             cmd.env("RUSTC_BOOTSTRAP", "1");
         }
     }
-    if oso_split {
+    if unpacked_debug_objects {
         cmd.arg("-Csplit-debuginfo=unpacked");
-        cmd.arg(format!(
-            "-Clink-arg=-Wl,-oso_prefix,{}/",
-            stage_root.display()
-        ));
     }
     cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
     cmd.arg(format!("-Cextra-filename=-{ef16}"));
-    cmd.arg("--out-dir").arg(&outdir);
+    cmd.arg("--out-dir").arg(&outdir_spelling);
     cmd.arg("-L")
         .arg(format!("dependency={}", ctx.pool_logical.display()));
     for (name, file, _) in &externs {
@@ -6850,7 +6887,7 @@ fn compile(
     drop(job_token); // compiler exited; hashing/ingestion is not codegen
     fs::remove_dir_all(&scratch).ok();
     if !success {
-        fs::remove_dir_all(&stage_root).ok();
+        fs::remove_dir_all(&outdir).ok();
         bail!(
             "rustc failed for {} v{} ({}):\n{}",
             pkg.name,
@@ -6925,9 +6962,11 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         outputs.push(OutputFile { name, hash, exe });
     }
     phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
-    fs::remove_dir_all(&stage_root).ok();
-    // The pinned output dir has been read and removed; only now may
-    // another action of this unit wipe and reuse it.
+    // Ingestion moved every file into the cache; the debug objects come
+    // back under these same names when the action is materialized.
+    fs::remove_dir_all(&outdir).ok();
+    // rustc is done with the session state, so another action of this unit
+    // may take it over.
     incr_lock.take();
 
     let t_finish = Instant::now();

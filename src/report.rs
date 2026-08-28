@@ -289,7 +289,6 @@ pub struct CompileKeyInputs {
     pub cap_lints: bool,
     pub uses_toolchain: bool,
     pub compiler_identity: String,
-    pub debug_prefix: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -706,7 +705,6 @@ mod tests {
                     cap_lints: false,
                     uses_toolchain: true,
                     compiler_identity: "compiler".into(),
-                    debug_prefix: String::new(),
                 })),
             }),
             timings: Some(UnitTimings::default()),

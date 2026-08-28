@@ -230,7 +230,9 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
 
 impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
-        for d in ["cache", "pool", "outdirs", "tmp", "reports", "metrics"] {
+        for d in [
+            "cache", "pool", "outdirs", "debug", "tmp", "reports", "metrics",
+        ] {
             fs::create_dir_all(root.join(d))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
@@ -391,6 +393,45 @@ impl Store {
             Some((stem, extension)) => format!("{stem}-{key16}.{extension}"),
             None => format!("{name}-{key16}"),
         }
+    }
+
+    /// Where one action's split debug-info objects live. A linked image
+    /// records these paths in its debug map, so they are addressed by the
+    /// action that produced the image: each compile owns its own directory,
+    /// and reclaiming it costs only source-level debugging of a binary that
+    /// can be rebuilt.
+    pub fn debug_objects_dir(&self, action_key: &str) -> PathBuf {
+        self.root.join("debug").join(&action_key[..16])
+    }
+
+    /// The same directory as every machine spells it. Paths a compiler bakes
+    /// into its output must use this spelling, never the physical one.
+    pub fn debug_objects_dir_logical(&self, action_key: &str) -> PathBuf {
+        self.logical_root().join("debug").join(&action_key[..16])
+    }
+
+    /// Hard-link a debug object back into its action's directory under the
+    /// name the debug map records, so a cached image stays debuggable
+    /// without recompiling. The directory's mtime doubles as its use marker
+    /// for expiry.
+    pub fn materialize_debug_object(
+        &self,
+        action_key: &str,
+        file_name: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let dir = self.debug_objects_dir(action_key);
+        fs::create_dir_all(&dir)?;
+        let dest = dir.join(file_name);
+        if fs::symlink_metadata(&dest).is_err() {
+            match fs::hard_link(self.cache_path(hash), &dest) {
+                Ok(()) => {}
+                Err(_) if dest.exists() => {}
+                Err(e) => return Err(e).with_context(|| format!("materialize {}", dest.display())),
+            }
+        }
+        Store::touch_used(&dir);
+        Ok(())
     }
 
     /// Hard-link a CAS blob into the pool under its rustc-visible file name.

@@ -495,6 +495,72 @@ fn non_rust_inputs_must_be_declared() {
     run_corgi(&directory.path, "build", []);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn debug_objects_of_a_linked_binary_live_in_the_store() {
+    let directory = TestDirectory::new("debug-objects");
+    let store = directory.path.join("store");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+
+    for revision in 0..2 {
+        fs::write(
+            workspace.join("src/main.rs"),
+            format!("fn main() {{ println!(\"revision {revision}\"); }}\n"),
+        )
+        .unwrap();
+        assert_success(
+            &invoke_corgi_with_store(&workspace, "build", [], &store),
+            "corgi build",
+        );
+    }
+
+    let profile = workspace.join("target/debug");
+    let stray_objects = fs::read_dir(&profile)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".o"))
+        .collect::<Vec<_>>();
+    assert!(
+        stray_objects.is_empty(),
+        "rebuilds left debug objects in the worktree: {stray_objects:?}"
+    );
+
+    let binary = profile.join(executable_name(&directory.package_name));
+    let objects = debug_map_objects(&binary, &store);
+    assert!(
+        !objects.is_empty(),
+        "the binary records no debug objects in the store"
+    );
+    for object in &objects {
+        assert!(object.exists(), "missing debug object {}", object.display());
+    }
+
+    // The objects are cached outputs like any other: a build that hits the
+    // cache has to restore them, or the binary it exports loses its debug
+    // info without anything recompiling.
+    fs::remove_dir_all(objects[0].parent().unwrap()).unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", [], &store),
+        "corgi rebuild",
+    );
+    for object in &objects {
+        assert!(
+            object.exists(),
+            "a cached build did not restore {}",
+            object.display()
+        );
+    }
+}
+
 #[test]
 fn local_package_artifacts_are_shared_across_repository_workspaces() {
     let directory = TestDirectory::new("cross-repository-cache");
@@ -815,6 +881,33 @@ fn initialize_git_repository(path: &Path, remote: &str) {
             .expect("failed to invoke git");
         assert_success(&output, "initializing fixture git repository");
     }
+}
+
+/// The object files a Mach-O image names in its debug map, as recorded in
+/// its symbol table.
+#[cfg(target_os = "macos")]
+fn debug_map_objects(binary: &Path, store: &Path) -> Vec<PathBuf> {
+    let recorded_prefix = format!("{}/debug/", store.canonicalize().unwrap().display());
+    let image = fs::read(binary).unwrap();
+    let mut objects = Vec::new();
+    let mut offset = 0;
+    while let Some(position) = image[offset..]
+        .windows(recorded_prefix.len())
+        .position(|window| window == recorded_prefix.as_bytes())
+    {
+        let start = offset + position;
+        let end = image[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map_or(image.len(), |terminator| start + terminator);
+        objects.push(PathBuf::from(
+            String::from_utf8_lossy(&image[start..end]).into_owned(),
+        ));
+        offset = end;
+    }
+    objects.sort();
+    objects.dedup();
+    objects
 }
 
 fn report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {

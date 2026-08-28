@@ -43,15 +43,20 @@ pub fn audit(
             s.display()
         );
         if s.exists() {
-            // The pool is a materialized view of action outputs, not the
-            // cache itself. Rebuild that view for this audit so artifacts
-            // retained from older corgi action-key schemes are not compared
-            // as though the current pair of builds had produced them.
-            let pool = s.join("pool");
-            if pool.exists() {
-                fs::remove_dir_all(&pool).context("clearing audit artifact pool")?;
+            // The pool and the debug directories are materialized views of
+            // action outputs, not the cache itself. Rebuild those views for
+            // this audit so artifacts retained from older corgi action-key
+            // schemes are not compared as though the current pair of builds
+            // had produced them.
+            for view in ["pool", "debug"] {
+                let view = s.join(view);
+                if view.exists() {
+                    fs::remove_dir_all(&view)
+                        .with_context(|| format!("clearing audit {}", view.display()))?;
+                }
+                fs::create_dir_all(&view)
+                    .with_context(|| format!("recreating audit {}", view.display()))?;
             }
-            fs::create_dir_all(&pool).context("recreating audit artifact pool")?;
             fs::rename(s, &canonical).context("unparking audit store")?;
         }
         let mut c = Command::new(&exe);
@@ -80,17 +85,35 @@ pub fn audit(
         }
     }
 
-    let pool = |s: &Path| -> Result<BTreeMap<String, String>> {
+    // Everything a build produces, addressed as the store spells it: the
+    // linkable artifacts in the pool, and the split debug-info objects that
+    // carry a linked image's DWARF.
+    let artifacts = |s: &Path| -> Result<BTreeMap<String, String>> {
         let mut m = BTreeMap::new();
         for e in fs::read_dir(s.join("pool"))? {
             let p = e?.path();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            m.insert(name, crate::store::sha256_file(&p)?);
+            m.insert(format!("pool/{name}"), crate::store::sha256_file(&p)?);
+        }
+        for action in fs::read_dir(s.join("debug"))? {
+            let action = action?.path();
+            if !action.is_dir() {
+                continue;
+            }
+            let action_name = action.file_name().unwrap().to_string_lossy().into_owned();
+            for object in fs::read_dir(&action)? {
+                let object = object?.path();
+                let name = object.file_name().unwrap().to_string_lossy().into_owned();
+                m.insert(
+                    format!("debug/{action_name}/{name}"),
+                    crate::store::sha256_file(&object)?,
+                );
+            }
         }
         Ok(m)
     };
-    let a = pool(&stores[0])?;
-    let b = pool(&stores[1])?;
+    let a = artifacts(&stores[0])?;
+    let b = artifacts(&stores[1])?;
     let mut identical = 0usize;
     let mut diffs: Vec<String> = Vec::new();
     let mut only: Vec<String> = Vec::new();
@@ -114,7 +137,7 @@ pub fn audit(
     for k in &diffs {
         eprintln!("corgi-audit: NONDETERMINISTIC OUTPUT: {k}");
         for (s, tag) in stores.iter().zip(["A", "B"]) {
-            let data = fs::read(s.join("pool").join(k))?;
+            let data = fs::read(s.join(k))?;
             let needle = s.display().to_string();
             if data.windows(needle.len()).any(|w| w == needle.as_bytes()) {
                 eprintln!("corgi-audit:   hint: store {tag}'s artifact embeds its own store path");

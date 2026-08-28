@@ -84,6 +84,10 @@ That said:
 * corgi disallows reading/writing arbitrary file-system paths. You can opt-in to
   reading more files in `corgi.toml`.
 * corgi does not inherit the passive shell env (though again you can opt-in).
+* on macOS a binary's debug info lives in object files that corgi keeps in
+  the cache rather than in `target/`, so `lldb target/debug/whatever` works
+  from anywhere, until the objects are trimmed for going five days unused
+  (rebuilding restores them).
 * corgi disallows you to write the CARGO_MANIFEST_DIR/CARGO_MANIFEST_PATH into
   the resulting binary (but we still do set them because there are just too many
   random crates out there that use them).
