@@ -290,12 +290,11 @@ struct TestCaptureFile {
 }
 
 impl TestCaptureFile {
-    fn create(stream: &str) -> Result<(Self, fs::File)> {
+    fn create(directory: &Path, stream: &str) -> Result<(Self, fs::File)> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         loop {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("corgi-test-{}-{id}-{stream}", std::process::id()));
+            let path = directory.join(format!("{id}-{stream}"));
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -4583,13 +4582,14 @@ fn run_test_case(
     name: &str,
     exec_args: &[String],
     timeout: Duration,
+    capture_directory: &Path,
 ) -> Result<TestOutcome> {
     let started = Instant::now();
     let mut command = configure_test_command(harness);
     command.args(["--exact", name, "--nocapture"]);
     command.args(exec_args);
-    let (stdout_capture, stdout_file) = TestCaptureFile::create("stdout")?;
-    let (stderr_capture, stderr_file) = TestCaptureFile::create("stderr")?;
+    let (stdout_capture, stdout_file) = TestCaptureFile::create(capture_directory, "stdout")?;
+    let (stderr_capture, stderr_file) = TestCaptureFile::create(capture_directory, "stderr")?;
     command.stdout(Stdio::from(stdout_file));
     command.stderr(Stdio::from(stderr_file));
     let mut child = command
@@ -4714,6 +4714,12 @@ fn run_tests_inner(
         "{test_count} tests ({} harnesses cached)",
         cached_harnesses,
     );
+    // Test output is captured to files rather than pipes so a test that
+    // outlives its harness cannot block a reader. They live in the store's
+    // staging area with everything else corgi writes, whose daily sweep
+    // reclaims them if this process dies before its own cleanup.
+    let capture_directory = ctx.store.tmp_path("test-output");
+    fs::create_dir_all(&capture_directory).context("creating test output directory")?;
     let queue = Mutex::new(queue);
     let outcomes = Mutex::new(Vec::<TimedTestOutcome>::new());
     let reporter = Mutex::new(());
@@ -4745,6 +4751,7 @@ fn run_tests_inner(
                     &test.name,
                     exec_args,
                     TEST_TIMEOUT,
+                    &capture_directory,
                 )
                 .map(|mut outcome| {
                     outcome.harness = test.harness;
@@ -4787,6 +4794,7 @@ fn run_tests_inner(
             });
         }
     });
+    fs::remove_dir_all(&capture_directory).ok();
     let mut failures = Vec::new();
     let mut harness_failed = vec![false; harnesses.len()];
     let mut harness_tests: Vec<Vec<crate::report::Test>> =
@@ -4882,16 +4890,21 @@ fn run_tests_inner(
 #[cfg(test)]
 mod test_runner_tests {
     use super::{run_test_case, TestHarness};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     #[test]
     fn test_process_is_killed_after_timeout() {
         let harness = current_test_harness();
+        let captures = CaptureDirectory::new();
         let outcome = run_test_case(
             &harness,
             "build::test_runner_tests::sleeps_longer_than_timeout",
             &["--ignored".to_string()],
             Duration::from_millis(50),
+            captures.path(),
         )
         .unwrap();
 
@@ -4903,11 +4916,13 @@ mod test_runner_tests {
     #[test]
     fn abruptly_terminated_test_is_a_failure() {
         let harness = current_test_harness();
+        let captures = CaptureDirectory::new();
         let outcome = run_test_case(
             &harness,
             "build::test_runner_tests::aborts",
             &["--ignored".to_string()],
             Duration::from_secs(2),
+            captures.path(),
         )
         .unwrap();
 
@@ -4939,6 +4954,33 @@ mod test_runner_tests {
             cache_bypassed: false,
             discovery_ns: 0,
             tests: Vec::new(),
+        }
+    }
+
+    /// Stands in for the staging directory a build hands the test runner,
+    /// and takes the captured output with it when the test ends.
+    struct CaptureDirectory(PathBuf);
+
+    impl CaptureDirectory {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "corgi-test-runner-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for CaptureDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
         }
     }
 }
