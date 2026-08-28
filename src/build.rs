@@ -6544,6 +6544,34 @@ fn compile(
     };
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
+    // A cached record stands in for this compile only when it covers the
+    // outputs the compile would produce; a record that does not was written
+    // by a buggy or interrupted run. `probe` names how the record was found,
+    // for the report.
+    let cached_result = |res: ActionResult, probe: &str, phases: Phases| {
+        let expected: Vec<String> = if self_checked {
+            res.outputs.iter().map(|o| o.name.clone()).collect()
+        } else {
+            expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
+        };
+        if !expected
+            .iter()
+            .all(|e| res.outputs.iter().any(|o| &o.name == e))
+        {
+            return Ok(None);
+        }
+        ctx.report.update(|report| {
+            report.units[uidx].cache = crate::report::UnitCache {
+                result: crate::report::UnitCacheResult::Hit,
+                probe: Some(probe.to_string()),
+            };
+        });
+        if !res.stderr.is_empty() && pkg.source.is_none() {
+            eprint!("{}", res.stderr);
+        }
+        finish_compile(&expected, key.clone(), true, res, phases).map(Some)
+    };
+
     let t_cache = Instant::now();
     let (hit, cache_miss) = match ctx.try_cache_hit(&key)? {
         Ok(result) => (Some(result), None),
@@ -6559,28 +6587,10 @@ fn compile(
     };
     phases.cache_ns = t_cache.elapsed().as_nanos() as u64;
     if let Some(res) = hit {
-        let expected: Vec<String> = if self_checked {
-            res.outputs.iter().map(|o| o.name.clone()).collect()
-        } else {
-            expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
-        };
-        if expected
-            .iter()
-            .all(|e| res.outputs.iter().any(|o| &o.name == e))
-        {
-            ctx.report.update(|report| {
-                report.units[uidx].cache = crate::report::UnitCache {
-                    result: crate::report::UnitCacheResult::Hit,
-                    probe: Some("found".to_string()),
-                };
-            });
-            if !res.stderr.is_empty() && pkg.source.is_none() {
-                eprint!("{}", res.stderr);
-            }
-            return finish_compile(&expected, key, true, res, phases);
+        if let Some(result) = cached_result(res, "found", phases)? {
+            return Ok(result);
         }
-        // A record that does not cover the expected outputs was written by
-        // a buggy or interrupted run: heal by dropping it and re-executing.
+        // Heal by dropping the record and re-executing.
         eprintln!(
             "{:>12} corrupt action record for {} ({crate_name})",
             "Discarding", pkg.name
@@ -6669,21 +6679,8 @@ fn compile(
         lock.lock()
             .with_context(|| format!("locking debug objects for {crate_name}"))?;
         if let Ok(res) = ctx.try_cache_hit(&key)? {
-            let expected = expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?;
-            if expected
-                .iter()
-                .all(|e| res.outputs.iter().any(|o| &o.name == e))
-            {
-                ctx.report.update(|report| {
-                    report.units[uidx].cache = crate::report::UnitCache {
-                        result: crate::report::UnitCacheResult::Hit,
-                        probe: Some("found_after_wait".to_string()),
-                    };
-                });
-                if !res.stderr.is_empty() && pkg.source.is_none() {
-                    eprint!("{}", res.stderr);
-                }
-                return finish_compile(&expected, key, true, res, phases);
+            if let Some(result) = cached_result(res, "found_after_wait", phases)? {
+                return Ok(result);
             }
         }
         fs::remove_dir_all(&dir).ok();
