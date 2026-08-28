@@ -1485,9 +1485,10 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
     }
     // cargo-home/: dependency sources are re-fetchable. Registry
     // extractions and git checkouts are judged by their use-touched
-    // .cargo-ok (fallback: the dir itself); crate tarballs and git dbs
-    // by plain mtime. The sparse index is left alone (small, and cargo
-    // refreshes it itself).
+    // .cargo-ok (fallback: the dir itself), git clones by their
+    // use-touched dir; crate tarballs by plain mtime, since they are only
+    // ever needed to produce the extraction beside them. The sparse index
+    // is left alone (small, and cargo refreshes it itself).
     let cargo_home = store.root.join("cargo-home");
     for index_dir in read_dir_paths(&cargo_home.join("registry/src"))? {
         for pkg_dir in read_dir_paths(&index_dir)? {
@@ -1581,6 +1582,21 @@ fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// Refresh the use marker of the bare clone a git checkout was made from.
+/// Cargo materializes each revision it needs as its own checkout beside the
+/// others, all from one fetched repository, and only the checkouts carry a
+/// marker of their own — so without this the clone expires under them and
+/// the next revision costs a fresh fetch.
+fn touch_git_database(cargo_home: &Path, package_root: &Path) {
+    let Ok(relative) = package_root.strip_prefix(cargo_home.join("git/checkouts")) else {
+        return;
+    };
+    let Some(repository) = relative.components().next() else {
+        return;
+    };
+    Store::touch_used(&cargo_home.join("git/db").join(repository));
 }
 
 /// Refresh a tool/toolchain dir's use marker (throttled like all touches).
@@ -2760,6 +2776,7 @@ fn build_inner(
             cursor = c.parent();
         }
         Store::touch_used(marker.as_deref().unwrap_or(root.as_path()));
+        touch_git_database(Path::new(&cargo_home), &root);
     }
 
     let mut pkgs = HashMap::new();
