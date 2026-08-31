@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.26";
+const TOOL_VERSION: &str = "corgi/0.27";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! status {
@@ -91,6 +91,8 @@ struct Unit {
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct BuildScriptOut {
     cfgs: Vec<String>,
+    #[serde(default)]
+    check_cfgs: Vec<String>,
     envs: Vec<(String, String)>,
     link_libs: Vec<String>,
     link_search: Vec<String>,
@@ -495,6 +497,7 @@ struct CompileKey<'a> {
     externs: &'a [(String, String, String)],
     link_closure: &'a [(String, String)],
     cfgs: &'a [String],
+    check_cfgs: &'a [String],
     renvs: &'a [(String, String)],
     link_libs: &'a [String],
     link_search: &'a [String],
@@ -6313,6 +6316,18 @@ fn compile(
     }
     externs.sort();
 
+    let declared_feature_values = pkg
+        .features
+        .keys()
+        .map(|feature| format!("{feature:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut check_cfgs = vec![
+        "cfg(docsrs,test)".to_string(),
+        format!("cfg(feature, values({declared_feature_values}))"),
+    ];
+    check_cfgs.extend(bs.check_cfgs.iter().cloned());
+
     // Linking units consume every transitive rlib: enumerate the closure's
     // artifacts into the key (the interface chain is cut by rmeta keying,
     // so implementations must be pinned flat, at the link).
@@ -6491,6 +6506,7 @@ fn compile(
         externs: &externs,
         link_closure: &link_closure,
         cfgs: &bs.cfgs,
+        check_cfgs: &check_cfgs,
         renvs: &bs.envs,
         link_libs: &bs.link_libs,
         link_search: &link_search,
@@ -6873,6 +6889,9 @@ fn compile(
     }
     for f in &features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
+    }
+    for check_cfg in &check_cfgs {
+        cmd.arg("--check-cfg").arg(check_cfg);
     }
     for c in &bs.cfgs {
         cmd.arg("--cfg").arg(c);
@@ -7653,6 +7672,7 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
         };
         match k {
             "rustc-cfg" => bs.cfgs.push(v.to_string()),
+            "rustc-check-cfg" => bs.check_cfgs.push(v.to_string()),
             "rustc-env" => {
                 if let Some((ek, ev)) = v.split_once('=') {
                     bs.envs.push((ek.to_string(), ev.to_string()));
@@ -7688,10 +7708,7 @@ fn parse_directives(stdout: &str, warnings: &mut Vec<String>) -> Result<BuildScr
                     bs.metadata.push((mk.to_string(), mv.to_string()));
                 }
             }
-            "rerun-if-changed"
-            | "rerun-if-env-changed"
-            | "rustc-check-cfg"
-            | "rustc-cdylib-link-arg" => {}
+            "rerun-if-changed" | "rerun-if-env-changed" | "rustc-cdylib-link-arg" => {}
             other => bs.metadata.push((other.to_string(), v.to_string())),
         }
     }

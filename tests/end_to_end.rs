@@ -37,6 +37,28 @@ fn features_enable_only_the_selected_packages_feature() {
 }
 
 #[test]
+fn cfg_checking_uses_cargo_and_build_script_declarations() {
+    let directory = TestDirectory::new("cfg-checking");
+    copy_directory(&fixture_path("cfg-checking"), &directory.path);
+
+    run_corgi(&directory.path, "check", []);
+
+    let source_path = directory.path.join("src/main.rs");
+    let mut source = fs::read_to_string(&source_path).unwrap();
+    source.push_str("\n#[cfg(feature = \"misspelled\")]\nfn misspelled_feature() {}\n");
+    fs::write(source_path, source).unwrap();
+
+    let rejected = invoke_corgi(&directory.path, "check", []);
+    assert_failure(&rejected, "corgi check with a misspelled feature");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("unexpected `cfg` condition value: `misspelled`"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
 fn repeated_packages_build_with_package_scoped_features() {
     let directory = TestDirectory::new("multiple-packages");
     copy_directory(&fixture_path("feature-selection"), &directory.path);
