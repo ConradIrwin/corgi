@@ -28,7 +28,7 @@ jobs:
         env:
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          version="0.1.${RUN_NUMBER}+$(date -u +%y%m%d)"
+          version="0.1.${RUN_NUMBER}"
           python3 - "$version" <<'PY'
           import pathlib
           import re
