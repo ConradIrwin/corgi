@@ -229,10 +229,12 @@ dependencies = [
  "jobserver",
  "libc",
  "memchr",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
  "toml 0.8.23",
+ "toml_edit",
 ]
 
 [[package]]

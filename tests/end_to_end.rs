@@ -133,6 +133,68 @@ fn early_build_failures_are_recorded() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn required_corgi_is_installed_executed_and_reused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = TestDirectory::new("self-update-workspace");
+    let store = TestDirectory::new("self-update-store");
+    let fake_cargo = workspace.path.join("fake-cargo");
+    fs::write(
+        workspace.path.join("corgi.toml"),
+        "corgi_version = \"99.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        &fake_cargo,
+        r#"#!/bin/sh
+set -eu
+test "$1" = install
+test "$2" = corgi-build
+test "$3" = --locked
+test "$4" = --version
+test "$5" = '=99.0.0'
+test "$6" = --root
+mkdir -p "$7/bin"
+cat > "$7/bin/corgi" <<'EOF'
+#!/bin/sh
+printf 'managed corgi: %s\n' "$*"
+EOF
+chmod +x "$7/bin/corgi"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let invoke = |cargo: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .arg("--version")
+            .current_dir(&workspace.path)
+            .env("CORGI_STORE", &store.path)
+            .env("CARGO", cargo)
+            .output()
+            .expect("failed to invoke self-updating corgi")
+    };
+
+    let installed = invoke(&fake_cargo);
+    assert_success(&installed, "self-updating corgi");
+    assert_eq!(
+        String::from_utf8(installed.stdout).unwrap(),
+        "managed corgi: --version\n"
+    );
+    assert!(String::from_utf8_lossy(&installed.stderr).contains("Installing corgi 99.0.0"));
+    assert!(store.path.join("tools/corgi-99.0.0/.corgi-used").is_file());
+
+    let reused = invoke(Path::new("/cargo-must-not-run-again"));
+    assert_success(&reused, "cached self-updating corgi");
+    assert_eq!(
+        String::from_utf8(reused.stdout).unwrap(),
+        "managed corgi: --version\n"
+    );
+    assert!(!String::from_utf8_lossy(&reused.stderr).contains("Installing"));
+}
+
 #[test]
 fn clippy_keys_delimited_arguments_without_poisoning_plain_runs() {
     let fixture = fixture_path("clippy-package-directory");

@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 const TOOL_VERSION: &str = "corgi/0.27";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! status {
     ($label:expr, $($arg:tt)*) => {
@@ -556,7 +557,6 @@ struct TestPass {
 }
 
 #[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct ToolSpec {
     #[serde(skip)]
     name: String,
@@ -584,7 +584,6 @@ struct ToolSpec {
 }
 
 #[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct EnvProbe {
     #[serde(skip)]
     name: String,
@@ -600,7 +599,6 @@ struct EnvProbe {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RootDef {
     packages: Vec<String>,
 }
@@ -609,10 +607,8 @@ struct RootDef {
 /// named resolution roots. Every setting names the packages it applies to, and
 /// only those actions key on it — the file itself is never hashed into
 /// keys, so comment or command-text edits rebuild nothing. Parsed with
-/// the `toml` crate (the parser cargo itself builds on); unknown sections
-/// or keys are hard errors via deny_unknown_fields.
+/// the `toml` crate (the parser cargo itself builds on).
 #[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct CorgiToml {
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
@@ -630,7 +626,6 @@ struct CorgiToml {
 
 type RootSets = std::collections::BTreeMap<String, Vec<String>>;
 type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
-type CorgiManifest = (Vec<ToolSpec>, Vec<EnvProbe>, RootSets, ExtraInputs);
 
 /// Selects the fixed package set used for feature resolution.
 ///
@@ -679,24 +674,27 @@ fn select_resolution_roots(
     }
 }
 
-fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
-    let mut found: Option<PathBuf> = None;
+fn find_corgi_toml(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let p = d.join("corgi.toml");
         if p.exists() {
-            found = Some(p);
-            break;
+            return Some(p);
         }
         cur = d.parent();
     }
-    let Some(p) = found else { return Ok(None) };
+    None
+}
+
+fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
+    let Some(p) = find_corgi_toml(dir) else {
+        return Ok(None);
+    };
     let text = fs::read_to_string(&p)?;
-    let parsed: CorgiToml =
+    let mut parsed: CorgiToml =
         toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
-    let mut specs: Vec<ToolSpec> = Vec::new();
-    for (name, mut t) in parsed.tools {
-        t.name = name;
+    for (name, t) in &mut parsed.tools {
+        t.name.clone_from(name);
         if t.bin.is_empty() == t.path.is_empty() {
             bail!(
                 "tool `{}` in {} needs exactly one of `bin` (executable) or `path` (file/dir)",
@@ -704,11 +702,9 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
                 p.display()
             );
         }
-        specs.push(t);
     }
-    let mut probes: Vec<EnvProbe> = Vec::new();
-    for (name, mut e) in parsed.env {
-        e.name = name;
+    for (name, e) in &mut parsed.env {
+        e.name.clone_from(name);
         if e.command.is_some() == e.inherit || e.packages.is_empty() {
             bail!(
                 "env `{}` in {} needs exactly one of `command` or `inherit = true` and a non-empty packages list",
@@ -716,10 +712,8 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
                 p.display()
             );
         }
-        probes.push(e);
     }
-    let mut root_sets = RootSets::new();
-    for (name, mut def) in parsed.roots {
+    for (name, def) in &mut parsed.roots {
         def.packages.sort();
         def.packages.dedup();
         if def.packages.is_empty() {
@@ -728,9 +722,60 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiManifest>> {
                 p.display()
             );
         }
-        root_sets.insert(name, def.packages);
     }
-    Ok(Some((specs, probes, root_sets, parsed.extra_inputs)))
+    Ok(Some(parsed))
+}
+
+pub(crate) fn configured_corgi_version(dir: &Path) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct VersionOnly {
+        corgi_version: Option<String>,
+    }
+
+    let Some(path) = find_corgi_toml(dir) else {
+        return Ok(None);
+    };
+    let source =
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: VersionOnly =
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed.corgi_version)
+}
+
+pub(crate) fn pin_corgi_version(dir: &Path, version: &str) -> Result<PathBuf> {
+    let path = find_corgi_toml(dir).unwrap_or_else(|| dir.join("corgi.toml"));
+    let source = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut document = source
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    document["corgi_version"] = toml_edit::value(version);
+    let temporary_path = path.with_file_name(format!(
+        ".corgi-pin-{}-{}.tmp",
+        std::process::id(),
+        NEXT_PIN_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut temporary = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .with_context(|| format!("creating {}", temporary_path.display()))?;
+        if let Ok(metadata) = fs::metadata(&path) {
+            temporary.set_permissions(metadata.permissions())?;
+        }
+        temporary.write_all(document.to_string().as_bytes())?;
+        temporary.sync_all()?;
+        fs::rename(&temporary_path, &path).with_context(|| format!("replacing {}", path.display()))
+    })();
+    if write_result.is_err() {
+        fs::remove_file(&temporary_path).ok();
+    }
+    write_result?;
+    Ok(path)
 }
 
 /// Resolved lint flags for one workspace member. Lints are inputs like
@@ -2537,7 +2582,14 @@ fn build_inner(
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
     let (root_sets, extra_inputs) = match read_corgi_toml(&dir)? {
-        Some((_, _, root_sets, extra_inputs)) => (root_sets, extra_inputs),
+        Some(manifest) => (
+            manifest
+                .roots
+                .into_iter()
+                .map(|(name, root)| (name, root.packages))
+                .collect(),
+            manifest.extra_inputs,
+        ),
         None => (RootSets::new(), ExtraInputs::new()),
     };
     let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
@@ -3044,8 +3096,8 @@ fn build_inner(
     }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    if let Some((specs, probes, _, _)) = read_corgi_toml(&dir)? {
-        for t in &specs {
+    if let Some(manifest) = read_corgi_toml(&dir)? {
+        for t in manifest.tools.values() {
             let active = units.iter().any(|unit| {
                 let package_name = &meta.packages[unit.pkg].name;
                 let platform = if unit.host {
@@ -3104,7 +3156,7 @@ fn build_inner(
         // sandbox, frozen into keyed values. A probe only runs when some
         // scoped package builds under a scoped profile — dev builds never
         // execute (or key on) a release-only probe.
-        for probe in &probes {
+        for probe in manifest.env.values() {
             let active = units.iter().any(|u| {
                 let pkg_name = &meta.packages[u.pkg].name;
                 probe.packages.iter().any(|p| p == pkg_name)
@@ -7887,7 +7939,7 @@ mod named_root_tests {
     }
 
     #[test]
-    fn legacy_root_sections_are_rejected() {
+    fn unknown_sections_are_ignored() {
         for section in ["target", "universe"] {
             let text = format!(
                 r#"
@@ -7895,13 +7947,9 @@ mod named_root_tests {
                     packages = ["cloud_worker"]
                 "#
             );
-            let error = toml::from_str::<CorgiToml>(&text)
-                .err()
-                .expect("legacy root section must be rejected");
+            let manifest = toml::from_str::<CorgiToml>(&text).unwrap();
 
-            assert!(error
-                .to_string()
-                .contains(&format!("unknown field `{section}`")));
+            assert!(manifest.roots.is_empty());
         }
     }
 

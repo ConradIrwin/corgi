@@ -5,6 +5,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub fn default_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("CORGI_STORE") {
+        return Ok(PathBuf::from(root));
+    }
+    if cfg!(target_os = "macos") {
+        Ok(PathBuf::from("/Users/Shared/corgi"))
+    } else {
+        let home = std::env::var_os("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join(".cache/corgi"))
+    }
+}
+
 /// Hash-work counters included in performance reports (relaxed: stats only).
 pub static STAT_FILES: AtomicU64 = AtomicU64::new(0);
 pub static REHASHED_FILES: AtomicU64 = AtomicU64::new(0);

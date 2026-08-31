@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -19,6 +20,33 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Resolve the global project directory before strict parsing so toolchain
+/// selection can hand newer command-line syntax to the requested corgi.
+pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
+    let mut directory = None;
+    let mut arguments = argv.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "-C" || argument == "--dir" {
+            directory = arguments.next().map(PathBuf::from);
+        } else if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--dir="))
+        {
+            directory = Some(PathBuf::from(value));
+        } else if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("-C"))
+            .filter(|value| !value.is_empty())
+        {
+            directory = Some(PathBuf::from(value));
+        }
+    }
+    directory
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,6 +77,9 @@ pub enum Command {
 
     /// Trim cached data unused for more than five days
     Clean(CleanArgs),
+
+    /// Record this corgi version in corgi.toml
+    Pin,
 }
 
 #[derive(Debug, Args, Default)]
@@ -259,6 +290,7 @@ mod tests {
             "corgi fmt:",
             "corgi audit:",
             "corgi clean:",
+            "corgi pin:",
             "--no-incremental",
             "--all-targets",
             "--all-features",
@@ -286,6 +318,36 @@ mod tests {
     }
 
     #[test]
+    fn partial_parse_finds_directory_before_newer_syntax() {
+        for arguments in [
+            vec!["corgi", "build", "-C", "project", "--future-option"],
+            vec!["corgi", "build", "--future-option", "-C", "project"],
+            vec!["corgi", "build", "-Cproject", "--future-option"],
+            vec!["corgi", "build", "--dir=project", "--future-option"],
+        ] {
+            let argv = arguments
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                invocation_directory(&argv).as_deref(),
+                Some(std::path::Path::new("project"))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_parse_ignores_child_arguments_after_delimiter() {
+        let argv = ["corgi", "run", "--", "-C", "child-directory"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(invocation_directory(&argv), None);
+    }
+
+    #[test]
     fn clean_uses_a_normal_long_cache_flag() {
         let cli = Cli::try_parse_from(["corgi", "clean", "--cache"]).unwrap();
         let Some(Command::Clean(args)) = cli.command else {
@@ -293,6 +355,15 @@ mod tests {
         };
         assert!(args.cache);
         assert!(Cli::try_parse_from(["corgi", "clean", "-cache"]).is_err());
+    }
+
+    #[test]
+    fn pin_has_no_arguments() {
+        assert!(matches!(
+            Cli::try_parse_from(["corgi", "pin"]).unwrap().command,
+            Some(Command::Pin)
+        ));
+        assert!(Cli::try_parse_from(["corgi", "pin", "1.2.3"]).is_err());
     }
 
     #[test]

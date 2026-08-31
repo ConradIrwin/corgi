@@ -4,12 +4,12 @@ mod cli;
 mod config;
 mod meta;
 mod report;
+mod self_update;
 mod store;
 mod zig;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
-use std::path::PathBuf;
 
 impl From<cli::TargetSelectionArgs> for build::TargetSelection {
     fn from(args: cli::TargetSelectionArgs) -> Self {
@@ -40,33 +40,30 @@ fn real_main() -> Result<()> {
         return zig::run_linker_invocation(&argv);
     }
     let had_argument_delimiter = argv.iter().any(|arg| arg == "--");
+    let invocation_dir = match cli::invocation_directory(&argv) {
+        Some(dir) if dir.is_absolute() => dir,
+        Some(dir) => std::env::current_dir()?.join(dir),
+        None => std::env::current_dir()?,
+    };
+    self_update::update_if_required(&invocation_dir, &argv)?;
     let cli::Cli {
         dir,
         verbose,
         command,
     } = cli::Cli::parse_from(argv);
-    let Some(command) = command else {
-        cli::Cli::command().print_help()?;
-        return Ok(());
-    };
     let dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
+    };
+    let Some(command) = command else {
+        cli::Cli::command().print_help()?;
+        return Ok(());
     };
     // Default: the store lives *directly at* the canonical machine-wide
     // path, so embedded OUT_DIR paths are canonical with no indirection.
     // CORGI_STORE relocates it (a symlink alias then preserves the
     // canonical spelling).
-    let store_root = std::env::var_os("CORGI_STORE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                PathBuf::from("/Users/Shared/corgi")
-            } else {
-                let home = std::env::var_os("HOME").expect("HOME not set");
-                PathBuf::from(home).join(".cache/corgi")
-            }
-        });
+    let store_root = store::default_root()?;
 
     match command {
         cli::Command::Audit(args) => audit::audit(
@@ -76,6 +73,16 @@ fn real_main() -> Result<()> {
             args.target.as_deref(),
             args.root.as_deref(),
         ),
+        cli::Command::Pin => {
+            let path = build::pin_corgi_version(&dir, env!("CARGO_PKG_VERSION"))?;
+            eprintln!(
+                "{:>12} corgi {} in {}",
+                "Pinned",
+                env!("CARGO_PKG_VERSION"),
+                path.display()
+            );
+            Ok(())
+        }
         command => {
             let store = store::Store::new(store_root)?;
             let run_build = |store: store::Store,
@@ -213,7 +220,7 @@ fn real_main() -> Result<()> {
                     )
                 }
                 cli::Command::Clean(args) => build::clean(&store, args.cache),
-                cli::Command::Audit(_) => unreachable!(),
+                cli::Command::Audit(_) | cli::Command::Pin => unreachable!(),
             }
         }
     }
