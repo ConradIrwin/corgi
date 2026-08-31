@@ -1,101 +1,112 @@
-# corgi
+Your high-energy–lap-dog inspired rust toolchain.
 
-A (mostly) cargo compatible build tool for Rust that shares the cache between
-multiple worktrees with no coarse-grained locking. This lets you make progress
-in all your worktrees concurrently, and saves significant energy, time and disk
-space.
+Corgi exists to explore a different trade-off space to cargo, in particular we aggressively try and decrease the latency and resource usage of the rust toolchain by:
+* Using one unified cache per machine, instead of per worktree.
+* Doing workspace-hack inspired feature unification to reduce incidental rebuilds with `-p`.
+* Running build.rs and proc-macros in a sandbox with no env, or network; and only a whitelist of files to make it much harder to accidentally bust their caches.
+* Caching successful test runs to avoid re-runs (agent harness seem to love to run one package’s tests, and then the whole workspace, even if most of it hasn’t changed at all).
 
-While the original idea was to make builds fully reproducible, rustc's approach
-to incremental compilation shattered our dreams (and we need to use that to be
-as fast as `cargo`).
+Unlike bazel or buck2, which go much further along this path, a key tenet of corgi is that it is (mostly) compatible with cargo - we still use cargo for dependency resolution, and you can use corgi locally while relying on cargo in CI (or on your risk-averse collaborator’s machines).
 
-However, in the spirit of that original goal, we do still run `build.rs` and
-proc macros in a sandbox. (it disallows access to the network, file system and
-environment). This allows much tighter control of the inputs to the build
-process and improves caching (and as a side effect makes it a bit more difficult
-for supply chain attackes to work - assuming you never run the code you compile
-of course :D)
+Currently corgi is macOS only, but PRs are welcome to make this cross-platform.
 
-We copy best practices from elsewhere in the ecosystem. Feature flags are
-unified by default as would be done by `workspace-hack` so that changing the
-compilation root doesn't destroy your cache. Tests are run fully in parallel
-(like `nextest`), and we cache full-package test runs if they succeed.
-Cross-platform builds (currently macOS host building Linux binaries) use
-`zigbuild` under the hood, but hook into the existing cache.
+One major missing feature I’d like to add is the ability to share caches between multiple trusted machines. But it requires some thought to do this without slowing builds down - network should be an accelerant never a blocker.
 
-Corgi does not attempt to completely replace cargo. We still use it for
-dependency and lockfile management. It is designed to be run side-by-side so you
-can adopt corgi on your machine without needing to mess with CI (or your
-colleagues).
+## Usage
 
-We intend to (but haven't yet) build support for Linux and Windows; and also to
-provide a mechanism for trusted team-mates to share cached builds between
-machines.
-
-# Usage
+Use as you would cargo, except corgi…
 
 ```
 cargo install corgi-build
-
-corgi [ build | bench | run | test | check | clippy | fmt | audit | clean ] ...
+corgi [ run | build | test | bench | check | clippy | fmt ] 
 ```
 
-Benchmarks use the same target declarations as Cargo. A benchmark using Rust's
-built-in harness needs no additional configuration:
+Corgi does not yet support `install` (just use cargo) or path-inherited subcommands like `cargo make`.
 
-```toml
-[[bench]]
-name = "built_in"
+## Configuration
+
+Corgi is primarily configured by your existing rust files:
+* Cargo.toml
+* Cargo.lock
+* rust-toolchain.toml
+* .cargo/config.toml
+
+For most crates, you will not need to configure corgi at all. But, there are *some* things you do need to do.
+
+### tools
+Because corgi sandboxes build.rs, any dependencies you need from the network must be pre-downloaded. 
+
+Zed and similar codebases frequently use tools like `protoc` to compile things. In the cargo world these are ambiently used from the path. To keep builds reproducible, corgi requires that you explicitly define these.
+
+```
+# corgi.toml
+
+[tools.protoc]
+# user-visible version
+version = "35.1"
+# where to get an archive of it from
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-osx-aarch_64.zip"
+# sha256 to verify it got the right version
+sha256 = "193289af0470c6a1aada357d4fba0bbf8d78bfaac8b5e42ca30af2ef75583de2"
+# path relative to the root of the archive
+bin = "bin/protoc"
+# how to provide the tool to build.rs (the PROTOC env var)
+env = "PROTOC"
+# which packages use this tool
+packages = ["proto", "livekit_api"]
+
 ```
 
-A benchmark framework that provides its own `main`, such as Criterion, disables
-the built-in harness:
+### env vars
+A common footgun in our use of cargo was incidental environment variable changes causing rebuilds. Corgi only passes a whitelist of environment variables to rustc, build.rs and proc-macros.
 
-```toml
-[[bench]]
-name = "criterion"
-harness = false
+```
+[env.ZED_COMMIT_SHA]
+# how to calculate the env var (run outside the sandbox)
+command = "git rev-parse HEAD"
+# which packages need this
+packages = ["zed", "cli", "remote_server"]
+# (and if set, which releases).
+# This lets zed's test builds not re-build on every commit
+profiles = ["release"]
 ```
 
-Both forms can be selected when checking or running:
+### Extra inputs
+Rust build.rs can read whatever files it likes from where-ever, this makes it hard to share builds between machines - and hard to cache builds well.
 
-```sh
-corgi check --bench criterion
-corgi bench --bench criterion -- --sample-size 50
+If your build needs to read a file (beyond `.rs` files in the crate’s directory), you must declare them:
+
+```
+[extra-inputs]
+extension_host = ["../extension_api/wit"]
+agent_prompt = ["src/prompt.md"]
 ```
 
-There are definitely sub-options and commands missing; please file reports or
-send PRs.
+### Feature unification roots
 
-# Migrating
+Cargo by default picks default features based on the packaged passed to `-p` on the command line. This makes it very easy to have feature drift (depending on which package is compiled, what flags the dependencies are provided with).
 
-Corgi already works to compile [Zed](https://zed.dev) and [Delta](https://delta.dev), and a bunch of other Zed code.
+Corgi copies workspace-hack, and asserts that this is almost certainly not what you actually want, and by default all features are unified across all crates.
 
-If you aren't doing anything fancy in `build.rs` or proc macros, then you'll be
-fine (most ecosystem crates, with the exception of `scratch`, seem to fall into
-this category).
+To avoid this you can add crates that you want to exclude from feature unification to your `corgi.toml`
 
-That said:
+```
+[roots.wasm]
+packages = ["delta_runner"]
+```
 
-* corgi requires a rust-toolchain.toml to pin the rust version exactly.
-* corgi disallows network access in `build.rs` and `proc-macros`. You can
-  configure downloads in the `corgi.toml` and may need to update your build
-  scripts.
-* corgi disallows reading/writing arbitrary file-system paths. You can opt-in to
-  reading more files in `corgi.toml`.
-* corgi does not inherit the passive shell env (though again you can opt-in).
-* on macOS a binary's debug info lives in object files that corgi keeps in
-  the cache rather than in `target/`, so `lldb target/debug/whatever` works
-  from anywhere, until the objects are trimmed for going five days unused
-  (rebuilding restores them).
-* corgi disallows you to write the CARGO_MANIFEST_DIR/CARGO_MANIFEST_PATH into
-  the resulting binary (but we still do set them because there are just too many
-  random crates out there that use them).
+When running a corgi command, you can specify which feature universe to exist in with `--root`.
 
-That said, corgi is very early; and you may run into issues I didn't yet, in
-which case reach out and we'll figure it out (or send a PR).
+## And more..?
 
-# AI disclaimer
+Corgi is still in early days, but I’m actively using it to improve build times and reduce cache size.
 
-Almost all the code in the repository was generated by LLMs (though I wrote the
-README manually).
+If you’d like to use it and need help, please file an issue - I’d love to work with you to make it work.
+
+If you are using it, and it’s working, I’d love to know - file an issue or send me an [email](mailto:me@cirw.in).
+
+If you have amazing ideas for making reproducibility better or performance faster I’d love to hear from you. (Maybe even we could make some rustc changes so we don’t need quite such an intense disk layout…)
+
+### AI disclosure
+
+The code is almost all AI written (but I wrote the README by hand!)
