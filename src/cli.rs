@@ -202,7 +202,7 @@ pub struct TestArgs {
     pub workspace: bool,
 
     /// Run tests even if a successful result is cached
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, visible_alias = "no-cache")]
     pub force: bool,
 
     /// Name filter passed to every test harness
@@ -403,6 +403,17 @@ mod tests {
         };
 
         assert_eq!(args.build.packages, ["app", "server"]);
+    }
+
+    #[test]
+    fn no_cache_forces_test_execution() {
+        for argument in ["--force", "--no-cache"] {
+            let cli = Cli::try_parse_from(["corgi", "test", argument]).unwrap();
+            let Some(Command::Test(args)) = cli.command else {
+                panic!("test command not parsed");
+            };
+            assert!(args.force);
+        }
     }
 
     #[test]

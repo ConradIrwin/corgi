@@ -254,6 +254,7 @@ struct TestHarness {
     binary_environment: Vec<(String, String)>,
     pass_key: String,
     cached_pass: bool,
+    cached_test_count: u64,
     cache_bypassed: bool,
     discovery_ns: u64,
     tests: Vec<String>,
@@ -548,12 +549,12 @@ struct TestPassKey<'a> {
     kind: &'a str,
     tool: &'a str,
     harness_action: &'a str,
-    runtime: &'a str,
 }
 
 #[derive(Serialize, Deserialize)]
 struct TestPass {
     passed: bool,
+    test_count: u64,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -3373,8 +3374,11 @@ fn build_inner(
             if matches!(mode, Mode::Test) {
                 if u.test_harness {
                     let pass_key = test_pass_key(&r.key)?;
-                    let cached_pass =
-                        canonical_run && !force_tests && load_test_pass(&ctx.store, &pass_key);
+                    let cached_test_count = if canonical_run && !force_tests {
+                        load_test_pass(&ctx.store, &pass_key)
+                    } else {
+                        None
+                    };
                     test_harnesses.push(TestHarness {
                         unit_id: i,
                         name,
@@ -3382,7 +3386,8 @@ fn build_inner(
                         cwd,
                         binary_environment,
                         pass_key,
-                        cached_pass,
+                        cached_pass: cached_test_count.is_some(),
+                        cached_test_count: cached_test_count.unwrap_or(0),
                         cache_bypassed: !canonical_run || force_tests,
                         discovery_ns: 0,
                         tests: Vec::new(),
@@ -4527,20 +4532,26 @@ fn test_pass_key(harness_action: &str) -> Result<String> {
         kind: "test-pass",
         tool: TOOL_VERSION,
         harness_action,
-        runtime: "ambient-env-v1",
     };
     Ok(sha256_hex(&serde_json::to_vec(&key)?))
 }
 
-fn load_test_pass(store: &Store, key: &str) -> bool {
+fn load_test_pass(store: &Store, key: &str) -> Option<u64> {
     store
         .load_action(key)
         .and_then(|bytes| serde_json::from_slice::<TestPass>(&bytes).ok())
-        .is_some_and(|result| result.passed)
+        .filter(|result| result.passed)
+        .map(|result| result.test_count)
 }
 
-fn save_test_pass(store: &Store, key: &str) -> Result<()> {
-    store.save_action(key, &serde_json::to_vec(&TestPass { passed: true })?)
+fn save_test_pass(store: &Store, key: &str, test_count: u64) -> Result<()> {
+    store.save_action(
+        key,
+        &serde_json::to_vec(&TestPass {
+            passed: true,
+            test_count,
+        })?,
+    )
 }
 
 fn configure_test_command(harness: &TestHarness) -> Command {
@@ -4713,7 +4724,10 @@ fn run_tests(
                 },
                 discovery_ns: harness.discovery_ns,
                 duration_ns: 0,
-                summary: crate::report::TestSummary::default(),
+                summary: crate::report::TestSummary {
+                    passed: harness.cached_test_count,
+                    ..crate::report::TestSummary::default()
+                },
                 tests: Vec::new(),
             });
         }
@@ -4746,12 +4760,17 @@ fn run_tests_inner(
         .iter()
         .any(|argument| argument == "--include-ignored");
     let mut queue = VecDeque::new();
-    let mut cached_harnesses = 0usize;
+    let mut cached_test_count = 0u64;
     for (harness_index, harness) in harnesses.iter_mut().enumerate() {
         if harness.cached_pass {
-            cached_harnesses += 1;
+            cached_test_count += harness.cached_test_count;
             if ctx.verbose {
-                status!("Cached", "test {}", harness.name);
+                status!(
+                    "Cached",
+                    "{} tests from {}",
+                    harness.cached_test_count,
+                    harness.name
+                );
             }
             continue;
         }
@@ -4780,12 +4799,11 @@ fn run_tests_inner(
             });
         }
     }
-    let test_count = queue.len();
-    status!(
-        "Running",
-        "{test_count} tests ({} harnesses cached)",
-        cached_harnesses,
-    );
+    let uncached_test_count = queue.len();
+    let test_count = uncached_test_count as u64 + cached_test_count;
+    if uncached_test_count > 0 {
+        status!("Running", "{uncached_test_count} tests");
+    }
     // Test output is captured to files rather than pipes so a test that
     // outlives its harness cannot block a reader. They live in the store's
     // staging area with everything else corgi writes, whose daily sweep
@@ -4798,7 +4816,7 @@ fn run_tests_inner(
     let worker_count = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(4)
-        .min(test_count.max(1));
+        .min(uncached_test_count.max(1));
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             scope.spawn(|| loop {
@@ -4872,6 +4890,11 @@ fn run_tests_inner(
     let mut harness_tests: Vec<Vec<crate::report::Test>> =
         (0..harnesses.len()).map(|_| Vec::new()).collect();
     let mut harness_summaries = vec![crate::report::TestSummary::default(); harnesses.len()];
+    for (summary, harness) in harness_summaries.iter_mut().zip(harnesses.iter()) {
+        if harness.cached_pass {
+            summary.passed = harness.cached_test_count;
+        }
+    }
     let mut harness_start_ns = vec![u64::MAX; harnesses.len()];
     let mut harness_end_ns = vec![0u64; harnesses.len()];
     let mut infrastructure_error = None;
@@ -4943,16 +4966,29 @@ fn run_tests_inner(
     if canonical_run {
         for (index, harness) in harnesses.iter().enumerate() {
             if !harness.cached_pass && !harness_failed[index] {
-                save_test_pass(&ctx.store, &harness.pass_key)?;
+                save_test_pass(
+                    &ctx.store,
+                    &harness.pass_key,
+                    harness_summaries[index].passed,
+                )?;
             }
         }
     }
     if failures.is_empty() {
-        status!(
-            "Finished",
-            "{test_count} tests passed, {cached_harnesses} harnesses cached in {:.2}s",
-            started.elapsed().as_secs_f64(),
-        );
+        let elapsed = started.elapsed().as_secs_f64();
+        if !harnesses.is_empty() && harnesses.iter().all(|harness| harness.cached_pass) {
+            status!(
+                "Finished",
+                "{test_count} tests passed (cached) in {elapsed:.2}s"
+            );
+        } else if cached_test_count > 0 {
+            status!(
+                "Finished",
+                "{test_count} tests passed ({cached_test_count} cached) in {elapsed:.2}s"
+            );
+        } else {
+            status!("Finished", "{test_count} tests passed in {elapsed:.2}s");
+        }
         Ok(())
     } else {
         bail!("{} test(s) failed: {}", failures.len(), failures.join(", "))
@@ -5023,6 +5059,7 @@ mod test_runner_tests {
             binary_environment: Vec::new(),
             pass_key: String::new(),
             cached_pass: false,
+            cached_test_count: 0,
             cache_bypassed: false,
             discovery_ns: 0,
             tests: Vec::new(),

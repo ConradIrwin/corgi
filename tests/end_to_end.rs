@@ -583,6 +583,74 @@ fn adding_an_implicit_test_invalidates_the_cached_plan() {
 }
 
 #[test]
+fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
+    let directory = TestDirectory::new("cached-test-count");
+    let store_directory = TestDirectory::new("cached-test-store");
+    let store = &store_directory.path;
+    let marker = directory.path.join("test-ran");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/lib.rs"),
+        "#[test]\nfn test_runs() {\n    std::fs::write(std::env::var(\"CORGI_TEST_MARKER\").unwrap(), \"ran\").unwrap();\n}\n",
+    )
+    .unwrap();
+
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .arg("test")
+            .arg("-C")
+            .arg(&directory.path)
+            .args(arguments)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_TEST_MARKER", &marker)
+            .output()
+            .expect("failed to invoke corgi test")
+    };
+
+    let initial = invoke(&[]);
+    assert_success(&initial, "initial corgi test");
+    assert!(
+        String::from_utf8_lossy(&initial.stderr).contains("Running 1 tests")
+            && String::from_utf8_lossy(&initial.stderr).contains("1 tests passed in"),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    fs::remove_file(&marker).unwrap();
+    let cached = invoke(&[]);
+    assert_success(&cached, "cached corgi test");
+    assert!(
+        String::from_utf8_lossy(&cached.stderr).contains("1 tests passed (cached)"),
+        "{}",
+        String::from_utf8_lossy(&cached.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&cached.stderr).contains("Running 1 tests"),
+        "{}",
+        String::from_utf8_lossy(&cached.stderr)
+    );
+    assert!(!marker.exists(), "a cached test was executed");
+
+    let uncached = invoke(&["--no-cache"]);
+    assert_success(&uncached, "corgi test --no-cache");
+    assert!(
+        String::from_utf8_lossy(&uncached.stderr).contains("Running 1 tests")
+            && String::from_utf8_lossy(&uncached.stderr).contains("1 tests passed in"),
+        "{}",
+        String::from_utf8_lossy(&uncached.stderr)
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "ran");
+}
+
+#[test]
 fn generated_non_rust_files_do_not_invalidate_local_packages() {
     let directory = TestDirectory::new("generated-output");
     fs::create_dir_all(directory.path.join("src")).unwrap();
