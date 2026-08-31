@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const RELEASE_ROOT: &str = "https://github.com/ConradIrwin/corgi/releases/download";
 const SWITCH_VERSION_ENV: &str = "CORGI_INTERNAL_SWITCH_VERSION";
 static NEXT_INSTALL: AtomicU64 = AtomicU64::new(0);
 
@@ -56,15 +57,96 @@ fn install(store_root: &Path, version: &Version) -> Result<PathBuf> {
     let store_root = store_root
         .canonicalize()
         .with_context(|| format!("resolving {}", store_root.display()))?;
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    install_with_cargo(&store_root, version, &cargo)
+    let target = release_target()?;
+    install_from_release(&store_root, version, target)
 }
 
-fn install_with_cargo(
-    store_root: &Path,
-    version: &Version,
-    cargo: &std::ffi::OsStr,
-) -> Result<PathBuf> {
+fn release_target() -> Result<&'static str> {
+    release_target_for(std::env::consts::OS, std::env::consts::ARCH).with_context(|| {
+        format!(
+            "automatic corgi installation is not available for {}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )
+    })
+}
+
+fn release_target_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        _ => None,
+    }
+}
+
+fn release_asset(version: &Version, target: &str) -> (String, String, String) {
+    let asset = format!("corgi-{target}.tar.gz");
+    let root = format!("{RELEASE_ROOT}/v{version}");
+    (
+        asset.clone(),
+        format!("{root}/{asset}"),
+        format!("{root}/{asset}.sha256"),
+    )
+}
+
+fn download(url: &str, destination: &Path) -> Result<()> {
+    let status = Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--output",
+        ])
+        .arg(destination)
+        .arg(url)
+        .status()
+        .with_context(|| format!("starting curl to download {url}"))?;
+    if !status.success() {
+        bail!("downloading {url} failed with {status}");
+    }
+    Ok(())
+}
+
+fn parse_checksum(contents: &str, asset: &str) -> Result<String> {
+    let mut fields = contents.split_whitespace();
+    let checksum = fields.next().context("checksum file is empty")?;
+    let filename = fields.next().context("checksum file has no asset name")?;
+    if fields.next().is_some() {
+        bail!("checksum file has unexpected trailing fields");
+    }
+    if filename != asset {
+        bail!("checksum names `{filename}`, expected `{asset}`");
+    }
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("checksum for {asset} is not a SHA-256 digest");
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+fn create_staging_directory(store_root: &Path) -> Result<PathBuf> {
+    let parent = store_root.join("tmp");
+    fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
+    loop {
+        let staging = parent.join(format!(
+            "corgi-install-{}-{}",
+            std::process::id(),
+            NEXT_INSTALL.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", staging.display()));
+            }
+        }
+    }
+}
+
+fn install_from_release(store_root: &Path, version: &Version, target: &str) -> Result<PathBuf> {
     let destination = installation_root(store_root, version);
     let executable = installation_binary(store_root, version);
     if executable.is_file() {
@@ -75,64 +157,117 @@ fn install_with_cargo(
         bail!("incomplete corgi installation at {}", destination.display());
     }
 
-    let staging = store_root.join("tmp").join(format!(
-        "corgi-install-{}-{}",
-        std::process::id(),
-        NEXT_INSTALL.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(staging.parent().unwrap())
-        .with_context(|| format!("creating {}", staging.parent().unwrap().display()))?;
     fs::create_dir_all(destination.parent().unwrap())
         .with_context(|| format!("creating {}", destination.parent().unwrap().display()))?;
-    fs::remove_dir_all(&staging).ok();
-    fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let staging = create_staging_directory(store_root)?;
 
-    eprintln!("{:>12} corgi {version}", "Installing");
-    let status = Command::new(cargo)
-        .args(["install", "corgi-build", "--locked", "--version"])
-        .arg(format!("={version}"))
-        .arg("--root")
-        .arg(&staging)
-        // rustup selects cargo's toolchain from the parent process's working
-        // directory, not from the downloaded package. A project may pin a
-        // Rust version too old to compile the corgi it requires.
-        .current_dir(&staging)
-        .status();
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => {
-            fs::remove_dir_all(&staging).ok();
-            return Err(error)
-                .with_context(|| format!("starting cargo to install corgi {version}"));
-        }
-    };
-    if !status.success() {
-        fs::remove_dir_all(&staging).ok();
-        bail!("installing corgi {version} failed with {status}");
-    }
-    let staged_executable = staging.join("bin").join(executable_name("corgi"));
-    if !staged_executable.is_file() {
-        fs::remove_dir_all(&staging).ok();
-        bail!(
-            "installing corgi {version} did not produce {}",
-            staged_executable.display()
-        );
-    }
-    touch_used(&staging);
+    let result = (|| {
+        eprintln!("{:>12} corgi {version} ({target})", "Installing");
+        let (asset, archive_url, checksum_url) = release_asset(version, target);
+        let archive = staging.join(&asset);
+        let checksum_file = staging.join(format!("{asset}.sha256"));
+        download(&archive_url, &archive)?;
+        download(&checksum_url, &checksum_file)?;
 
-    match fs::rename(&staging, &destination) {
-        Ok(()) => {}
-        Err(_) if executable.is_file() => {
-            // Another process won the race to publish the same immutable version.
-            fs::remove_dir_all(&staging).ok();
+        let expected = parse_checksum(
+            &fs::read_to_string(&checksum_file)
+                .with_context(|| format!("reading {}", checksum_file.display()))?,
+            &asset,
+        )?;
+        let actual = crate::store::sha256_file(&archive)?;
+        if actual != expected {
+            bail!("checksum mismatch for corgi {version}: expected {expected}, got {actual}");
         }
-        Err(error) => {
-            fs::remove_dir_all(&staging).ok();
-            return Err(error)
-                .with_context(|| format!("publishing corgi {}", destination.display()));
+
+        let bin = staging.join("bin");
+        fs::create_dir(&bin).with_context(|| format!("creating {}", bin.display()))?;
+        let executable_filename = executable_name("corgi");
+        let status = Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&bin)
+            // Extract only the expected root entry, not arbitrary archive paths.
+            .arg(&executable_filename)
+            .status()
+            .with_context(|| format!("starting tar to unpack {archive_url}"))?;
+        if !status.success() {
+            bail!("unpacking corgi {version} failed with {status}");
         }
+
+        let staged_executable = bin.join(executable_filename);
+        let metadata = fs::symlink_metadata(&staged_executable).with_context(|| {
+            format!(
+                "corgi {version} archive did not contain {}",
+                staged_executable.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "corgi {version} archive entry {} is not a regular file",
+                staged_executable.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&staged_executable, permissions)
+                .with_context(|| format!("making {} executable", staged_executable.display()))?;
+        }
+
+        let validation_dir = staging.join("validate");
+        fs::create_dir(&validation_dir)
+            .with_context(|| format!("creating {}", validation_dir.display()))?;
+        fs::write(validation_dir.join("corgi.toml"), "")
+            .with_context(|| format!("creating validation corgi.toml for corgi {version}"))?;
+        let output = Command::new(&staged_executable)
+            .arg("--version")
+            .current_dir(&validation_dir)
+            .env(SWITCH_VERSION_ENV, version.to_string())
+            .output()
+            .with_context(|| format!("checking downloaded corgi {version}"))?;
+        if !output.status.success() {
+            bail!(
+                "downloaded corgi {version} failed its version check with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let reported = String::from_utf8(output.stdout)
+            .with_context(|| format!("downloaded corgi {version} printed a non-UTF-8 version"))?;
+        if reported.trim() != format!("corgi {version}") {
+            bail!(
+                "downloaded corgi {version} reported unexpected version `{}`",
+                reported.trim()
+            );
+        }
+
+        fs::remove_file(&archive).with_context(|| format!("removing {}", archive.display()))?;
+        fs::remove_file(&checksum_file)
+            .with_context(|| format!("removing {}", checksum_file.display()))?;
+        fs::remove_dir_all(&validation_dir)
+            .with_context(|| format!("removing {}", validation_dir.display()))?;
+        touch_used(&staging);
+
+        match fs::rename(&staging, &destination) {
+            Ok(()) => {}
+            Err(_) if executable.is_file() => {
+                // Another process won the race to publish the same immutable version.
+                fs::remove_dir_all(&staging).ok();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("publishing corgi {}", destination.display()));
+            }
+        }
+        Ok(executable)
+    })();
+    if result.is_err() {
+        fs::remove_dir_all(&staging).ok();
     }
-    Ok(executable)
+    result
 }
 
 fn installation_root(store_root: &Path, version: &Version) -> PathBuf {
@@ -185,6 +320,45 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn release_target_uses_the_full_rust_triple() {
+        assert_eq!(
+            release_target_for("macos", "aarch64"),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(release_target_for("macos", "x86_64"), None);
+        assert_eq!(release_target_for("linux", "aarch64"), None);
+    }
+
+    #[test]
+    fn release_urls_name_the_version_and_target() {
+        let version = Version::parse("1.2.3").unwrap();
+
+        let (asset, archive_url, checksum_url) = release_asset(&version, "aarch64-apple-darwin");
+
+        assert_eq!(asset, "corgi-aarch64-apple-darwin.tar.gz");
+        assert_eq!(
+            archive_url,
+            "https://github.com/ConradIrwin/corgi/releases/download/v1.2.3/corgi-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(checksum_url, format!("{archive_url}.sha256"));
+    }
+
+    #[test]
+    fn release_checksums_are_strictly_parsed() {
+        let asset = "corgi-aarch64-apple-darwin.tar.gz";
+        let checksum = "0123456789abcdef".repeat(4);
+
+        assert_eq!(
+            parse_checksum(&format!("{checksum}  {asset}\n"), asset).unwrap(),
+            checksum
+        );
+        assert!(parse_checksum("", asset).is_err());
+        assert!(parse_checksum(&format!("{checksum}  another-file\n"), asset).is_err());
+        assert!(parse_checksum(&format!("not-a-digest  {asset}\n"), asset).is_err());
+        assert!(parse_checksum(&format!("{checksum}  {asset} extra\n"), asset).is_err());
     }
 
     #[test]

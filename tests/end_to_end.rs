@@ -133,64 +133,141 @@ fn early_build_failures_are_recorded() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn required_corgi_is_installed_executed_and_reused() {
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
 
     let workspace = TestDirectory::new("self-update-workspace");
     let store = TestDirectory::new("self-update-store");
-    let fake_cargo = workspace.path.join("fake-cargo");
+    let payload = workspace.path.join("payload");
+    let fake_bin = workspace.path.join("fake-bin");
+    let fake_curl = fake_bin.join("curl");
+    let archive = workspace.path.join("corgi-aarch64-apple-darwin.tar.gz");
+    let checksum_file = workspace
+        .path
+        .join("corgi-aarch64-apple-darwin.tar.gz.sha256");
+    fs::create_dir_all(&payload).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
     fs::write(
         workspace.path.join("corgi.toml"),
         "corgi_version = \"99.0.0\"\n",
     )
     .unwrap();
     fs::write(
-        &fake_cargo,
+        payload.join("corgi"),
         r#"#!/bin/sh
-set -eu
-test "$1" = install
-test "$2" = corgi-build
-test "$3" = --locked
-test "$4" = --version
-test "$5" = '=99.0.0'
-test "$6" = --root
-mkdir -p "$7/bin"
-cat > "$7/bin/corgi" <<'EOF'
-#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf 'corgi 99.0.0\n'
+    exit
+fi
 printf 'managed corgi: %s\n' "$*"
-EOF
-chmod +x "$7/bin/corgi"
 "#,
     )
     .unwrap();
-    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(payload.join("corgi"), fs::Permissions::from_mode(0o755)).unwrap();
+    let archived = Command::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload)
+        .arg("corgi")
+        .status()
+        .expect("failed to create fake corgi release");
+    assert!(archived.success());
+    let checksum = Sha256::digest(fs::read(&archive).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let valid_checksum = format!("{checksum}  corgi-aarch64-apple-darwin.tar.gz\n");
+    fs::write(&checksum_file, &valid_checksum).unwrap();
+    fs::write(
+        &fake_curl,
+        r#"#!/bin/sh
+set -eu
+output=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --fail|--location|--silent|--show-error)
+            shift
+            ;;
+        --proto|--proto-redir)
+            test "$2" = '=https'
+            shift 2
+            ;;
+        --output)
+            output="$2"
+            shift 2
+            ;;
+        *)
+            test -z "$url"
+            url="$1"
+            shift
+            ;;
+    esac
+done
+test -n "$output"
+case "$url" in
+    https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz)
+        cp "$CORGI_TEST_ARCHIVE" "$output"
+        ;;
+    https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz.sha256)
+        cp "$CORGI_TEST_CHECKSUM" "$output"
+        ;;
+    *)
+        exit 97
+        ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let invoke = |cargo: &Path| {
+    let invoke = || {
         Command::new(env!("CARGO_BIN_EXE_corgi"))
-            .arg("--version")
+            .arg("--help")
             .current_dir(&workspace.path)
             .env("CORGI_STORE", &store.path)
-            .env("CARGO", cargo)
+            .env("CORGI_TEST_ARCHIVE", &archive)
+            .env("CORGI_TEST_CHECKSUM", &checksum_file)
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
             .output()
             .expect("failed to invoke self-updating corgi")
     };
 
-    let installed = invoke(&fake_cargo);
+    fs::write(
+        &checksum_file,
+        format!("{}  corgi-aarch64-apple-darwin.tar.gz\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let rejected = invoke();
+    assert_failure(&rejected, "self-update with a mismatched checksum");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("checksum mismatch for corgi 99.0.0"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!store.path.join("tools/corgi-99.0.0").exists());
+    assert_eq!(fs::read_dir(store.path.join("tmp")).unwrap().count(), 0);
+
+    fs::write(&checksum_file, valid_checksum).unwrap();
+    let installed = invoke();
     assert_success(&installed, "self-updating corgi");
     assert_eq!(
         String::from_utf8(installed.stdout).unwrap(),
-        "managed corgi: --version\n"
+        "managed corgi: --help\n"
     );
     assert!(String::from_utf8_lossy(&installed.stderr).contains("Installing corgi 99.0.0"));
     assert!(store.path.join("tools/corgi-99.0.0/.corgi-used").is_file());
 
-    let reused = invoke(Path::new("/cargo-must-not-run-again"));
+    fs::write(&fake_curl, "#!/bin/sh\nexit 98\n").unwrap();
+    let reused = invoke();
     assert_success(&reused, "cached self-updating corgi");
     assert_eq!(
         String::from_utf8(reused.stdout).unwrap(),
-        "managed corgi: --version\n"
+        "managed corgi: --help\n"
     );
     assert!(!String::from_utf8_lossy(&reused.stderr).contains("Installing"));
 }
