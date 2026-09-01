@@ -724,6 +724,95 @@ fn non_rust_inputs_must_be_declared() {
     run_corgi(&directory.path, "build", []);
 }
 
+#[test]
+fn extra_inputs_may_be_globs() {
+    let directory = TestDirectory::new("glob-input");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::create_dir_all(directory.path.join("messages")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/main.rs"),
+        format!(
+            "const POLICY_REVISION: u32 = {};\nfn main() {{ println!(\"{{}} {{}}\", POLICY_REVISION, include_str!(\"../messages/hello.txt\")); }}\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    fs::write(directory.path.join("messages/hello.txt"), "declared").unwrap();
+    fs::write(
+        directory.path.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n\"{}\" = [\"messages/*.txt\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+
+    run_corgi(&directory.path, "build", []);
+
+    // A file the glob newly matches is an input even though no source file
+    // changed: the build has to see it.
+    fs::write(directory.path.join("messages/later.txt"), "appeared").unwrap();
+    let rebuilt = run_corgi(&directory.path, "build", []);
+    assert!(
+        !String::from_utf8_lossy(&rebuilt.stderr).contains(" 0 executed"),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+
+    // A file the glob does not match is not.
+    fs::write(directory.path.join("messages/ignored.md"), "unmatched").unwrap();
+    let unchanged = run_corgi(&directory.path, "build", []);
+    assert!(
+        String::from_utf8_lossy(&unchanged.stderr).contains(" 0 executed"),
+        "{}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+}
+
+#[test]
+fn extra_input_globs_must_match_something() {
+    let directory = TestDirectory::new("glob-input-empty");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/main.rs"),
+        "fn main() { println!(\"nothing\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n\"{}\" = [\"messages/*.txt\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+
+    let output = invoke_corgi(&directory.path, "build", []);
+
+    assert_failure(&output, "corgi build with an unmatched extra-input glob");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("matches no files"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn debug_objects_of_a_linked_binary_live_in_the_store() {

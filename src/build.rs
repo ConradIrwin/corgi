@@ -404,8 +404,8 @@ pub struct Ctx {
     host_rustflags: Vec<String>,
     /// Resolved [env] entries, sorted; applied and keyed on every action.
     config_env: Vec<(String, String)>,
-    /// corgi.toml [extra-inputs]: package -> package-root-relative reads
-    /// outside the package, granted to its actions and hashed as inputs.
+    /// Reads outside their own root that packages declared through corgi.toml
+    /// [extra-inputs], granted to their actions and hashed as inputs.
     extra_inputs: ExtraInputs,
     report: Arc<crate::report::Recorder>,
 }
@@ -422,13 +422,6 @@ struct ZigRuntime {
 }
 
 impl Ctx {
-    fn extra_inputs_for(&self, pkg: &Package) -> &[String] {
-        self.extra_inputs
-            .get(&pkg.name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
     fn source_files_for(&self, package_index: usize) -> Result<Vec<PathBuf>> {
         if let Some(paths) = self.source_files_memo.lock().unwrap().get(&package_index) {
             return Ok(paths.clone());
@@ -443,28 +436,6 @@ impl Ctx {
         Ok(paths)
     }
 
-    fn declared_extra_inputs_for(&self, pkg: &Package) -> Result<Vec<PathBuf>> {
-        self.extra_inputs_for(pkg)
-            .iter()
-            .map(|extra_input| {
-                let path = pkg
-                    .root()
-                    .join(extra_input)
-                    .canonicalize()
-                    .with_context(|| {
-                        format!("extra-input `{extra_input}` of {} does not exist", pkg.name)
-                    })?;
-                if !path.starts_with(Path::new(&self.workspace_root)) {
-                    bail!(
-                        "extra-input `{extra_input}` of {} escapes the workspace",
-                        pkg.name
-                    );
-                }
-                Ok(path)
-            })
-            .collect()
-    }
-
     fn package_read_inputs(&self, package_index: usize) -> Result<Vec<PathBuf>> {
         let pkg = &self.meta.packages[package_index];
         let mut inputs = if pkg.source.is_some() {
@@ -476,10 +447,289 @@ impl Ctx {
                 .collect::<std::io::Result<Vec<_>>>()?
         };
         inputs.push(PathBuf::from(&pkg.manifest_path).canonicalize()?);
-        inputs.extend(self.declared_extra_inputs_for(pkg)?);
+        inputs.extend(
+            self.extra_inputs
+                .for_package(package_index)
+                .iter()
+                .map(|extra_input| extra_input.path.clone()),
+        );
         inputs.sort();
         inputs.dedup();
         Ok(inputs)
+    }
+}
+
+/// A resolved [extra-inputs] entry: an existing file, plus the label it is
+/// hashed under. Labels are workspace-relative so the source hash stays
+/// location independent, and so that adding, removing, or renaming a matched
+/// file changes the hash even when no file's contents do.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtraInput {
+    label: String,
+    path: PathBuf,
+}
+
+/// Expands a package-root-relative pattern to the canonical paths it matches,
+/// sorted. `*`, `?` and `[...]` match within one path component; `**` (alone
+/// in a component) matches any number of components, and a trailing `**`
+/// means everything under that directory. Matches are whatever is on disk,
+/// directories included, and may be empty.
+fn expand_extra_input(root: &Path, entry: &str) -> Result<Vec<PathBuf>> {
+    let root = root
+        .to_str()
+        .with_context(|| format!("package root {} is not valid UTF-8", root.display()))?;
+    // A trailing `**` is a directory and its subdirectories to the glob
+    // crate, which never names a file; `**/*` is what "everything under here"
+    // has to be spelled as.
+    let entry_pattern = match entry.strip_suffix("**") {
+        Some(prefix) => format!("{prefix}**/*"),
+        None => entry.to_string(),
+    };
+    // The root is a literal prefix, so hide any glob syntax a directory name
+    // happens to contain.
+    let pattern = format!(
+        "{}/{entry_pattern}",
+        glob::Pattern::escape(root.trim_end_matches('/'))
+    );
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        // `*` stays within a path component; `**` is how you recurse.
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    let matches = glob::glob_with(&pattern, options)
+        .with_context(|| format!("extra-input `{entry}` is not a valid pattern"))?;
+    let mut paths = Vec::new();
+    for matched in matches {
+        let matched = matched.with_context(|| format!("expanding extra-input `{entry}`"))?;
+        paths.push(
+            matched
+                .canonicalize()
+                .with_context(|| format!("resolving {}", matched.display()))?,
+        );
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod extra_input_tests {
+    use super::{expand_extra_input, ExtraInputDeclarations, ExtraInputs, Package};
+    use anyhow::Result;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn a_directory_is_not_an_input_but_a_pattern_can_reach_into_one() {
+        let workspace = workspace_with(["shared/one.wit", "shared/nested/two.wit"]);
+
+        assert_eq!(
+            resolve(&workspace, ["../shared/**"]).unwrap(),
+            ["shared/nested/two.wit", "shared/one.wit"]
+        );
+        assert_eq!(
+            resolve(&workspace, ["../shared/*"]).unwrap(),
+            ["shared/one.wit"]
+        );
+        assert_eq!(
+            resolve(&workspace, ["../shared"]).unwrap_err().to_string(),
+            "extra-input `../shared` of pkg matches no files; \
+             append `/**` to take the files under a directory"
+        );
+        assert_eq!(
+            resolve(&workspace, ["../shared/*.md"])
+                .unwrap_err()
+                .to_string(),
+            "extra-input `../shared/*.md` of pkg matches no files"
+        );
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn labels_are_workspace_relative_and_patterns_may_overlap() {
+        let workspace = workspace_with(["shared/one.wit"]);
+
+        assert_eq!(
+            resolve(&workspace, ["../shared/one.wit", "../shared/*.wit"]).unwrap(),
+            ["shared/one.wit"]
+        );
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_published_crate_of_the_same_name_takes_no_extra_inputs() {
+        let workspace = workspace_with(["shared/one.wit"]);
+        let local = package("pkg", workspace.join("pkg/Cargo.toml"), None);
+        let published = package(
+            "pkg",
+            "/elsewhere/registry/pkg-0.1.0/Cargo.toml",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+        );
+        let declarations = declarations(["../shared/*.wit"]);
+
+        let resolved =
+            ExtraInputs::resolve(&declarations, &[local, published], [0, 1], &workspace).unwrap();
+
+        assert_eq!(labels(&resolved, 0), ["shared/one.wit"]);
+        assert!(labels(&resolved, 1).is_empty());
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn inputs_outside_the_workspace_are_rejected() {
+        let workspace = workspace_with([]);
+        write(workspace.parent().unwrap(), "outside.txt");
+
+        assert_eq!(
+            resolve(&workspace, ["../../outside.txt"])
+                .unwrap_err()
+                .to_string(),
+            "extra-input `../../outside.txt` of pkg escapes the workspace"
+        );
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stars_match_within_one_directory_and_double_stars_recurse() {
+        let root = temp_dir();
+        write(&root, "top.md");
+        write(&root, "top.txt");
+        write(&root, "nested/inner.md");
+        write(&root, "nested/deeper/deepest.md");
+
+        assert_eq!(expand(&root, "*.md"), ["top.md"]);
+        assert_eq!(
+            expand(&root, "nested/**/*.md"),
+            ["nested/deeper/deepest.md", "nested/inner.md"]
+        );
+        assert_eq!(
+            expand(&root, "nested/*"),
+            ["nested/deeper", "nested/inner.md"]
+        );
+        assert_eq!(
+            expand(&root, "nested/**"),
+            [
+                "nested/deeper",
+                "nested/deeper/deepest.md",
+                "nested/inner.md"
+            ]
+        );
+        assert!(expand(&root, "*.rs").is_empty());
+        assert!(expand(&root, "missing/*").is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_pattern_without_wildcards_is_the_path_it_spells() {
+        let root = temp_dir();
+        write(&root, "nested/inner.md");
+
+        assert_eq!(expand(&root, "nested/inner.md"), ["nested/inner.md"]);
+        assert_eq!(expand(&root, "nested"), ["nested"]);
+        assert!(expand(&root, "nested/missing.md").is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wildcards_in_the_package_root_are_literal() {
+        let root = temp_dir().join("pkg[1]");
+        write(&root, "prompt.md");
+
+        assert_eq!(expand(&root, "*.md"), ["prompt.md"]);
+
+        fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    /// The labels the patterns resolve to for a package `pkg` rooted at
+    /// `<workspace>/pkg`.
+    fn resolve<const PATTERN_COUNT: usize>(
+        workspace: &Path,
+        patterns: [&str; PATTERN_COUNT],
+    ) -> Result<Vec<String>> {
+        let package = package("pkg", workspace.join("pkg/Cargo.toml"), None);
+        let resolved = ExtraInputs::resolve(&declarations(patterns), &[package], [0], workspace)?;
+        Ok(labels(&resolved, 0))
+    }
+
+    fn labels(resolved: &ExtraInputs, package_index: usize) -> Vec<String> {
+        resolved
+            .for_package(package_index)
+            .iter()
+            .map(|extra_input| extra_input.label.clone())
+            .collect()
+    }
+
+    fn declarations<const PATTERN_COUNT: usize>(
+        patterns: [&str; PATTERN_COUNT],
+    ) -> ExtraInputDeclarations {
+        ExtraInputDeclarations::from([(
+            "pkg".to_string(),
+            patterns.iter().map(|pattern| pattern.to_string()).collect(),
+        )])
+    }
+
+    fn package(name: &str, manifest_path: impl AsRef<Path>, source: Option<&str>) -> Package {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": "0.1.0",
+            "id": format!("{name} 0.1.0"),
+            "source": source,
+            "manifest_path": manifest_path.as_ref(),
+            "edition": "2021",
+            "targets": [],
+            "metadata": {}
+        }))
+        .unwrap()
+    }
+
+    /// A canonical workspace holding an empty package `pkg` plus `files`.
+    fn workspace_with<const FILE_COUNT: usize>(files: [&str; FILE_COUNT]) -> PathBuf {
+        let workspace = temp_dir().join("workspace");
+        write(&workspace, "pkg/Cargo.toml");
+        for file in files {
+            write(&workspace, file);
+        }
+        workspace.canonicalize().unwrap()
+    }
+
+    /// Matches as paths relative to `root`, in the order they are returned.
+    fn expand(root: &Path, entry: &str) -> Vec<String> {
+        expand_extra_input(root, entry)
+            .unwrap()
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root.canonicalize().unwrap())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn write(root: &Path, relative: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, relative).unwrap();
+    }
+
+    fn temp_dir() -> PathBuf {
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "corgi-extra-input-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
 
@@ -617,16 +867,113 @@ struct CorgiToml {
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
     roots: std::collections::BTreeMap<String, RootDef>,
-    /// Reads outside a package's root that its actions may perform:
-    /// package name -> package-root-relative paths, granted and hashed as
-    /// inputs. Lives here rather than in package manifests so dependency
-    /// packages can be covered too and crate manifests stay untouched.
+    /// Files outside a package's root that its actions may read: package name
+    /// -> package-root-relative glob patterns, granted and hashed as inputs.
+    /// Lives here rather than in package manifests so dependency packages can
+    /// be covered too and crate manifests stay untouched.
     #[serde(default, rename = "extra-inputs")]
-    extra_inputs: std::collections::BTreeMap<String, Vec<String>>,
+    extra_inputs: ExtraInputDeclarations,
+}
+
+impl CorgiToml {
+    /// The named roots as the package lists that feature resolution selects
+    /// between.
+    fn root_sets(&self) -> RootSets {
+        self.roots
+            .iter()
+            .map(|(name, root)| (name.clone(), root.packages.clone()))
+            .collect()
+    }
 }
 
 type RootSets = std::collections::BTreeMap<String, Vec<String>>;
-type ExtraInputs = std::collections::BTreeMap<String, Vec<String>>;
+
+/// corgi.toml [extra-inputs] as written: package name -> patterns.
+type ExtraInputDeclarations = std::collections::BTreeMap<String, Vec<String>>;
+
+/// The [extra-inputs] patterns, resolved against disk once per package.
+///
+/// Resolving up front means every action of a package sees the same inputs
+/// however the file system changes while the build runs, and a pattern that
+/// matches nothing fails the build before any action does work.
+struct ExtraInputs {
+    /// Keyed by index into `Metadata::packages`, like `Ctx`'s other
+    /// per-package tables.
+    by_package: HashMap<usize, Vec<ExtraInput>>,
+}
+
+impl ExtraInputs {
+    /// Resolves the declared patterns for the given packages, sorting and
+    /// deduplicating each package's matches so that neither declaration order
+    /// nor two patterns covering the same file affects its source hash.
+    ///
+    /// Only local packages take extra inputs. A registry or Git package is
+    /// hashed as a whole directory and reads its own root freely, so a pattern
+    /// staying inside it would add nothing, and one leaving it necessarily
+    /// leaves the workspace. Skipping them also keeps a declaration meant for
+    /// a workspace member from reaching a published crate of the same name.
+    fn resolve(
+        declarations: &ExtraInputDeclarations,
+        packages: &[Package],
+        package_indices: impl IntoIterator<Item = usize>,
+        workspace_root: &Path,
+    ) -> Result<Self> {
+        let mut by_package = HashMap::new();
+        for package_index in package_indices {
+            if by_package.contains_key(&package_index) {
+                continue;
+            }
+            let pkg = &packages[package_index];
+            if pkg.source.is_some() {
+                continue;
+            }
+            let Some(declared_patterns) = declarations.get(&pkg.name) else {
+                continue;
+            };
+            let root = pkg.root();
+            let mut resolved: Vec<ExtraInput> = Vec::new();
+            for declared in declared_patterns {
+                let matched = expand_extra_input(&root, declared)?;
+                let files: Vec<PathBuf> = matched
+                    .iter()
+                    .filter(|path| !path.is_dir())
+                    .cloned()
+                    .collect();
+                if files.is_empty() {
+                    let hint = if matched.is_empty() {
+                        ""
+                    } else {
+                        "; append `/**` to take the files under a directory"
+                    };
+                    bail!(
+                        "extra-input `{declared}` of {} matches no files{hint}",
+                        pkg.name
+                    );
+                }
+                for path in files {
+                    let Ok(relative) = path.strip_prefix(workspace_root) else {
+                        bail!(
+                            "extra-input `{declared}` of {} escapes the workspace",
+                            pkg.name
+                        );
+                    };
+                    let label = relative.to_string_lossy().into_owned();
+                    resolved.push(ExtraInput { label, path });
+                }
+            }
+            resolved.sort();
+            resolved.dedup();
+            by_package.insert(package_index, resolved);
+        }
+        Ok(Self { by_package })
+    }
+
+    fn for_package(&self, package_index: usize) -> &[ExtraInput] {
+        self.by_package
+            .get(&package_index)
+            .map_or(&[], Vec::as_slice)
+    }
+}
 
 /// Selects the fixed package set used for feature resolution.
 ///
@@ -2582,17 +2929,8 @@ fn build_inner(
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let (root_sets, extra_inputs) = match read_corgi_toml(&dir)? {
-        Some(manifest) => (
-            manifest
-                .roots
-                .into_iter()
-                .map(|(name, root)| (name, root.packages))
-                .collect(),
-            manifest.extra_inputs,
-        ),
-        None => (RootSets::new(), ExtraInputs::new()),
-    };
+    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
+    let root_sets = corgi_toml.root_sets();
     let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
     let resolution_root_name = root.clone().or_else(|| {
         resolution_roots.as_ref().and_then(|selected_root| {
@@ -3097,126 +3435,124 @@ fn build_inner(
     }
     let mut tools_rt: Vec<ToolRt> = Vec::new();
     let mut env_probes: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    if let Some(manifest) = read_corgi_toml(&dir)? {
-        for t in manifest.tools.values() {
-            let active = units.iter().any(|unit| {
-                let package_name = &meta.packages[unit.pkg].name;
-                let platform = if unit.host {
-                    &host
-                } else {
-                    target.as_deref().unwrap_or(&host)
-                };
-                matches!(unit.kind, Kind::Bsr)
-                    && (t.packages.is_empty()
-                        || t.packages.iter().any(|package| package == package_name))
-                    && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
-            });
-            if !active {
-                continue;
-            }
-            ensure_tool(&store, t)?;
-            let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
-            let logical = store
-                .logical_root()
-                .join("tools")
-                .join(format!("{}-{}", t.name, t.version))
-                .join(exported);
-            let scope = if t.packages.is_empty() {
-                String::new()
+    for t in corgi_toml.tools.values() {
+        let active = units.iter().any(|unit| {
+            let package_name = &meta.packages[unit.pkg].name;
+            let platform = if unit.host {
+                &host
             } else {
-                format!(" (packages {:?})", t.packages)
+                target.as_deref().unwrap_or(&host)
+            };
+            matches!(unit.kind, Kind::Bsr)
+                && (t.packages.is_empty()
+                    || t.packages.iter().any(|package| package == package_name))
+                && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
+        });
+        if !active {
+            continue;
+        }
+        ensure_tool(&store, t)?;
+        let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
+        let logical = store
+            .logical_root()
+            .join("tools")
+            .join(format!("{}-{}", t.name, t.version))
+            .join(exported);
+        let scope = if t.packages.is_empty() {
+            String::new()
+        } else {
+            format!(" (packages {:?})", t.packages)
+        };
+        status!(
+            "Using",
+            "tool {} {} -> ${}{scope}",
+            t.name,
+            t.version,
+            t.env
+        );
+        // The setting's own identity: exactly the scoped actions key
+        // on it, so a pin edit has exactly the declared blast radius.
+        let id = sha256_hex(
+            format!(
+                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                t.name, t.version, t.url, t.sha256, t.bin, t.path, t.env
+            )
+            .as_bytes(),
+        );
+        tools_rt.push(ToolRt {
+            name: t.name.clone(),
+            version: t.version.clone(),
+            env: t.env.clone(),
+            value: logical.display().to_string(),
+            id,
+            bin: t.bin.clone(),
+            packages: t.packages.clone(),
+            targets: t.targets.clone(),
+        });
+    }
+    // Plan-time probes: ambient reads happen HERE, outside the
+    // sandbox, frozen into keyed values. A probe only runs when some
+    // scoped package builds under a scoped profile — dev builds never
+    // execute (or key on) a release-only probe.
+    for probe in corgi_toml.env.values() {
+        let active = units.iter().any(|u| {
+            let pkg_name = &meta.packages[u.pkg].name;
+            probe.packages.iter().any(|p| p == pkg_name)
+                && (probe.profiles.is_empty()
+                    || probe.profiles.iter().any(|pr| pr == &u.profile.name))
+        });
+        if !active {
+            continue;
+        }
+        let val = if probe.inherit {
+            let Ok(value) = std::env::var(&probe.name) else {
+                continue;
             };
             status!(
                 "Using",
-                "tool {} {} -> ${}{scope}",
-                t.name,
-                t.version,
-                t.env
-            );
-            // The setting's own identity: exactly the scoped actions key
-            // on it, so a pin edit has exactly the declared blast radius.
-            let id = sha256_hex(
-                format!(
-                    "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-                    t.name, t.version, t.url, t.sha256, t.bin, t.path, t.env
-                )
-                .as_bytes(),
-            );
-            tools_rt.push(ToolRt {
-                name: t.name.clone(),
-                version: t.version.clone(),
-                env: t.env.clone(),
-                value: logical.display().to_string(),
-                id,
-                bin: t.bin.clone(),
-                packages: t.packages.clone(),
-                targets: t.targets.clone(),
-            });
-        }
-        // Plan-time probes: ambient reads happen HERE, outside the
-        // sandbox, frozen into keyed values. A probe only runs when some
-        // scoped package builds under a scoped profile — dev builds never
-        // execute (or key on) a release-only probe.
-        for probe in manifest.env.values() {
-            let active = units.iter().any(|u| {
-                let pkg_name = &meta.packages[u.pkg].name;
-                probe.packages.iter().any(|p| p == pkg_name)
-                    && (probe.profiles.is_empty()
-                        || probe.profiles.iter().any(|pr| pr == &u.profile.name))
-            });
-            if !active {
-                continue;
-            }
-            let val = if probe.inherit {
-                let Ok(value) = std::env::var(&probe.name) else {
-                    continue;
-                };
-                status!(
-                    "Using",
-                    "inherited env {} (packages {:?}{})",
-                    probe.name,
-                    probe.packages,
-                    if probe.profiles.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", profiles {:?}", probe.profiles)
-                    }
-                );
-                value
-            } else {
-                let command = probe.command.as_deref().unwrap_or_default();
-                let parts: Vec<&str> = command.split_whitespace().collect();
-                if parts.is_empty() {
-                    bail!("env {} has an empty command", probe.name);
+                "inherited env {} (packages {:?}{})",
+                probe.name,
+                probe.packages,
+                if probe.profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!(", profiles {:?}", probe.profiles)
                 }
-                let out = capture(
-                    Command::new(parts[0])
-                        .args(&parts[1..])
-                        .current_dir(Path::new(&meta.workspace_root)),
-                    &format!("env probe {}", probe.name),
-                )?;
-                let value = out.trim().to_string();
-                status!(
-                    "Using",
-                    "env {}={} (packages {:?}{})",
-                    probe.name,
-                    value,
-                    probe.packages,
-                    if probe.profiles.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", profiles {:?}", probe.profiles)
-                    }
-                );
-                value
-            };
-            env_probes.push((
-                probe.name.clone(),
-                val,
-                probe.packages.clone(),
-                probe.profiles.clone(),
-            ));
-        }
+            );
+            value
+        } else {
+            let command = probe.command.as_deref().unwrap_or_default();
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            if parts.is_empty() {
+                bail!("env {} has an empty command", probe.name);
+            }
+            let out = capture(
+                Command::new(parts[0])
+                    .args(&parts[1..])
+                    .current_dir(Path::new(&meta.workspace_root)),
+                &format!("env probe {}", probe.name),
+            )?;
+            let value = out.trim().to_string();
+            status!(
+                "Using",
+                "env {}={} (packages {:?}{})",
+                probe.name,
+                value,
+                probe.packages,
+                if probe.profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!(", profiles {:?}", probe.profiles)
+                }
+            );
+            value
+        };
+        env_probes.push((
+            probe.name.clone(),
+            val,
+            probe.packages.clone(),
+            probe.profiles.clone(),
+        ));
     }
     // Actions never see the ambient PATH: they get [shims:]/usr/bin:/bin,
     // where the shim dir (built per visible tool subset in
@@ -3267,6 +3603,12 @@ fn build_inner(
         }
     }
     let report_unit_keys = report_unit_keys(&meta, &units, &logical_pkg_ids);
+    let extra_inputs = ExtraInputs::resolve(
+        &corgi_toml.extra_inputs,
+        &meta.packages,
+        units.iter().map(|unit| unit.pkg),
+        Path::new(&workspace_root),
+    )?;
     let ctx = Ctx {
         store,
         verbose,
@@ -4257,16 +4599,12 @@ impl Ctx {
                 .hash_files_cached(&pkg.root(), &self.source_files_for(pi)?)
         }
         .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
-        let extras = self.extra_inputs_for(pkg);
+        let extras = self.extra_inputs.for_package(pi);
         if !extras.is_empty() {
             let mut acc = h;
-            for (e, p) in extras.iter().zip(self.declared_extra_inputs_for(pkg)?) {
-                let eh = if p.is_dir() {
-                    self.store.hash_dir_cached(&p, None)?
-                } else {
-                    crate::store::sha256_file(&p)?
-                };
-                acc.push_str(&format!("|{e}\0{eh}"));
+            for extra in extras {
+                let eh = crate::store::sha256_file(&extra.path)?;
+                acc.push_str(&format!("|{}\0{eh}", extra.label));
             }
             h = sha256_hex(acc.as_bytes());
         }
