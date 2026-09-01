@@ -78,7 +78,7 @@ If your build needs to read a file (beyond `.rs` files in the crate’s director
 
 ```
 [extra-inputs]
-extension_host = ["../extension_api/wit"]
+extension_host = ["../extension_api/wit/**"]
 agent_prompt = ["src/prompt.md"]
 ```
 
