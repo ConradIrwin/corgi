@@ -5,16 +5,28 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Where a corgi store lives on every machine. Actions embed store paths in
+/// their outputs — `OUT_DIR` most visibly — so artifacts are only shareable
+/// between checkouts and machines if that spelling is the same everywhere. A
+/// store elsewhere (`CORGI_STORE`) keeps the canonical spelling by way of a
+/// symlink at this path.
+///
+/// Both spellings name a world-writable directory, so no privileged setup
+/// step stands between a fresh machine and a working store. `/var/tmp` is
+/// also the one such directory on Linux that survives a reboot; distributions
+/// do expire its contents, but only on roughly the timescale corgi's own
+/// garbage collection already works on.
+pub const CANONICAL_ROOT: &str = if cfg!(target_os = "macos") {
+    "/Users/Shared/corgi"
+} else {
+    "/var/tmp/corgi"
+};
+
 pub fn default_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("CORGI_STORE") {
         return Ok(PathBuf::from(root));
     }
-    if cfg!(target_os = "macos") {
-        Ok(PathBuf::from("/Users/Shared/corgi"))
-    } else {
-        let home = std::env::var_os("HOME").context("HOME not set")?;
-        Ok(PathBuf::from(home).join(".cache/corgi"))
-    }
+    Ok(PathBuf::from(CANONICAL_ROOT))
 }
 
 /// Hash-work counters included in performance reports (relaxed: stats only).
@@ -245,7 +257,8 @@ impl Store {
         for d in [
             "cache", "pool", "outdirs", "debug", "tmp", "reports", "metrics",
         ] {
-            fs::create_dir_all(root.join(d))?;
+            fs::create_dir_all(root.join(d))
+                .with_context(|| format!("creating the corgi store at {}", root.display()))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
         // (e.g. /tmp/store -> /private/tmp/store)
@@ -255,7 +268,7 @@ impl Store {
         } else {
             let alias_path = std::env::var_os("CORGI_ALIAS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/Users/Shared/corgi"));
+                .unwrap_or_else(|| PathBuf::from(CANONICAL_ROOT));
             if root == alias_path {
                 // the store already lives at the canonical path: no alias,
                 // no symlink, nothing for realpath() to see through

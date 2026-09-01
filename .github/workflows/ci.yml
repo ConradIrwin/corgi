@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default stable
+
+      # Corgi confines every build action, and on Linux that is bubblewrap.
+      # Ubuntu 24.04 blocks unprivileged user namespaces for unconfined
+      # binaries, but ships an AppArmor profile that exempts the packaged
+      # bwrap, so installing from the archive is enough.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin -- /bin/true
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The end-to-end tests drive the `corgi` binary through real builds, so
+      # this is also the coverage of the host's sandbox and toolchain wiring.
+      - name: Run tests
+        run: cargo test --all-targets

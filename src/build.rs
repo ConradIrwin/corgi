@@ -341,10 +341,7 @@ pub struct Ctx {
     base_env: Vec<(String, String)>,
     workspace_root: String,
     sysroot: String,
-    rustup_home: String,
-    devdir: String,
-    sandbox: bool,
-    darwin_dirs: Vec<String>,
+    sandbox: Box<dyn crate::sandbox::Sandbox>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
@@ -412,6 +409,8 @@ pub struct Ctx {
 
 #[derive(Clone)]
 struct ZigRuntime {
+    /// The Rust triple this Zig runtime is pinned to compile and link for.
+    rust_target: String,
     cc: PathBuf,
     cxx: PathBuf,
     ar: PathBuf,
@@ -422,6 +421,18 @@ struct ZigRuntime {
 }
 
 impl Ctx {
+    /// The pinned Zig runtime, when it is the C toolchain for the platform
+    /// this unit builds for. Cross builds pin Zig to the requested target,
+    /// so it does not apply to the host units built alongside them.
+    fn zig_for_platform(&self, unit: &Unit) -> Option<&ZigRuntime> {
+        let platform = if unit.host {
+            &self.host
+        } else {
+            self.target.as_deref().unwrap_or(&self.host)
+        };
+        self.zig.as_ref().filter(|zig| zig.rust_target == platform)
+    }
+
     fn extra_inputs_for(&self, pkg: &Package) -> &[String] {
         self.extra_inputs
             .get(&pkg.name)
@@ -1099,15 +1110,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
             t.sha256
         );
     }
-    let st = Command::new("tar")
-        .arg("-xf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&unpack)
-        .status()?;
-    if !st.success() {
-        bail!("unpack failed for tool {}", t.name);
-    }
+    unpack_archive(&archive, &unpack).with_context(|| format!("unpacking tool {}", t.name))?;
     if !unpack.join(exported).exists() {
         bail!("tool {}: `{exported}` not found inside the archive", t.name);
     }
@@ -1120,6 +1123,31 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
+}
+
+/// Unpack a downloaded tool archive. Debian packages carry their payload in a
+/// nested tarball, so they are unwrapped first; everything else goes straight
+/// to tar, which detects the compression itself.
+fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
+    let bytes = fs::read(archive)?;
+    let tarball = if crate::deb::is_deb(&bytes) {
+        let data = crate::deb::data_member(&bytes)?;
+        let extracted = archive.with_extension("data.tar");
+        fs::write(&extracted, data)?;
+        extracted
+    } else {
+        archive.to_path_buf()
+    };
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(into)
+        .status()?;
+    if !status.success() {
+        bail!("tar exited with {status}");
+    }
+    Ok(())
 }
 
 fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
@@ -1218,6 +1246,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
             .unwrap_or(installed.as_path()),
     );
     Ok(ZigRuntime {
+        rust_target: target.rust.to_string(),
         cc: logical_wrapper_dir.join("cc"),
         cxx: logical_wrapper_dir.join("c++"),
         ar: logical_wrapper_dir.join("ar"),
@@ -2309,10 +2338,7 @@ pub fn fmt(
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
-    ensure_supported_build_platform(
-        std::env::consts::OS,
-        Path::new("/usr/bin/sandbox-exec").is_file(),
-    )?;
+    crate::sandbox::ensure_available()?;
     opts.packages.sort();
     opts.packages.dedup();
     let store_root = store.root.clone();
@@ -2449,20 +2475,24 @@ fn build_inner(
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
-    let zig_target = requested_target
-        .as_deref()
-        .map(|target| {
-            crate::zig::target_requires_zig(&host_guess, target)
-                .map(|required| required.then(|| target.to_string()))
-        })
-        .transpose()?
-        .flatten();
+    let zig_target = match requested_target.as_deref() {
+        Some(target) => {
+            crate::zig::target_requires_zig(&host_guess, target)?.then(|| target.to_string())
+        }
+        // Linux offers no C toolchain corgi is willing to key on: whichever
+        // gcc and glibc the distribution happens to ship would decide the
+        // emitted bits. The pinned Zig supplies the linker, the C and C++
+        // compilers, and libc for native builds just as it does for cross
+        // ones, so a Linux store is shareable.
+        None if host_guess.contains("linux") => Some(host_guess.clone()),
+        None => None,
+    };
     if zig_target.is_some() {
         crate::zig::raise_file_descriptor_limit()?;
     }
-    let target = match zig_target.as_deref() {
-        Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
-        None => requested_target,
+    let target = match (&requested_target, zig_target.as_deref()) {
+        (Some(_), Some(zig_target)) => Some(crate::zig::rust_target(zig_target)?.to_string()),
+        _ => requested_target,
     };
     ensure_toolchain(&store, &channel, &host_guess)?;
     // Debugger convenience, deliberately outside the sysroot (see
@@ -2976,29 +3006,35 @@ fn build_inner(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let devdir = capture(
-        Command::new("/usr/bin/xcode-select").arg("-p"),
-        "xcode-select -p",
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
-    // toolchain identity beyond rustc: the linker chain shapes final bits
-    let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
-        .ok()
-        .and_then(|o| o.lines().next().map(str::to_string))
-        .unwrap_or_default();
-    let ld_v = Command::new("ld")
-        .arg("-v")
-        .output()
-        .map(|o| {
-            let all = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            all.lines().next().unwrap_or("").to_string()
-        })
-        .unwrap_or_default();
+    // Toolchain identity beyond rustc: the linker chain shapes final bits.
+    // Only Apple hosts have an ambient one — elsewhere the pinned Zig is the
+    // whole C toolchain, and keying on the distribution's gcc would make the
+    // store machine-specific for tools no action can even run.
+    let ambient_c_toolchain = host.contains("apple");
+    let cc_v = if ambient_c_toolchain {
+        capture(Command::new("cc").arg("--version"), "cc --version")
+            .ok()
+            .and_then(|o| o.lines().next().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let ld_v = if ambient_c_toolchain {
+        Command::new("ld")
+            .arg("-v")
+            .output()
+            .map(|o| {
+                let all = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                all.lines().next().unwrap_or("").to_string()
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let sdk_v = if host.contains("apple") {
         capture(
             Command::new("/usr/bin/xcrun").arg("--show-sdk-version"),
@@ -3038,29 +3074,23 @@ fn build_inner(
         xcode: xcode_v,
     };
     recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
-    // Unconditional where the platform supports it: there is exactly one
-    // mode, and it fails hard. Errors name the missing input (denied exec,
-    // undeclared read), and the fix is a pinned tool or extra-inputs
-    // stanza — loop until green.
-    let sandbox = true;
+    // Confinement is unconditional: there is exactly one mode, and it fails
+    // hard. Errors name the missing input (denied exec, undeclared read), and
+    // the fix is a pinned tool or extra-inputs stanza — loop until green.
+    let sandbox = crate::sandbox::for_host(crate::sandbox::Environment {
+        store_root: store.root.clone(),
+        store_alias: store.alias.clone(),
+        sysroot: sysroot.clone(),
+        cargo_home: cargo_home.clone(),
+        rustup_home,
+        workspace_root: meta.workspace_root.clone(),
+    })?;
     if verbose {
-        status!("Sandbox", "hermetic mode enabled (seatbelt)");
-    }
-    // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
-    // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
-    let mut darwin_dirs = Vec::new();
-    for key in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
-        if let Ok(d) = capture(Command::new("/usr/bin/getconf").arg(key), "getconf") {
-            let d = d.trim().trim_end_matches('/').to_string();
-            if !d.is_empty() {
-                let canon = if d.starts_with("/var/") {
-                    format!("/private{d}")
-                } else {
-                    d
-                };
-                darwin_dirs.push(canon);
-            }
-        }
+        status!(
+            "Sandbox",
+            "hermetic mode enabled ({})",
+            sandbox.description()
+        );
     }
     // resolve the SDK once, outside the sandbox, instead of letting every
     // rustc link shell out to xcrun (slow and an untracked probe)
@@ -3283,10 +3313,7 @@ fn build_inner(
         base_env,
         workspace_root,
         sysroot,
-        rustup_home,
-        devdir,
         sandbox,
-        darwin_dirs,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         source_files_memo: Mutex::new(HashMap::new()),
@@ -3872,17 +3899,6 @@ fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for d in std::env::split_paths(&path) {
-        let c = d.join(name);
-        if c.is_file() {
-            return Some(c);
-        }
-    }
-    None
-}
-
 /// `rustc --print cfg` -> CARGO_CFG_* env for build scripts.
 fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -4362,169 +4378,6 @@ fn collect_rust_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     walk(root, Path::new(""), &mut files)?;
     Ok(files)
-}
-
-/// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
-/// system dirs, the toolchain, the store, and keyed inputs; writes limited
-/// to the action's output and scratch dirs; no network. Children inherit it.
-fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
-    if !ctx.sandbox {
-        return Command::new(program);
-    }
-    let mut prof = String::from(concat!(
-        "(version 1)\n",
-        "(deny default)\n",
-        "(allow process-fork)\n",
-        "(allow process-info*)\n",
-        "(allow file-map-executable)\n",
-        "(allow signal (target same-sandbox))\n",
-        "(allow sysctl-read)\n",
-        "(allow mach-lookup)\n",
-        "(allow file-read-metadata)\n",
-    ));
-    // exec allowlist: the *only* runnable binaries are dispatchers
-    // (/usr/bin/cc, the rustup shim) and tools whose identity is part of
-    // the action key (rustc, clang/ld via the toolchain hash, build
-    // scripts via their content hash)
-    prof.push_str("(allow process-exec*\n");
-    prof.push_str("  (literal \"/usr/bin/cc\")\n");
-    let mut exec_lits = vec![
-        format!("{}/bin/rustc", ctx.cargo_home),
-        format!("{}/bin/rustc", ctx.sysroot),
-    ];
-    if let Some(r) = find_in_path(&ctx.rustc) {
-        exec_lits.push(r.display().to_string());
-    }
-    // the whole pinned-toolchain bin dir is keyed content (e.g.
-    // proc-macro-crate spawns `cargo locate-project` at macro expansion)
-    let toolchain_bin = Path::new(&ctx.sysroot).join("bin");
-    if let Ok(canon) = fs::canonicalize(&toolchain_bin) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    // rust-lld & friends live under lib/rustlib/<triple>/bin — also keyed
-    let rustlib = Path::new(&ctx.sysroot).join("lib/rustlib");
-    if let Ok(canon) = fs::canonicalize(&rustlib) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    for p in exec_lits {
-        // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
-        // to rustup, so resolve before emitting the rule
-        let canon = fs::canonicalize(&p)
-            .map(|c| c.display().to_string())
-            .unwrap_or(p);
-        prof.push_str(&format!("  (literal \"{canon}\")\n"));
-    }
-    prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
-    // the Apple tool group, keyed collectively via the Xcode identity in
-    // the toolchain hash
-    for p in [
-        "/usr/bin/ar",
-        "/usr/bin/ranlib",
-        "/usr/bin/clang",
-        "/usr/bin/clang++",
-        "/usr/bin/c++",
-        "/usr/bin/xcrun",
-        "/usr/bin/xcodebuild",
-        "/usr/bin/xcode-select",
-        "/bin/sh",
-    ] {
-        prof.push_str(&format!("  (literal \"{p}\")\n"));
-    }
-    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
-    prof.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        ctx.store.root.join("tools").display()
-    ));
-    // actions may execute binaries they just built in their own writable
-    // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
-    // are products of keyed inputs, so this stays hermetic
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
-    prof.push_str(")\n");
-    prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
-    // Compiles run with cwd = the workspace root (cargo's shape); getcwd
-    // needs the directory node itself, but nothing under it beyond the
-    // explicitly granted package/extra-input subpaths.
-    prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
-    for p in [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/System",
-        "/Library",
-        "/Applications",
-        "/opt",
-        "/private/etc",
-        "/private/var/db",
-        "/private/preboot",
-        "/private/var/run/com.apple.security.cryptexd",
-    ] {
-        prof.push_str(&format!("  (subpath \"{p}\")\n"));
-    }
-    let mut reads: Vec<String> = vec![
-        ctx.sysroot.clone(),
-        ctx.cargo_home.clone(),
-        ctx.rustup_home.clone(),
-        ctx.devdir.clone(),
-        ctx.store.root.display().to_string(),
-    ];
-    for d in &ctx.darwin_dirs {
-        reads.push(d.clone());
-    }
-    for r in reads {
-        prof.push_str(&format!("  (subpath \"{r}\")\n"));
-    }
-    let workspace_root = Path::new(&ctx.workspace_root);
-    let mut input_directories = std::collections::BTreeSet::new();
-    for path in extra_reads {
-        let mut ancestor = path.parent();
-        while let Some(directory) = ancestor {
-            if !directory.starts_with(workspace_root) {
-                break;
-            }
-            input_directories.insert(directory);
-            ancestor = directory.parent();
-        }
-    }
-    for directory in input_directories {
-        prof.push_str(&format!("  (literal \"{}\")\n", directory.display()));
-    }
-    for path in extra_reads {
-        let operation = if path.is_dir() { "subpath" } else { "literal" };
-        prof.push_str(&format!("  ({operation} \"{}\")\n", path.display()));
-    }
-    prof.push_str(")\n");
-    // Align the readable set with the hashed set: the source hash deliberately
-    // excludes .git, build output dirs, and Cargo.lock, so reading them must
-    // be denied or they become unhashed inputs. Later SBPL rules win.
-    prof.push_str("(deny file-read* file-read-metadata\n");
-    let mut deny_roots: Vec<String> = vec![ctx.workspace_root.clone()];
-    for path in extra_reads {
-        if path.is_dir() {
-            deny_roots.push(path.display().to_string());
-        }
-    }
-    deny_roots.sort();
-    deny_roots.dedup();
-    for r in &deny_roots {
-        for d in [".git", "target", "dtarget"] {
-            prof.push_str(&format!("  (subpath \"{r}/{d}\")\n"));
-        }
-        prof.push_str(&format!("  (literal \"{r}/Cargo.lock\")\n"));
-    }
-    prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
-    for d in &ctx.darwin_dirs {
-        prof.push_str(&format!("  (subpath \"{d}\")\n"));
-    }
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(")\n");
-    let mut c = Command::new("/usr/bin/sandbox-exec");
-    c.arg("-p").arg(prof).arg(program);
-    c
 }
 
 fn test_pass_key(harness_action: &str) -> Result<String> {
@@ -6845,8 +6698,9 @@ fn compile(
     if let Some(d) = &incr_dir {
         writes.push(d.as_path());
     }
-    let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
-    cmd.current_dir(compile_dir);
+    let mut cmd = ctx
+        .sandbox
+        .command(Path::new(executor), compile_dir, &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig.is_some() {
@@ -6919,13 +6773,16 @@ fn compile(
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
-            if let Some(zig) = ctx.zig.as_ref().filter(|zig| zig.use_zig_as_rust_linker) {
-                cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
-            }
             if let Some(libdir) = &ctx.target_std_libdir {
                 cmd.arg("-L").arg(libdir);
             }
         }
+    }
+    if let Some(zig) = ctx
+        .zig_for_platform(unit)
+        .filter(|zig| zig.use_zig_as_rust_linker)
+    {
+        cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
     }
     for f in &pflags {
         cmd.arg(f);
@@ -7205,7 +7062,6 @@ fn run_build_script(
     } else {
         ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
     };
-    let cross_compiling = plat_triple != ctx.host;
     env.push(("TARGET".into(), plat_triple.clone()));
     env.push(("HOST".into(), ctx.host.clone()));
     env.push(("PROFILE".into(), unit.profile.env_name().into()));
@@ -7224,24 +7080,22 @@ fn run_build_script(
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    if cross_compiling {
-        if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
-            let target_environment = target.replace('-', "_");
-            for (name, value) in [
-                (format!("CC_{target_environment}"), &zig.cc),
-                (format!("CXX_{target_environment}"), &zig.cxx),
-                (format!("AR_{target_environment}"), &zig.ar),
-                (format!("RANLIB_{target_environment}"), &zig.ranlib),
-            ] {
-                env.push((name, value.display().to_string()));
-            }
-            for name in [
-                "CMAKE_TOOLCHAIN_FILE",
-                "TARGET_CMAKE_TOOLCHAIN_FILE",
-                &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
-            ] {
-                env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
-            }
+    if let Some(zig) = ctx.zig_for_platform(unit) {
+        let target_environment = plat_triple.replace('-', "_");
+        for (name, value) in [
+            (format!("CC_{target_environment}"), &zig.cc),
+            (format!("CXX_{target_environment}"), &zig.cxx),
+            (format!("AR_{target_environment}"), &zig.ar),
+            (format!("RANLIB_{target_environment}"), &zig.ranlib),
+        ] {
+            env.push((name, value.display().to_string()));
+        }
+        for name in [
+            "CMAKE_TOOLCHAIN_FILE",
+            "TARGET_CMAKE_TOOLCHAIN_FILE",
+            &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
+        ] {
+            env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
         }
     }
     // Cargo hands build scripts the rustflags of the unit they configure,
@@ -7431,8 +7285,9 @@ fn run_build_script(
     let package_inputs = ctx.package_read_inputs(unit.pkg)?;
     let reads: Vec<&Path> = package_inputs.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
-    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
-    cmd.current_dir(&pkg_root);
+    let mut cmd = ctx
+        .sandbox
+        .command(&script_path, Path::new(&pkg_root), &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig.is_some() {
@@ -7704,41 +7559,6 @@ mod dep_info_tests {
         .unwrap_err()
         .to_string()
         .contains("/Application Support/elsewhere/icon.png"));
-    }
-}
-
-fn ensure_supported_build_platform(host_os: &str, sandbox_available: bool) -> Result<()> {
-    if host_os != "macos" {
-        bail!("corgi builds require macOS");
-    }
-    if !sandbox_available {
-        bail!("corgi builds require /usr/bin/sandbox-exec");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod build_platform_tests {
-    use super::ensure_supported_build_platform;
-
-    #[test]
-    fn builds_reject_non_macos_hosts() {
-        assert_eq!(
-            ensure_supported_build_platform("linux", true)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require macOS"
-        );
-    }
-
-    #[test]
-    fn builds_require_the_macos_sandbox() {
-        assert_eq!(
-            ensure_supported_build_platform("macos", false)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require /usr/bin/sandbox-exec"
-        );
     }
 }
 
