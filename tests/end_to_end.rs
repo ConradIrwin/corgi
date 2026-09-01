@@ -956,6 +956,176 @@ fn local_package_artifacts_are_shared_across_repository_workspaces() {
 }
 
 #[test]
+fn build_script_archives_restore_only_for_executing_consumers() {
+    let directory = TestDirectory::new("demand-driven-root-hit");
+    let store = directory.path.join("store");
+    let workspace = directory.path.join("workspace");
+    copy_directory(&fixture_path("demand-driven-root-hit"), &workspace);
+
+    let initial = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&initial, "initial demand-driven fixture build");
+    let initial_report = latest_report_for_workspace(&store, &workspace);
+    let units = initial_report["units"].as_array().unwrap();
+    let build_script_unit = units
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == "generated-dependency"
+                && unit["action"]["kind"] == "run_build_script"
+        })
+        .expect("initial build-script unit");
+    let build_script_key = build_script_unit["key"]["hash"]
+        .as_str()
+        .expect("initial build-script action key")
+        .to_string();
+    let archive_bytes = build_script_unit["timings"]["ingest_bytes"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(archive_bytes > 0, "OUT_DIR archive bytes were not recorded");
+    assert!(
+        archive_bytes < 1024 * 1024,
+        "repetitive OUT_DIR payload was not compressed: {archive_bytes} bytes"
+    );
+    assert!(
+        build_script_unit["timings"]["ingest_ns"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "OUT_DIR archive time was not recorded"
+    );
+    let root_key = units
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == "demand-driven-root-hit" && unit["action"]["is_root"] == true
+        })
+        .and_then(|unit| unit["key"]["hash"].as_str())
+        .expect("initial root action key")
+        .to_string();
+    let dependency_key = units
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == "generated-dependency" && unit["action"]["kind"] == "compile"
+        })
+        .and_then(|unit| unit["key"]["hash"].as_str())
+        .expect("initial generated dependency action key")
+        .to_string();
+    let action_path = |key: &str| {
+        store
+            .join("cache")
+            .join(&key[..2])
+            .join(format!("{key}.json"))
+    };
+    let build_script_action: serde_json::Value =
+        serde_json::from_slice(&fs::read(action_path(&build_script_key)).unwrap()).unwrap();
+    assert!(build_script_action["out_dir"]["hash"].is_string());
+    assert!(build_script_action["out_dir"]["size"]
+        .as_u64()
+        .is_some_and(|size| size > 0));
+
+    // Relinking the root needs the cached Rust library, not the generated
+    // sources that produced it. Loading the build-script result for transitive
+    // directives must therefore leave its deleted OUT_DIR untouched.
+    fs::remove_file(action_path(&root_key)).unwrap();
+    fs::remove_dir_all(store.join("outdirs").join(&build_script_key)).unwrap();
+    let relinked = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&relinked, "build using a cached generated dependency");
+    assert!(
+        !store.join("outdirs").join(&build_script_key).exists(),
+        "relinking restored an OUT_DIR whose consuming crate stayed cached"
+    );
+
+    // Rebuilding the package that includes generated source does require its
+    // OUT_DIR. The cached build-script result restores it from zstd without
+    // rerunning the script.
+    fs::remove_file(action_path(&root_key)).unwrap();
+    fs::remove_file(action_path(&dependency_key)).unwrap();
+    let rebuilt = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&rebuilt, "build using a restored build-script OUT_DIR");
+    assert!(
+        store
+            .join("outdirs")
+            .join(&build_script_key)
+            .join("out/generated.rs")
+            .is_file(),
+        "cached build-script action did not restore generated source"
+    );
+    let rebuilt_report = latest_report_for_workspace(&store, &workspace);
+    let rebuilt_build_script = rebuilt_report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == "generated-dependency"
+                && unit["action"]["kind"] == "run_build_script"
+        })
+        .expect("restored build-script unit");
+    assert_eq!(rebuilt_build_script["cache"]["result"], "hit");
+
+    // A root hit is self-contained. Make walking the dependency action both
+    // observable and expensive, then prove the warm build never does so.
+    fs::remove_file(action_path(&build_script_key)).unwrap();
+    fs::remove_dir_all(store.join("outdirs").join(&build_script_key)).unwrap();
+    fs::remove_dir_all(workspace.join("target")).unwrap();
+    let warm = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&warm, "warm root-cache build");
+    let warm_report = latest_report_for_workspace(&store, &workspace);
+    let warm_units = warm_report["units"].as_array().unwrap();
+    let root = warm_units
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == "demand-driven-root-hit" && unit["action"]["is_root"] == true
+        })
+        .expect("warm root unit");
+    assert_eq!(root["cache"]["result"], "hit");
+    let dependency_units = warm_units
+        .iter()
+        .filter(|unit| unit["package"]["name"] == "generated-dependency")
+        .collect::<Vec<_>>();
+    assert!(!dependency_units.is_empty());
+    assert!(
+        dependency_units
+            .iter()
+            .all(|unit| unit["cache"]["result"] == "not_checked"),
+        "warm root hit probed dependency actions:\n{}",
+        serde_json::to_string_pretty(&dependency_units).unwrap()
+    );
+    assert!(
+        dependency_units
+            .iter()
+            .all(|unit| unit["key"]["hash"].is_string()),
+        "precomputed keys should be reported even for actions below a root hit:\n{}",
+        serde_json::to_string_pretty(&dependency_units).unwrap()
+    );
+    assert!(
+        dependency_units
+            .iter()
+            .all(|unit| unit["key"].get("inputs").is_none()),
+        "actions below a root hit should omit deferred key inputs:\n{}",
+        serde_json::to_string_pretty(&dependency_units).unwrap()
+    );
+    assert!(
+        root["key"]["inputs"].is_object(),
+        "checked actions should report detailed key inputs:\n{}",
+        serde_json::to_string_pretty(root).unwrap()
+    );
+    assert!(
+        !store.join("outdirs").join(&build_script_key).exists(),
+        "warm root hit restored a dependency OUT_DIR"
+    );
+
+    let executable = workspace
+        .join("target/debug")
+        .join(executable_name("demand-driven-root-hit"));
+    let output = Command::new(executable)
+        .output()
+        .expect("failed to run cached root executable");
+    assert_success(&output, "cached root executable");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "generated by build script 1048576\n"
+    );
+}
+
+#[test]
 fn non_git_packages_use_manifest_and_source_fallback_across_checkouts() {
     let directory = TestDirectory::new("non-git-package-cache");
     let store = directory.path.join("store");
@@ -1244,6 +1414,29 @@ fn report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
                 == Some(canonical_workspace.to_string_lossy().as_ref())
         })
         .expect("missing build report for workspace")
+}
+
+fn latest_report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
+    let canonical_workspace = workspace.canonicalize().unwrap();
+    fs::read_dir(store.join("reports"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .then(|| serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap())
+        })
+        .filter(|report| {
+            report["run"]["workspace"]["root"].as_str()
+                == Some(canonical_workspace.to_string_lossy().as_ref())
+        })
+        .max_by_key(|report| {
+            report["run"]["started_at_unix_ns"]
+                .as_u64()
+                .unwrap_or_default()
+        })
+        .expect("missing latest build report for workspace")
 }
 
 fn write_non_git_package_fixture(root: &Path, checkout: &str) {

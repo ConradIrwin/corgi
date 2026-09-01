@@ -2,6 +2,7 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.27";
+const TOOL_VERSION: &str = "corgi/0.29";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -109,6 +110,12 @@ struct OutputFile {
     exe: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct OutDirArchive {
+    hash: String,
+    size: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct ActionResult {
     #[serde(default)]
@@ -117,6 +124,8 @@ struct ActionResult {
     stderr: String,
     #[serde(default)]
     bs: Option<BuildScriptOut>,
+    #[serde(default)]
+    out_dir: Option<OutDirArchive>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -125,7 +134,6 @@ enum CacheMiss {
     NotFound,
     RecordInvalid,
     BlobMissing,
-    SentinelMissing,
     OutputMismatch,
 }
 
@@ -135,7 +143,6 @@ impl CacheMiss {
             Self::NotFound => "not_found",
             Self::RecordInvalid => "record_invalid",
             Self::BlobMissing => "blob_missing",
-            Self::SentinelMissing => "sentinel_missing",
             Self::OutputMismatch => "output_mismatch",
         }
     }
@@ -144,7 +151,7 @@ impl CacheMiss {
 #[derive(Clone)]
 /// Early (meta-ready) result of a pipelined lib compile: published the
 /// moment rustc reports the rmeta written, while its codegen continues.
-/// Enough for dependent compiles to key themselves and start.
+/// Action keys are already planned; this lets dependent execution start.
 struct MetaOut {
     /// Pool-addressed (key-spliced) file name of the rmeta.
     file: String,
@@ -377,6 +384,11 @@ pub struct Ctx {
     /// incremental state stays valid. -Cextra-filename keeps the full
     /// key16, so pool file names remain globally unique.
     idents: Vec<String>,
+    /// Full action identities, computed for the complete unit graph before
+    /// any cache record is loaded. Dependency edges contain producer action
+    /// keys rather than produced-byte hashes, so a cached parent can be found
+    /// without first evaluating its dependencies.
+    action_keys: Vec<String>,
     /// Location-independent package identities. Local Git packages use the
     /// repository remote plus manifest path; other local packages use their
     /// manifest contents. Registry and Git dependencies retain Cargo's ID.
@@ -419,6 +431,113 @@ struct ZigRuntime {
     cmake_toolchain: PathBuf,
     use_zig_as_rust_linker: bool,
     identity: String,
+}
+
+struct DigestWriter<W> {
+    inner: W,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<W> DigestWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            digest: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (W, String, u64) {
+        (
+            self.inner,
+            crate::store::hex(&self.digest.finalize()),
+            self.bytes,
+        )
+    }
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.digest.update(&buffer[..written]);
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn immutable_source_roots_for_action(ctx: &Ctx, index: usize) -> Vec<PathBuf> {
+    let cargo_home = Path::new(&ctx.cargo_home);
+    let registry_sources = cargo_home.join("registry/src");
+    let git_checkouts = cargo_home.join("git/checkouts");
+    let mut pending = vec![index];
+    let mut visited_units = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+
+    while let Some(index) = pending.pop() {
+        if !visited_units.insert(index) {
+            continue;
+        }
+        let unit = &ctx.units[index];
+        let package = &ctx.meta.packages[unit.pkg];
+        let root = package.root();
+        if package.source.is_some()
+            && (root.starts_with(&registry_sources) || root.starts_with(&git_checkouts))
+        {
+            roots.insert(root);
+        }
+        pending.extend(unit.deps.iter().map(|dependency| dependency.unit));
+    }
+
+    roots.into_iter().collect()
+}
+
+fn archive_out_dir(
+    store: &Store,
+    out_dir: &Path,
+    workspace_root: &str,
+    allowed_external_roots: &[PathBuf],
+) -> Result<OutDirArchive> {
+    let temporary = store.tmp_path("out-dir-tar");
+    let file = fs::File::create(&temporary)
+        .with_context(|| format!("creating OUT_DIR archive {}", temporary.display()))?;
+    let mut writer = DigestWriter::new(file);
+    match crate::out_dir_archive::archive_out_dir_scanning(
+        out_dir,
+        &mut writer,
+        workspace_root.as_bytes(),
+        allowed_external_roots,
+    ) {
+        Ok(Some(path)) => {
+            drop(writer);
+            fs::remove_file(&temporary).ok();
+            bail!(
+                "build script output {} embeds the workspace path ({workspace_root}); \
+                 outputs must be location-free — resolve paths at runtime instead of \
+                 baking them in at build time",
+                out_dir.join(path).display()
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            drop(writer);
+            fs::remove_file(&temporary).ok();
+            return Err(error);
+        }
+    }
+    if let Err(error) = writer.flush() {
+        drop(writer);
+        fs::remove_file(&temporary).ok();
+        return Err(error.into());
+    }
+    let (file, hash, size) = writer.finish();
+    drop(file);
+    let hash = store.insert_prehashed_file(&temporary, hash)?;
+    Ok(OutDirArchive { hash, size })
 }
 
 impl Ctx {
@@ -733,65 +852,424 @@ mod extra_input_tests {
     }
 }
 
-#[derive(Serialize)]
-struct CompileKey<'a> {
-    kind: &'a str,
-    tool: &'a str,
-    rustc: &'a str,
-    host: &'a str,
-    pkg: [&'a str; 3],
-    src_hash: &'a str,
-    crate_name: &'a str,
-    edition: &'a str,
-    crate_type: &'a str,
-    src_rel: &'a str,
-    features: &'a [String],
-    externs: &'a [(String, String, String)],
-    link_closure: &'a [(String, String)],
-    cfgs: &'a [String],
-    check_cfgs: &'a [String],
-    renvs: &'a [(String, String)],
-    link_libs: &'a [String],
-    link_search: &'a [String],
-    link_args: &'a [String],
-    out_key: &'a str,
-    profile: &'a [String],
-    /// resolved lint-level flags (value-keyed inputs; empty for deps)
-    lints: &'a [String],
-    /// clippy identity (driver version + clippy.toml hash); "" = rustc
-    clippy: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    clippy_args: Option<&'a [String]>,
-    /// Incremental namespace: history-seeded, functionally equivalent but
-    /// not bit-reproducible. Never mixes with the clean namespace.
-    incr: bool,
-    /// -Cmetadata value (source-free unit identity).
-    ident: &'a str,
-    env: &'a [(String, String)],
-    cap_lints: bool,
-    /// Resolved .cargo/config.toml rustflags applied to this unit.
-    rustflags: &'a [String],
-    /// linker-chain identity; only linking crate types depend on it
-    toolchain: &'a str,
-    /// cross-compilation target triple ("" = host)
-    tgt: &'a str,
+fn compile_identity(ctx: &Ctx, uidx: usize) -> (String, String, String) {
+    let unit = &ctx.units[uidx];
+    let target = &unit.target;
+    let crate_name = target.name.replace('-', "_");
+    let crate_type = unit_crate_type(unit);
+    let package_root = ctx.meta.packages[unit.pkg].root();
+    let source = Path::new(&target.src_path)
+        .strip_prefix(&package_root)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.src_path.clone());
+    (crate_name, crate_type, source)
+}
+
+fn effective_profile_flags(ctx: &Ctx, uidx: usize) -> Vec<String> {
+    let unit = &ctx.units[uidx];
+    let profile = &unit.profile;
+    let debuginfo = if is_checked(ctx, uidx) {
+        "0".to_string()
+    } else {
+        profile.debuginfo_flag()
+    };
+    let mut flags = vec![
+        format!(
+            "-Copt-level={}",
+            if profile.opt_level.is_empty() {
+                "0"
+            } else {
+                profile.opt_level.as_str()
+            }
+        ),
+        format!(
+            "-Cdebug-assertions={}",
+            if profile.debug_assertions {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        format!(
+            "-Coverflow-checks={}",
+            if profile.overflow_checks { "on" } else { "off" }
+        ),
+        format!("-Cdebuginfo={debuginfo}"),
+        format!("-Cstrip={}", profile.strip_flag()),
+        "-Cembed-bitcode=no".to_string(),
+    ];
+    if let Some(units) = profile.codegen_units {
+        flags.push(format!("-Ccodegen-units={units}"));
+    }
+    if !profile.panic.is_empty() && profile.panic != "unwind" && !matches!(unit.kind, Kind::Test) {
+        flags.push(format!("-Cpanic={}", profile.panic));
+    }
+    flags
+}
+
+fn compile_action_kind(ctx: &Ctx, uidx: usize) -> &'static str {
+    let unit = &ctx.units[uidx];
+    let clippy = ctx.clippy && ctx.meta.packages[unit.pkg].source.is_none();
+    if clippy {
+        if is_checked(ctx, uidx) {
+            "clippy"
+        } else {
+            "clippy-compile"
+        }
+    } else if is_checked(ctx, uidx) {
+        "check"
+    } else if matches!(unit.kind, Kind::Test) {
+        "compile-test"
+    } else {
+        "compile"
+    }
+}
+
+fn action_extra_filename(ctx: &Ctx, uidx: usize, key: &str) -> String {
+    let unit = &ctx.units[uidx];
+    if ctx.incremental && unit.profile.incremental {
+        ctx.idents[uidx].clone()
+    } else {
+        key[..16].to_string()
+    }
+}
+
+fn planned_outputs(ctx: &Ctx, uidx: usize, key: &str) -> Result<Vec<String>> {
+    let unit = &ctx.units[uidx];
+    if matches!(unit.kind, Kind::Bsr) {
+        return Ok(Vec::new());
+    }
+    let (crate_name, crate_type, _) = compile_identity(ctx, uidx);
+    let extra = action_extra_filename(ctx, uidx, key);
+    if is_checked(ctx, uidx) {
+        // Checked dependency units are libraries in practice; unlike
+        // `--print file-names`, `--emit=metadata` always names the metadata
+        // artifact directly.
+        return Ok(vec![format!("lib{crate_name}-{extra}.rmeta")]);
+    }
+    expected_outputs(ctx, &crate_name, &extra, &crate_type, unit.host)
+}
+
+fn planned_main_output(ctx: &Ctx, uidx: usize, key: &str) -> Result<Option<String>> {
+    let outputs = planned_outputs(ctx, uidx, key)?;
+    Ok(outputs
+        .iter()
+        .find(|output| output.ends_with(".rlib"))
+        .or_else(|| outputs.first())
+        .cloned())
 }
 
 #[derive(Serialize)]
-struct RunKey<'a> {
+struct PlannedActionTarget<'a> {
+    name: &'a str,
+    kind: &'a [String],
+    crate_types: &'a [String],
+    edition: &'a str,
+    test_harness: bool,
+}
+
+#[derive(Serialize)]
+struct PlannedActionKey<'a> {
     kind: &'a str,
-    tool: &'a str,
+    tool: &'static str,
     rustc: &'a str,
     host: &'a str,
-    pkg: [&'a str; 3],
-    src_hash: &'a str,
-    script: [&'a str; 2],
-    env: &'a [(String, String)],
-    dep_env: &'a [(String, String)],
-    /// build scripts may invoke cc themselves
-    toolchain: &'a str,
-    /// identity hashes of the tools scoped to this package (sorted)
+    package: (&'a str, &'a str, &'a str),
+    source_hash: &'a str,
+    crate_name: &'a str,
+    crate_type: &'a str,
+    source: &'a str,
+    target: PlannedActionTarget<'a>,
+    platform: &'a str,
+    features: &'a [String],
+    dependencies: &'a [(String, Option<String>, Option<String>)],
+    profile: &'a [String],
+    profile_name: &'a str,
+    incremental: bool,
+    compiler_identity: &'a str,
+    environment: &'a [(String, String)],
+    environment_probes: &'a [(String, String)],
+    rustflags: &'a [String],
+    lints: &'a [String],
+    clippy: &'a str,
+    clippy_args: &'a [String],
+    cap_lints: bool,
     tools: &'a [String],
+    toolchain: &'a str,
+}
+
+/// Compute every cache identity from declared inputs and producer action
+/// identities. No action result is loaded here: output bytes and build-script
+/// directives are resolved only if an action later needs to execute.
+fn compute_action_keys(ctx: &Ctx) -> Result<Vec<String>> {
+    fn key_of(ctx: &Ctx, index: usize, keys: &[OnceLock<String>]) -> Result<String> {
+        let dependency_edges: Vec<(usize, Option<String>)> = ctx.units[index]
+            .deps
+            .iter()
+            .map(|dependency| (dependency.unit, dependency.extern_name.clone()))
+            .collect();
+
+        let unit = &ctx.units[index];
+        let package = &ctx.meta.packages[unit.pkg];
+        let source_hash = ctx.pkg_src_hash(unit.pkg)?;
+        let mut features = unit.features.clone();
+        features.sort();
+        let (crate_name, crate_type, source) = compile_identity(ctx, index);
+        // Producer keys recursively include their own inputs, so direct action
+        // references cover the full implementation closure. Unlike the old
+        // output-hash scheme, linking actions do not need to flatten every
+        // transitive artifact into their keys.
+        let mut dependencies = Vec::new();
+        for (dependency, extern_name) in &dependency_edges {
+            let producer = keys[*dependency]
+                .get()
+                .context("dependency action key missing")?;
+            let output = if extern_name.is_some() {
+                if is_pipelined(ctx, index) && is_pipelined(ctx, *dependency) {
+                    let (dependency_crate, _, _) = compile_identity(ctx, *dependency);
+                    Some(format!(
+                        "lib{dependency_crate}-{}.rmeta",
+                        action_extra_filename(ctx, *dependency, producer)
+                    ))
+                } else {
+                    planned_main_output(ctx, *dependency, producer)?
+                }
+            } else if matches!(ctx.units[*dependency].kind, Kind::Bsc) {
+                planned_main_output(ctx, *dependency, producer)?
+            } else {
+                None
+            };
+            dependencies.push((producer.clone(), output, extern_name.clone()));
+        }
+        dependencies.sort();
+
+        let mut package_environment = ctx.pkg_env(package);
+        package_environment.extend(ctx.config_env.iter().cloned());
+        package_environment.sort();
+        let mut probes = ctx
+            .env_probes
+            .iter()
+            .filter(|(_, _, packages, profiles)| {
+                packages.iter().any(|candidate| candidate == &package.name)
+                    && (profiles.is_empty()
+                        || profiles.iter().any(|profile| profile == &unit.profile.name))
+            })
+            .map(|(name, value, _, _)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        probes.sort();
+        let platform = if unit.host {
+            ctx.host.as_str()
+        } else {
+            ctx.target.as_deref().unwrap_or(ctx.host.as_str())
+        };
+        let mut tools = if matches!(unit.kind, Kind::Bsr) {
+            ctx.tools
+                .iter()
+                .filter(|tool| tool.is_visible_to(&package.name, platform))
+                .map(|tool| tool.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        tools.sort();
+        let rustflags = if unit.host {
+            &ctx.host_rustflags
+        } else {
+            &ctx.target_rustflags
+        };
+        let lint_flags = if ctx.clippy && package.source.is_none() {
+            &ctx.lints[unit.pkg].with_clippy
+        } else {
+            &ctx.lints[unit.pkg].rustc_only
+        };
+        let profile_flags = effective_profile_flags(ctx, index);
+        let uses_toolchain = matches!(unit.kind, Kind::Bsr) || is_linking(ctx, index);
+        let key_input = PlannedActionKey {
+            kind: if matches!(unit.kind, Kind::Bsr) {
+                "run-build-script"
+            } else {
+                compile_action_kind(ctx, index)
+            },
+            tool: TOOL_VERSION,
+            rustc: &ctx.rustc_version,
+            host: &ctx.host,
+            package: (
+                &package.name,
+                &package.version,
+                package.source.as_deref().unwrap_or("local"),
+            ),
+            source_hash: &source_hash,
+            crate_name: &crate_name,
+            crate_type: &crate_type,
+            source: &source,
+            target: PlannedActionTarget {
+                name: &unit.target.name,
+                kind: &unit.target.kind,
+                crate_types: &unit.target.crate_types,
+                edition: &unit.target.edition,
+                test_harness: unit.test_harness,
+            },
+            platform,
+            features: &features,
+            dependencies: &dependencies,
+            profile: &profile_flags,
+            profile_name: &unit.profile.name,
+            incremental: ctx.incremental && unit.profile.incremental,
+            compiler_identity: &ctx.idents[index],
+            environment: &package_environment,
+            environment_probes: &probes,
+            rustflags,
+            lints: lint_flags,
+            clippy: if ctx.clippy && package.source.is_none() {
+                ctx.clippy_id.as_str()
+            } else {
+                ""
+            },
+            clippy_args: if ctx.clippy && package.source.is_none() {
+                ctx.clippy_args.as_slice()
+            } else {
+                &[]
+            },
+            cap_lints: package.source.is_some(),
+            tools: &tools,
+            toolchain: if uses_toolchain {
+                ctx.toolchain.as_str()
+            } else {
+                ""
+            },
+        };
+        let key = sha256_hex(&serde_json::to_vec(&key_input)?);
+        Ok(key)
+    }
+
+    // Source hashes are package-scoped. Populate the memo once before unit
+    // planning so sibling host/target/profile actions cannot duplicate a
+    // package scan when their keys are computed concurrently. Package scans
+    // are independent and include potentially large declared input trees, so
+    // run them in parallel rather than serializing the prepare stage.
+    let package_indices = ctx
+        .units
+        .iter()
+        .map(|unit| unit.pkg)
+        .collect::<BTreeSet<_>>();
+    let package_count = package_indices.len();
+    let package_indices = Mutex::new(package_indices.into_iter().collect::<VecDeque<_>>());
+    let source_hash_errors = Mutex::new(Vec::new());
+    let source_hash_workers = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(package_count.max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..source_hash_workers {
+            scope.spawn(|| loop {
+                let Some(package_index) = package_indices.lock().unwrap().pop_front() else {
+                    return;
+                };
+                if let Err(error) = ctx.pkg_src_hash(package_index) {
+                    source_hash_errors.lock().unwrap().push(error);
+                }
+            });
+        }
+    });
+    if let Some(error) = source_hash_errors.into_inner().unwrap().into_iter().next() {
+        return Err(error);
+    }
+
+    struct State {
+        ready: Vec<usize>,
+        remaining_dependencies: Vec<usize>,
+        in_flight: usize,
+        completed: usize,
+        errors: Vec<String>,
+    }
+
+    let unit_count = ctx.units.len();
+    let keys = (0..unit_count).map(|_| OnceLock::new()).collect::<Vec<_>>();
+    let mut reverse_dependencies = vec![Vec::new(); unit_count];
+    let mut remaining_dependencies = vec![0; unit_count];
+    for (index, unit) in ctx.units.iter().enumerate() {
+        remaining_dependencies[index] = unit.deps.len();
+        for dependency in &unit.deps {
+            reverse_dependencies[dependency.unit].push(index);
+        }
+    }
+    let ready = remaining_dependencies
+        .iter()
+        .enumerate()
+        .filter_map(|(index, remaining)| (*remaining == 0).then_some(index))
+        .collect();
+    let state = Mutex::new(State {
+        ready,
+        remaining_dependencies,
+        in_flight: 0,
+        completed: 0,
+        errors: Vec::new(),
+    });
+    let condition = Condvar::new();
+    let workers = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(unit_count.max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = {
+                    let mut state = state.lock().unwrap();
+                    loop {
+                        if let Some(index) = state.ready.pop() {
+                            state.in_flight += 1;
+                            break index;
+                        }
+                        if state.in_flight == 0 {
+                            return;
+                        }
+                        state = condition.wait(state).unwrap();
+                    }
+                };
+                let result = key_of(ctx, index, &keys);
+                let mut state = state.lock().unwrap();
+                state.in_flight -= 1;
+                match result {
+                    Ok(key) => {
+                        let _ = keys[index].set(key);
+                        state.completed += 1;
+                        for &dependent in &reverse_dependencies[index] {
+                            state.remaining_dependencies[dependent] -= 1;
+                            if state.remaining_dependencies[dependent] == 0 {
+                                state.ready.push(dependent);
+                            }
+                        }
+                    }
+                    Err(error) => state
+                        .errors
+                        .push(format!("[{}] {error:#}", describe(ctx, index))),
+                }
+                drop(state);
+                condition.notify_all();
+            });
+        }
+    });
+
+    let state = state.into_inner().unwrap();
+    if !state.errors.is_empty() {
+        bail!(
+            "{} action keys could not be planned:\n{}",
+            state.errors.len(),
+            state.errors.join("\n")
+        );
+    }
+    if state.completed != unit_count {
+        bail!(
+            "unit graph contains a cycle: planned {} of {unit_count} action keys",
+            state.completed
+        );
+    }
+    keys.into_iter()
+        .map(|key| {
+            key.into_inner()
+                .context("action key missing after planning")
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -3609,7 +4087,7 @@ fn build_inner(
         units.iter().map(|unit| unit.pkg),
         Path::new(&workspace_root),
     )?;
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         store,
         verbose,
         rustc,
@@ -3649,6 +4127,7 @@ fn build_inner(
         )
         .context("creating jobserver")?,
         idents,
+        action_keys: Vec::new(),
         logical_pkg_ids,
         report_unit_keys,
         check_mode,
@@ -3666,6 +4145,7 @@ fn build_inner(
         extra_inputs,
         report: Arc::clone(&recorder),
     };
+    ctx.action_keys = compute_action_keys(&ctx)?;
 
     register_report_units(&ctx);
     finish_report_stage(&recorder, "prepare", report_stage_start);
@@ -3712,7 +4192,7 @@ fn build_inner(
             ctx.store.export(&m.hash, &dest, true)?;
             let name = u.target.name.clone();
             let cwd = ctx.meta.packages[u.pkg].root();
-            let binary_environment = binary_executable_environment(&ctx, u, &results)?;
+            let binary_environment = binary_executable_environment(&ctx, u)?;
             if matches!(mode, Mode::Test) {
                 if u.test_harness {
                     let pass_key = test_pass_key(&r.key)?;
@@ -4530,11 +5010,10 @@ impl Ctx {
             .join("out")
     }
 
-    /// Lay out an action's cached outputs where consumers expect them: the
-    /// artifacts rustc links against go in the shared pool, and the debug
-    /// objects of a linked image go in that image's debug directory, under
-    /// the exact names its debug map records.
-    fn materialize(&self, action_key: &str, res: &ActionResult) -> Result<()> {
+    /// Lay out an action's cached compiler outputs where consumers expect them:
+    /// artifacts rustc links against go in the shared pool, while debug objects
+    /// of a linked image go under the paths its debug map records.
+    fn materialize_action(&self, action_key: &str, res: &ActionResult) -> Result<()> {
         for o in &res.outputs {
             if is_debug_object(&o.name) {
                 self.store
@@ -4547,7 +5026,60 @@ impl Ctx {
         Ok(())
     }
 
-    fn try_cache_hit(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
+    fn materialize_out_dir(&self, key: &str, archive: &OutDirArchive) -> Result<()> {
+        let parent = self.store.root.join("outdirs").join(key);
+        let sentinel = parent.join(".ok");
+        if sentinel.is_file() {
+            Store::touch_used(&sentinel);
+            return Ok(());
+        }
+
+        let lock_path = self.store.root.join("outdirs").join(format!("{key}.lock"));
+        let lock = fs::File::create(&lock_path)?;
+        lock.lock()
+            .with_context(|| format!("locking OUT_DIR for action {key}"))?;
+        self.restore_out_dir_locked(key, archive)
+    }
+
+    /// Restore an OUT_DIR while its per-action lock is already held.
+    ///
+    /// Build-script execution performs the second cache lookup while holding
+    /// this same lock, so keeping lock acquisition out of this helper avoids a
+    /// self-deadlock when a concurrent winner published an archive but its
+    /// local materialization was removed.
+    fn restore_out_dir_locked(&self, key: &str, archive: &OutDirArchive) -> Result<()> {
+        let parent = self.store.root.join("outdirs").join(key);
+        let sentinel = parent.join(".ok");
+        if sentinel.is_file() {
+            Store::touch_used(&sentinel);
+            return Ok(());
+        }
+
+        if parent.exists() {
+            fs::remove_dir_all(&parent).context("clearing incomplete cached OUT_DIR")?;
+        }
+        let staging = self.store.tmp_path("out-dir-restore");
+        let staging_out = staging.join("out");
+        fs::create_dir_all(&staging_out)?;
+        let restored = (|| -> Result<()> {
+            let file = fs::File::open(self.store.cache_path(&archive.hash))
+                .context("opening cached OUT_DIR archive")?;
+            crate::out_dir_archive::extract_out_dir(file, &staging_out)?;
+            fs::write(staging.join(".ok"), b"ok\n")?;
+            fs::rename(&staging, &parent)
+                .with_context(|| format!("installing cached OUT_DIR {}", parent.display()))?;
+            Ok(())
+        })();
+        if restored.is_err() {
+            fs::remove_dir_all(&staging).ok();
+        }
+        restored
+    }
+
+    /// Load and validate an action record without creating any consumer-visible
+    /// paths. Demand evaluation can therefore inspect a cached parent without
+    /// materializing anything beneath it.
+    fn lookup_action(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
         let Some(bytes) = self.store.load_action(key) else {
             return Ok(Err(CacheMiss::NotFound));
         };
@@ -4561,15 +5093,22 @@ impl Ctx {
             }
             Store::touch_used(&p);
         }
-        if res.bs.is_some() {
-            let ok = self.store.root.join("outdirs").join(key).join(".ok");
-            if !ok.exists() {
-                return Ok(Err(CacheMiss::SentinelMissing));
+        if let Some(archive) = &res.out_dir {
+            let path = self.store.cache_path(&archive.hash);
+            if !path.exists() {
+                return Ok(Err(CacheMiss::BlobMissing));
             }
-            Store::touch_used(&ok);
+            Store::touch_used(&path);
         }
-        self.materialize(key, &res)?;
         Ok(Ok(res))
+    }
+
+    fn try_cache_hit(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
+        let result = self.lookup_action(key)?;
+        if let Ok(action) = &result {
+            self.materialize_action(key, action)?;
+        }
+        Ok(result)
     }
 
     fn pkg_src_hash(&self, pi: usize) -> Result<String> {
@@ -5511,6 +6050,138 @@ fn report_unit_keys(meta: &Metadata, units: &[Unit], logical_pkg_ids: &[String])
         .collect()
 }
 
+fn planned_compile_report_key_inputs(
+    ctx: &Ctx,
+    index: usize,
+) -> Result<crate::report::ActionKeyInputs> {
+    let unit = &ctx.units[index];
+    let package = &ctx.meta.packages[unit.pkg];
+    let (_, crate_type, _) = compile_identity(ctx, index);
+    let mut environment = ctx.pkg_env(package);
+    environment.extend(ctx.config_env.iter().cloned());
+    environment.extend(binary_executable_environment(ctx, unit)?);
+    if matches!(unit.kind, Kind::Bin) {
+        environment.push(("CARGO_BIN_NAME".to_string(), unit.target.name.clone()));
+    }
+    if matches!(unit.kind, Kind::Test)
+        && unit
+            .target
+            .kind
+            .iter()
+            .any(|kind| kind == "test" || kind == "bench")
+    {
+        environment.push((
+            "CARGO_TARGET_TMPDIR".to_string(),
+            "/tmp/corgi/target-tmp".to_string(),
+        ));
+    }
+
+    let mut link_dependencies = Vec::new();
+    if is_linking(ctx, index) {
+        let mut seen = vec![false; ctx.units.len()];
+        let mut stack = unit
+            .deps
+            .iter()
+            .map(|dependency| dependency.unit)
+            .collect::<Vec<_>>();
+        while let Some(dependency) = stack.pop() {
+            if seen[dependency] {
+                continue;
+            }
+            seen[dependency] = true;
+            if planned_main_output(ctx, dependency, &ctx.action_keys[dependency])?.is_some() {
+                link_dependencies.push(ctx.report_unit_keys[dependency].clone());
+            }
+            for child in &ctx.units[dependency].deps {
+                stack.push(child.unit);
+            }
+        }
+        link_dependencies.sort();
+        link_dependencies.dedup();
+    }
+    let build_script = unit
+        .deps
+        .iter()
+        .find(|dependency| {
+            matches!(ctx.units[dependency.unit].kind, Kind::Bsr)
+                && ctx.units[dependency.unit].pkg == unit.pkg
+        })
+        .map(|dependency| ctx.report_unit_keys[dependency.unit].clone());
+    let clippy = ctx.clippy && package.source.is_none();
+    let lints = if clippy {
+        &ctx.lints[unit.pkg].with_clippy
+    } else {
+        &ctx.lints[unit.pkg].rustc_only
+    };
+    Ok(crate::report::ActionKeyInputs::Compile(Box::new(
+        crate::report::CompileKeyInputs {
+            source_hash: ctx.pkg_src_hash(unit.pkg)?,
+            declared_environment: ctx
+                .config_env
+                .iter()
+                .map(|(name, value)| crate::report::EnvironmentInput {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            effective_environment_hash: sha256_hex(serde_json::to_string(&environment)?.as_bytes()),
+            link_dependencies,
+            build_script,
+            lints: lints.clone(),
+            clippy: clippy.then(|| ctx.clippy_id.clone()),
+            cap_lints: package.source.is_some(),
+            uses_toolchain: crate_type != "lib" && !is_checked(ctx, index),
+            compiler_identity: ctx.idents[index].clone(),
+        },
+    )))
+}
+
+fn planned_build_script_report_key_inputs(
+    ctx: &Ctx,
+    index: usize,
+) -> Result<crate::report::ActionKeyInputs> {
+    let unit = &ctx.units[index];
+    let package = &ctx.meta.packages[unit.pkg];
+    let script = unit
+        .deps
+        .iter()
+        .find(|dependency| matches!(ctx.units[dependency.unit].kind, Kind::Bsc))
+        .map(|dependency| ctx.report_unit_keys[dependency.unit].clone())
+        .context("build script compile dependency missing")?;
+    let (environment, declared_environment, visible_tools) =
+        build_script_environment(ctx, unit, package);
+    Ok(crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
+        crate::report::BuildScriptRunKeyInputs {
+            source_hash: ctx.pkg_src_hash(unit.pkg)?,
+            script,
+            declared_environment: declared_environment
+                .into_iter()
+                .map(|(name, value)| crate::report::EnvironmentInput { name, value })
+                .collect(),
+            effective_environment_hash: sha256_hex(serde_json::to_string(&environment)?.as_bytes()),
+            tools: visible_tools
+                .into_iter()
+                .map(|tool| crate::report::ToolInput {
+                    name: tool.name.clone(),
+                    version: tool.version.clone(),
+                    identity: tool.id.clone(),
+                    environment_name: tool.env.clone(),
+                    environment_value: tool.value.clone(),
+                })
+                .collect(),
+            uses_toolchain: true,
+        },
+    )))
+}
+
+fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::ActionKeyInputs> {
+    if matches!(ctx.units[index].kind, Kind::Bsr) {
+        planned_build_script_report_key_inputs(ctx, index)
+    } else {
+        planned_compile_report_key_inputs(ctx, index)
+    }
+}
+
 fn register_report_units(ctx: &Ctx) {
     let workspace_members: std::collections::HashSet<&str> = ctx
         .meta
@@ -5589,7 +6260,11 @@ fn register_report_units(ctx: &Ctx) {
                 root: package.root().display().to_string(),
             },
             action: crate::report::UnitAction {
-                kind: action_kind.to_string(),
+                kind: if matches!(unit.kind, Kind::Bsr) {
+                    action_kind.to_string()
+                } else {
+                    compile_action_kind(ctx, id).replace('-', "_")
+                },
                 host: unit.host,
                 is_root: unit.is_root,
             },
@@ -5625,12 +6300,202 @@ fn register_report_units(ctx: &Ctx) {
                 result: crate::report::UnitCacheResult::NotChecked,
                 probe: None,
             },
-            key: None,
+            key: Some(crate::report::UnitKey {
+                hash: ctx.action_keys[id].clone(),
+                inputs: None,
+            }),
             timings: None,
             outputs: Vec::new(),
         };
         ctx.report.update(|report| report.units.push(report_unit));
     }
+}
+
+fn populate_report_key_inputs(ctx: &Ctx, index: usize) -> Result<()> {
+    let inputs = planned_report_key_inputs(ctx, index)?;
+    ctx.report.update(|report| {
+        if let Some(key) = &mut report.units[index].key {
+            key.inputs = Some(inputs);
+        }
+    });
+    Ok(())
+}
+
+fn cached_unit_result(
+    ctx: &Ctx,
+    index: usize,
+    result: ActionResult,
+    phases: Phases,
+) -> Result<Option<UnitResult>> {
+    let key = ctx.action_keys[index].clone();
+    if matches!(ctx.units[index].kind, Kind::Bsr) {
+        if result.bs.is_none() || result.out_dir.is_none() {
+            return Ok(None);
+        }
+        ctx.report.update(|report| {
+            report.units[index].cache = crate::report::UnitCache {
+                result: crate::report::UnitCacheResult::Hit,
+                probe: Some("found".to_string()),
+            };
+        });
+        return Ok(Some(UnitResult {
+            key,
+            cached: true,
+            res: result,
+            main: None,
+            phases,
+        }));
+    }
+
+    let unit = &ctx.units[index];
+    let package = &ctx.meta.packages[unit.pkg];
+    // The action key predicts the outputs that make a record usable. Require
+    // those outputs even for `check` actions, while permitting rustc to add
+    // auxiliary outputs that are harmless to retain in the record.
+    let expected = planned_outputs(ctx, index, &key)?;
+    if !expected
+        .iter()
+        .all(|name| result.outputs.iter().any(|output| &output.name == name))
+    {
+        return Ok(None);
+    }
+    ctx.materialize_action(&key, &result)?;
+    if !result.stderr.is_empty() && package.source.is_none() {
+        eprint!("{}", result.stderr);
+    }
+    ctx.report.update(|report| {
+        report.units[index].cache = crate::report::UnitCache {
+            result: crate::report::UnitCacheResult::Hit,
+            probe: Some("found".to_string()),
+        };
+    });
+    finish_compile(&expected, key, true, result, phases).map(Some)
+}
+
+fn requested_units(ctx: &Ctx) -> Vec<usize> {
+    let mut requested = ctx
+        .units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| unit.is_root.then_some(index))
+        .collect::<Vec<_>>();
+    // Integration tests and benchmarks receive CARGO_BIN_EXE_* paths at
+    // runtime. A cached harness therefore still needs those binaries even
+    // though it does not need its ordinary build dependency closure.
+    let harnesses = requested.clone();
+    for index in harnesses {
+        let unit = &ctx.units[index];
+        if !matches!(unit.kind, Kind::Test) {
+            continue;
+        }
+        for dependency in &unit.deps {
+            let binary = &ctx.units[dependency.unit];
+            if binary.pkg == unit.pkg
+                && matches!(binary.kind, Kind::Bin)
+                && binary.target.kind.iter().any(|kind| kind == "bin")
+            {
+                requested.push(dependency.unit);
+            }
+        }
+    }
+    requested.sort_unstable();
+    requested.dedup();
+    requested
+}
+
+/// Probe requested outputs from the top down. A requested hit is self-contained
+/// and cuts off its build dependencies. Once an ancestor misses, continue
+/// through cached intermediate actions: rustc resolves transitive crate
+/// metadata from the shared pool, so their dependency artifacts must also be
+/// materialized even though those actions do not execute.
+fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bool>, usize)> {
+    fn demand(
+        ctx: &Ctx,
+        index: usize,
+        descend: bool,
+        needed: &mut [bool],
+        expanded: &mut [bool],
+        results: &[OnceLock<UnitResult>],
+        cached: &mut usize,
+    ) -> Result<()> {
+        if !needed[index] {
+            needed[index] = true;
+            populate_report_key_inputs(ctx, index)?;
+            let started = Instant::now();
+            let lookup = ctx.lookup_action(&ctx.action_keys[index])?;
+            let phases = Phases {
+                cache_ns: started.elapsed().as_nanos() as u64,
+                ..Phases::default()
+            };
+            let miss = match lookup {
+                Ok(action) => match cached_unit_result(ctx, index, action, phases)? {
+                    Some(mut result) => {
+                        result.phases.cache_ns = started.elapsed().as_nanos() as u64;
+                        let _ = results[index].set(result);
+                        *cached += 1;
+                        None
+                    }
+                    None => {
+                        fs::remove_file(ctx.store.action_path(&ctx.action_keys[index])).ok();
+                        Some(CacheMiss::OutputMismatch)
+                    }
+                },
+                Err(miss) => Some(miss),
+            };
+            if let Some(miss) = miss {
+                ctx.report.update(|report| {
+                    report.units[index].cache = crate::report::UnitCache {
+                        result: crate::report::UnitCacheResult::Miss,
+                        probe: Some(miss.name().to_string()),
+                    };
+                });
+                expanded[index] = true;
+                for dependency in &ctx.units[index].deps {
+                    demand(
+                        ctx,
+                        dependency.unit,
+                        true,
+                        needed,
+                        expanded,
+                        results,
+                        cached,
+                    )?;
+                }
+            }
+        }
+
+        if descend && !expanded[index] {
+            expanded[index] = true;
+            for dependency in &ctx.units[index].deps {
+                demand(
+                    ctx,
+                    dependency.unit,
+                    true,
+                    needed,
+                    expanded,
+                    results,
+                    cached,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut needed = vec![false; ctx.units.len()];
+    let mut expanded = vec![false; ctx.units.len()];
+    let mut cached = 0;
+    for index in requested_units(ctx) {
+        demand(
+            ctx,
+            index,
+            false,
+            &mut needed,
+            &mut expanded,
+            results,
+            &mut cached,
+        )?;
+    }
+    Ok((needed, cached))
 }
 
 struct SchedState {
@@ -5645,14 +6510,19 @@ struct SchedState {
 
 fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize)> {
     let n = ctx.units.len();
+    let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
-    // linker consumes every rlib, and closure rlib hashes enter its key).
+    // linker consumes every rlib). Cache identity was already established
+    // from producer action keys during planning.
     let mut rdeps_meta: Vec<Vec<usize>> = vec![vec![]; n];
     let mut rdeps_full: Vec<Vec<usize>> = vec![vec![]; n];
     let mut indeg = vec![0usize; n];
     for (i, u) in ctx.units.iter().enumerate() {
+        if !needed[i] || results[i].get().is_some() {
+            continue;
+        }
         let mut required: std::collections::HashSet<(usize, bool)> =
             std::collections::HashSet::new();
         let self_meta_ok = !is_linking(ctx, i);
@@ -5676,6 +6546,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 }
             }
         }
+        required.retain(|(dependency, _)| results[*dependency].get().is_none());
         indeg[i] = required.len();
         for (j, full) in required {
             if full {
@@ -5686,6 +6557,22 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         }
     }
     let metas: Vec<OnceLock<MetaOut>> = (0..n).map(|_| OnceLock::new()).collect();
+    for (index, result) in results.iter().enumerate() {
+        let Some(result) = result.get() else {
+            continue;
+        };
+        if let Some(metadata) = result
+            .res
+            .outputs
+            .iter()
+            .find(|output| output.name.ends_with(".rmeta"))
+        {
+            let _ = metas[index].set(MetaOut {
+                file: Store::pool_file_name(&metadata.name, &result.key),
+                hash: metadata.hash.clone(),
+            });
+        }
+    }
     // Per-unit wall-clock samples (ns since scheduling began); cheap
     // enough to collect always, reported only under --timings.
     let t_sched = Instant::now();
@@ -5697,18 +6584,20 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let t_end: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
-    let ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let ready: Vec<usize> = (0..n)
+        .filter(|&i| needed[i] && results[i].get().is_none() && indeg[i] == 0)
+        .collect();
     for &index in &ready {
         t_ready[index].store(0, Relaxed);
     }
     let state = Mutex::new(SchedState {
         ready,
         indeg,
-        done: 0,
+        done: preloaded_cached,
         in_flight: 0,
         errors: Vec::new(),
         executed: 0,
-        cached: 0,
+        cached: preloaded_cached,
     });
     let cv = Condvar::new();
     let meta_fired: Vec<std::sync::atomic::AtomicBool> = (0..n)
@@ -5732,10 +6621,15 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         drop(st);
         cv.notify_all();
     };
+    let missing = needed
+        .iter()
+        .enumerate()
+        .filter(|(index, needed)| **needed && results[*index].get().is_none())
+        .count();
     let workers = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
-        .min(n.max(1));
+        .min(missing.max(1));
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -5849,6 +6743,21 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 });
             }
             if let Some(result) = results[index].get() {
+                if result.cached && report.units[index].timings.is_none() {
+                    report.units[index].timings = Some(crate::report::UnitTimings {
+                        ready_ns: None,
+                        start_ns: None,
+                        metadata_ns: None,
+                        end_ns: None,
+                        key_ns: result.phases.key_ns,
+                        cache_ns: result.phases.cache_ns,
+                        compiler_ns: 0,
+                        validate_ns: 0,
+                        ingest_ns: 0,
+                        ingest_bytes: 0,
+                        finish_ns: 0,
+                    });
+                }
                 report.units[index].outcome = crate::report::UnitOutcome {
                     status: crate::report::UnitStatus::Success,
                     message: None,
@@ -6626,11 +7535,7 @@ fn finish_compile(
 
 /// Returns the package binaries Cargo exposes while compiling and running an
 /// integration test or benchmark.
-fn binary_executable_environment(
-    ctx: &Ctx,
-    unit: &Unit,
-    results: &[OnceLock<UnitResult>],
-) -> Result<Vec<(String, String)>> {
+fn binary_executable_environment(ctx: &Ctx, unit: &Unit) -> Result<Vec<(String, String)>> {
     if !matches!(unit.kind, Kind::Test)
         || !unit
             .target
@@ -6650,16 +7555,10 @@ fn binary_executable_environment(
         {
             continue;
         }
-        let result = results[dependency.unit]
-            .get()
-            .context("binary dependency result missing")?;
-        let output = result
-            .main
-            .as_ref()
+        let key = &ctx.action_keys[dependency.unit];
+        let output = planned_main_output(ctx, dependency.unit, key)?
             .context("binary dependency artifact missing")?;
-        let path = ctx
-            .pool_logical
-            .join(Store::pool_file_name(&output.name, &result.key));
+        let path = ctx.pool_logical.join(Store::pool_file_name(&output, key));
         environment.push((
             format!("CARGO_BIN_EXE_{}", binary.target.name),
             path.display().to_string(),
@@ -6718,12 +7617,12 @@ fn compile(
     let mut bs: &BuildScriptOut = &default_bs;
     let mut out_key = String::new();
     let mut externs: Vec<(String, String, String)> = Vec::new();
-    let mut build_script_unit_id = None;
     for d in &unit.deps {
         if let Some(name) = &d.extern_name {
             if self_pipelined && is_pipelined(ctx, d.unit) {
-                // pipelined edge: compile against the dep's rmeta, keyed by
-                // the rmeta's bytes (what this action actually consumes)
+                // A pipelined edge executes against the dependency's rmeta.
+                // Its producer action key and predictable filename were
+                // already incorporated into this action key during planning.
                 let m = metas[d.unit].get().context("dependency rmeta missing")?;
                 externs.push((name.clone(), m.file.clone(), m.hash.clone()));
             } else {
@@ -6734,10 +7633,15 @@ fn compile(
             }
         } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
             let r = results[d.unit].get().context("dependency result missing")?;
+            let archive = r
+                .res
+                .out_dir
+                .as_ref()
+                .context("build script OUT_DIR archive missing")?;
+            ctx.materialize_out_dir(&r.key, archive)?;
             if let Some(b) = &r.res.bs {
                 bs = b;
                 out_key = r.key.clone();
-                build_script_unit_id = Some(d.unit);
             }
         }
     }
@@ -6755,35 +7659,6 @@ fn compile(
     ];
     check_cfgs.extend(bs.check_cfgs.iter().cloned());
 
-    // Linking units consume every transitive rlib: enumerate the closure's
-    // artifacts into the key (the interface chain is cut by rmeta keying,
-    // so implementations must be pinned flat, at the link).
-    let mut link_closure: Vec<(String, String)> = Vec::new();
-    let mut report_link_dependencies = Vec::new();
-    if is_linking(ctx, uidx) {
-        let mut seen = vec![false; ctx.units.len()];
-        let mut stack: Vec<usize> = unit.deps.iter().map(|d| d.unit).collect();
-        while let Some(i) = stack.pop() {
-            if seen[i] {
-                continue;
-            }
-            seen[i] = true;
-            if let Some(r) = results[i].get() {
-                if let Some(m) = &r.main {
-                    link_closure.push((m.name.clone(), m.hash.clone()));
-                    report_link_dependencies.push(ctx.report_unit_keys[i].clone());
-                }
-            }
-            for d in &ctx.units[i].deps {
-                stack.push(d.unit);
-            }
-        }
-        link_closure.sort();
-        link_closure.dedup();
-        report_link_dependencies.sort();
-        report_link_dependencies.dedup();
-    }
-
     let mut link_search: Vec<String> = bs.link_search.clone();
     let mut link_args: Vec<String> = Vec::new();
     if matches!(unit.kind, Kind::Bin) {
@@ -6799,6 +7674,14 @@ fn compile(
             seen[i] = true;
             if let Some(r) = results[i].get() {
                 if let Some(b) = &r.res.bs {
+                    if !b.link_search.is_empty() {
+                        let archive = r
+                            .res
+                            .out_dir
+                            .as_ref()
+                            .context("native build script OUT_DIR archive missing")?;
+                        ctx.materialize_out_dir(&r.key, archive)?;
+                    }
                     for s in &b.link_search {
                         if !link_search.contains(s) {
                             link_search.push(s.clone());
@@ -6814,7 +7697,7 @@ fn compile(
 
     let mut env = ctx.pkg_env(pkg);
     env.extend(ctx.config_env.iter().cloned());
-    env.extend(binary_executable_environment(ctx, unit, results)?);
+    env.extend(binary_executable_environment(ctx, unit)?);
     if matches!(unit.kind, Kind::Bin) {
         env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
     }
@@ -6837,7 +7720,6 @@ fn compile(
     };
     let t_phase = Instant::now();
     let mut phases = Phases::default();
-    let src_hash = ctx.pkg_src_hash(unit.pkg)?;
     let cap_lints = pkg.source.is_some();
 
     // Per-unit resolved profile straight from cargo's unit graph.
@@ -6848,33 +7730,7 @@ fn compile(
     } else {
         prof.debuginfo_flag()
     };
-    let mut pflags: Vec<String> = vec![
-        format!(
-            "-Copt-level={}",
-            if prof.opt_level.is_empty() {
-                "0"
-            } else {
-                prof.opt_level.as_str()
-            }
-        ),
-        format!(
-            "-Cdebug-assertions={}",
-            if prof.debug_assertions { "on" } else { "off" }
-        ),
-        format!(
-            "-Coverflow-checks={}",
-            if prof.overflow_checks { "on" } else { "off" }
-        ),
-        format!("-Cdebuginfo={debuginfo}"),
-        format!("-Cstrip={}", prof.strip_flag()),
-        "-Cembed-bitcode=no".to_string(),
-    ];
-    if let Some(n) = prof.codegen_units {
-        pflags.push(format!("-Ccodegen-units={n}"));
-    }
-    if !prof.panic.is_empty() && prof.panic != "unwind" && !matches!(unit.kind, Kind::Test) {
-        pflags.push(format!("-Cpanic={}", prof.panic));
-    }
+    let pflags = effective_profile_flags(ctx, uidx);
     // Lints and (in clippy mode) the executor swap. Like cargo's
     // workspace wrapper, clippy-driver runs for EVERY unit of local
     // packages — checked units and the codegen closure (proc-macros,
@@ -6902,106 +7758,12 @@ fn compile(
     // the compile either way, so they are always the unpacked kind.
     let unpacked_debug_objects =
         debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
-    let key_inputs = CompileKey {
-        kind: if clippy_action {
-            if self_checked {
-                "clippy"
-            } else {
-                "clippy-compile"
-            }
-        } else if self_checked {
-            "check"
-        } else if matches!(unit.kind, Kind::Test) {
-            "compile-test"
-        } else {
-            "compile"
-        },
-        tool: TOOL_VERSION,
-        rustc: &ctx.rustc_version,
-        host: &ctx.host,
-        pkg: [
-            &pkg.name,
-            &pkg.version,
-            pkg.source.as_deref().unwrap_or("local"),
-        ],
-        src_hash: &src_hash,
-        crate_name: &crate_name,
-        edition: &target.edition,
-        crate_type,
-        src_rel: &src_rel,
-        features: &features,
-        externs: &externs,
-        link_closure: &link_closure,
-        cfgs: &bs.cfgs,
-        check_cfgs: &check_cfgs,
-        renvs: &bs.envs,
-        link_libs: &bs.link_libs,
-        link_search: &link_search,
-        link_args: &link_args,
-        out_key: &out_key,
-        profile: &pflags,
-        lints: lint_flags,
-        clippy: if clippy_action { &ctx.clippy_id } else { "" },
-        clippy_args: clippy_action
-            .then_some(ctx.clippy_args.as_slice())
-            .filter(|args| !args.is_empty()),
-        incr: incr_action,
-        ident: &ctx.idents[uidx],
-        env: &env,
-        cap_lints,
-        rustflags: unit_rustflags,
-        toolchain: if crate_type == "lib" || self_checked {
-            ""
-        } else {
-            &ctx.toolchain
-        },
-        tgt: if unit.host {
-            ""
-        } else {
-            ctx.target.as_deref().unwrap_or("")
-        },
-    };
-    let key_json = serde_json::to_string(&key_inputs)?;
-    let key = sha256_hex(key_json.as_bytes());
-    let effective_environment_hash = sha256_hex(serde_json::to_string(key_inputs.env)?.as_bytes());
-    let report_key_inputs =
-        crate::report::ActionKeyInputs::Compile(Box::new(crate::report::CompileKeyInputs {
-            source_hash: key_inputs.src_hash.to_string(),
-            declared_environment: ctx
-                .config_env
-                .iter()
-                .map(|(name, value)| crate::report::EnvironmentInput {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-            effective_environment_hash,
-            link_dependencies: report_link_dependencies,
-            build_script: build_script_unit_id.map(|unit_id| ctx.report_unit_keys[unit_id].clone()),
-            lints: key_inputs.lints.to_vec(),
-            clippy: (!key_inputs.clippy.is_empty()).then(|| key_inputs.clippy.to_string()),
-            cap_lints: key_inputs.cap_lints,
-            uses_toolchain: !key_inputs.toolchain.is_empty(),
-            compiler_identity: key_inputs.ident.to_string(),
-        }));
-    ctx.report.update(|report| {
-        let unit = &mut report.units[uidx];
-        unit.action.kind = key_inputs.kind.replace('-', "_");
-        unit.key = Some(crate::report::UnitKey {
-            hash: key.clone(),
-            inputs: report_key_inputs,
-        });
-    });
-    let k16: String = key[..16].to_string();
+    let key = ctx.action_keys[uidx].clone();
     // Incremental units use the identity hash, not the action key, in
     // -Cextra-filename: rustc's dep graph embeds the output file names,
     // so a key-derived (source-dependent) value marks every saved session
     // red on each edit. Clean-namespace units keep the key-unique k16.
-    let ef16: String = if incr_action {
-        ctx.idents[uidx].clone()
-    } else {
-        k16.clone()
-    };
+    let ef16 = action_extra_filename(ctx, uidx, &key);
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
     // A cached record stands in for this compile only when it covers the
@@ -7009,11 +7771,7 @@ fn compile(
     // by a buggy or interrupted run. `probe` names how the record was found,
     // for the report.
     let cached_result = |res: ActionResult, probe: &str, phases: Phases| {
-        let expected: Vec<String> = if self_checked {
-            res.outputs.iter().map(|o| o.name.clone()).collect()
-        } else {
-            expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
-        };
+        let expected = planned_outputs(ctx, uidx, &key)?;
         if !expected
             .iter()
             .all(|e| res.outputs.iter().any(|o| &o.name == e))
@@ -7031,39 +7789,6 @@ fn compile(
         }
         finish_compile(&expected, key.clone(), true, res, phases).map(Some)
     };
-
-    let t_cache = Instant::now();
-    let (hit, cache_miss) = match ctx.try_cache_hit(&key)? {
-        Ok(result) => (Some(result), None),
-        Err(miss) => {
-            ctx.report.update(|report| {
-                report.units[uidx].cache = crate::report::UnitCache {
-                    result: crate::report::UnitCacheResult::Miss,
-                    probe: Some(miss.name().to_string()),
-                };
-            });
-            (None, Some(miss))
-        }
-    };
-    phases.cache_ns = t_cache.elapsed().as_nanos() as u64;
-    if let Some(res) = hit {
-        if let Some(result) = cached_result(res, "found", phases)? {
-            return Ok(result);
-        }
-        // Heal by dropping the record and re-executing.
-        eprintln!(
-            "{:>12} corrupt action record for {} ({crate_name})",
-            "Discarding", pkg.name
-        );
-        ctx.report.update(|report| {
-            report.units[uidx].cache = crate::report::UnitCache {
-                result: crate::report::UnitCacheResult::Miss,
-                probe: Some(CacheMiss::OutputMismatch.name().to_string()),
-            };
-        });
-        fs::remove_file(ctx.store.action_path(&key)).ok();
-    }
-    let _ = cache_miss;
 
     // Incremental state: store-managed, scoped per (checkout, crate,
     // crate-type, mode, platform, profile) so histories never cross;
@@ -7476,12 +8201,9 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         outputs,
         stderr,
         bs: None,
+        out_dir: None,
     };
-    let expected: Vec<String> = if self_checked {
-        res.outputs.iter().map(|o| o.name.clone()).collect()
-    } else {
-        expected_outputs(ctx, &crate_name, &ef16, crate_type, unit.host)?
-    };
+    let expected = planned_outputs(ctx, uidx, &key)?;
     // Never record an action whose outputs are incomplete: a poisoned
     // record would replay the failure from cache on every future run.
     for e in &expected {
@@ -7493,58 +8215,28 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         }
     }
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    ctx.materialize(&key, &res)?;
+    ctx.materialize_action(&key, &res)?;
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
     finish_compile(&expected, key, false, res, phases)
 }
 
-fn run_build_script(
-    ctx: &Ctx,
-    uidx: usize,
-    results: &[OnceLock<UnitResult>],
-) -> Result<UnitResult> {
-    let unit = &ctx.units[uidx];
-    let pkg = &ctx.meta.packages[unit.pkg];
-    let pkg_root = pkg.root();
-
-    let mut script: Option<OutputFile> = None;
-    let mut script_key = String::new();
-    let mut script_unit_id = None;
-    let mut dep_env: Vec<(String, String)> = Vec::new();
-    for d in &unit.deps {
-        let r = results[d.unit].get().context("dep result missing")?;
-        match ctx.units[d.unit].kind {
-            Kind::Bsc => {
-                script = r.main.clone();
-                script_key = r.key.clone();
-                script_unit_id = Some(d.unit);
-            }
-            Kind::Bsr => {
-                let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
-                if let (Some(links), Some(b)) = (&dpkg.links, &r.res.bs) {
-                    let l = links.to_uppercase().replace('-', "_");
-                    for (k, v) in &b.metadata {
-                        dep_env.push((
-                            format!("DEP_{l}_{}", k.to_uppercase().replace('-', "_")),
-                            v.clone(),
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let script = script.context("build script binary missing")?;
-
+fn build_script_environment<'a>(
+    ctx: &'a Ctx,
+    unit: &Unit,
+    pkg: &Package,
+) -> (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<&'a ToolRt>,
+) {
     let mut env = ctx.pkg_env(pkg);
     let mut declared_environment = ctx.config_env.clone();
-    let plat_triple = if unit.host {
+    let platform = if unit.host {
         ctx.host.clone()
     } else {
         ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
     };
-    let cross_compiling = plat_triple != ctx.host;
-    env.push(("TARGET".into(), plat_triple.clone()));
+    env.push(("TARGET".into(), platform.clone()));
     env.push(("HOST".into(), ctx.host.clone()));
     env.push(("PROFILE".into(), unit.profile.env_name().into()));
     env.push((
@@ -7562,7 +8254,7 @@ fn run_build_script(
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    if cross_compiling {
+    if platform != ctx.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
             let target_environment = target.replace('-', "_");
             for (name, value) in [
@@ -7598,131 +8290,85 @@ fn run_build_script(
         env.push(("CARGO_MANIFEST_LINKS".into(), links.clone()));
     }
     // Scoped settings: only the tools and env probes naming this package
-    // reach it, and only their identity hashes enter this action's key.
-    let visible_tools: Vec<&ToolRt> = ctx
+    // reach it.
+    let visible_tools = ctx
         .tools
         .iter()
-        .filter(|tool| tool.is_visible_to(&pkg.name, &plat_triple))
-        .collect();
-    for t in &visible_tools {
-        env.push((t.env.clone(), t.value.clone()));
+        .filter(|tool| tool.is_visible_to(&pkg.name, &platform))
+        .collect::<Vec<_>>();
+    for tool in &visible_tools {
+        env.push((tool.env.clone(), tool.value.clone()));
     }
-    for (name, value, pkgs, profiles) in &ctx.env_probes {
-        if pkgs.iter().any(|p| p == &pkg.name)
-            && (profiles.is_empty() || profiles.iter().any(|pr| pr == &unit.profile.name))
+    for (name, value, packages, profiles) in &ctx.env_probes {
+        if packages.iter().any(|package| package == &pkg.name)
+            && (profiles.is_empty() || profiles.iter().any(|profile| profile == &unit.profile.name))
         {
-            env.push((name.clone(), value.clone())); // keyed via the env vec
+            env.push((name.clone(), value.clone()));
             declared_environment.push((name.clone(), value.clone()));
         }
     }
-    let mut tool_ids: Vec<String> = visible_tools.iter().map(|t| t.id.clone()).collect();
-    tool_ids.sort();
-    let plat_cfg = if unit.host {
+    let platform_cfg = if unit.host {
         &ctx.cfg_env
     } else {
         &ctx.cfg_env_target
     };
-    for (k, v) in plat_cfg {
-        env.push((k.clone(), v.clone()));
+    for (name, value) in platform_cfg {
+        env.push((name.clone(), value.clone()));
     }
     let mut features = unit.features.clone();
     features.sort();
-    for f in &features {
+    for feature in &features {
         env.push((
-            format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")),
+            format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_")),
             "1".into(),
         ));
     }
     env.sort();
-    dep_env.sort();
     declared_environment.sort();
+    (env, declared_environment, visible_tools)
+}
 
-    let key_started = Instant::now();
-    let mut phases = Phases::default();
-    let src_hash = ctx.pkg_src_hash(unit.pkg)?;
-    let key_inputs = RunKey {
-        kind: "run-build-script",
-        tool: TOOL_VERSION,
-        rustc: &ctx.rustc_version,
-        host: &ctx.host,
-        pkg: [
-            &pkg.name,
-            &pkg.version,
-            pkg.source.as_deref().unwrap_or("local"),
-        ],
-        src_hash: &src_hash,
-        script: [&script.name, &script.hash],
-        env: &env,
-        dep_env: &dep_env,
-        toolchain: &ctx.toolchain,
-        tools: &tool_ids,
-    };
-    let key_json = serde_json::to_string(&key_inputs)?;
-    let key = sha256_hex(key_json.as_bytes());
-    let effective_environment_hash = sha256_hex(serde_json::to_string(key_inputs.env)?.as_bytes());
-    let report_key_inputs = crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
-        crate::report::BuildScriptRunKeyInputs {
-            source_hash: key_inputs.src_hash.to_string(),
-            script: ctx.report_unit_keys
-                [script_unit_id.context("build script compile dependency missing")?]
-            .clone(),
-            declared_environment: declared_environment
-                .iter()
-                .map(|(name, value)| crate::report::EnvironmentInput {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-            effective_environment_hash,
-            tools: visible_tools
-                .iter()
-                .map(|tool| crate::report::ToolInput {
-                    name: tool.name.clone(),
-                    version: tool.version.clone(),
-                    identity: tool.id.clone(),
-                    environment_name: tool.env.clone(),
-                    environment_value: tool.value.clone(),
-                })
-                .collect(),
-            uses_toolchain: true,
-        },
-    ));
-    ctx.report.update(|report| {
-        report.units[uidx].key = Some(crate::report::UnitKey {
-            hash: key.clone(),
-            inputs: report_key_inputs,
-        });
-    });
-    phases.key_ns = key_started.elapsed().as_nanos() as u64;
+fn run_build_script(
+    ctx: &Ctx,
+    uidx: usize,
+    results: &[OnceLock<UnitResult>],
+) -> Result<UnitResult> {
+    let unit = &ctx.units[uidx];
+    let pkg = &ctx.meta.packages[unit.pkg];
+    let pkg_root = pkg.root();
 
-    let cache_started = Instant::now();
-    let initial_probe = ctx.try_cache_hit(&key)?;
-    phases.cache_ns = cache_started.elapsed().as_nanos() as u64;
-    match initial_probe {
-        Ok(res) => {
-            ctx.report.update(|report| {
-                report.units[uidx].cache = crate::report::UnitCache {
-                    result: crate::report::UnitCacheResult::Hit,
-                    probe: Some("found".to_string()),
-                };
-            });
-            return Ok(UnitResult {
-                key,
-                cached: true,
-                res,
-                main: None,
-                phases,
-            });
-        }
-        Err(miss) => {
-            ctx.report.update(|report| {
-                report.units[uidx].cache = crate::report::UnitCache {
-                    result: crate::report::UnitCacheResult::Miss,
-                    probe: Some(miss.name().to_string()),
-                };
-            });
+    let mut script: Option<OutputFile> = None;
+    let mut script_key = String::new();
+    let mut dep_env: Vec<(String, String)> = Vec::new();
+    for d in &unit.deps {
+        let r = results[d.unit].get().context("dep result missing")?;
+        match ctx.units[d.unit].kind {
+            Kind::Bsc => {
+                script = r.main.clone();
+                script_key = r.key.clone();
+            }
+            Kind::Bsr => {
+                let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
+                if let (Some(links), Some(b)) = (&dpkg.links, &r.res.bs) {
+                    let l = links.to_uppercase().replace('-', "_");
+                    for (k, v) in &b.metadata {
+                        dep_env.push((
+                            format!("DEP_{l}_{}", k.to_uppercase().replace('-', "_")),
+                            v.clone(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    let script = script.context("build script binary missing")?;
+
+    let (env, _, visible_tools) = build_script_environment(ctx, unit, pkg);
+    dep_env.sort();
+
+    let mut phases = Phases::default();
+    let key = ctx.action_keys[uidx].clone();
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
     // embeds -- literally or derived (cc names objects by a hash of their
@@ -7738,21 +8384,28 @@ fn run_build_script(
     lock_file
         .lock()
         .with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
-    // While we waited: a concurrent winner may have finished the work.
-    if let Ok(res) = ctx.try_cache_hit(&key)? {
-        ctx.report.update(|report| {
-            report.units[uidx].cache = crate::report::UnitCache {
-                result: crate::report::UnitCacheResult::Hit,
-                probe: Some("found_after_wait".to_string()),
-            };
-        });
-        return Ok(UnitResult {
-            key,
-            cached: true,
-            res,
-            main: None,
-            phases,
-        });
+    // While we waited: a concurrent winner may have finished the work. This
+    // lock is also the restoration lock, so restore without trying to acquire
+    // it recursively.
+    if let Ok(res) = ctx.lookup_action(&key)? {
+        if res.bs.is_some() {
+            if let Some(archive) = &res.out_dir {
+                ctx.restore_out_dir_locked(&key, archive)?;
+                ctx.report.update(|report| {
+                    report.units[uidx].cache = crate::report::UnitCache {
+                        result: crate::report::UnitCacheResult::Hit,
+                        probe: Some("found_after_wait".to_string()),
+                    };
+                });
+                return Ok(UnitResult {
+                    key,
+                    cached: true,
+                    res,
+                    main: None,
+                    phases,
+                });
+            }
+        }
     }
     if final_parent.exists() {
         // No sentinel (the cache probe above would have hit): crash leftover.
@@ -7843,15 +8496,29 @@ fn run_build_script(
         eprintln!("corgi warning ({} build script): {w}", pkg.name);
     }
 
-    scan_dir_for_workspace_path(&stage_out, &ctx.workspace_root)?;
+    // Keep local cold-build overhead to one sequential read of OUT_DIR:
+    // workspace-path scanning happens as files stream into the compressed tar,
+    // and compressed bytes are hashed as they stream to the temporary file.
+    // CAS installation does not reread them.
+    let archive_started = Instant::now();
+    let allowed_external_roots = immutable_source_roots_for_action(ctx, uidx);
+    let out_dir = archive_out_dir(
+        &ctx.store,
+        &stage_out,
+        &ctx.workspace_root,
+        &allowed_external_roots,
+    )?;
+    phases.ingest_ns = archive_started.elapsed().as_nanos() as u64;
+    phases.ingest_bytes = out_dir.size;
     let res = ActionResult {
         outputs: vec![],
         stderr,
         bs: Some(bs),
+        out_dir: Some(out_dir),
     };
-    // Commit order: sentinel (OUT_DIR complete), then the action record.
-    // A crash between the two leaves a probe-miss either way; the next
-    // builder re-acquires the lock and redoes the work.
+    // Commit order: archive, sentinel (local OUT_DIR complete), then action
+    // record. A crash before the record leaves only reclaimable CAS/local
+    // state; a missing local directory after commit is restored from tar.
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     Ok(UnitResult {
@@ -7861,30 +8528,6 @@ fn run_build_script(
         main: None,
         phases,
     })
-}
-
-/// Location-leak tripwire for build-script outputs: OUT_DIR is shared at
-/// its canonical store path, so nothing under it may embed the checkout
-/// location. Generated code is also covered at its consumer's ingest;
-/// this catches data files a crate only reads at runtime.
-fn scan_dir_for_workspace_path(dir: &Path, workspace_root: &str) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            scan_dir_for_workspace_path(&path, workspace_root)?;
-        } else if path.is_file() {
-            let (_, leaked) = crate::store::sha256_file_scan(&path, workspace_root.as_bytes())?;
-            if leaked {
-                bail!(
-                    "build script output {} embeds the workspace path ({workspace_root}); \
-                     outputs must be location-free — resolve paths at runtime instead of \
-                     baking them in at build time",
-                    path.display()
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> Result<()> {

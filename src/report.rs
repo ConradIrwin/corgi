@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -262,7 +262,8 @@ pub enum UnitCacheResult {
 #[derive(Clone, Debug, Serialize)]
 pub struct UnitKey {
     pub hash: String,
-    pub inputs: ActionKeyInputs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<ActionKeyInputs>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -570,7 +571,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(persisted["schema_version"], 3);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }
@@ -694,7 +695,7 @@ mod tests {
             },
             key: Some(UnitKey {
                 hash: "action-key".into(),
-                inputs: ActionKeyInputs::Compile(Box::new(CompileKeyInputs {
+                inputs: Some(ActionKeyInputs::Compile(Box::new(CompileKeyInputs {
                     source_hash: "source".into(),
                     declared_environment: vec![],
                     effective_environment_hash: "environment".into(),
@@ -705,7 +706,7 @@ mod tests {
                     cap_lints: false,
                     uses_toolchain: true,
                     compiler_identity: "compiler".into(),
-                })),
+                }))),
             }),
             timings: Some(UnitTimings::default()),
             outputs: vec![Output {

@@ -331,6 +331,13 @@ impl Store {
         Ok((self.insert_hashed(path, hash)?, found))
     }
 
+    /// Install a temporary file whose SHA-256 was computed while it was
+    /// written. This avoids rereading streamed artifacts such as OUT_DIR
+    /// archives solely to choose their CAS path.
+    pub(crate) fn insert_prehashed_file(&self, path: &Path, hash: String) -> Result<String> {
+        self.insert_hashed(path, hash)
+    }
+
     fn insert_hashed(&self, path: &Path, hash: String) -> Result<String> {
         let dest = self.cache_path(&hash);
         if dest.exists() {
