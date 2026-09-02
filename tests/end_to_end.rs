@@ -609,7 +609,7 @@ fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
             .arg("-C")
             .arg(&directory.path)
             .args(arguments)
-            .env("CORGI_STORE", &store)
+            .env("CORGI_STORE", store)
             .env("CORGI_TEST_MARKER", &marker)
             .output()
             .expect("failed to invoke corgi test")

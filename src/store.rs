@@ -5,16 +5,19 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The machine-independent store spelling embedded in action inputs and
+/// outputs. A custom `CORGI_STORE` is exposed through a symlink here.
+pub const CANONICAL_ROOT: &str = if cfg!(target_os = "macos") {
+    "/Users/Shared/corgi"
+} else {
+    "/var/tmp/corgi"
+};
+
 pub fn default_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("CORGI_STORE") {
         return Ok(PathBuf::from(root));
     }
-    if cfg!(target_os = "macos") {
-        Ok(PathBuf::from("/Users/Shared/corgi"))
-    } else {
-        let home = std::env::var_os("HOME").context("HOME not set")?;
-        Ok(PathBuf::from(home).join(".cache/corgi"))
-    }
+    Ok(PathBuf::from(CANONICAL_ROOT))
 }
 
 /// Hash-work counters included in performance reports (relaxed: stats only).
@@ -273,7 +276,8 @@ impl Store {
         for d in [
             "cache", "pool", "outdirs", "debug", "tmp", "reports", "metrics",
         ] {
-            fs::create_dir_all(root.join(d))?;
+            fs::create_dir_all(root.join(d))
+                .with_context(|| format!("creating the corgi store at {}", root.display()))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
         // (e.g. /tmp/store -> /private/tmp/store)
@@ -283,7 +287,7 @@ impl Store {
         } else {
             let alias_path = std::env::var_os("CORGI_ALIAS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/Users/Shared/corgi"));
+                .unwrap_or_else(|| PathBuf::from(CANONICAL_ROOT));
             if root == alias_path {
                 // the store already lives at the canonical path: no alias,
                 // no symlink, nothing for realpath() to see through

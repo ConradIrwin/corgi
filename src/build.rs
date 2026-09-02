@@ -240,9 +240,10 @@ fn is_linking(ctx: &Ctx, idx: usize) -> bool {
     unit_links(&ctx.units[idx]) && !is_checked(ctx, idx)
 }
 
-/// A pinned tool ready for scoped injection into build-script runs.
+/// A pinned tool ready for scoped injection into package actions.
 struct ToolRt {
     name: String,
+    command: String,
     version: String,
     env: String,
     value: String,
@@ -258,6 +259,44 @@ impl ToolRt {
     fn is_visible_to(&self, package: &str, target: &str) -> bool {
         (self.packages.is_empty() || self.packages.iter().any(|candidate| candidate == package))
             && (self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target))
+    }
+}
+
+#[derive(Clone)]
+struct TargetSysroot {
+    identity: String,
+    root: PathBuf,
+    library_dirs: Vec<PathBuf>,
+    pkg_config_dirs: Vec<PathBuf>,
+    pkg_config: PathBuf,
+}
+
+#[derive(Clone, Serialize)]
+struct PlannedTargetSysroot {
+    identity: String,
+    root: String,
+    library_dirs: Vec<String>,
+    pkg_config_dirs: Vec<String>,
+    pkg_config: String,
+}
+
+impl TargetSysroot {
+    fn planned(&self) -> PlannedTargetSysroot {
+        PlannedTargetSysroot {
+            identity: self.identity.clone(),
+            root: self.root.display().to_string(),
+            library_dirs: self
+                .library_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            pkg_config_dirs: self
+                .pkg_config_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            pkg_config: self.pkg_config.display().to_string(),
+        }
     }
 }
 
@@ -375,10 +414,7 @@ pub struct Ctx {
     base_env: Vec<(String, String)>,
     workspace_root: String,
     sysroot: String,
-    rustup_home: String,
-    devdir: String,
-    sandbox: bool,
-    darwin_dirs: Vec<String>,
+    sandbox: Box<dyn crate::sandbox::Sandbox>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
@@ -391,6 +427,7 @@ pub struct Ctx {
     /// Pinned tools resolved for injection: env var, logical path,
     /// identity hash, shim name/bin, and package scope (empty = all).
     tools: Vec<ToolRt>,
+    target_sysroot: Option<TargetSysroot>,
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
@@ -449,6 +486,8 @@ pub struct Ctx {
 
 #[derive(Clone)]
 struct ZigRuntime {
+    /// The Rust triple this Zig runtime compiles and links for.
+    rust_target: String,
     cc: PathBuf,
     cxx: PathBuf,
     ar: PathBuf,
@@ -456,6 +495,20 @@ struct ZigRuntime {
     cmake_toolchain: PathBuf,
     use_zig_as_rust_linker: bool,
     identity: String,
+}
+
+impl Ctx {
+    /// The pinned Zig runtime when it is the C toolchain for this unit's
+    /// platform. Cross builds do not apply their target toolchain to host
+    /// build scripts and proc macros.
+    fn zig_for_platform(&self, unit: &Unit) -> Option<&ZigRuntime> {
+        let platform = if unit.host {
+            &self.host
+        } else {
+            self.target.as_deref().unwrap_or(&self.host)
+        };
+        self.zig.as_ref().filter(|zig| zig.rust_target == platform)
+    }
 }
 
 struct PackageReadInputs {
@@ -962,6 +1015,7 @@ struct CompileActionSpec {
     incremental: bool,
     compiler_identity: String,
     environment: Vec<(String, String)>,
+    target_sysroot: Option<PlannedTargetSysroot>,
     rustflags: Vec<String>,
     lints: Vec<String>,
     clippy: Option<String>,
@@ -978,6 +1032,7 @@ struct BuildScriptRunActionSpec {
     dependencies: Vec<PlannedActionDependency>,
     environment: Vec<(String, String)>,
     tools: Vec<PlannedTool>,
+    target_sysroot: Option<PlannedTargetSysroot>,
     toolchain: String,
 }
 
@@ -1087,6 +1142,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 dependencies,
                 environment,
                 tools,
+                target_sysroot: ctx.target_sysroot.as_ref().map(TargetSysroot::planned),
                 toolchain: ctx.toolchain.clone(),
             });
             (spec, declared_environment)
@@ -1171,6 +1227,11 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 incremental: ctx.incremental && unit.profile.incremental,
                 compiler_identity: ctx.idents[index].clone(),
                 environment,
+                target_sysroot: (is_linking(ctx, index)
+                    && !matches!(unit.kind, Kind::Bsc)
+                    && unit_crate_type(unit) != "proc-macro")
+                    .then(|| ctx.target_sysroot.as_ref().map(TargetSysroot::planned))
+                    .flatten(),
                 rustflags,
                 lints: lint_flags,
                 clippy: (ctx.clippy && package.source.is_none()).then(|| ctx.clippy_id.clone()),
@@ -1361,16 +1422,27 @@ struct ToolSpec {
     version: String,
     url: String,
     sha256: String,
+    /// Additional archives extracted over the primary archive. This supports
+    /// distribution libraries split between development and runtime packages.
+    #[serde(default)]
+    overlays: Vec<ToolArchiveSpec>,
     #[serde(default)]
     bin: String,
+    /// Bare command name exposed on PATH. Empty uses the tool's table name.
+    #[serde(default)]
+    command: String,
     #[serde(default)]
     path: String,
     env: String,
+    /// Text prepended to the exported path in the environment value, for
+    /// variables whose value is a command-line fragment rather than a path.
+    #[serde(default, rename = "env-prefix")]
+    env_prefix: String,
     /// Packages whose actions see and key on this tool; empty = every
-    /// build script (right for graph-wide tools like a wasm C compiler).
+    /// package action (right for graph-wide tools like a wasm C compiler).
     #[serde(default)]
     packages: Vec<String>,
-    /// Compilation targets whose build scripts see this tool; empty = all.
+    /// Compilation targets whose package actions see this tool; empty = all.
     #[serde(default)]
     targets: Vec<String>,
     /// How the archive is fetched. Empty = plain unauthenticated download.
@@ -1379,6 +1451,22 @@ struct ToolSpec {
     /// sha256 pin remains the tool's identity either way.
     #[serde(default)]
     auth: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+struct SysrootArchiveSpec {
+    url: String,
+    sha256: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    auth: String,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+struct ToolArchiveSpec {
+    url: String,
+    sha256: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1410,6 +1498,9 @@ struct RootDef {
 struct CorgiToml {
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
+    #[serde(default)]
+    sysroot:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, SysrootArchiveSpec>>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
@@ -1901,7 +1992,12 @@ fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>
             .join("tools")
             .join(format!("{}-{}", t.name, t.version))
             .join(&t.bin);
-        std::os::unix::fs::symlink(&target, tmp.join(&t.name)).ok();
+        let command = if t.command.is_empty() {
+            &t.name
+        } else {
+            &t.command
+        };
+        std::os::unix::fs::symlink(&target, tmp.join(command)).ok();
     }
     fs::create_dir_all(dir.parent().unwrap())?;
     match fs::rename(&tmp, &dir) {
@@ -1935,22 +2031,62 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
     let archive = work.join("archive");
-    match t.auth.as_str() {
+    download_tool_archive(&t.name, &t.url, &t.auth, &archive)?;
+    let actual = crate::store::sha256_file(&archive)?;
+    if actual != t.sha256 {
+        bail!(
+            "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
+            t.name,
+            t.sha256
+        );
+    }
+    unpack_archive(&archive, &unpack).with_context(|| format!("unpacking tool {}", t.name))?;
+    for (index, overlay) in t.overlays.iter().enumerate() {
+        let archive = work.join(format!("overlay-{index}"));
+        download_tool_archive(&t.name, &overlay.url, "", &archive)?;
+        let actual = crate::store::sha256_file(&archive)?;
+        if actual != overlay.sha256 {
+            bail!(
+                "sha256 mismatch for tool {} overlay {}: manifest pins {}, archive is {actual}",
+                t.name,
+                overlay.url,
+                overlay.sha256
+            );
+        }
+        unpack_archive(&archive, &unpack)
+            .with_context(|| format!("unpacking tool {} overlay {}", t.name, overlay.url))?;
+    }
+    if !unpack.join(exported).exists() {
+        bail!("tool {}: `{exported}` not found inside the archive", t.name);
+    }
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&unpack, &dest) {
+        Ok(()) => {}
+        Err(_) if dest.join(exported).exists() => {}
+        Err(e) => return Err(e).context("publishing tool"),
+    }
+    touch_tool_marker(&dest);
+    fs::remove_dir_all(&work).ok();
+    Ok(dest.join(exported))
+}
+
+fn download_tool_archive(name: &str, url: &str, auth: &str, archive: &Path) -> Result<()> {
+    match auth {
         "" => {
             let st = Command::new("curl")
                 .args(["-sSfL", "-o"])
                 .arg(&archive)
-                .arg(&t.url)
+                .arg(url)
                 .status()?;
             if !st.success() {
-                bail!("download failed: {}", t.url);
+                bail!("download failed: {url}");
             }
         }
         "github" => {
-            let (repo, tag, asset) = parse_github_release_url(&t.url).with_context(|| {
+            let (repo, tag, asset) = parse_github_release_url(url).with_context(|| {
                 format!(
                     "tool {}: auth = \"github\" requires a github.com release-asset url",
-                    t.name
+                    name
                 )
             })?;
             let st = Command::new("gh")
@@ -1969,51 +2105,311 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
                 .with_context(|| {
                     format!(
                         "tool {}: running gh (auth = \"github\" needs the GitHub CLI, logged in)",
-                        t.name
+                        name
                     )
                 })?;
             if !st.success() {
                 bail!(
                     "tool {}: gh release download failed for {} (is `gh auth status` ok?)",
-                    t.name,
-                    t.url
+                    name,
+                    url
                 );
             }
         }
         other => bail!(
             "tool {}: unknown auth scheme `{other}` (supported: \"github\")",
-            t.name
+            name
         ),
     }
-    let actual = crate::store::sha256_file(&archive)?;
-    if actual != t.sha256 {
-        bail!(
-            "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
-            t.name,
-            t.sha256
-        );
+    Ok(())
+}
+
+/// Unpack a downloaded tool archive. Debian packages carry their payload in a
+/// nested tarball, so unwrap that member before handing it to tar.
+fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
+    let bytes = fs::read(archive)?;
+    if bytes.starts_with(b"PK\x03\x04") {
+        let status = Command::new("unzip")
+            .arg("-q")
+            .arg(archive)
+            .arg("-d")
+            .arg(into)
+            .status()?;
+        if !status.success() {
+            bail!("unzip exited with {status}");
+        }
+        return Ok(());
     }
-    let st = Command::new("tar")
+    let tarball = if crate::deb::is_deb(&bytes) {
+        let data = crate::deb::data_member(&bytes)?;
+        let extracted = archive.with_extension("data.tar");
+        fs::write(&extracted, data)?;
+        extracted
+    } else {
+        archive.to_path_buf()
+    };
+    let status = Command::new("tar")
         .arg("-xf")
-        .arg(&archive)
+        .arg(&tarball)
         .arg("-C")
-        .arg(&unpack)
+        .arg(into)
         .status()?;
-    if !st.success() {
-        bail!("unpack failed for tool {}", t.name);
+    if !status.success() {
+        bail!("tar exited with {status}");
     }
-    if !unpack.join(exported).exists() {
-        bail!("tool {}: `{exported}` not found inside the archive", t.name);
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct TargetSysrootManifest {
+    library_dirs: Vec<PathBuf>,
+    pkg_config_dirs: Vec<PathBuf>,
+}
+
+fn ensure_target_sysroot(
+    store: &Store,
+    target: &str,
+    archives: &BTreeMap<String, SysrootArchiveSpec>,
+    host: &str,
+) -> Result<TargetSysroot> {
+    let identity = sha256_hex(&serde_json::to_vec(&(target, archives))?);
+    let directory_name = format!("{target}-{}", &identity[..16]);
+    let destination = store.root.join("sysroots").join(&directory_name);
+    let manifest_path = destination.join(".corgi-sysroot.json");
+
+    if !manifest_path.exists() {
+        status!("Installing", "target sysroot {target}");
+        let work = store.tmp_path("sysroot");
+        let assembled = work.join("assembled");
+        fs::create_dir_all(&assembled)?;
+
+        for (name, spec) in archives {
+            let archive = work.join(format!("{name}.archive"));
+            download_tool_archive(name, &spec.url, &spec.auth, &archive)?;
+            let actual = crate::store::sha256_file(&archive)?;
+            if actual != spec.sha256 {
+                let mismatch = actual
+                    .bytes()
+                    .zip(spec.sha256.bytes())
+                    .position(|(actual, expected)| actual != expected);
+                bail!(
+                    "sysroot archive {name}: sha256 mismatch: expected {}, got {actual}; first \
+                     mismatch at byte {mismatch:?}",
+                    spec.sha256
+                );
+            }
+
+            let extracted = work.join(format!("{name}.extracted"));
+            fs::create_dir_all(&extracted)?;
+            unpack_archive(&archive, &extracted)
+                .with_context(|| format!("unpacking sysroot archive {name}"))?;
+            let relative_root = if spec.path.is_empty() {
+                Path::new(".")
+            } else {
+                Path::new(&spec.path)
+            };
+            if relative_root.is_absolute()
+                || relative_root
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!("sysroot archive {name}: path must stay within the archive");
+            }
+            let contribution = extracted.join(relative_root);
+            if !contribution.is_dir() {
+                bail!(
+                    "sysroot archive {name}: path `{}` is not a directory in the archive",
+                    relative_root.display()
+                );
+            }
+            merge_sysroot_tree(&contribution, &assembled, name)?;
+        }
+
+        let manifest = discover_target_sysroot(&assembled)?;
+        fs::write(
+            assembled.join(".corgi-sysroot.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("sysroot store has no parent")?,
+        )?;
+        match fs::rename(&assembled, &destination) {
+            Ok(()) => {}
+            Err(_) if manifest_path.exists() => {}
+            Err(error) => return Err(error).context("publishing target sysroot"),
+        }
+        fs::remove_dir_all(&work).ok();
     }
-    fs::create_dir_all(dest.parent().unwrap())?;
-    match fs::rename(&unpack, &dest) {
-        Ok(()) => {}
-        Err(_) if dest.join(exported).exists() => {}
-        Err(e) => return Err(e).context("publishing tool"),
+
+    let manifest: TargetSysrootManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let logical_root = store.logical_root().join("sysroots").join(directory_name);
+    let pkg_config = ensure_builtin_pkg_config(store, host)?;
+    Ok(TargetSysroot {
+        identity,
+        library_dirs: manifest
+            .library_dirs
+            .iter()
+            .map(|path| logical_root.join(path))
+            .collect(),
+        pkg_config_dirs: manifest
+            .pkg_config_dirs
+            .iter()
+            .map(|path| logical_root.join(path))
+            .collect(),
+        root: logical_root,
+        pkg_config,
+    })
+}
+
+fn merge_sysroot_tree(source: &Path, destination: &Path, archive_name: &str) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination_path)?;
+            merge_sysroot_tree(&source_path, &destination_path, archive_name)?;
+        } else if file_type.is_symlink() {
+            let link_target = fs::read_link(&source_path)?;
+            if destination_path.exists() || destination_path.is_symlink() {
+                if !destination_path.is_symlink()
+                    || fs::read_link(&destination_path)? != link_target
+                {
+                    bail!(
+                        "sysroot archive {archive_name} conflicts at {}",
+                        destination_path.display()
+                    );
+                }
+            } else {
+                std::os::unix::fs::symlink(link_target, &destination_path)?;
+            }
+        } else if file_type.is_file() {
+            if destination_path.exists() {
+                if crate::store::sha256_file(&source_path)?
+                    != crate::store::sha256_file(&destination_path)?
+                {
+                    bail!(
+                        "sysroot archive {archive_name} conflicts at {}",
+                        destination_path.display()
+                    );
+                }
+            } else {
+                fs::copy(&source_path, &destination_path)?;
+            }
+        }
     }
-    touch_tool_marker(&dest);
-    fs::remove_dir_all(&work).ok();
-    Ok(dest.join(exported))
+    Ok(())
+}
+
+fn discover_target_sysroot(root: &Path) -> Result<TargetSysrootManifest> {
+    let mut library_dirs = BTreeSet::new();
+    let mut pkg_config_dirs = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let relative_directory = directory.strip_prefix(root)?.to_path_buf();
+            if name.ends_with(".pc") {
+                pkg_config_dirs.insert(relative_directory.clone());
+            }
+            if is_native_library_name(name) {
+                library_dirs.insert(relative_directory);
+            }
+        }
+    }
+    Ok(TargetSysrootManifest {
+        library_dirs: library_dirs.into_iter().collect(),
+        pkg_config_dirs: pkg_config_dirs.into_iter().collect(),
+    })
+}
+
+fn is_native_library_name(name: &str) -> bool {
+    (name.starts_with("lib")
+        && (name.ends_with(".a")
+            || name.ends_with(".dylib")
+            || name.contains(".so")
+            || name.ends_with(".dll.a")))
+        || name.ends_with(".lib")
+}
+
+fn ensure_builtin_pkg_config(store: &Store, host: &str) -> Result<PathBuf> {
+    if host != "x86_64-unknown-linux-gnu" {
+        bail!("target sysroots are not yet supported on build host `{host}`");
+    }
+    let spec = ToolSpec {
+        name: "corgi-pkgconf".to_string(),
+        version: "1.8.1-1".to_string(),
+        url: "https://deb.debian.org/debian/pool/main/p/pkgconf/pkgconf-bin_1.8.1-1_amd64.deb"
+            .to_string(),
+        sha256: "8fb5a8f83e46ad04b4cf02651ceec56c0611a335cf0d30780d859a95d0400174".to_string(),
+        overlays: vec![ToolArchiveSpec {
+            url: "https://deb.debian.org/debian/pool/main/p/pkgconf/libpkgconf3_1.8.1-1_amd64.deb"
+                .to_string(),
+            sha256: "da01fb901123ae498c36387a32240e09e1f2866810146c5a574273f7eaf31093".to_string(),
+        }],
+        bin: "usr/bin/pkgconf".to_string(),
+        command: "pkg-config".to_string(),
+        path: String::new(),
+        env: String::new(),
+        env_prefix: String::new(),
+        packages: Vec::new(),
+        targets: Vec::new(),
+        auth: String::new(),
+    };
+    ensure_tool(store, &spec)?;
+    let tool_root = store
+        .logical_root()
+        .join("tools")
+        .join(format!("{}-{}", spec.name, spec.version));
+    let wrapper_identity =
+        sha256_hex(format!("{}\0{}\0{}", spec.sha256, spec.overlays[0].sha256, host).as_bytes());
+    let wrapper_directory = store
+        .root
+        .join("tools")
+        .join(format!("pkg-config-wrapper-{}", &wrapper_identity[..16]));
+    let wrapper = wrapper_directory.join("pkg-config");
+    if !wrapper.exists() {
+        let staging = store.tmp_path("pkg-config-wrapper");
+        fs::create_dir_all(&staging)?;
+        let script = format!(
+            "#!/bin/sh\nLD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\" exec \"{}\" \"$@\"\n",
+            tool_root.join("usr/lib/x86_64-linux-gnu").display(),
+            tool_root.join("usr/bin/pkgconf").display(),
+        );
+        fs::write(staging.join("pkg-config"), script)?;
+        let mut permissions = fs::metadata(staging.join("pkg-config"))?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(staging.join("pkg-config"), permissions)?;
+        fs::create_dir_all(
+            wrapper_directory
+                .parent()
+                .context("tool store has no parent")?,
+        )?;
+        match fs::rename(&staging, &wrapper_directory) {
+            Ok(()) => {}
+            Err(_) if wrapper.exists() => {
+                fs::remove_dir_all(&staging).ok();
+            }
+            Err(error) => return Err(error).context("publishing pkg-config wrapper"),
+        }
+    }
+    Ok(store
+        .logical_root()
+        .join("tools")
+        .join(format!("pkg-config-wrapper-{}", &wrapper_identity[..16]))
+        .join("pkg-config"))
 }
 
 fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
@@ -2026,9 +2422,12 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         version: crate::zig::VERSION.to_string(),
         url: crate::zig::url(&asset),
         sha256: asset.sha256.to_string(),
+        overlays: Vec::new(),
         bin: format!("{archive_root}/zig"),
+        command: String::new(),
         path: String::new(),
         env: String::new(),
+        env_prefix: String::new(),
         packages: Vec::new(),
         targets: Vec::new(),
         auth: String::new(),
@@ -2112,6 +2511,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
             .unwrap_or(installed.as_path()),
     );
     Ok(ZigRuntime {
+        rust_target: target.rust.to_string(),
         cc: logical_wrapper_dir.join("cc"),
         cxx: logical_wrapper_dir.join("c++"),
         ar: logical_wrapper_dir.join("ar"),
@@ -2154,6 +2554,25 @@ fn host_triple() -> Result<String> {
         o => bail!("unsupported host OS {o}"),
     };
     Ok(format!("{arch}-{os}"))
+}
+
+/// Selects a pinned C toolchain whenever a build cannot use the host's
+/// ambient one.
+fn zig_target_for_build(host: &str, requested_target: Option<&str>) -> Result<Option<String>> {
+    match requested_target {
+        Some(target) => {
+            let native_linux_target =
+                host.contains("linux") && crate::zig::rust_target(target)? == host;
+            Ok(
+                (native_linux_target || crate::zig::target_requires_zig(host, target)?)
+                    .then(|| target.to_string()),
+            )
+        }
+        // A distribution's ambient gcc and libc are not stable action inputs.
+        // Use the pinned Zig C toolchain for native Linux builds too.
+        None if host.contains("linux") => Ok(Some(host.to_string())),
+        None => Ok(None),
+    }
 }
 
 fn read_toolchain_pin(dir: &Path) -> Result<String> {
@@ -3203,10 +3622,7 @@ pub fn fmt(
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
-    ensure_supported_build_platform(
-        std::env::consts::OS,
-        Path::new("/usr/bin/sandbox-exec").is_file(),
-    )?;
+    crate::sandbox::ensure_available()?;
     opts.packages.sort();
     opts.packages.dedup();
     let store_root = store.root.clone();
@@ -3343,20 +3759,13 @@ fn build_inner(
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
-    let zig_target = requested_target
-        .as_deref()
-        .map(|target| {
-            crate::zig::target_requires_zig(&host_guess, target)
-                .map(|required| required.then(|| target.to_string()))
-        })
-        .transpose()?
-        .flatten();
+    let zig_target = zig_target_for_build(&host_guess, requested_target.as_deref())?;
     if zig_target.is_some() {
         crate::zig::raise_file_descriptor_limit()?;
     }
-    let target = match zig_target.as_deref() {
-        Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
-        None => requested_target,
+    let target = match (&requested_target, zig_target.as_deref()) {
+        (Some(_), Some(zig_target)) => Some(crate::zig::rust_target(zig_target)?.to_string()),
+        _ => requested_target,
     };
     ensure_toolchain(&store, &channel, &host_guess)?;
     // Debugger convenience, deliberately outside the sysroot (see
@@ -3477,6 +3886,12 @@ fn build_inner(
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
+    let compilation_target = target.as_deref().unwrap_or(&host_guess);
+    let target_sysroot = corgi_toml
+        .sysroot
+        .get(compilation_target)
+        .map(|archives| ensure_target_sysroot(&store, compilation_target, archives, &host_guess))
+        .transpose()?;
     let root_sets = corgi_toml.root_sets();
     let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
     let resolution_root_name = root.clone().or_else(|| {
@@ -3861,29 +4276,34 @@ fn build_inner(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let devdir = capture(
-        Command::new("/usr/bin/xcode-select").arg("-p"),
-        "xcode-select -p",
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
-    // toolchain identity beyond rustc: the linker chain shapes final bits
-    let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
-        .ok()
-        .and_then(|o| o.lines().next().map(str::to_string))
-        .unwrap_or_default();
-    let ld_v = Command::new("ld")
-        .arg("-v")
-        .output()
-        .map(|o| {
-            let all = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            all.lines().next().unwrap_or("").to_string()
-        })
-        .unwrap_or_default();
+    // Only Apple hosts use an ambient C toolchain. Linux uses pinned Zig, so
+    // keying on the distribution's unused gcc would make actions needlessly
+    // machine-specific.
+    let ambient_c_toolchain = host.contains("apple");
+    let cc_v = if ambient_c_toolchain {
+        capture(Command::new("cc").arg("--version"), "cc --version")
+            .ok()
+            .and_then(|output| output.lines().next().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let ld_v = if ambient_c_toolchain {
+        Command::new("ld")
+            .arg("-v")
+            .output()
+            .map(|output| {
+                let all = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                all.lines().next().unwrap_or("").to_string()
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let sdk_v = if host.contains("apple") {
         capture(
             Command::new("/usr/bin/xcrun").arg("--show-sdk-version"),
@@ -3923,29 +4343,23 @@ fn build_inner(
         xcode: xcode_v,
     };
     recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
-    // Unconditional where the platform supports it: there is exactly one
-    // mode, and it fails hard. Errors name the missing input (denied exec,
-    // undeclared read), and the fix is a pinned tool or extra-inputs
-    // stanza — loop until green.
-    let sandbox = true;
+    // Confinement is unconditional: there is exactly one mode, and it fails
+    // hard. Errors name the missing input (denied exec, undeclared read), and
+    // the fix is a pinned tool or extra-inputs stanza.
+    let sandbox = crate::sandbox::for_host(crate::sandbox::Environment {
+        store_root: store.root.clone(),
+        store_alias: store.alias.clone(),
+        sysroot: sysroot.clone(),
+        cargo_home: cargo_home.clone(),
+        rustup_home,
+        workspace_root: meta.workspace_root.clone(),
+    })?;
     if verbose {
-        status!("Sandbox", "hermetic mode enabled (seatbelt)");
-    }
-    // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
-    // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
-    let mut darwin_dirs = Vec::new();
-    for key in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
-        if let Ok(d) = capture(Command::new("/usr/bin/getconf").arg(key), "getconf") {
-            let d = d.trim().trim_end_matches('/').to_string();
-            if !d.is_empty() {
-                let canon = if d.starts_with("/var/") {
-                    format!("/private{d}")
-                } else {
-                    d
-                };
-                darwin_dirs.push(canon);
-            }
-        }
+        status!(
+            "Sandbox",
+            "hermetic mode enabled ({})",
+            sandbox.description()
+        );
     }
     // resolve the SDK once, outside the sandbox, instead of letting every
     // rustc link shell out to xcrun (slow and an untracked probe)
@@ -3990,9 +4404,7 @@ fn build_inner(
             } else {
                 target.as_deref().unwrap_or(&host)
             };
-            matches!(unit.kind, Kind::Bsr)
-                && (t.packages.is_empty()
-                    || t.packages.iter().any(|package| package == package_name))
+            (t.packages.is_empty() || t.packages.iter().any(|package| package == package_name))
                 && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
         });
         if !active {
@@ -4021,16 +4433,26 @@ fn build_inner(
         // on it, so a pin edit has exactly the declared blast radius.
         let id = sha256_hex(
             format!(
-                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-                t.name, t.version, t.url, t.sha256, t.bin, t.path, t.env
+                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                t.name,
+                t.version,
+                t.url,
+                t.sha256,
+                t.bin,
+                t.command,
+                t.path,
+                t.env,
+                t.env_prefix,
+                serde_json::to_string(&t.overlays)?
             )
             .as_bytes(),
         );
         tools_rt.push(ToolRt {
             name: t.name.clone(),
+            command: t.command.clone(),
             version: t.version.clone(),
             env: t.env.clone(),
-            value: logical.display().to_string(),
+            value: format!("{}{}", t.env_prefix, logical.display()),
             id,
             bin: t.bin.clone(),
             packages: t.packages.clone(),
@@ -4172,10 +4594,7 @@ fn build_inner(
         base_env,
         workspace_root,
         sysroot,
-        rustup_home,
-        devdir,
         sandbox,
-        darwin_dirs,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         source_files_memo: Mutex::new(HashMap::new()),
@@ -4184,6 +4603,7 @@ fn build_inner(
         profile_name,
         toolchain,
         tools: tools_rt,
+        target_sysroot,
         env_probes,
         target,
         zig: zig_runtime,
@@ -4769,17 +5189,6 @@ fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for d in std::env::split_paths(&path) {
-        let c = d.join(name);
-        if c.is_file() {
-            return Some(c);
-        }
-    }
-    None
-}
-
 /// `rustc --print cfg` -> CARGO_CFG_* env for build scripts.
 fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -5319,169 +5728,6 @@ fn collect_rust_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     walk(root, Path::new(""), &mut files)?;
     Ok(files)
-}
-
-/// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
-/// system dirs, the toolchain, the store, and keyed inputs; writes limited
-/// to the action's output and scratch dirs; no network. Children inherit it.
-fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
-    if !ctx.sandbox {
-        return Command::new(program);
-    }
-    let mut prof = String::from(concat!(
-        "(version 1)\n",
-        "(deny default)\n",
-        "(allow process-fork)\n",
-        "(allow process-info*)\n",
-        "(allow file-map-executable)\n",
-        "(allow signal (target same-sandbox))\n",
-        "(allow sysctl-read)\n",
-        "(allow mach-lookup)\n",
-        "(allow file-read-metadata)\n",
-    ));
-    // exec allowlist: the *only* runnable binaries are dispatchers
-    // (/usr/bin/cc, the rustup shim) and tools whose identity is part of
-    // the action key (rustc, clang/ld via the toolchain hash, build
-    // scripts via their content hash)
-    prof.push_str("(allow process-exec*\n");
-    prof.push_str("  (literal \"/usr/bin/cc\")\n");
-    let mut exec_lits = vec![
-        format!("{}/bin/rustc", ctx.cargo_home),
-        format!("{}/bin/rustc", ctx.sysroot),
-    ];
-    if let Some(r) = find_in_path(&ctx.rustc) {
-        exec_lits.push(r.display().to_string());
-    }
-    // the whole pinned-toolchain bin dir is keyed content (e.g.
-    // proc-macro-crate spawns `cargo locate-project` at macro expansion)
-    let toolchain_bin = Path::new(&ctx.sysroot).join("bin");
-    if let Ok(canon) = fs::canonicalize(&toolchain_bin) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    // rust-lld & friends live under lib/rustlib/<triple>/bin — also keyed
-    let rustlib = Path::new(&ctx.sysroot).join("lib/rustlib");
-    if let Ok(canon) = fs::canonicalize(&rustlib) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    for p in exec_lits {
-        // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
-        // to rustup, so resolve before emitting the rule
-        let canon = fs::canonicalize(&p)
-            .map(|c| c.display().to_string())
-            .unwrap_or(p);
-        prof.push_str(&format!("  (literal \"{canon}\")\n"));
-    }
-    prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
-    // the Apple tool group, keyed collectively via the Xcode identity in
-    // the toolchain hash
-    for p in [
-        "/usr/bin/ar",
-        "/usr/bin/ranlib",
-        "/usr/bin/clang",
-        "/usr/bin/clang++",
-        "/usr/bin/c++",
-        "/usr/bin/xcrun",
-        "/usr/bin/xcodebuild",
-        "/usr/bin/xcode-select",
-        "/bin/sh",
-    ] {
-        prof.push_str(&format!("  (literal \"{p}\")\n"));
-    }
-    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
-    prof.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        ctx.store.root.join("tools").display()
-    ));
-    // actions may execute binaries they just built in their own writable
-    // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
-    // are products of keyed inputs, so this stays hermetic
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
-    prof.push_str(")\n");
-    prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
-    // Compiles run with cwd = the workspace root (cargo's shape); getcwd
-    // needs the directory node itself, but nothing under it beyond the
-    // explicitly granted package/extra-input subpaths.
-    prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
-    for p in [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/System",
-        "/Library",
-        "/Applications",
-        "/opt",
-        "/private/etc",
-        "/private/var/db",
-        "/private/preboot",
-        "/private/var/run/com.apple.security.cryptexd",
-    ] {
-        prof.push_str(&format!("  (subpath \"{p}\")\n"));
-    }
-    let mut reads: Vec<String> = vec![
-        ctx.sysroot.clone(),
-        ctx.cargo_home.clone(),
-        ctx.rustup_home.clone(),
-        ctx.devdir.clone(),
-        ctx.store.root.display().to_string(),
-    ];
-    for d in &ctx.darwin_dirs {
-        reads.push(d.clone());
-    }
-    for r in reads {
-        prof.push_str(&format!("  (subpath \"{r}\")\n"));
-    }
-    let workspace_root = Path::new(&ctx.workspace_root);
-    let mut input_directories = std::collections::BTreeSet::new();
-    for path in extra_reads {
-        let mut ancestor = path.parent();
-        while let Some(directory) = ancestor {
-            if !directory.starts_with(workspace_root) {
-                break;
-            }
-            input_directories.insert(directory);
-            ancestor = directory.parent();
-        }
-    }
-    for directory in input_directories {
-        prof.push_str(&format!("  (literal \"{}\")\n", directory.display()));
-    }
-    for path in extra_reads {
-        let operation = if path.is_dir() { "subpath" } else { "literal" };
-        prof.push_str(&format!("  ({operation} \"{}\")\n", path.display()));
-    }
-    prof.push_str(")\n");
-    // Align the readable set with the hashed set: the source hash deliberately
-    // excludes .git, build output dirs, and Cargo.lock, so reading them must
-    // be denied or they become unhashed inputs. Later SBPL rules win.
-    prof.push_str("(deny file-read* file-read-metadata\n");
-    let mut deny_roots: Vec<String> = vec![ctx.workspace_root.clone()];
-    for path in extra_reads {
-        if path.is_dir() {
-            deny_roots.push(path.display().to_string());
-        }
-    }
-    deny_roots.sort();
-    deny_roots.dedup();
-    for r in &deny_roots {
-        for d in [".git", "target", "dtarget"] {
-            prof.push_str(&format!("  (subpath \"{r}/{d}\")\n"));
-        }
-        prof.push_str(&format!("  (literal \"{r}/Cargo.lock\")\n"));
-    }
-    prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
-    for d in &ctx.darwin_dirs {
-        prof.push_str(&format!("  (subpath \"{d}\")\n"));
-    }
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(")\n");
-    let mut c = Command::new("/usr/bin/sandbox-exec");
-    c.arg("-p").arg(prof).arg(program);
-    c
 }
 
 fn test_pass_key(harness_action: &str) -> Result<String> {
@@ -7438,6 +7684,7 @@ mod tool_scope_tests {
     fn target_scoped_tool_is_visible_only_to_matching_package_and_target() {
         let tool = ToolRt {
             name: "ghostty".into(),
+            command: String::new(),
             version: "1".into(),
             env: "GHOSTTY_PREFIX".into(),
             value: "/tools/ghostty".into(),
@@ -7660,6 +7907,16 @@ fn compile(
             }
         }
     }
+    for directory in spec
+        .target_sysroot
+        .iter()
+        .flat_map(|sysroot| &sysroot.library_dirs)
+    {
+        let search = format!("native={directory}");
+        if !link_search.contains(&search) {
+            link_search.push(search);
+        }
+    }
 
     let env = &spec.environment;
     let unit_rustflags = &spec.rustflags;
@@ -7825,8 +8082,9 @@ fn compile(
     if let Some(d) = &incr_dir {
         writes.push(d.as_path());
     }
-    let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
-    cmd.current_dir(compile_dir);
+    let mut cmd = ctx
+        .sandbox
+        .command(Path::new(executor), compile_dir, &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig.is_some() {
@@ -7899,13 +8157,16 @@ fn compile(
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
-            if let Some(zig) = ctx.zig.as_ref().filter(|zig| zig.use_zig_as_rust_linker) {
-                cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
-            }
             if let Some(libdir) = &ctx.target_std_libdir {
                 cmd.arg("-L").arg(libdir);
             }
         }
+    }
+    if let Some(zig) = ctx
+        .zig_for_platform(unit)
+        .filter(|zig| zig.use_zig_as_rust_linker)
+    {
+        cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
     }
     for f in pflags {
         cmd.arg(f);
@@ -8170,24 +8431,22 @@ fn build_script_environment<'a>(
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    if platform != ctx.host {
-        if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
-            let target_environment = target.replace('-', "_");
-            for (name, value) in [
-                (format!("CC_{target_environment}"), &zig.cc),
-                (format!("CXX_{target_environment}"), &zig.cxx),
-                (format!("AR_{target_environment}"), &zig.ar),
-                (format!("RANLIB_{target_environment}"), &zig.ranlib),
-            ] {
-                env.push((name, value.display().to_string()));
-            }
-            for name in [
-                "CMAKE_TOOLCHAIN_FILE",
-                "TARGET_CMAKE_TOOLCHAIN_FILE",
-                &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
-            ] {
-                env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
-            }
+    if let Some(zig) = ctx.zig_for_platform(unit) {
+        let target_environment = platform.replace('-', "_");
+        for (name, value) in [
+            (format!("CC_{target_environment}"), &zig.cc),
+            (format!("CXX_{target_environment}"), &zig.cxx),
+            (format!("AR_{target_environment}"), &zig.ar),
+            (format!("RANLIB_{target_environment}"), &zig.ranlib),
+        ] {
+            env.push((name, value.display().to_string()));
+        }
+        for name in [
+            "CMAKE_TOOLCHAIN_FILE",
+            "TARGET_CMAKE_TOOLCHAIN_FILE",
+            &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
+        ] {
+            env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
         }
     }
     // Cargo hands build scripts the rustflags of the unit they configure,
@@ -8212,8 +8471,15 @@ fn build_script_environment<'a>(
         .iter()
         .filter(|tool| tool.is_visible_to(&pkg.name, &platform))
         .collect::<Vec<_>>();
+    let mut tool_environment: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for tool in &visible_tools {
-        env.push((tool.env.clone(), tool.value.clone()));
+        tool_environment
+            .entry(&tool.env)
+            .or_default()
+            .push(&tool.value);
+    }
+    for (name, values) in tool_environment {
+        env.push((name.to_string(), values.join(":")));
     }
     for (name, value, packages, profiles) in &ctx.env_probes {
         if packages.iter().any(|package| package == &pkg.name)
@@ -8333,8 +8599,9 @@ fn run_build_script(
     let package_inputs = ctx.package_read_inputs(unit.pkg)?;
     let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
-    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
-    cmd.current_dir(&pkg_root);
+    let mut cmd = ctx
+        .sandbox
+        .command(&script_path, Path::new(&pkg_root), &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig.is_some() {
@@ -8355,23 +8622,37 @@ fn run_build_script(
     if !ctx.sdkroot.is_empty() {
         cmd.env("SDKROOT", &ctx.sdkroot);
     }
-    for (k, v) in &ctx.base_env {
-        cmd.env(k, v);
+    for (key, value) in &ctx.base_env {
+        cmd.env(key, value);
+    }
+    let mut path = Vec::new();
+    if let Some(sysroot) = &spec.target_sysroot {
+        path.push(
+            Path::new(&sysroot.pkg_config)
+                .parent()
+                .context("pkg-config has no parent directory")?
+                .display()
+                .to_string(),
+        );
+        cmd.env("PKG_CONFIG", &sysroot.pkg_config);
+        cmd.env("PKG_CONFIG_SYSROOT_DIR", &sysroot.root);
+        cmd.env("PKG_CONFIG_ALLOW_CROSS", "1");
+        cmd.env("PKG_CONFIG_PATH", "");
+        cmd.env("PKG_CONFIG_LIBDIR", sysroot.pkg_config_dirs.join(":"));
     }
     if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
-        cmd.env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
+        path.push(shims.display().to_string());
     }
-    for (k, v) in &spec.environment {
-        cmd.env(k, v);
+    path.push("/usr/bin".to_string());
+    path.push("/bin".to_string());
+    cmd.env("PATH", path.join(":"));
+    for (key, value) in &spec.environment {
+        cmd.env(key, value);
     }
-    for (k, v) in &dep_env {
-        cmd.env(k, v);
+    for (key, value) in &dep_env {
+        cmd.env(key, value);
     }
     cmd.env("OUT_DIR", &stage_logical);
-    // Cargo-identical manifest env; unkeyed for the same reason as in
-    // compiles. Generated code that embeds it is rejected at the
-    // consuming compile's ingest; data files are covered by the OUT_DIR
-    // scan before this action commits.
     cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
     cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
     ctx.jobserver.configure(&mut cmd);
@@ -8403,8 +8684,8 @@ fn run_build_script(
 
     let mut warnings = Vec::new();
     let bs = parse_directives(&stdout, &mut warnings)?;
-    for w in warnings {
-        eprintln!("corgi warning ({} build script): {w}", pkg.name);
+    for warning in warnings {
+        eprintln!("corgi warning ({} build script): {warning}", pkg.name);
     }
 
     // Keep local cold-build overhead to one sequential read of OUT_DIR:
@@ -8598,38 +8879,79 @@ mod dep_info_tests {
     }
 }
 
-fn ensure_supported_build_platform(host_os: &str, sandbox_available: bool) -> Result<()> {
-    if host_os != "macos" {
-        bail!("corgi builds require macOS");
+#[cfg(test)]
+mod zig_target_tests {
+    use super::zig_target_for_build;
+
+    #[test]
+    fn explicit_native_linux_target_uses_zig() {
+        assert_eq!(
+            zig_target_for_build("x86_64-unknown-linux-gnu", Some("x86_64-unknown-linux-gnu"))
+                .unwrap(),
+            Some("x86_64-unknown-linux-gnu".to_string())
+        );
     }
-    if !sandbox_available {
-        bail!("corgi builds require /usr/bin/sandbox-exec");
+
+    #[test]
+    fn explicit_native_macos_target_uses_the_ambient_toolchain() {
+        assert_eq!(
+            zig_target_for_build("aarch64-apple-darwin", Some("aarch64-apple-darwin")).unwrap(),
+            None
+        );
     }
-    Ok(())
 }
 
-#[cfg(test)]
-mod build_platform_tests {
-    use super::ensure_supported_build_platform;
+mod target_sysroot_tests {
+    use super::{discover_target_sysroot, CorgiToml};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn builds_reject_non_macos_hosts() {
-        assert_eq!(
-            ensure_supported_build_platform("linux", true)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require macOS"
-        );
+    fn nested_tables_group_archives_by_target() {
+        let config: CorgiToml = toml::from_str(
+            r#"
+            [sysroot.x86_64-unknown-linux-gnu.sdk]
+            url = "https://example.com/sdk.tar.gz"
+            sha256 = "0123456789abcdef"
+            path = "sdk"
+            "#,
+        )
+        .unwrap();
+
+        let archive = &config.sysroot["x86_64-unknown-linux-gnu"]["sdk"];
+        assert_eq!(archive.url, "https://example.com/sdk.tar.gz");
+        assert_eq!(archive.path, "sdk");
     }
 
     #[test]
-    fn builds_require_the_macos_sandbox() {
+    fn discovers_library_and_pkg_config_directories() {
+        let root = temporary_directory();
+        fs::create_dir_all(root.join("sdk/lib/pkgconfig")).unwrap();
+        fs::create_dir_all(root.join("sdk/other")).unwrap();
+        fs::write(root.join("sdk/lib/libexample.so.1"), b"library").unwrap();
+        fs::write(root.join("sdk/lib/pkgconfig/example.pc"), b"Name: example").unwrap();
+        fs::write(root.join("sdk/other/readme.txt"), b"not an input").unwrap();
+
+        let manifest = discover_target_sysroot(&root).unwrap();
+
+        assert_eq!(manifest.library_dirs, [PathBuf::from("sdk/lib")]);
         assert_eq!(
-            ensure_supported_build_platform("macos", false)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require /usr/bin/sandbox-exec"
+            manifest.pkg_config_dirs,
+            [PathBuf::from("sdk/lib/pkgconfig")]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temporary_directory() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "corgi-sysroot-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }
 
