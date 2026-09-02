@@ -79,7 +79,7 @@ pub enum Command {
     /// Build twice and compare artifacts for determinism
     Audit(AuditArgs),
 
-    /// Trim cached data unused for more than five days
+    /// Trim cached data according to the retention policy
     Clean(CleanArgs),
 
     /// Record this corgi version in corgi.toml

@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime},
 };
 
 #[test]
@@ -120,6 +121,45 @@ fn non_incremental_results_satisfy_incremental_actions() {
     assert_eq!(edited_unit["cache"]["result"], "miss");
     assert_ne!(edited_unit["key"]["hash"], clean_unit["key"]["hash"]);
     assert_eq!(edited_unit["outputs"][0]["name"], expected_output);
+}
+
+#[test]
+fn clean_expires_incremental_state_before_other_cached_data() {
+    let directory = TestDirectory::new("clean-retention");
+    let store = directory.path.join("store");
+    let old_incremental = store.join("incr/old");
+    let recent_incremental = store.join("incr/recent");
+    let artifact = store.join("cache/aa/artifact");
+    let report = store.join("reports/report.json");
+    for path in [&old_incremental, &recent_incremental] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("state"), b"incremental").unwrap();
+    }
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, b"artifact").unwrap();
+    fs::create_dir_all(report.parent().unwrap()).unwrap();
+    fs::write(&report, b"report").unwrap();
+
+    let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+    for path in [&old_incremental, &artifact, &report] {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("clean")
+        .env("CORGI_STORE", &store)
+        .env("CORGI_NO_ALIAS", "1")
+        .output()
+        .expect("failed to invoke corgi clean");
+    assert_success(&output, "corgi clean");
+
+    assert!(!old_incremental.exists());
+    assert!(recent_incremental.exists());
+    assert!(artifact.exists());
+    assert!(report.exists());
 }
 
 #[test]

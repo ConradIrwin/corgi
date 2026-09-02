@@ -2257,22 +2257,24 @@ fn is_concrete_channel(c: &str) -> bool {
     semver || dated
 }
 
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
+const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Go-style cache expiry: every file is judged by its own mtime, which
 /// use-sites keep fresh with throttled touches. No reference counting —
 /// blobs are touched whenever a referencing action is used, so a stale
 /// blob implies only stale actions point at it. Deleting something in
 /// use is benign: probes self-heal by rebuilding.
 pub fn clean(store: &Store, all: bool) -> Result<()> {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
     if all {
         fs::remove_dir_all(&store.root)
             .with_context(|| format!("removing cache {}", store.root.display()))?;
         eprintln!("{:>12} removed {}", "CLEAN", store.root.display());
         return Ok(());
     }
-    let (files, dirs, bytes) = clean_trim(store, TTL)?;
+    let (files, dirs, bytes) = clean_trim(store, CACHE_TTL)?;
     eprintln!(
-        "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) older than 5 days",
+        "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) according to retention policy",
         "CLEAN",
         bytes as f64 / 1e6
     );
@@ -2294,8 +2296,7 @@ fn maybe_auto_clean(store: &Store) {
             return; // clock skew: fine, skip
         }
     }
-    let ttl = std::time::Duration::from_secs(5 * 24 * 3600);
-    if let Err(e) = clean_trim(store, ttl) {
+    if let Err(e) = clean_trim(store, CACHE_TTL) {
         eprintln!("corgi warning: clean trim failed: {e:#}");
     }
     let _ = store.write_atomic(&marker, b"trimmed\n");
@@ -2304,10 +2305,19 @@ fn maybe_auto_clean(store: &Store) {
 fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
     let now = std::time::SystemTime::now();
     let cutoff = now.checked_sub(ttl).context("ttl too large")?;
+    let incremental_cutoff = now
+        .checked_sub(INCREMENTAL_TTL)
+        .context("incremental ttl too large")?;
     let stale = |p: &Path| -> bool {
         fs::metadata(p)
             .and_then(|m| m.modified())
             .map(|m| m < cutoff)
+            .unwrap_or(false)
+    };
+    let stale_incremental = |p: &Path| -> bool {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|m| m < incremental_cutoff)
             .unwrap_or(false)
     };
     let mut files = 0u64;
@@ -2407,14 +2417,15 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
             dirs += 1;
         }
     }
-    // incr/: dev-loop incremental state — fat, rebuildable, judged by
-    // dir mtime (rustc session writes refresh it on every use).
+    // incr/: dev-loop incremental state — fat and rebuildable, so retain
+    // it for one day rather than the five days used by the artifact cache.
+    // It is judged by dir mtime (rustc session writes refresh it on use).
     for p in read_dir_paths(&store.root.join("incr"))? {
         if p.is_dir() {
-            if stale(&p) && retire_dir(store, &p) {
+            if stale_incremental(&p) && retire_dir(store, &p) {
                 dirs += 1;
             }
-        } else if stale(&p) && fs::remove_file(&p).is_ok() {
+        } else if stale_incremental(&p) && fs::remove_file(&p).is_ok() {
             files += 1;
         }
     }
