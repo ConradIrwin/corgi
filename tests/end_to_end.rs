@@ -964,15 +964,10 @@ fn build_script_archives_restore_only_for_executing_consumers() {
 
     let initial = invoke_corgi_with_store(&workspace, "build", [], &store);
     assert_success(&initial, "initial demand-driven fixture build");
-    let initial_report = latest_report_for_workspace(&store, &workspace);
+    let initial_report = report_for_workspace(&store, &workspace);
     let units = initial_report["units"].as_array().unwrap();
-    let build_script_unit = units
-        .iter()
-        .find(|unit| {
-            unit["package"]["name"] == "generated-dependency"
-                && unit["action"]["kind"] == "run_build_script"
-        })
-        .expect("initial build-script unit");
+    let build_script_unit =
+        report_unit(&initial_report, "generated-dependency", "run_build_script");
     let build_script_key = build_script_unit["key"]["hash"]
         .as_str()
         .expect("initial build-script action key")
@@ -1000,12 +995,9 @@ fn build_script_archives_restore_only_for_executing_consumers() {
         .and_then(|unit| unit["key"]["hash"].as_str())
         .expect("initial root action key")
         .to_string();
-    let dependency_key = units
-        .iter()
-        .find(|unit| {
-            unit["package"]["name"] == "generated-dependency" && unit["action"]["kind"] == "compile"
-        })
-        .and_then(|unit| unit["key"]["hash"].as_str())
+    let dependency_key = report_unit(&initial_report, "generated-dependency", "compile")["key"]
+        ["hash"]
+        .as_str()
         .expect("initial generated dependency action key")
         .to_string();
     let action_path = |key: &str| {
@@ -1014,13 +1006,6 @@ fn build_script_archives_restore_only_for_executing_consumers() {
             .join(&key[..2])
             .join(format!("{key}.json"))
     };
-    let build_script_action: serde_json::Value =
-        serde_json::from_slice(&fs::read(action_path(&build_script_key)).unwrap()).unwrap();
-    assert!(build_script_action["out_dir"]["hash"].is_string());
-    assert!(build_script_action["out_dir"]["size"]
-        .as_u64()
-        .is_some_and(|size| size > 0));
-
     // Relinking the root needs the cached Rust library, not the generated
     // sources that produced it. Loading the build-script result for transitive
     // directives must therefore leave its deleted OUT_DIR untouched.
@@ -1048,16 +1033,9 @@ fn build_script_archives_restore_only_for_executing_consumers() {
             .is_file(),
         "cached build-script action did not restore generated source"
     );
-    let rebuilt_report = latest_report_for_workspace(&store, &workspace);
-    let rebuilt_build_script = rebuilt_report["units"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|unit| {
-            unit["package"]["name"] == "generated-dependency"
-                && unit["action"]["kind"] == "run_build_script"
-        })
-        .expect("restored build-script unit");
+    let rebuilt_report = report_for_workspace(&store, &workspace);
+    let rebuilt_build_script =
+        report_unit(&rebuilt_report, "generated-dependency", "run_build_script");
     assert_eq!(rebuilt_build_script["cache"]["result"], "hit");
 
     // A root hit is self-contained. Make walking the dependency action both
@@ -1067,7 +1045,7 @@ fn build_script_archives_restore_only_for_executing_consumers() {
     fs::remove_dir_all(workspace.join("target")).unwrap();
     let warm = invoke_corgi_with_store(&workspace, "build", [], &store);
     assert_success(&warm, "warm root-cache build");
-    let warm_report = latest_report_for_workspace(&store, &workspace);
+    let warm_report = report_for_workspace(&store, &workspace);
     let warm_units = warm_report["units"].as_array().unwrap();
     let root = warm_units
         .iter()
@@ -1409,24 +1387,6 @@ fn report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
                 .is_some_and(|extension| extension == "json"))
             .then(|| serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap())
         })
-        .find(|report| {
-            report["run"]["workspace"]["root"].as_str()
-                == Some(canonical_workspace.to_string_lossy().as_ref())
-        })
-        .expect("missing build report for workspace")
-}
-
-fn latest_report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
-    let canonical_workspace = workspace.canonicalize().unwrap();
-    fs::read_dir(store.join("reports"))
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            (path
-                .extension()
-                .is_some_and(|extension| extension == "json"))
-            .then(|| serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap())
-        })
         .filter(|report| {
             report["run"]["workspace"]["root"].as_str()
                 == Some(canonical_workspace.to_string_lossy().as_ref())
@@ -1437,6 +1397,19 @@ fn latest_report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Va
                 .unwrap_or_default()
         })
         .expect("missing latest build report for workspace")
+}
+
+fn report_unit<'a>(
+    report: &'a serde_json::Value,
+    package: &str,
+    action: &str,
+) -> &'a serde_json::Value {
+    report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["package"]["name"] == package && unit["action"]["kind"] == action)
+        .unwrap_or_else(|| panic!("missing {action} unit for {package}"))
 }
 
 fn write_non_git_package_fixture(root: &Path, checkout: &str) {

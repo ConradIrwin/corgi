@@ -6,13 +6,15 @@
 
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
-use tar::{Archive, Builder, EntryType, Header};
+#[cfg(test)]
+use tar::EntryType;
+use tar::{Archive, Builder, Header, HeaderMode};
 
 const ZSTD_LEVEL: i32 = 1;
 
@@ -23,7 +25,7 @@ const ZSTD_LEVEL: i32 = 1;
 /// copies of their targets.
 #[cfg(test)]
 pub fn archive_out_dir<W: Write>(out_dir: &Path, writer: W) -> Result<()> {
-    let leaked = archive_out_dir_impl(out_dir, writer, None, &[])?;
+    let leaked = archive_out_dir_impl(out_dir, writer, b"not-present", &[])?;
     debug_assert!(leaked.is_none());
     Ok(())
 }
@@ -45,21 +47,22 @@ pub fn archive_out_dir_scanning<W: Write>(
     if needle.is_empty() {
         bail!("archive scan needle is empty");
     }
-    archive_out_dir_impl(out_dir, writer, Some(needle), allowed_external_roots)
+    archive_out_dir_impl(out_dir, writer, needle, allowed_external_roots)
 }
 
 fn archive_out_dir_impl<W: Write>(
     out_dir: &Path,
     writer: W,
-    needle: Option<&[u8]>,
+    needle: &[u8],
     allowed_external_roots: &[PathBuf],
 ) -> Result<Option<PathBuf>> {
+    let entries = collect_archive_entries(out_dir, allowed_external_roots)?;
     let mut encoder = zstd::stream::write::Encoder::new(writer, ZSTD_LEVEL)
         .context("starting OUT_DIR archive compression")?;
     encoder
         .include_checksum(false)
         .context("configuring OUT_DIR archive compression")?;
-    let leaked = archive_tar(out_dir, &mut encoder, needle, allowed_external_roots)?;
+    let leaked = archive_tar(&entries, &mut encoder, needle)?;
     if leaked.is_none() {
         encoder
             .finish()
@@ -68,12 +71,22 @@ fn archive_out_dir_impl<W: Write>(
     Ok(leaked)
 }
 
-fn archive_tar<W: Write>(
+enum ArchivedFileType {
+    Directory,
+    Regular,
+}
+
+struct ArchiveEntry {
+    relative: PathBuf,
+    source: PathBuf,
+    file_type: ArchivedFileType,
+    metadata: fs::Metadata,
+}
+
+fn collect_archive_entries(
     out_dir: &Path,
-    writer: W,
-    needle: Option<&[u8]>,
     allowed_external_roots: &[PathBuf],
-) -> Result<Option<PathBuf>> {
+) -> Result<Vec<ArchiveEntry>> {
     if !fs::metadata(out_dir)
         .with_context(|| format!("reading OUT_DIR {}", out_dir.display()))?
         .is_dir()
@@ -97,19 +110,49 @@ fn archive_tar<W: Write>(
         .collect::<Result<Vec<_>>>()?;
 
     let mut entries = Vec::new();
-    collect_entries(&out_dir, &out_dir, &mut entries)?;
-    entries.sort();
-
-    let mut archive = Builder::new(writer);
-    for relative in entries {
-        if let Some(leaked) = append_entry(
-            &mut archive,
+    let mut directory_ancestors = BTreeSet::from([out_dir.clone()]);
+    for child in fs::read_dir(&out_dir).with_context(|| format!("reading {}", out_dir.display()))? {
+        let child = child?;
+        let relative = PathBuf::from(child.file_name());
+        collect_archive_entry(
             &out_dir,
             &relative,
-            needle,
+            &child.path(),
             &allowed_external_roots,
-        )? {
-            return Ok(Some(leaked));
+            None,
+            &mut directory_ancestors,
+            &mut entries,
+        )?;
+    }
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(entries)
+}
+
+fn archive_tar<W: Write>(
+    entries: &[ArchiveEntry],
+    writer: W,
+    needle: &[u8],
+) -> Result<Option<PathBuf>> {
+    let mut archive = Builder::new(writer);
+    for entry in entries {
+        let mut header = Header::new_gnu();
+        header.set_metadata_in_mode(&entry.metadata, HeaderMode::Deterministic);
+        header.set_mode(source_mode(&entry.metadata));
+        match entry.file_type {
+            ArchivedFileType::Directory => archive
+                .append_data(&mut header, &entry.relative, io::empty())
+                .with_context(|| format!("archiving {}", entry.relative.display()))?,
+            ArchivedFileType::Regular => {
+                let file = File::open(&entry.source)
+                    .with_context(|| format!("opening {}", entry.source.display()))?;
+                let mut file = ScanningReader::new(file, needle);
+                archive
+                    .append_data(&mut header, &entry.relative, &mut file)
+                    .with_context(|| format!("archiving {}", entry.relative.display()))?;
+                if file.found {
+                    return Ok(Some(entry.relative.clone()));
+                }
+            }
         }
     }
     archive.finish().context("finishing OUT_DIR archive")?;
@@ -129,6 +172,8 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<()> {
     ensure_empty_directory(destination)?;
 
     let mut archive = Archive::new(reader);
+    archive.set_overwrite(false);
+    archive.set_preserve_mtime(false);
     let mut seen = BTreeSet::new();
     let mut directory_modes = Vec::new();
 
@@ -172,13 +217,21 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<()> {
             }
             directory_modes.push((destination_path, mode));
         } else if entry_type.is_file() {
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&destination_path)
-                .with_context(|| format!("creating {}", destination_path.display()))?;
-            io::copy(&mut entry, &mut output)
+            let unpacked = entry
+                .unpack_in(destination)
                 .with_context(|| format!("extracting {}", relative.display()))?;
+            if !unpacked {
+                bail!("unsafe archive entry path {}", relative.display());
+            }
+            let extracted_type = fs::symlink_metadata(&destination_path)
+                .with_context(|| format!("reading extracted {}", destination_path.display()))?
+                .file_type();
+            if !extracted_type.is_file() {
+                bail!(
+                    "regular file entry did not extract as a file: {}",
+                    relative.display()
+                );
+            }
             set_mode(&destination_path, mode)?;
         } else {
             bail!(
@@ -189,135 +242,81 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<()> {
         }
     }
 
-    // Directories must be writable while their children are extracted. Apply
-    // their recorded modes only once all archive content has been written.
-    for (path, mode) in directory_modes.into_iter().rev() {
+    directory_modes.sort_by(|(left, _), (right, _)| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for (path, mode) in directory_modes {
         set_mode(&path, mode)?;
     }
     Ok(())
 }
 
-fn collect_entries(root: &Path, directory: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
-    for child in
-        fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
-    {
-        let child = child?;
-        let path = child.path();
-        let relative = path
-            .strip_prefix(root)
-            .expect("walked path is below its root")
-            .to_path_buf();
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("reading metadata for {}", path.display()))?;
-        entries.push(relative);
-        if metadata.file_type().is_dir() {
-            collect_entries(root, &path, entries)?;
-        }
-    }
-    Ok(())
-}
-
-fn append_entry<W: Write>(
-    archive: &mut Builder<W>,
-    root: &Path,
+fn collect_archive_entry(
+    out_dir: &Path,
     relative: &Path,
-    needle: Option<&[u8]>,
+    source: &Path,
     allowed_external_roots: &[PathBuf],
-) -> Result<Option<PathBuf>> {
-    let source = root.join(relative);
-    let metadata = fs::symlink_metadata(&source)
-        .with_context(|| format!("reading metadata for {}", source.display()))?;
-    let file_type = metadata.file_type();
-
-    if file_type.is_dir() {
-        append_directory(archive, relative, &metadata)?;
-    } else if file_type.is_file() {
-        return append_regular_file(archive, relative, &source, &metadata, needle);
-    } else if file_type.is_symlink() {
-        let target = fs::read_link(&source)
-            .with_context(|| format!("reading symlink {}", source.display()))?;
-        let (target, dereferenced_root) =
-            archive_symlink_target(relative, &source, &target, root, allowed_external_roots)?;
-        return append_dereferenced_entry(
-            archive,
-            relative,
-            &target,
-            needle,
-            &dereferenced_root,
-            &mut BTreeSet::new(),
-        );
-    } else {
-        bail!("unsupported filesystem entry {}", source.display());
-    }
-    Ok(None)
-}
-
-fn append_directory<W: Write>(
-    archive: &mut Builder<W>,
-    relative: &Path,
-    metadata: &fs::Metadata,
-) -> Result<()> {
-    let mut header = normalized_header(EntryType::Directory, source_mode(metadata), 0);
-    archive
-        .append_data(&mut header, relative, io::empty())
-        .with_context(|| format!("archiving {}", relative.display()))
-}
-
-fn append_regular_file<W: Write>(
-    archive: &mut Builder<W>,
-    relative: &Path,
-    source: &Path,
-    metadata: &fs::Metadata,
-    needle: Option<&[u8]>,
-) -> Result<Option<PathBuf>> {
-    let mut header = normalized_header(EntryType::Regular, source_mode(metadata), metadata.len());
-    let file = File::open(source).with_context(|| format!("opening {}", source.display()))?;
-    if let Some(needle) = needle {
-        let mut file = ScanningReader::new(file, needle);
-        archive
-            .append_data(&mut header, relative, &mut file)
-            .with_context(|| format!("archiving {}", relative.display()))?;
-        if file.found {
-            return Ok(Some(relative.to_path_buf()));
-        }
-    } else {
-        archive
-            .append_data(&mut header, relative, file)
-            .with_context(|| format!("archiving {}", relative.display()))?;
-    }
-    Ok(None)
-}
-
-fn append_dereferenced_entry<W: Write>(
-    archive: &mut Builder<W>,
-    relative: &Path,
-    source: &Path,
-    needle: Option<&[u8]>,
-    dereferenced_root: &Path,
+    dereferenced_root: Option<&Path>,
     directory_ancestors: &mut BTreeSet<PathBuf>,
-) -> Result<Option<PathBuf>> {
+    entries: &mut Vec<ArchiveEntry>,
+) -> Result<()> {
     let source_metadata = fs::symlink_metadata(source)
         .with_context(|| format!("reading metadata for {}", source.display()))?;
-    let source = if source_metadata.file_type().is_symlink() {
+    if source_metadata.file_type().is_symlink() {
+        let target = fs::read_link(source)
+            .with_context(|| format!("reading symlink {}", source.display()))?;
         let resolved = source
             .canonicalize()
             .with_context(|| format!("resolving symlink {}", source.display()))?;
-        if !resolved.starts_with(dereferenced_root) {
+        let selected_root = if let Some(dereferenced_root) = dereferenced_root {
+            if !resolved.starts_with(dereferenced_root) {
+                bail!(
+                    "symlink {} escapes dereferenced directory {}",
+                    source.display(),
+                    dereferenced_root.display()
+                );
+            }
+            dereferenced_root.to_path_buf()
+        } else if resolved.starts_with(out_dir) {
+            out_dir.to_path_buf()
+        } else if let Some(root) = allowed_external_roots
+            .iter()
+            .filter(|root| resolved.starts_with(root))
+            .max_by_key(|root| root.components().count())
+        {
+            root.clone()
+        } else {
             bail!(
-                "symlink {} escapes dereferenced directory {}",
-                source.display(),
-                dereferenced_root.display()
+                "symlink {} resolves outside the allowed external roots: {}",
+                relative.display(),
+                target.display()
             );
-        }
-        resolved
-    } else {
-        source.to_path_buf()
-    };
-    let metadata = fs::metadata(&source)
-        .with_context(|| format!("reading metadata for {}", source.display()))?;
+        };
+        return collect_archive_entry(
+            out_dir,
+            relative,
+            &resolved,
+            allowed_external_roots,
+            Some(&selected_root),
+            directory_ancestors,
+            entries,
+        );
+    }
 
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("reading metadata for {}", source.display()))?;
     if metadata.is_file() {
-        return append_regular_file(archive, relative, &source, &metadata, needle);
+        entries.push(ArchiveEntry {
+            relative: relative.to_path_buf(),
+            source: source.to_path_buf(),
+            file_type: ArchivedFileType::Regular,
+            metadata,
+        });
+        return Ok(());
     }
     if !metadata.is_dir() {
         bail!("unsupported filesystem entry {}", source.display());
@@ -329,42 +328,46 @@ fn append_dereferenced_entry<W: Write>(
     if !directory_ancestors.insert(canonical.clone()) {
         bail!("symlink cycle while archiving {}", source.display());
     }
-    append_directory(archive, relative, &metadata)?;
+    entries.push(ArchiveEntry {
+        relative: relative.to_path_buf(),
+        source: source.to_path_buf(),
+        file_type: ArchivedFileType::Directory,
+        metadata,
+    });
 
-    let mut children = fs::read_dir(&source)
-        .with_context(|| format!("reading {}", source.display()))?
-        .collect::<io::Result<Vec<_>>>()?;
-    children.sort_by_key(|child| child.file_name());
-    for child in children {
+    for child in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
+        let child = child?;
         let child_relative = relative.join(child.file_name());
-        if let Some(leaked) = append_dereferenced_entry(
-            archive,
+        collect_archive_entry(
+            out_dir,
             &child_relative,
             &child.path(),
-            needle,
+            allowed_external_roots,
             dereferenced_root,
             directory_ancestors,
-        )? {
-            return Ok(Some(leaked));
-        }
+            entries,
+        )?;
     }
     directory_ancestors.remove(&canonical);
-    Ok(None)
+    Ok(())
 }
 
 struct ScanningReader<'a, R> {
     inner: R,
-    needle: &'a [u8],
+    finder: memchr::memmem::Finder<'a>,
     tail: Vec<u8>,
+    boundary: Vec<u8>,
     found: bool,
 }
 
 impl<'a, R> ScanningReader<'a, R> {
     fn new(inner: R, needle: &'a [u8]) -> Self {
+        let overlap = needle.len().saturating_sub(1);
         Self {
             inner,
-            needle,
-            tail: Vec::new(),
+            finder: memchr::memmem::Finder::new(needle),
+            tail: Vec::with_capacity(overlap),
+            boundary: Vec::with_capacity(overlap.saturating_mul(2)),
             found: false,
         }
     }
@@ -377,33 +380,29 @@ impl<R: Read> Read for ScanningReader<'_, R> {
             return Ok(read);
         }
 
-        let mut combined = Vec::with_capacity(self.tail.len() + read);
-        combined.extend_from_slice(&self.tail);
-        combined.extend_from_slice(&buffer[..read]);
-        self.found = memchr::memmem::find(&combined, self.needle).is_some();
-        let retained = self.needle.len().saturating_sub(1).min(combined.len());
+        let overlap = self.finder.needle().len().saturating_sub(1);
+        self.boundary.clear();
+        self.boundary.extend_from_slice(&self.tail);
+        self.boundary
+            .extend_from_slice(&buffer[..read.min(overlap)]);
+        self.found = self.finder.find(&self.boundary).is_some()
+            || self.finder.find(&buffer[..read]).is_some();
         self.tail.clear();
-        self.tail
-            .extend_from_slice(&combined[combined.len() - retained..]);
+        if read >= overlap {
+            self.tail.extend_from_slice(&buffer[read - overlap..read]);
+        } else {
+            let retained = overlap.min(self.boundary.len());
+            self.tail
+                .extend_from_slice(&self.boundary[self.boundary.len() - retained..]);
+        }
         Ok(read)
     }
 }
 
-fn normalized_header(entry_type: EntryType, mode: u32, size: u64) -> Header {
-    let mut header = Header::new_gnu();
-    header.set_entry_type(entry_type);
-    header.set_mode(mode);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_mtime(0);
-    header.set_size(size);
-    header
-}
-
 fn ensure_empty_directory(path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("reading extraction destination {}", path.display()))?;
-    if !metadata.is_dir() {
+    if !metadata.file_type().is_dir() {
         bail!(
             "extraction destination {} is not a directory",
             path.display()
@@ -446,38 +445,11 @@ fn ensure_safe_parents(destination: &Path, relative: &Path) -> Result<()> {
                     .with_context(|| format!("creating parent {}", current.display()))?;
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", current.display()))
+                return Err(error).with_context(|| format!("reading {}", current.display()));
             }
         }
     }
     Ok(())
-}
-
-fn archive_symlink_target(
-    link_path: &Path,
-    source: &Path,
-    target: &Path,
-    out_dir: &Path,
-    allowed_external_roots: &[PathBuf],
-) -> Result<(PathBuf, PathBuf)> {
-    let resolved = source
-        .canonicalize()
-        .with_context(|| format!("resolving symlink {}", source.display()))?;
-    if resolved.starts_with(out_dir) {
-        return Ok((resolved, out_dir.to_path_buf()));
-    }
-    if let Some(root) = allowed_external_roots
-        .iter()
-        .filter(|root| resolved.starts_with(root))
-        .max_by_key(|root| root.components().count())
-    {
-        return Ok((resolved, root.clone()));
-    }
-    bail!(
-        "symlink {} resolves outside the allowed external roots: {}",
-        link_path.display(),
-        target.display()
-    )
 }
 
 #[cfg(unix)]
@@ -626,6 +598,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn applies_child_before_parent_restrictive_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let archive = tar_with_entries(&[
+            (Path::new("parent/child"), EntryType::Directory, 0o500, None),
+            (Path::new("parent"), EntryType::Directory, 0o600, None),
+        ]);
+        let destination = TempDir::new();
+
+        extract_out_dir(archive.as_slice(), &destination.0).unwrap();
+
+        let parent = destination.0.join("parent");
+        let child = parent.join("child");
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::metadata(&child).unwrap().permissions().mode() & 0o7777,
+            0o500
+        );
+        fs::set_permissions(child, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn external_symlinks_are_dereferenced_through_staging() {
         let temporary = TempDir::new();
         let store = temporary.0.join("store");
@@ -694,6 +693,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_ancestor_symlink_cycles() {
+        let out_dir = TempDir::new();
+        fs::create_dir(out_dir.0.join("nested")).unwrap();
+        std::os::unix::fs::symlink("..", out_dir.0.join("nested/ancestor")).unwrap();
+
+        let error = archive_out_dir(&out_dir.0, Vec::new())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("symlink cycle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_links_escaping_dereferenced_directories() {
         let temporary = TempDir::new();
         let store = temporary.0.join("store");
@@ -739,31 +752,38 @@ mod tests {
     }
 
     fn tar_with_entry(path: &Path, entry_type: EntryType, link: Option<&Path>) -> Vec<u8> {
+        tar_with_entries(&[(path, entry_type, 0o644, link)])
+    }
+
+    fn tar_with_entries(entries: &[(&Path, EntryType, u32, Option<&Path>)]) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = Builder::new(&mut tar);
-            let mut header = Header::new_gnu();
-            header.set_entry_type(entry_type);
-            header.set_mode(0o644);
-            header.set_size(0);
-            if path.is_absolute() {
-                header.set_path_absolute(path).unwrap();
-            } else if path
-                .components()
-                .any(|component| component == Component::ParentDir)
-            {
-                header.set_path("outside").unwrap();
-                let name = header.as_mut_bytes();
-                name[..100].fill(0);
-                name[..path.as_os_str().len()].copy_from_slice(path.as_os_str().as_encoded_bytes());
-            } else {
-                header.set_path(path).unwrap();
+            for &(path, entry_type, mode, link) in entries {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(entry_type);
+                header.set_mode(mode);
+                header.set_size(0);
+                if path.is_absolute() {
+                    header.set_path_absolute(path).unwrap();
+                } else if path
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                {
+                    header.set_path("outside").unwrap();
+                    let name = header.as_mut_bytes();
+                    name[..100].fill(0);
+                    name[..path.as_os_str().len()]
+                        .copy_from_slice(path.as_os_str().as_encoded_bytes());
+                } else {
+                    header.set_path(path).unwrap();
+                }
+                if let Some(link) = link {
+                    header.set_link_name(link).unwrap();
+                }
+                header.set_cksum();
+                builder.append(&mut header, io::empty()).unwrap();
             }
-            if let Some(link) = link {
-                header.set_link_name(link).unwrap();
-            }
-            header.set_cksum();
-            builder.append(&mut header, io::empty()).unwrap();
             builder.finish().unwrap();
         }
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
@@ -780,6 +800,20 @@ mod tests {
 
         let archive = tar_with_entry(Path::new("/outside"), EntryType::Regular, None);
         assert!(extract_out_dir(archive.as_slice(), &destination.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_extraction_destination() {
+        let temporary = TempDir::new();
+        let target = temporary.0.join("target");
+        let destination = temporary.0.join("destination");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        let archive = tar_with_entry(Path::new("file"), EntryType::Regular, None);
+
+        assert!(extract_out_dir(archive.as_slice(), &destination).is_err());
+        assert!(fs::read_dir(target).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

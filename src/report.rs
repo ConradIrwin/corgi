@@ -188,8 +188,7 @@ pub struct Unit {
     pub dependencies: Vec<UnitDependency>,
     pub outcome: UnitOutcome,
     pub cache: UnitCache,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<UnitKey>,
+    pub key: UnitKey,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<UnitTimings>,
     pub outputs: Vec<Output>,
@@ -693,7 +692,7 @@ mod tests {
                 result: UnitCacheResult::Hit,
                 probe: None,
             },
-            key: Some(UnitKey {
+            key: UnitKey {
                 hash: "action-key".into(),
                 inputs: Some(ActionKeyInputs::Compile(Box::new(CompileKeyInputs {
                     source_hash: "source".into(),
@@ -707,7 +706,7 @@ mod tests {
                     uses_toolchain: true,
                     compiler_identity: "compiler".into(),
                 }))),
-            }),
+            },
             timings: Some(UnitTimings::default()),
             outputs: vec![Output {
                 name: "libdemo.rlib".into(),

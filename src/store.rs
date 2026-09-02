@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -72,6 +72,34 @@ pub fn sha256_file_scan(path: &Path, needle: &[u8]) -> Result<(String, bool)> {
         }
     }
     Ok((hex(&h.finalize()), found))
+}
+
+pub(crate) struct StreamedInsert {
+    path: Option<PathBuf>,
+    file: fs::File,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl Write for StreamedInsert {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buffer)?;
+        self.digest.update(&buffer[..written]);
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for StreamedInsert {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            fs::remove_file(path).ok();
+        }
+    }
 }
 
 /// Per-file hint: (size, mtime_ns, inode) -> content hash. Hints only let
@@ -331,11 +359,34 @@ impl Store {
         Ok((self.insert_hashed(path, hash)?, found))
     }
 
-    /// Install a temporary file whose SHA-256 was computed while it was
-    /// written. This avoids rereading streamed artifacts such as OUT_DIR
-    /// archives solely to choose their CAS path.
-    pub(crate) fn insert_prehashed_file(&self, path: &Path, hash: String) -> Result<String> {
-        self.insert_hashed(path, hash)
+    pub(crate) fn begin_streamed_insert(&self, tag: &str) -> Result<StreamedInsert> {
+        let path = self.tmp_path(tag);
+        let file = fs::File::create(&path)
+            .with_context(|| format!("creating streamed CAS input {}", path.display()))?;
+        Ok(StreamedInsert {
+            path: Some(path),
+            file,
+            digest: Sha256::new(),
+            bytes: 0,
+        })
+    }
+
+    pub(crate) fn finish_streamed_insert(
+        &self,
+        mut pending: StreamedInsert,
+    ) -> Result<(String, u64)> {
+        pending.flush()?;
+        let hash = hex(&std::mem::take(&mut pending.digest).finalize());
+        let bytes = pending.bytes;
+        let hash = {
+            let path = pending
+                .path
+                .as_deref()
+                .context("streamed CAS input missing")?;
+            self.insert_hashed(path, hash)?
+        };
+        pending.path = None;
+        Ok((hash, bytes))
     }
 
     fn insert_hashed(&self, path: &Path, hash: String) -> Result<String> {

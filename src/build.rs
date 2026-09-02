@@ -2,7 +2,6 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
@@ -12,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.29";
+const TOOL_VERSION: &str = "corgi/0.30";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -73,7 +72,37 @@ enum Kind {
 
 struct UnitDep {
     unit: usize,
-    extern_name: Option<String>,
+    role: DependencyRole,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum DependencyRole {
+    Extern(String),
+    BuildScriptCompile,
+    BuildScriptOutput,
+    BuildScriptMetadata,
+    BinaryExecutable,
+    Other,
+}
+
+impl DependencyRole {
+    fn extern_name(&self) -> Option<&str> {
+        match self {
+            Self::Extern(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn report_name(&self) -> &'static str {
+        match self {
+            Self::Extern(_) => "extern",
+            Self::BuildScriptCompile => "build_script_compile",
+            Self::BuildScriptOutput => "build_script",
+            Self::BuildScriptMetadata => "build_script_metadata",
+            Self::BinaryExecutable => "binary_executable",
+            Self::Other => "dependency",
+        }
+    }
 }
 
 struct Unit {
@@ -155,7 +184,6 @@ impl CacheMiss {
 struct MetaOut {
     /// Pool-addressed (key-spliced) file name of the rmeta.
     file: String,
-    hash: String,
 }
 
 /// The crate type a unit compiles as (mirrors the logic in `compile`).
@@ -246,7 +274,6 @@ struct Phases {
 }
 
 struct UnitResult {
-    key: String,
     cached: bool,
     res: ActionResult,
     main: Option<OutputFile>,
@@ -384,11 +411,9 @@ pub struct Ctx {
     /// incremental state stays valid. -Cextra-filename keeps the full
     /// key16, so pool file names remain globally unique.
     idents: Vec<String>,
-    /// Full action identities, computed for the complete unit graph before
-    /// any cache record is loaded. Dependency edges contain producer action
-    /// keys rather than produced-byte hashes, so a cached parent can be found
-    /// without first evaluating its dependencies.
-    action_keys: Vec<String>,
+    /// Complete action plans, computed for the unit graph before any cache
+    /// record is loaded.
+    action_plans: Vec<ActionPlan>,
     /// Location-independent package identities. Local Git packages use the
     /// repository remote plus manifest path; other local packages use their
     /// manifest contents. Registry and Git dependencies retain Cargo's ID.
@@ -433,67 +458,9 @@ struct ZigRuntime {
     identity: String,
 }
 
-struct DigestWriter<W> {
-    inner: W,
-    digest: Sha256,
-    bytes: u64,
-}
-
-impl<W> DigestWriter<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            digest: Sha256::new(),
-            bytes: 0,
-        }
-    }
-
-    fn finish(self) -> (W, String, u64) {
-        (
-            self.inner,
-            crate::store::hex(&self.digest.finalize()),
-            self.bytes,
-        )
-    }
-}
-
-impl<W: Write> Write for DigestWriter<W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        self.digest.update(&buffer[..written]);
-        self.bytes += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn immutable_source_roots_for_action(ctx: &Ctx, index: usize) -> Vec<PathBuf> {
-    let cargo_home = Path::new(&ctx.cargo_home);
-    let registry_sources = cargo_home.join("registry/src");
-    let git_checkouts = cargo_home.join("git/checkouts");
-    let mut pending = vec![index];
-    let mut visited_units = BTreeSet::new();
-    let mut roots = BTreeSet::new();
-
-    while let Some(index) = pending.pop() {
-        if !visited_units.insert(index) {
-            continue;
-        }
-        let unit = &ctx.units[index];
-        let package = &ctx.meta.packages[unit.pkg];
-        let root = package.root();
-        if package.source.is_some()
-            && (root.starts_with(&registry_sources) || root.starts_with(&git_checkouts))
-        {
-            roots.insert(root);
-        }
-        pending.extend(unit.deps.iter().map(|dependency| dependency.unit));
-    }
-
-    roots.into_iter().collect()
+struct PackageReadInputs {
+    paths: Vec<PathBuf>,
+    immutable_source_roots: Vec<PathBuf>,
 }
 
 fn archive_out_dir(
@@ -502,10 +469,7 @@ fn archive_out_dir(
     workspace_root: &str,
     allowed_external_roots: &[PathBuf],
 ) -> Result<OutDirArchive> {
-    let temporary = store.tmp_path("out-dir-tar");
-    let file = fs::File::create(&temporary)
-        .with_context(|| format!("creating OUT_DIR archive {}", temporary.display()))?;
-    let mut writer = DigestWriter::new(file);
+    let mut writer = store.begin_streamed_insert("out-dir-tar")?;
     match crate::out_dir_archive::archive_out_dir_scanning(
         out_dir,
         &mut writer,
@@ -514,7 +478,6 @@ fn archive_out_dir(
     ) {
         Ok(Some(path)) => {
             drop(writer);
-            fs::remove_file(&temporary).ok();
             bail!(
                 "build script output {} embeds the workspace path ({workspace_root}); \
                  outputs must be location-free — resolve paths at runtime instead of \
@@ -523,20 +486,9 @@ fn archive_out_dir(
             );
         }
         Ok(None) => {}
-        Err(error) => {
-            drop(writer);
-            fs::remove_file(&temporary).ok();
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     }
-    if let Err(error) = writer.flush() {
-        drop(writer);
-        fs::remove_file(&temporary).ok();
-        return Err(error.into());
-    }
-    let (file, hash, size) = writer.finish();
-    drop(file);
-    let hash = store.insert_prehashed_file(&temporary, hash)?;
+    let (hash, size) = store.finish_streamed_insert(writer)?;
     Ok(OutDirArchive { hash, size })
 }
 
@@ -555,7 +507,7 @@ impl Ctx {
         Ok(paths)
     }
 
-    fn package_read_inputs(&self, package_index: usize) -> Result<Vec<PathBuf>> {
+    fn package_read_inputs(&self, package_index: usize) -> Result<PackageReadInputs> {
         let pkg = &self.meta.packages[package_index];
         let mut inputs = if pkg.source.is_some() {
             vec![pkg.root().canonicalize()?]
@@ -574,7 +526,31 @@ impl Ctx {
         );
         inputs.sort();
         inputs.dedup();
-        Ok(inputs)
+        let cargo_home = Path::new(&self.cargo_home);
+        let registry_sources = cargo_home.join("registry/src");
+        let git_checkouts = cargo_home.join("git/checkouts");
+        let immutable_source_roots = inputs
+            .iter()
+            .filter(|path| path.starts_with(&registry_sources) || path.starts_with(&git_checkouts))
+            .cloned()
+            .collect();
+        Ok(PackageReadInputs {
+            paths: inputs,
+            immutable_source_roots,
+        })
+    }
+
+    fn build_script_archive_roots(&self, index: usize) -> Result<Vec<PathBuf>> {
+        let mut roots = Vec::new();
+        for dependency in dependency_closure(self, [index]) {
+            roots.extend(
+                self.package_read_inputs(self.units[dependency].pkg)?
+                    .immutable_source_roots,
+            );
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
     }
 }
 
@@ -934,212 +910,304 @@ fn action_extra_filename(ctx: &Ctx, uidx: usize, key: &str) -> String {
     }
 }
 
-fn planned_outputs(ctx: &Ctx, uidx: usize, key: &str) -> Result<Vec<String>> {
-    let unit = &ctx.units[uidx];
-    if matches!(unit.kind, Kind::Bsr) {
-        return Ok(Vec::new());
-    }
-    let (crate_name, crate_type, _) = compile_identity(ctx, uidx);
-    let extra = action_extra_filename(ctx, uidx, key);
-    if is_checked(ctx, uidx) {
-        // Checked dependency units are libraries in practice; unlike
-        // `--print file-names`, `--emit=metadata` always names the metadata
-        // artifact directly.
-        return Ok(vec![format!("lib{crate_name}-{extra}.rmeta")]);
-    }
-    expected_outputs(ctx, &crate_name, &extra, &crate_type, unit.host)
-}
-
-fn planned_main_output(ctx: &Ctx, uidx: usize, key: &str) -> Result<Option<String>> {
-    let outputs = planned_outputs(ctx, uidx, key)?;
-    Ok(outputs
-        .iter()
-        .find(|output| output.ends_with(".rlib"))
-        .or_else(|| outputs.first())
-        .cloned())
-}
-
-#[derive(Serialize)]
-struct PlannedActionTarget<'a> {
-    name: &'a str,
-    kind: &'a [String],
-    crate_types: &'a [String],
-    edition: &'a str,
+#[derive(Clone, Serialize)]
+struct PlannedActionTarget {
+    name: String,
+    kind: Vec<String>,
+    crate_types: Vec<String>,
+    edition: String,
     test_harness: bool,
 }
 
-#[derive(Serialize)]
-struct PlannedActionKey<'a> {
-    kind: &'a str,
+#[derive(Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct PlannedActionDependency {
+    producer: String,
+    filename: Option<String>,
+    extern_name: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct PlannedTool {
+    name: String,
+    version: String,
+    identity: String,
+    environment_name: String,
+    environment_value: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ActionSpec {
+    Compile(CompileActionSpec),
+    BuildScriptRun(BuildScriptRunActionSpec),
+}
+
+#[derive(Clone, Serialize)]
+struct CompileActionSpec {
+    kind: String,
     tool: &'static str,
-    rustc: &'a str,
-    host: &'a str,
-    package: (&'a str, &'a str, &'a str),
-    source_hash: &'a str,
-    crate_name: &'a str,
-    crate_type: &'a str,
-    source: &'a str,
-    target: PlannedActionTarget<'a>,
-    platform: &'a str,
-    features: &'a [String],
-    dependencies: &'a [(String, Option<String>, Option<String>)],
-    profile: &'a [String],
-    profile_name: &'a str,
+    rustc: String,
+    host: String,
+    package: (String, String, String),
+    source_hash: String,
+    crate_name: String,
+    crate_type: String,
+    source: String,
+    target: PlannedActionTarget,
+    platform: String,
+    features: Vec<String>,
+    dependencies: Vec<PlannedActionDependency>,
+    profile: Vec<String>,
+    profile_name: String,
     incremental: bool,
-    compiler_identity: &'a str,
-    environment: &'a [(String, String)],
-    environment_probes: &'a [(String, String)],
-    rustflags: &'a [String],
-    lints: &'a [String],
-    clippy: &'a str,
-    clippy_args: &'a [String],
+    compiler_identity: String,
+    environment: Vec<(String, String)>,
+    rustflags: Vec<String>,
+    lints: Vec<String>,
+    clippy: Option<String>,
+    clippy_args: Vec<String>,
     cap_lints: bool,
-    tools: &'a [String],
-    toolchain: &'a str,
+    toolchain: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct BuildScriptRunActionSpec {
+    tool: &'static str,
+    package: (String, String, String),
+    source_hash: String,
+    dependencies: Vec<PlannedActionDependency>,
+    environment: Vec<(String, String)>,
+    tools: Vec<PlannedTool>,
+    toolchain: String,
+}
+
+struct ActionPlan {
+    key: String,
+    spec: ActionSpec,
+    outputs: Vec<String>,
+    main_output: Option<String>,
+    declared_environment: Vec<(String, String)>,
+}
+
+impl ActionPlan {
+    fn compile_spec(&self) -> Result<&CompileActionSpec> {
+        match &self.spec {
+            ActionSpec::Compile(spec) => Ok(spec),
+            ActionSpec::BuildScriptRun(_) => bail!("compile action plan expected"),
+        }
+    }
+
+    fn build_script_run_spec(&self) -> Result<&BuildScriptRunActionSpec> {
+        match &self.spec {
+            ActionSpec::BuildScriptRun(spec) => Ok(spec),
+            ActionSpec::Compile(_) => bail!("build-script action plan expected"),
+        }
+    }
 }
 
 /// Compute every cache identity from declared inputs and producer action
 /// identities. No action result is loaded here: output bytes and build-script
 /// directives are resolved only if an action later needs to execute.
-fn compute_action_keys(ctx: &Ctx) -> Result<Vec<String>> {
-    fn key_of(ctx: &Ctx, index: usize, keys: &[OnceLock<String>]) -> Result<String> {
-        let dependency_edges: Vec<(usize, Option<String>)> = ctx.units[index]
-            .deps
-            .iter()
-            .map(|dependency| (dependency.unit, dependency.extern_name.clone()))
-            .collect();
-
+fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
+    fn plan_action(ctx: &Ctx, index: usize, plans: &[OnceLock<ActionPlan>]) -> Result<ActionPlan> {
         let unit = &ctx.units[index];
         let package = &ctx.meta.packages[unit.pkg];
         let source_hash = ctx.pkg_src_hash(unit.pkg)?;
         let mut features = unit.features.clone();
         features.sort();
         let (crate_name, crate_type, source) = compile_identity(ctx, index);
-        // Producer keys recursively include their own inputs, so direct action
-        // references cover the full implementation closure. Unlike the old
-        // output-hash scheme, linking actions do not need to flatten every
-        // transitive artifact into their keys.
         let mut dependencies = Vec::new();
-        for (dependency, extern_name) in &dependency_edges {
-            let producer = keys[*dependency]
+        for dependency in &unit.deps {
+            let producer = plans[dependency.unit]
                 .get()
-                .context("dependency action key missing")?;
-            let output = if extern_name.is_some() {
-                if is_pipelined(ctx, index) && is_pipelined(ctx, *dependency) {
-                    let (dependency_crate, _, _) = compile_identity(ctx, *dependency);
-                    Some(format!(
-                        "lib{dependency_crate}-{}.rmeta",
-                        action_extra_filename(ctx, *dependency, producer)
-                    ))
-                } else {
-                    planned_main_output(ctx, *dependency, producer)?
+                .context("dependency action plan missing")?;
+            let (include, filename) = match &dependency.role {
+                DependencyRole::Extern(_) => {
+                    let filename = if is_pipelined(ctx, index) && is_pipelined(ctx, dependency.unit)
+                    {
+                        let dependency_spec = producer.compile_spec()?;
+                        Some(format!(
+                            "lib{}-{}.rmeta",
+                            dependency_spec.crate_name,
+                            action_extra_filename(ctx, dependency.unit, &producer.key)
+                        ))
+                    } else {
+                        producer.main_output.clone()
+                    };
+                    (true, filename)
                 }
-            } else if matches!(ctx.units[*dependency].kind, Kind::Bsc) {
-                planned_main_output(ctx, *dependency, producer)?
-            } else {
-                None
+                DependencyRole::BuildScriptCompile | DependencyRole::BinaryExecutable => {
+                    (true, producer.main_output.clone())
+                }
+                DependencyRole::BuildScriptOutput | DependencyRole::BuildScriptMetadata => {
+                    (true, None)
+                }
+                DependencyRole::Other => (false, None),
             };
-            dependencies.push((producer.clone(), output, extern_name.clone()));
+            if include {
+                dependencies.push(PlannedActionDependency {
+                    producer: producer.key.clone(),
+                    filename,
+                    extern_name: dependency.role.extern_name().map(str::to_string),
+                });
+            }
         }
         dependencies.sort();
 
-        let mut package_environment = ctx.pkg_env(package);
-        package_environment.extend(ctx.config_env.iter().cloned());
-        package_environment.sort();
-        let mut probes = ctx
-            .env_probes
-            .iter()
-            .filter(|(_, _, packages, profiles)| {
-                packages.iter().any(|candidate| candidate == &package.name)
-                    && (profiles.is_empty()
-                        || profiles.iter().any(|profile| profile == &unit.profile.name))
-            })
-            .map(|(name, value, _, _)| (name.clone(), value.clone()))
-            .collect::<Vec<_>>();
-        probes.sort();
         let platform = if unit.host {
-            ctx.host.as_str()
+            ctx.host.clone()
         } else {
-            ctx.target.as_deref().unwrap_or(ctx.host.as_str())
+            ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
         };
-        let mut tools = if matches!(unit.kind, Kind::Bsr) {
-            ctx.tools
-                .iter()
-                .filter(|tool| tool.is_visible_to(&package.name, platform))
-                .map(|tool| tool.id.clone())
-                .collect::<Vec<_>>()
+        let (spec, declared_environment) = if matches!(unit.kind, Kind::Bsr) {
+            let (environment, declared_environment, visible_tools) =
+                build_script_environment(ctx, unit, package);
+            let mut tools = visible_tools
+                .into_iter()
+                .map(|tool| PlannedTool {
+                    name: tool.name.clone(),
+                    version: tool.version.clone(),
+                    identity: tool.id.clone(),
+                    environment_name: tool.env.clone(),
+                    environment_value: tool.value.clone(),
+                })
+                .collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.identity.cmp(&right.identity));
+            let spec = ActionSpec::BuildScriptRun(BuildScriptRunActionSpec {
+                tool: TOOL_VERSION,
+                package: (
+                    package.name.clone(),
+                    package.version.clone(),
+                    package
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string()),
+                ),
+                source_hash,
+                dependencies,
+                environment,
+                tools,
+                toolchain: ctx.toolchain.clone(),
+            });
+            (spec, declared_environment)
         } else {
-            Vec::new()
-        };
-        tools.sort();
-        let rustflags = if unit.host {
-            &ctx.host_rustflags
-        } else {
-            &ctx.target_rustflags
-        };
-        let lint_flags = if ctx.clippy && package.source.is_none() {
-            &ctx.lints[unit.pkg].with_clippy
-        } else {
-            &ctx.lints[unit.pkg].rustc_only
-        };
-        let profile_flags = effective_profile_flags(ctx, index);
-        let uses_toolchain = matches!(unit.kind, Kind::Bsr) || is_linking(ctx, index);
-        let key_input = PlannedActionKey {
-            kind: if matches!(unit.kind, Kind::Bsr) {
-                "run-build-script"
+            let mut environment = ctx.pkg_env(package);
+            environment.extend(ctx.config_env.iter().cloned());
+            for dependency in &unit.deps {
+                if !matches!(dependency.role, DependencyRole::BinaryExecutable) {
+                    continue;
+                }
+                let binary = &ctx.units[dependency.unit];
+                let producer = plans[dependency.unit]
+                    .get()
+                    .context("binary dependency action plan missing")?;
+                let output = producer
+                    .main_output
+                    .as_ref()
+                    .context("binary dependency artifact missing")?;
+                environment.push((
+                    format!("CARGO_BIN_EXE_{}", binary.target.name),
+                    ctx.pool_logical
+                        .join(Store::pool_file_name(output, &producer.key))
+                        .display()
+                        .to_string(),
+                ));
+            }
+            if matches!(unit.kind, Kind::Bin) {
+                environment.push(("CARGO_BIN_NAME".to_string(), unit.target.name.clone()));
+            }
+            if matches!(unit.kind, Kind::Test)
+                && unit
+                    .target
+                    .kind
+                    .iter()
+                    .any(|kind| kind == "test" || kind == "bench")
+            {
+                environment.push((
+                    "CARGO_TARGET_TMPDIR".to_string(),
+                    "/tmp/corgi/target-tmp".to_string(),
+                ));
+            }
+            environment.sort();
+            let rustflags = if unit.host {
+                ctx.host_rustflags.clone()
             } else {
-                compile_action_kind(ctx, index)
-            },
-            tool: TOOL_VERSION,
-            rustc: &ctx.rustc_version,
-            host: &ctx.host,
-            package: (
-                &package.name,
-                &package.version,
-                package.source.as_deref().unwrap_or("local"),
-            ),
-            source_hash: &source_hash,
-            crate_name: &crate_name,
-            crate_type: &crate_type,
-            source: &source,
-            target: PlannedActionTarget {
-                name: &unit.target.name,
-                kind: &unit.target.kind,
-                crate_types: &unit.target.crate_types,
-                edition: &unit.target.edition,
-                test_harness: unit.test_harness,
-            },
-            platform,
-            features: &features,
-            dependencies: &dependencies,
-            profile: &profile_flags,
-            profile_name: &unit.profile.name,
-            incremental: ctx.incremental && unit.profile.incremental,
-            compiler_identity: &ctx.idents[index],
-            environment: &package_environment,
-            environment_probes: &probes,
-            rustflags,
-            lints: lint_flags,
-            clippy: if ctx.clippy && package.source.is_none() {
-                ctx.clippy_id.as_str()
+                ctx.target_rustflags.clone()
+            };
+            let lint_flags = if ctx.clippy && package.source.is_none() {
+                ctx.lints[unit.pkg].with_clippy.clone()
             } else {
-                ""
-            },
-            clippy_args: if ctx.clippy && package.source.is_none() {
-                ctx.clippy_args.as_slice()
-            } else {
-                &[]
-            },
-            cap_lints: package.source.is_some(),
-            tools: &tools,
-            toolchain: if uses_toolchain {
-                ctx.toolchain.as_str()
-            } else {
-                ""
-            },
+                ctx.lints[unit.pkg].rustc_only.clone()
+            };
+            let spec = ActionSpec::Compile(CompileActionSpec {
+                kind: compile_action_kind(ctx, index).to_string(),
+                tool: TOOL_VERSION,
+                rustc: ctx.rustc_version.clone(),
+                host: ctx.host.clone(),
+                package: (
+                    package.name.clone(),
+                    package.version.clone(),
+                    package
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string()),
+                ),
+                source_hash,
+                crate_name,
+                crate_type,
+                source,
+                target: PlannedActionTarget {
+                    name: unit.target.name.clone(),
+                    kind: unit.target.kind.clone(),
+                    crate_types: unit.target.crate_types.clone(),
+                    edition: unit.target.edition.clone(),
+                    test_harness: unit.test_harness,
+                },
+                platform,
+                features,
+                dependencies,
+                profile: effective_profile_flags(ctx, index),
+                profile_name: unit.profile.name.clone(),
+                incremental: ctx.incremental && unit.profile.incremental,
+                compiler_identity: ctx.idents[index].clone(),
+                environment,
+                rustflags,
+                lints: lint_flags,
+                clippy: (ctx.clippy && package.source.is_none()).then(|| ctx.clippy_id.clone()),
+                clippy_args: if ctx.clippy && package.source.is_none() {
+                    ctx.clippy_args.clone()
+                } else {
+                    Vec::new()
+                },
+                cap_lints: package.source.is_some(),
+                toolchain: is_linking(ctx, index).then(|| ctx.toolchain.clone()),
+            });
+            (spec, ctx.config_env.clone())
         };
-        let key = sha256_hex(&serde_json::to_vec(&key_input)?);
-        Ok(key)
+        let key = sha256_hex(&serde_json::to_vec(&spec)?);
+        let outputs = match &spec {
+            ActionSpec::Compile(spec) => {
+                let extra = action_extra_filename(ctx, index, &key);
+                if is_checked(ctx, index) {
+                    vec![format!("lib{}-{extra}.rmeta", spec.crate_name)]
+                } else {
+                    expected_outputs(ctx, &spec.crate_name, &extra, &spec.crate_type, unit.host)?
+                }
+            }
+            ActionSpec::BuildScriptRun(_) => Vec::new(),
+        };
+        let main_output = outputs
+            .iter()
+            .find(|output| output.ends_with(".rlib"))
+            .or_else(|| outputs.first())
+            .cloned();
+        Ok(ActionPlan {
+            key,
+            spec,
+            outputs,
+            main_output,
+            declared_environment,
+        })
     }
 
     // Source hashes are package-scoped. Populate the memo once before unit
@@ -1184,7 +1252,7 @@ fn compute_action_keys(ctx: &Ctx) -> Result<Vec<String>> {
     }
 
     let unit_count = ctx.units.len();
-    let keys = (0..unit_count).map(|_| OnceLock::new()).collect::<Vec<_>>();
+    let plans = (0..unit_count).map(|_| OnceLock::new()).collect::<Vec<_>>();
     let mut reverse_dependencies = vec![Vec::new(); unit_count];
     let mut remaining_dependencies = vec![0; unit_count];
     for (index, unit) in ctx.units.iter().enumerate() {
@@ -1226,12 +1294,12 @@ fn compute_action_keys(ctx: &Ctx) -> Result<Vec<String>> {
                         state = condition.wait(state).unwrap();
                     }
                 };
-                let result = key_of(ctx, index, &keys);
+                let result = plan_action(ctx, index, &plans);
                 let mut state = state.lock().unwrap();
                 state.in_flight -= 1;
                 match result {
-                    Ok(key) => {
-                        let _ = keys[index].set(key);
+                    Ok(plan) => {
+                        let _ = plans[index].set(plan);
                         state.completed += 1;
                         for &dependent in &reverse_dependencies[index] {
                             state.remaining_dependencies[dependent] -= 1;
@@ -1264,10 +1332,11 @@ fn compute_action_keys(ctx: &Ctx) -> Result<Vec<String>> {
             state.completed
         );
     }
-    keys.into_iter()
-        .map(|key| {
-            key.into_inner()
-                .context("action key missing after planning")
+    plans
+        .into_iter()
+        .map(|plan| {
+            plan.into_inner()
+                .context("action plan missing after planning")
         })
         .collect()
 }
@@ -4127,7 +4196,7 @@ fn build_inner(
         )
         .context("creating jobserver")?,
         idents,
-        action_keys: Vec::new(),
+        action_plans: Vec::new(),
         logical_pkg_ids,
         report_unit_keys,
         check_mode,
@@ -4145,7 +4214,7 @@ fn build_inner(
         extra_inputs,
         report: Arc::clone(&recorder),
     };
-    ctx.action_keys = compute_action_keys(&ctx)?;
+    ctx.action_plans = compute_action_plans(&ctx)?;
 
     register_report_units(&ctx);
     finish_report_stage(&recorder, "prepare", report_stage_start);
@@ -4192,10 +4261,16 @@ fn build_inner(
             ctx.store.export(&m.hash, &dest, true)?;
             let name = u.target.name.clone();
             let cwd = ctx.meta.packages[u.pkg].root();
-            let binary_environment = binary_executable_environment(&ctx, u)?;
+            let binary_environment = ctx.action_plans[i]
+                .compile_spec()?
+                .environment
+                .iter()
+                .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
+                .cloned()
+                .collect();
             if matches!(mode, Mode::Test) {
                 if u.test_harness {
-                    let pass_key = test_pass_key(&r.key)?;
+                    let pass_key = test_pass_key(&ctx.action_plans[i].key)?;
                     let cached_test_count = if canonical_run && !force_tests {
                         load_test_pass(&ctx.store, &pass_key)
                     } else {
@@ -4256,7 +4331,7 @@ fn build_inner(
         }
         if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
             if let Some(r) = results[i].get() {
-                let k16 = &r.key[..16];
+                let k16 = &ctx.action_plans[i].key[..16];
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm")
                         || o.name.ends_with(".dylib")
@@ -4885,15 +4960,22 @@ fn translate_unit_graph(
     for (i, u) in g.units.iter().enumerate() {
         let mut deps = Vec::new();
         for d in &u.dependencies {
-            let extern_name =
-                if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
-                    Some(d.extern_crate_name.clone())
-                } else {
-                    None
-                };
+            let role = if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
+                DependencyRole::Extern(d.extern_crate_name.clone())
+            } else {
+                match (kinds[i], kinds[d.index]) {
+                    (Kind::Bsr, Kind::Bsc) => DependencyRole::BuildScriptCompile,
+                    (Kind::Bsr, Kind::Bsr) => DependencyRole::BuildScriptMetadata,
+                    (_, Kind::Bsr) if units[i].pkg == units[d.index].pkg => {
+                        DependencyRole::BuildScriptOutput
+                    }
+                    (_, Kind::Bsr) => DependencyRole::BuildScriptMetadata,
+                    _ => DependencyRole::Other,
+                }
+            };
             deps.push(UnitDep {
                 unit: d.index,
-                extern_name,
+                role,
             });
         }
         units[i].deps = deps;
@@ -4922,7 +5004,7 @@ fn translate_unit_graph(
                 if !unit.deps.iter().any(|dependency| dependency.unit == *index) {
                     unit.deps.push(UnitDep {
                         unit: *index,
-                        extern_name: None,
+                        role: DependencyRole::BinaryExecutable,
                     });
                 }
             }
@@ -5101,14 +5183,6 @@ impl Ctx {
             Store::touch_used(&path);
         }
         Ok(Ok(res))
-    }
-
-    fn try_cache_hit(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
-        let result = self.lookup_action(key)?;
-        if let Ok(action) = &result {
-            self.materialize_action(key, action)?;
-        }
-        Ok(result)
     }
 
     fn pkg_src_hash(&self, pi: usize) -> Result<String> {
@@ -6050,135 +6124,106 @@ fn report_unit_keys(meta: &Metadata, units: &[Unit], logical_pkg_ids: &[String])
         .collect()
 }
 
-fn planned_compile_report_key_inputs(
-    ctx: &Ctx,
-    index: usize,
-) -> Result<crate::report::ActionKeyInputs> {
-    let unit = &ctx.units[index];
-    let package = &ctx.meta.packages[unit.pkg];
-    let (_, crate_type, _) = compile_identity(ctx, index);
-    let mut environment = ctx.pkg_env(package);
-    environment.extend(ctx.config_env.iter().cloned());
-    environment.extend(binary_executable_environment(ctx, unit)?);
-    if matches!(unit.kind, Kind::Bin) {
-        environment.push(("CARGO_BIN_NAME".to_string(), unit.target.name.clone()));
-    }
-    if matches!(unit.kind, Kind::Test)
-        && unit
-            .target
-            .kind
-            .iter()
-            .any(|kind| kind == "test" || kind == "bench")
-    {
-        environment.push((
-            "CARGO_TARGET_TMPDIR".to_string(),
-            "/tmp/corgi/target-tmp".to_string(),
-        ));
-    }
-
-    let mut link_dependencies = Vec::new();
-    if is_linking(ctx, index) {
-        let mut seen = vec![false; ctx.units.len()];
-        let mut stack = unit
-            .deps
-            .iter()
-            .map(|dependency| dependency.unit)
-            .collect::<Vec<_>>();
-        while let Some(dependency) = stack.pop() {
-            if seen[dependency] {
-                continue;
-            }
-            seen[dependency] = true;
-            if planned_main_output(ctx, dependency, &ctx.action_keys[dependency])?.is_some() {
-                link_dependencies.push(ctx.report_unit_keys[dependency].clone());
-            }
-            for child in &ctx.units[dependency].deps {
-                stack.push(child.unit);
-            }
+fn dependency_closure(ctx: &Ctx, roots: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let mut seen = vec![false; ctx.units.len()];
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    let mut closure = Vec::new();
+    while let Some(index) = stack.pop() {
+        if seen[index] {
+            continue;
         }
-        link_dependencies.sort();
-        link_dependencies.dedup();
-    }
-    let build_script = unit
-        .deps
-        .iter()
-        .find(|dependency| {
-            matches!(ctx.units[dependency.unit].kind, Kind::Bsr)
-                && ctx.units[dependency.unit].pkg == unit.pkg
-        })
-        .map(|dependency| ctx.report_unit_keys[dependency.unit].clone());
-    let clippy = ctx.clippy && package.source.is_none();
-    let lints = if clippy {
-        &ctx.lints[unit.pkg].with_clippy
-    } else {
-        &ctx.lints[unit.pkg].rustc_only
-    };
-    Ok(crate::report::ActionKeyInputs::Compile(Box::new(
-        crate::report::CompileKeyInputs {
-            source_hash: ctx.pkg_src_hash(unit.pkg)?,
-            declared_environment: ctx
-                .config_env
+        seen[index] = true;
+        closure.push(index);
+        stack.extend(
+            ctx.units[index]
+                .deps
                 .iter()
-                .map(|(name, value)| crate::report::EnvironmentInput {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-            effective_environment_hash: sha256_hex(serde_json::to_string(&environment)?.as_bytes()),
-            link_dependencies,
-            build_script,
-            lints: lints.clone(),
-            clippy: clippy.then(|| ctx.clippy_id.clone()),
-            cap_lints: package.source.is_some(),
-            uses_toolchain: crate_type != "lib" && !is_checked(ctx, index),
-            compiler_identity: ctx.idents[index].clone(),
-        },
-    )))
-}
-
-fn planned_build_script_report_key_inputs(
-    ctx: &Ctx,
-    index: usize,
-) -> Result<crate::report::ActionKeyInputs> {
-    let unit = &ctx.units[index];
-    let package = &ctx.meta.packages[unit.pkg];
-    let script = unit
-        .deps
-        .iter()
-        .find(|dependency| matches!(ctx.units[dependency.unit].kind, Kind::Bsc))
-        .map(|dependency| ctx.report_unit_keys[dependency.unit].clone())
-        .context("build script compile dependency missing")?;
-    let (environment, declared_environment, visible_tools) =
-        build_script_environment(ctx, unit, package);
-    Ok(crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
-        crate::report::BuildScriptRunKeyInputs {
-            source_hash: ctx.pkg_src_hash(unit.pkg)?,
-            script,
-            declared_environment: declared_environment
-                .into_iter()
-                .map(|(name, value)| crate::report::EnvironmentInput { name, value })
-                .collect(),
-            effective_environment_hash: sha256_hex(serde_json::to_string(&environment)?.as_bytes()),
-            tools: visible_tools
-                .into_iter()
-                .map(|tool| crate::report::ToolInput {
-                    name: tool.name.clone(),
-                    version: tool.version.clone(),
-                    identity: tool.id.clone(),
-                    environment_name: tool.env.clone(),
-                    environment_value: tool.value.clone(),
-                })
-                .collect(),
-            uses_toolchain: true,
-        },
-    )))
+                .map(|dependency| dependency.unit),
+        );
+    }
+    closure
 }
 
 fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::ActionKeyInputs> {
-    if matches!(ctx.units[index].kind, Kind::Bsr) {
-        planned_build_script_report_key_inputs(ctx, index)
-    } else {
-        planned_compile_report_key_inputs(ctx, index)
+    let plan = &ctx.action_plans[index];
+    let declared_environment = plan
+        .declared_environment
+        .iter()
+        .map(|(name, value)| crate::report::EnvironmentInput {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    match &plan.spec {
+        ActionSpec::Compile(spec) => {
+            let mut link_dependencies = if spec.toolchain.is_some() {
+                dependency_closure(
+                    ctx,
+                    ctx.units[index]
+                        .deps
+                        .iter()
+                        .map(|dependency| dependency.unit),
+                )
+                .into_iter()
+                .filter(|dependency| ctx.action_plans[*dependency].main_output.is_some())
+                .map(|dependency| ctx.report_unit_keys[dependency].clone())
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            link_dependencies.sort();
+            let build_script = ctx.units[index]
+                .deps
+                .iter()
+                .find(|dependency| matches!(dependency.role, DependencyRole::BuildScriptOutput))
+                .map(|dependency| ctx.report_unit_keys[dependency.unit].clone());
+            Ok(crate::report::ActionKeyInputs::Compile(Box::new(
+                crate::report::CompileKeyInputs {
+                    source_hash: spec.source_hash.clone(),
+                    declared_environment,
+                    effective_environment_hash: sha256_hex(
+                        serde_json::to_string(&spec.environment)?.as_bytes(),
+                    ),
+                    link_dependencies,
+                    build_script,
+                    lints: spec.lints.clone(),
+                    clippy: spec.clippy.clone(),
+                    cap_lints: spec.cap_lints,
+                    uses_toolchain: spec.toolchain.is_some(),
+                    compiler_identity: spec.compiler_identity.clone(),
+                },
+            )))
+        }
+        ActionSpec::BuildScriptRun(spec) => {
+            let script = ctx.units[index]
+                .deps
+                .iter()
+                .find(|dependency| matches!(dependency.role, DependencyRole::BuildScriptCompile))
+                .map(|dependency| ctx.report_unit_keys[dependency.unit].clone())
+                .context("build script compile dependency missing")?;
+            Ok(crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
+                crate::report::BuildScriptRunKeyInputs {
+                    source_hash: spec.source_hash.clone(),
+                    script,
+                    declared_environment,
+                    effective_environment_hash: sha256_hex(
+                        serde_json::to_string(&spec.environment)?.as_bytes(),
+                    ),
+                    tools: spec
+                        .tools
+                        .iter()
+                        .map(|tool| crate::report::ToolInput {
+                            name: tool.name.clone(),
+                            version: tool.version.clone(),
+                            identity: tool.identity.clone(),
+                            environment_name: tool.environment_name.clone(),
+                            environment_value: tool.environment_value.clone(),
+                        })
+                        .collect(),
+                    uses_toolchain: true,
+                },
+            )))
+        }
     }
 }
 
@@ -6204,15 +6249,8 @@ fn register_report_units(ctx: &Ctx) {
             .iter()
             .map(|dependency| crate::report::UnitDependency {
                 unit: ctx.report_unit_keys[dependency.unit].clone(),
-                role: if dependency.extern_name.is_some() {
-                    "extern"
-                } else if matches!(ctx.units[dependency.unit].kind, Kind::Bsr) {
-                    "build_script"
-                } else {
-                    "dependency"
-                }
-                .to_string(),
-                name: dependency.extern_name.clone(),
+                role: dependency.role.report_name().to_string(),
+                name: dependency.role.extern_name().map(str::to_string),
             })
             .collect::<Vec<_>>();
         dependencies.sort_by(|left, right| {
@@ -6300,10 +6338,10 @@ fn register_report_units(ctx: &Ctx) {
                 result: crate::report::UnitCacheResult::NotChecked,
                 probe: None,
             },
-            key: Some(crate::report::UnitKey {
-                hash: ctx.action_keys[id].clone(),
+            key: crate::report::UnitKey {
+                hash: ctx.action_plans[id].key.clone(),
                 inputs: None,
-            }),
+            },
             timings: None,
             outputs: Vec::new(),
         };
@@ -6314,9 +6352,7 @@ fn register_report_units(ctx: &Ctx) {
 fn populate_report_key_inputs(ctx: &Ctx, index: usize) -> Result<()> {
     let inputs = planned_report_key_inputs(ctx, index)?;
     ctx.report.update(|report| {
-        if let Some(key) = &mut report.units[index].key {
-            key.inputs = Some(inputs);
-        }
+        report.units[index].key.inputs = Some(inputs);
     });
     Ok(())
 }
@@ -6325,9 +6361,10 @@ fn cached_unit_result(
     ctx: &Ctx,
     index: usize,
     result: ActionResult,
+    probe: &str,
     phases: Phases,
 ) -> Result<Option<UnitResult>> {
-    let key = ctx.action_keys[index].clone();
+    let plan = &ctx.action_plans[index];
     if matches!(ctx.units[index].kind, Kind::Bsr) {
         if result.bs.is_none() || result.out_dir.is_none() {
             return Ok(None);
@@ -6335,11 +6372,10 @@ fn cached_unit_result(
         ctx.report.update(|report| {
             report.units[index].cache = crate::report::UnitCache {
                 result: crate::report::UnitCacheResult::Hit,
-                probe: Some("found".to_string()),
+                probe: Some(probe.to_string()),
             };
         });
         return Ok(Some(UnitResult {
-            key,
             cached: true,
             res: result,
             main: None,
@@ -6352,24 +6388,24 @@ fn cached_unit_result(
     // The action key predicts the outputs that make a record usable. Require
     // those outputs even for `check` actions, while permitting rustc to add
     // auxiliary outputs that are harmless to retain in the record.
-    let expected = planned_outputs(ctx, index, &key)?;
-    if !expected
+    if !plan
+        .outputs
         .iter()
         .all(|name| result.outputs.iter().any(|output| &output.name == name))
     {
         return Ok(None);
     }
-    ctx.materialize_action(&key, &result)?;
+    ctx.materialize_action(&plan.key, &result)?;
     if !result.stderr.is_empty() && package.source.is_none() {
         eprint!("{}", result.stderr);
     }
     ctx.report.update(|report| {
         report.units[index].cache = crate::report::UnitCache {
             result: crate::report::UnitCacheResult::Hit,
-            probe: Some("found".to_string()),
+            probe: Some(probe.to_string()),
         };
     });
-    finish_compile(&expected, key, true, result, phases).map(Some)
+    finish_compile(plan, true, result, phases).map(Some)
 }
 
 fn requested_units(ctx: &Ctx) -> Vec<usize> {
@@ -6389,11 +6425,7 @@ fn requested_units(ctx: &Ctx) -> Vec<usize> {
             continue;
         }
         for dependency in &unit.deps {
-            let binary = &ctx.units[dependency.unit];
-            if binary.pkg == unit.pkg
-                && matches!(binary.kind, Kind::Bin)
-                && binary.target.kind.iter().any(|kind| kind == "bin")
-            {
+            if matches!(dependency.role, DependencyRole::BinaryExecutable) {
                 requested.push(dependency.unit);
             }
         }
@@ -6422,13 +6454,13 @@ fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bo
             needed[index] = true;
             populate_report_key_inputs(ctx, index)?;
             let started = Instant::now();
-            let lookup = ctx.lookup_action(&ctx.action_keys[index])?;
+            let lookup = ctx.lookup_action(&ctx.action_plans[index].key)?;
             let phases = Phases {
                 cache_ns: started.elapsed().as_nanos() as u64,
                 ..Phases::default()
             };
             let miss = match lookup {
-                Ok(action) => match cached_unit_result(ctx, index, action, phases)? {
+                Ok(action) => match cached_unit_result(ctx, index, action, "found", phases)? {
                     Some(mut result) => {
                         result.phases.cache_ns = started.elapsed().as_nanos() as u64;
                         let _ = results[index].set(result);
@@ -6436,7 +6468,7 @@ fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bo
                         None
                     }
                     None => {
-                        fs::remove_file(ctx.store.action_path(&ctx.action_keys[index])).ok();
+                        fs::remove_file(ctx.store.action_path(&ctx.action_plans[index].key)).ok();
                         Some(CacheMiss::OutputMismatch)
                     }
                 },
@@ -6527,7 +6559,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             std::collections::HashSet::new();
         let self_meta_ok = !is_linking(ctx, i);
         for d in &u.deps {
-            let meta_edge = self_meta_ok && d.extern_name.is_some() && is_pipelined(ctx, d.unit);
+            let meta_edge = self_meta_ok
+                && matches!(d.role, DependencyRole::Extern(_))
+                && is_pipelined(ctx, d.unit);
             required.insert((d.unit, !meta_edge));
         }
         let _ = u;
@@ -6568,8 +6602,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             .find(|output| output.name.ends_with(".rmeta"))
         {
             let _ = metas[index].set(MetaOut {
-                file: Store::pool_file_name(&metadata.name, &result.key),
-                hash: metadata.hash.clone(),
+                file: Store::pool_file_name(&metadata.name, &ctx.action_plans[index].key),
             });
         }
     }
@@ -6679,8 +6712,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                                 ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta"))
                             {
                                 let _ = metas[idx].set(MetaOut {
-                                    file: Store::pool_file_name(&rm.name, &ur.key),
-                                    hash: rm.hash.clone(),
+                                    file: Store::pool_file_name(
+                                        &rm.name,
+                                        &ctx.action_plans[idx].key,
+                                    ),
                                 });
                             }
                             for &j in &rdeps_meta[idx] {
@@ -7095,13 +7130,7 @@ fn run_rustc_streaming(
                         .unwrap_or_default();
                     let pool_name = Store::pool_file_name(&file, action_key);
                     ctx.store.materialize_pool(&hash, &pool_name, false)?;
-                    fire_meta(
-                        uidx,
-                        MetaOut {
-                            file: pool_name,
-                            hash,
-                        },
-                    );
+                    fire_meta(uidx, MetaOut { file: pool_name });
                 } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
                     rendered.push_str(r);
                 }
@@ -7501,14 +7530,13 @@ mod ident_tests {
 }
 
 fn finish_compile(
-    expected: &[String],
-    key: String,
+    plan: &ActionPlan,
     cached: bool,
     res: ActionResult,
     phases: Phases,
 ) -> Result<UnitResult> {
     // every rustc-reported output must exist: catches emission surprises
-    for e in expected {
+    for e in &plan.outputs {
         if !res.outputs.iter().any(|o| &o.name == e) {
             bail!(
                 "rustc-reported output {e} missing (got {:?})",
@@ -7518,54 +7546,14 @@ fn finish_compile(
     }
     // the dependency-linking artifact: the rlib when one is emitted,
     // otherwise the sole reported output (dylib/wasm/executable)
-    let main_name = expected
-        .iter()
-        .find(|e| e.ends_with(".rlib"))
-        .or_else(|| expected.first())
-        .context("no expected outputs")?;
+    let main_name = plan.main_output.as_ref().context("no expected outputs")?;
     let main = res.outputs.iter().find(|o| &o.name == main_name).cloned();
     Ok(UnitResult {
-        key,
         cached,
         res,
         main,
         phases,
     })
-}
-
-/// Returns the package binaries Cargo exposes while compiling and running an
-/// integration test or benchmark.
-fn binary_executable_environment(ctx: &Ctx, unit: &Unit) -> Result<Vec<(String, String)>> {
-    if !matches!(unit.kind, Kind::Test)
-        || !unit
-            .target
-            .kind
-            .iter()
-            .any(|kind| kind == "test" || kind == "bench")
-    {
-        return Ok(Vec::new());
-    }
-
-    let mut environment = Vec::new();
-    for dependency in &unit.deps {
-        let binary = &ctx.units[dependency.unit];
-        if binary.pkg != unit.pkg
-            || !matches!(binary.kind, Kind::Bin)
-            || !binary.target.kind.iter().any(|kind| kind == "bin")
-        {
-            continue;
-        }
-        let key = &ctx.action_keys[dependency.unit];
-        let output = planned_main_output(ctx, dependency.unit, key)?
-            .context("binary dependency artifact missing")?;
-        let path = ctx.pool_logical.join(Store::pool_file_name(&output, key));
-        environment.push((
-            format!("CARGO_BIN_EXE_{}", binary.target.name),
-            path.display().to_string(),
-        ));
-    }
-    environment.sort();
-    Ok(environment)
 }
 
 fn compile(
@@ -7578,70 +7566,51 @@ fn compile(
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
-
+    let plan = &ctx.action_plans[uidx];
+    let spec = plan.compile_spec()?;
     let target: &Target = &unit.target;
-    let (crate_name, crate_type): (String, String) = match unit.kind {
-        Kind::Lib => {
-            let ct = if target.kind.iter().any(|k| k == "proc-macro") {
-                "proc-macro".to_string()
-            } else if unit.is_root && target.crate_types.iter().any(|c| c == "cdylib") {
-                // the deployable: build with its declared crate types
-                target.crate_types.join(",")
-            } else {
-                "lib".to_string()
-            };
-            (target.name.replace('-', "_"), ct)
-        }
-        Kind::Bsc | Kind::Bin | Kind::Test => (target.name.replace('-', "_"), "bin".to_string()),
-        Kind::Bsr => unreachable!(),
-    };
-    let crate_type = crate_type.as_str();
-    let clippy_action = ctx.clippy && pkg.source.is_none();
+    let crate_name = &spec.crate_name;
+    let crate_type = spec.crate_type.as_str();
+    let clippy_action = spec.clippy.is_some();
     // Every invocation spells its source relative to the package root. Using
     // the invoking workspace as cwd would make the same package's rustc input
     // `src/lib.rs` when built directly but an absolute path when reached as a
     // dependency of another workspace, producing different artifacts and
     // defeating the location-independent action key.
     let compile_dir = &pkg_root;
-    let src_rel = Path::new(&target.src_path)
-        .strip_prefix(compile_dir)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| target.src_path.clone());
-
-    let mut features: Vec<String> = unit.features.clone();
-    features.sort();
+    let src_rel = &spec.source;
 
     let self_checked = is_checked(ctx, uidx);
     let self_pipelined = is_pipelined(ctx, uidx);
     let default_bs = BuildScriptOut::default();
     let mut bs: &BuildScriptOut = &default_bs;
     let mut out_key = String::new();
-    let mut externs: Vec<(String, String, String)> = Vec::new();
+    let mut externs: Vec<(String, String)> = Vec::new();
     for d in &unit.deps {
-        if let Some(name) = &d.extern_name {
+        if let DependencyRole::Extern(name) = &d.role {
             if self_pipelined && is_pipelined(ctx, d.unit) {
                 // A pipelined edge executes against the dependency's rmeta.
                 // Its producer action key and predictable filename were
                 // already incorporated into this action key during planning.
                 let m = metas[d.unit].get().context("dependency rmeta missing")?;
-                externs.push((name.clone(), m.file.clone(), m.hash.clone()));
+                externs.push((name.clone(), m.file.clone()));
             } else {
                 let r = results[d.unit].get().context("dependency result missing")?;
                 let m = r.main.as_ref().context("dependency artifact missing")?;
-                let file = Store::pool_file_name(&m.name, &r.key);
-                externs.push((name.clone(), file, m.hash.clone()));
+                let file = Store::pool_file_name(&m.name, &ctx.action_plans[d.unit].key);
+                externs.push((name.clone(), file));
             }
-        } else if matches!(ctx.units[d.unit].kind, Kind::Bsr) && ctx.units[d.unit].pkg == unit.pkg {
+        } else if matches!(d.role, DependencyRole::BuildScriptOutput) {
             let r = results[d.unit].get().context("dependency result missing")?;
             let archive = r
                 .res
                 .out_dir
                 .as_ref()
                 .context("build script OUT_DIR archive missing")?;
-            ctx.materialize_out_dir(&r.key, archive)?;
+            ctx.materialize_out_dir(&ctx.action_plans[d.unit].key, archive)?;
             if let Some(b) = &r.res.bs {
                 bs = b;
-                out_key = r.key.clone();
+                out_key = ctx.action_plans[d.unit].key.clone();
             }
         }
     }
@@ -7665,13 +7634,7 @@ fn compile(
         link_args = bs.link_args.clone();
         // native lib search paths from all transitive build scripts must be
         // visible when linking the final binary
-        let mut seen = vec![false; ctx.units.len()];
-        let mut stack: Vec<usize> = unit.deps.iter().map(|d| d.unit).collect();
-        while let Some(i) = stack.pop() {
-            if seen[i] {
-                continue;
-            }
-            seen[i] = true;
+        for i in dependency_closure(ctx, unit.deps.iter().map(|dependency| dependency.unit)) {
             if let Some(r) = results[i].get() {
                 if let Some(b) = &r.res.bs {
                     if !b.link_search.is_empty() {
@@ -7680,7 +7643,7 @@ fn compile(
                             .out_dir
                             .as_ref()
                             .context("native build script OUT_DIR archive missing")?;
-                        ctx.materialize_out_dir(&r.key, archive)?;
+                        ctx.materialize_out_dir(&ctx.action_plans[i].key, archive)?;
                     }
                     for s in &b.link_search {
                         if !link_search.contains(s) {
@@ -7689,38 +7652,14 @@ fn compile(
                     }
                 }
             }
-            for d in &ctx.units[i].deps {
-                stack.push(d.unit);
-            }
         }
     }
 
-    let mut env = ctx.pkg_env(pkg);
-    env.extend(ctx.config_env.iter().cloned());
-    env.extend(binary_executable_environment(ctx, unit)?);
-    if matches!(unit.kind, Kind::Bin) {
-        env.push(("CARGO_BIN_NAME".to_string(), target.name.clone()));
-    }
-    if matches!(unit.kind, Kind::Test) && target.kind.iter().any(|k| k == "test" || k == "bench") {
-        // Cargo sets CARGO_TARGET_TMPDIR only when compiling integration
-        // tests and benches: a scratch directory the harness may use at
-        // runtime, normally baked in via env!. proc-macro-crate keys its
-        // Itself-vs-Name answer off the variable's mere presence. One
-        // fixed machine-global path keeps the baked value identical
-        // everywhere (a workspace path would trip the location tripwire).
-        env.push((
-            "CARGO_TARGET_TMPDIR".to_string(),
-            "/tmp/corgi/target-tmp".to_string(),
-        ));
-    }
-    let unit_rustflags: &[String] = if unit.host {
-        &ctx.host_rustflags
-    } else {
-        &ctx.target_rustflags
-    };
+    let env = &spec.environment;
+    let unit_rustflags = &spec.rustflags;
     let t_phase = Instant::now();
     let mut phases = Phases::default();
-    let cap_lints = pkg.source.is_some();
+    let cap_lints = spec.cap_lints;
 
     // Per-unit resolved profile straight from cargo's unit graph.
     // Checked units skip debug info: they emit metadata only.
@@ -7730,18 +7669,14 @@ fn compile(
     } else {
         prof.debuginfo_flag()
     };
-    let pflags = effective_profile_flags(ctx, uidx);
+    let pflags = &spec.profile;
     // Lints and (in clippy mode) the executor swap. Like cargo's
     // workspace wrapper, clippy-driver runs for EVERY unit of local
     // packages — checked units and the codegen closure (proc-macros,
     // build scripts), so their own code is linted too. All of it lives
     // in clippy-keyed actions (--cfg clippy is code-visible); the
     // dependency layer stays plain-rustc and is shared with check.
-    let lint_flags: &[String] = if clippy_action {
-        &ctx.lints[unit.pkg].with_clippy
-    } else {
-        &ctx.lints[unit.pkg].rustc_only
-    };
+    let lint_flags = &spec.lints;
     let unit_platform = if unit.host {
         ctx.host.as_str()
     } else {
@@ -7750,7 +7685,7 @@ fn compile(
     // Cargo's resolved profile says which units it would compile
     // incrementally (local packages under dev); we honor exactly that,
     // in a separate key namespace.
-    let incr_action = ctx.incremental && prof.incremental;
+    let incr_action = spec.incremental;
     // On darwin, a linking unit with debug info keeps its DWARF in the
     // per-codegen-unit object files rather than in the linked image, and
     // the image's debug map names them by path. This holds whatever
@@ -7758,37 +7693,13 @@ fn compile(
     // the compile either way, so they are always the unpacked kind.
     let unpacked_debug_objects =
         debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
-    let key = ctx.action_keys[uidx].clone();
+    let key = plan.key.clone();
     // Incremental units use the identity hash, not the action key, in
     // -Cextra-filename: rustc's dep graph embeds the output file names,
     // so a key-derived (source-dependent) value marks every saved session
     // red on each edit. Clean-namespace units keep the key-unique k16.
     let ef16 = action_extra_filename(ctx, uidx, &key);
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
-
-    // A cached record stands in for this compile only when it covers the
-    // outputs the compile would produce; a record that does not was written
-    // by a buggy or interrupted run. `probe` names how the record was found,
-    // for the report.
-    let cached_result = |res: ActionResult, probe: &str, phases: Phases| {
-        let expected = planned_outputs(ctx, uidx, &key)?;
-        if !expected
-            .iter()
-            .all(|e| res.outputs.iter().any(|o| &o.name == e))
-        {
-            return Ok(None);
-        }
-        ctx.report.update(|report| {
-            report.units[uidx].cache = crate::report::UnitCache {
-                result: crate::report::UnitCacheResult::Hit,
-                probe: Some(probe.to_string()),
-            };
-        });
-        if !res.stderr.is_empty() && pkg.source.is_none() {
-            eprint!("{}", res.stderr);
-        }
-        finish_compile(&expected, key.clone(), true, res, phases).map(Some)
-    };
 
     // Incremental state: store-managed, scoped per (checkout, crate,
     // crate-type, mode, platform, profile) so histories never cross;
@@ -7863,8 +7774,8 @@ fn compile(
         let lock = fs::File::create(dir.with_extension("lock"))?;
         lock.lock()
             .with_context(|| format!("locking debug objects for {crate_name}"))?;
-        if let Ok(res) = ctx.try_cache_hit(&key)? {
-            if let Some(result) = cached_result(res, "found_after_wait", phases)? {
+        if let Ok(res) = ctx.lookup_action(&key)? {
+            if let Some(result) = cached_unit_result(ctx, uidx, res, "found_after_wait", phases)? {
                 return Ok(result);
             }
         }
@@ -7893,7 +7804,7 @@ fn compile(
     };
     fs::create_dir_all(&scratch)?;
     let package_inputs = ctx.package_read_inputs(unit.pkg)?;
-    let mut reads: Vec<&Path> = package_inputs.iter().map(PathBuf::as_path).collect();
+    let mut reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             reads.push(conf.as_path());
@@ -7933,7 +7844,7 @@ fn compile(
     for (k, v) in &ctx.base_env {
         cmd.env(k, v);
     }
-    for (k, v) in &env {
+    for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.env("CARGO_CRATE_NAME", &crate_name);
@@ -7990,7 +7901,7 @@ fn compile(
             }
         }
     }
-    for f in &pflags {
+    for f in pflags {
         cmd.arg(f);
     }
     for f in lint_flags {
@@ -8021,7 +7932,7 @@ fn compile(
     cmd.arg("--out-dir").arg(&outdir_spelling);
     cmd.arg("-L")
         .arg(format!("dependency={}", ctx.pool_logical.display()));
-    for (name, file, _) in &externs {
+    for (name, file) in &externs {
         cmd.arg("--extern")
             .arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
     }
@@ -8039,7 +7950,7 @@ fn compile(
             "-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"
         ));
     }
-    for f in &features {
+    for f in &spec.features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
     }
     for check_cfg in &check_cfgs {
@@ -8146,7 +8057,7 @@ fn compile(
                 allowed.push(conf.clone());
             }
         }
-        allowed.extend(package_inputs.iter().cloned());
+        allowed.extend(package_inputs.paths.iter().cloned());
         let t_val = Instant::now();
         validate_dep_info(&d, compile_dir, &allowed).with_context(|| {
             format!(
@@ -8203,10 +8114,9 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         bs: None,
         out_dir: None,
     };
-    let expected = planned_outputs(ctx, uidx, &key)?;
     // Never record an action whose outputs are incomplete: a poisoned
     // record would replay the failure from cache on every future run.
-    for e in &expected {
+    for e in &plan.outputs {
         if !res.outputs.iter().any(|o| &o.name == e) {
             bail!(
                 "rustc-reported output {e} missing (got {:?})",
@@ -8217,7 +8127,7 @@ location-free — resolve paths at runtime instead of baking them in at build ti
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     ctx.materialize_action(&key, &res)?;
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
-    finish_compile(&expected, key, false, res, phases)
+    finish_compile(plan, false, res, phases)
 }
 
 fn build_script_environment<'a>(
@@ -8336,18 +8246,20 @@ fn run_build_script(
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
+    let plan = &ctx.action_plans[uidx];
+    let spec = plan.build_script_run_spec()?;
 
     let mut script: Option<OutputFile> = None;
     let mut script_key = String::new();
     let mut dep_env: Vec<(String, String)> = Vec::new();
     for d in &unit.deps {
         let r = results[d.unit].get().context("dep result missing")?;
-        match ctx.units[d.unit].kind {
-            Kind::Bsc => {
+        match &d.role {
+            DependencyRole::BuildScriptCompile => {
                 script = r.main.clone();
-                script_key = r.key.clone();
+                script_key = ctx.action_plans[d.unit].key.clone();
             }
-            Kind::Bsr => {
+            DependencyRole::BuildScriptMetadata => {
                 let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
                 if let (Some(links), Some(b)) = (&dpkg.links, &r.res.bs) {
                     let l = links.to_uppercase().replace('-', "_");
@@ -8364,11 +8276,11 @@ fn run_build_script(
     }
     let script = script.context("build script binary missing")?;
 
-    let (env, _, visible_tools) = build_script_environment(ctx, unit, pkg);
+    let (_, _, visible_tools) = build_script_environment(ctx, unit, pkg);
     dep_env.sort();
 
     let mut phases = Phases::default();
-    let key = ctx.action_keys[uidx].clone();
+    let key = plan.key.clone();
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
     // embeds -- literally or derived (cc names objects by a hash of their
@@ -8388,23 +8300,16 @@ fn run_build_script(
     // lock is also the restoration lock, so restore without trying to acquire
     // it recursively.
     if let Ok(res) = ctx.lookup_action(&key)? {
-        if res.bs.is_some() {
-            if let Some(archive) = &res.out_dir {
-                ctx.restore_out_dir_locked(&key, archive)?;
-                ctx.report.update(|report| {
-                    report.units[uidx].cache = crate::report::UnitCache {
-                        result: crate::report::UnitCacheResult::Hit,
-                        probe: Some("found_after_wait".to_string()),
-                    };
-                });
-                return Ok(UnitResult {
-                    key,
-                    cached: true,
-                    res,
-                    main: None,
-                    phases,
-                });
-            }
+        if let Some(result) = cached_unit_result(ctx, uidx, res, "found_after_wait", phases)? {
+            ctx.restore_out_dir_locked(
+                &key,
+                result
+                    .res
+                    .out_dir
+                    .as_ref()
+                    .context("cached build script OUT_DIR archive missing")?,
+            )?;
+            return Ok(result);
         }
     }
     if final_parent.exists() {
@@ -8420,7 +8325,7 @@ fn run_build_script(
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
     let package_inputs = ctx.package_read_inputs(unit.pkg)?;
-    let reads: Vec<&Path> = package_inputs.iter().map(PathBuf::as_path).collect();
+    let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
     let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
     cmd.current_dir(&pkg_root);
@@ -8450,7 +8355,7 @@ fn run_build_script(
     if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
         cmd.env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
     }
-    for (k, v) in &env {
+    for (k, v) in &spec.environment {
         cmd.env(k, v);
     }
     for (k, v) in &dep_env {
@@ -8501,7 +8406,7 @@ fn run_build_script(
     // and compressed bytes are hashed as they stream to the temporary file.
     // CAS installation does not reread them.
     let archive_started = Instant::now();
-    let allowed_external_roots = immutable_source_roots_for_action(ctx, uidx);
+    let allowed_external_roots = ctx.build_script_archive_roots(uidx)?;
     let out_dir = archive_out_dir(
         &ctx.store,
         &stage_out,
@@ -8522,7 +8427,6 @@ fn run_build_script(
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     Ok(UnitResult {
-        key,
         cached: false,
         res,
         main: None,
