@@ -407,9 +407,8 @@ pub struct Ctx {
     jobserver: jobserver::Client,
     /// Per-unit identity (16 hex chars): pkg, crate, kind, platform,
     /// profile, features, dep identities — deliberately source-free, so
-    /// -Cmetadata (symbol hashes) is stable across edits and rustc's
-    /// incremental state stays valid. -Cextra-filename keeps the full
-    /// key16, so pool file names remain globally unique.
+    /// -Cmetadata (symbol hashes) and -Cextra-filename are stable across
+    /// edits and rustc's incremental state stays valid.
     idents: Vec<String>,
     /// Complete action plans, computed for the unit graph before any cache
     /// record is loaded.
@@ -901,13 +900,8 @@ fn compile_action_kind(ctx: &Ctx, uidx: usize) -> &'static str {
     }
 }
 
-fn action_extra_filename(ctx: &Ctx, uidx: usize, key: &str) -> String {
-    let unit = &ctx.units[uidx];
-    if ctx.incremental && unit.profile.incremental {
-        ctx.idents[uidx].clone()
-    } else {
-        key[..16].to_string()
-    }
+fn action_extra_filename(ctx: &Ctx, uidx: usize) -> &str {
+    &ctx.idents[uidx]
 }
 
 #[derive(Clone, Serialize)]
@@ -959,7 +953,6 @@ struct CompileActionSpec {
     dependencies: Vec<PlannedActionDependency>,
     profile: Vec<String>,
     profile_name: String,
-    incremental: bool,
     compiler_identity: String,
     environment: Vec<(String, String)>,
     rustflags: Vec<String>,
@@ -1029,7 +1022,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                         Some(format!(
                             "lib{}-{}.rmeta",
                             dependency_spec.crate_name,
-                            action_extra_filename(ctx, dependency.unit, &producer.key)
+                            action_extra_filename(ctx, dependency.unit)
                         ))
                     } else {
                         producer.main_output.clone()
@@ -1168,7 +1161,6 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 dependencies,
                 profile: effective_profile_flags(ctx, index),
                 profile_name: unit.profile.name.clone(),
-                incremental: ctx.incremental && unit.profile.incremental,
                 compiler_identity: ctx.idents[index].clone(),
                 environment,
                 rustflags,
@@ -1187,7 +1179,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         let key = sha256_hex(&serde_json::to_vec(&spec)?);
         let outputs = match &spec {
             ActionSpec::Compile(spec) => {
-                let extra = action_extra_filename(ctx, index, &key);
+                let extra = action_extra_filename(ctx, index);
                 if is_checked(ctx, index) {
                     vec![format!("lib{}-{extra}.rmeta", spec.crate_name)]
                 } else {
@@ -7683,9 +7675,9 @@ fn compile(
         ctx.target.as_deref().unwrap_or(ctx.host.as_str())
     };
     // Cargo's resolved profile says which units it would compile
-    // incrementally (local packages under dev); we honor exactly that,
-    // in a separate key namespace.
-    let incr_action = spec.incremental;
+    // incrementally (local packages under dev); --no-incremental changes
+    // execution without changing the artifact's action identity.
+    let incr_action = ctx.incremental && unit.profile.incremental;
     // On darwin, a linking unit with debug info keeps its DWARF in the
     // per-codegen-unit object files rather than in the linked image, and
     // the image's debug map names them by path. This holds whatever
@@ -7694,11 +7686,7 @@ fn compile(
     let unpacked_debug_objects =
         debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
     let key = plan.key.clone();
-    // Incremental units use the identity hash, not the action key, in
-    // -Cextra-filename: rustc's dep graph embeds the output file names,
-    // so a key-derived (source-dependent) value marks every saved session
-    // red on each edit. Clean-namespace units keep the key-unique k16.
-    let ef16 = action_extra_filename(ctx, uidx, &key);
+    let ef16 = action_extra_filename(ctx, uidx);
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
     // Incremental state: store-managed, scoped per (checkout, crate,

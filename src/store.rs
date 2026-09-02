@@ -444,16 +444,13 @@ impl Store {
 
     /// A pool spelling for a produced file: the producing action's key
     /// spliced into the name before the extension, so a pool name only ever
-    /// refers to outputs of one action. Incremental units keep one
-    /// -Cextra-filename across edits (rustc's sessions require it), so their
-    /// produced names alone would re-map to new content on every edit — and
-    /// concurrent builds of sibling checkouts would race on one name. The
-    /// splice must be the same for an action's rmeta and rlib: rustc's crate
-    /// locator groups flavor candidates by the file-name remainder after
-    /// lib<name><extra-filename>, and transitive resolution only sees the
-    /// rlib when the pair lands in one group. Clean-namespace units already
-    /// embed the key as their extra-filename; their names pass through
-    /// unchanged.
+    /// refers to outputs of one action. Rustc uses one source-independent
+    /// -Cextra-filename across edits, so produced names alone would re-map to
+    /// new content on every edit and concurrent builds would race. The splice
+    /// must be the same for an action's rmeta and rlib: rustc's crate locator
+    /// groups flavor candidates by the file-name remainder after
+    /// lib<name><extra-filename>, and transitive resolution only sees the rlib
+    /// when the pair lands in one group.
     pub fn pool_file_name(name: &str, action_key: &str) -> String {
         let key16 = &action_key[..16];
         if name.contains(key16) {
