@@ -5001,7 +5001,13 @@ fn translate_unit_graph(
                 .iter()
                 .filter(|(package, host, _)| *package == unit.pkg && *host == unit.host)
             {
-                if !unit.deps.iter().any(|dependency| dependency.unit == *index) {
+                if let Some(dependency) = unit
+                    .deps
+                    .iter_mut()
+                    .find(|dependency| dependency.unit == *index)
+                {
+                    dependency.role = DependencyRole::BinaryExecutable;
+                } else {
                     unit.deps.push(UnitDep {
                         unit: *index,
                         role: DependencyRole::BinaryExecutable,
@@ -8968,12 +8974,12 @@ mod feature_selection_tests {
 
 #[cfg(test)]
 mod unit_graph_tests {
-    use super::translate_unit_graph;
+    use super::{translate_unit_graph, DependencyRole};
     use crate::meta::UnitGraph;
     use std::collections::{HashMap, HashSet};
 
     #[test]
-    fn integration_tests_depend_on_package_binaries() {
+    fn integration_test_binary_dependencies_have_their_executable_role() {
         let graph: UnitGraph = serde_json::from_value(serde_json::json!({
             "roots": [0, 1],
             "units": [
@@ -8989,7 +8995,9 @@ mod unit_graph_tests {
                     "platform": null,
                     "mode": "test",
                     "features": [],
-                    "dependencies": []
+                    "dependencies": [
+                        {"index": 1, "extern_crate_name": "corgi"}
+                    ]
                 },
                 {
                     "pkg_id": "corgi",
@@ -9018,5 +9026,9 @@ mod unit_graph_tests {
             .unwrap();
         assert_eq!(integration_test.deps.len(), 1);
         assert_eq!(units[integration_test.deps[0].unit].target.name, "corgi");
+        assert!(matches!(
+            integration_test.deps[0].role,
+            DependencyRole::BinaryExecutable
+        ));
     }
 }
