@@ -18,7 +18,7 @@ Use as you would cargo, except corgi…
 
 ```
 cargo install corgi-build
-corgi [ run|r | build|b | test|t | bench | check|c | clippy | fmt ] 
+corgi [ run | r | build | b | test | t | bench | check | c | clippy | fmt ] 
 ```
 
 Corgi does not yet support `install` (just use cargo) or path-inherited subcommands like `cargo make`.
