@@ -52,21 +52,25 @@ pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Build the selected package
+    #[command(visible_alias = "b")]
     Build(WorkspaceBuildArgs),
 
     /// Build and run benchmarks
     Bench(BenchArgs),
 
     /// Type-check the selected package
+    #[command(visible_alias = "c")]
     Check(WorkspaceBuildArgs),
 
     /// Check the selected package with Clippy
     Clippy(ClippyArgs),
 
     /// Build and run a binary
+    #[command(visible_alias = "r")]
     Run(RunArgs),
 
     /// Build and run tests
+    #[command(visible_alias = "t")]
     Test(TestArgs),
 
     /// Format sources with the pinned toolchain
