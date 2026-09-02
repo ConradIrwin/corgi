@@ -8880,6 +8880,7 @@ mod dep_info_tests {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod zig_target_tests {
     use super::zig_target_for_build;
 
@@ -8901,6 +8902,7 @@ mod zig_target_tests {
     }
 }
 
+#[cfg(test)]
 mod target_sysroot_tests {
     use super::{discover_target_sysroot, CorgiToml};
     use std::fs;
