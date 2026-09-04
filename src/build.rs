@@ -1,6 +1,7 @@
 use crate::meta::{self, Metadata, Package, Target};
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
+use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -3017,9 +3018,8 @@ pub struct BuildOpts {
     pub force_tests: bool,
     /// Per-test timeout. `None` waits indefinitely, matching Cargo.
     pub test_timeout: Option<Duration>,
-    /// Test-name filter (cargo's positional TESTNAME), passed to every
-    /// harness.
-    pub test_filter: Option<String>,
+    /// Regular expressions matched against fully qualified test names.
+    pub test_filters: Vec<String>,
     /// Arguments after `--`: the program's argv for `run`, harness
     /// arguments for `test`.
     pub exec_args: Vec<String>,
@@ -3093,7 +3093,7 @@ fn report_run(
             features: selected_features,
             incremental: !opts.no_incremental,
             force_tests: opts.force_tests,
-            test_filter: opts.test_filter.clone(),
+            test_filters: opts.test_filters.clone(),
             exec_args: opts.exec_args.clone(),
         },
         tool: crate::report::Tool {
@@ -3313,7 +3313,7 @@ fn build_inner(
         no_incremental,
         force_tests,
         test_timeout,
-        test_filter,
+        test_filters,
         exec_args,
     } = opts;
     if matches!(mode, Mode::Run) && packages.len() > 1 {
@@ -4253,7 +4253,7 @@ fn build_inner(
     let mut benchmark_executables = Vec::new();
 
     if exports_harnesses {
-        let canonical_run = test_filter.is_none() && exec_args.is_empty();
+        let canonical_run = test_filters.is_empty() && exec_args.is_empty();
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(u.kind, Kind::Test) || !u.is_root {
                 continue;
@@ -4365,26 +4365,26 @@ fn build_inner(
     }
     if matches!(mode, Mode::Test) {
         let test_stage_start = begin_report_stage(&recorder, "test");
-        let canonical_run = test_filter.is_none() && exec_args.is_empty();
+        let canonical_run = test_filters.is_empty() && exec_args.is_empty();
+        let test_filter_set =
+            RegexSet::new(&test_filters).context("compiling test-name regular expressions")?;
         if test_harnesses.is_empty() && opaque_test_executables.is_empty() {
             bail!("no tests found");
+        }
+        if !test_filters.is_empty() && !opaque_test_executables.is_empty() {
+            bail!("pass arguments to test harnesses with --");
         }
         if !test_harnesses.is_empty() {
             run_tests(
                 &ctx,
                 &mut test_harnesses,
-                test_filter.as_deref(),
+                &test_filter_set,
                 &exec_args,
                 test_timeout,
                 canonical_run,
             )?;
         }
-        run_opaque_tests(
-            &opaque_test_executables,
-            test_filter.as_deref(),
-            &exec_args,
-            test_timeout,
-        )?;
+        run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
         finish_report_stage(&recorder, "test", test_stage_start);
     }
     if matches!(mode, Mode::Bench) {
@@ -5551,7 +5551,6 @@ fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> R
 
 fn run_opaque_tests(
     executables: &[BenchmarkExecutable],
-    filter: Option<&str>,
     exec_args: &[String],
     timeout: Option<Duration>,
 ) -> Result<()> {
@@ -5561,9 +5560,6 @@ fn run_opaque_tests(
         command
             .current_dir(&executable.cwd)
             .envs(executable.binary_environment.iter().cloned());
-        if let Some(filter) = filter {
-            command.arg(filter);
-        }
         let mut child = command
             .args(exec_args)
             .spawn()
@@ -5598,6 +5594,10 @@ fn parse_test_list(stdout: &[u8], harness: &str) -> Result<Vec<String>> {
     tests.sort();
     tests.dedup();
     Ok(tests)
+}
+
+fn matches_test_filters(filters: &RegexSet, test_name: &str) -> bool {
+    filters.patterns().is_empty() || filters.is_match(test_name)
 }
 
 fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
@@ -5676,12 +5676,12 @@ fn run_test_case(
 fn run_tests(
     ctx: &Ctx,
     harnesses: &mut [TestHarness],
-    filter: Option<&str>,
+    filters: &RegexSet,
     exec_args: &[String],
     timeout: Option<Duration>,
     canonical_run: bool,
 ) -> Result<()> {
-    let result = run_tests_inner(ctx, harnesses, filter, exec_args, timeout, canonical_run);
+    let result = run_tests_inner(ctx, harnesses, filters, exec_args, timeout, canonical_run);
     ctx.report.update(|report| {
         let recorded_unit_ids = report
             .test_harnesses
@@ -5734,7 +5734,7 @@ fn run_tests(
 fn run_tests_inner(
     ctx: &Ctx,
     harnesses: &mut [TestHarness],
-    filter: Option<&str>,
+    filters: &RegexSet,
     exec_args: &[String],
     timeout: Option<Duration>,
     canonical_run: bool,
@@ -5774,7 +5774,7 @@ fn run_tests_inner(
         };
         harness.tests = candidates
             .into_iter()
-            .filter(|test| filter.is_none_or(|filter| test.contains(filter)))
+            .filter(|test| matches_test_filters(filters, test))
             .collect();
         harness.discovery_ns = discovery_started.elapsed().as_nanos() as u64;
         for name in &harness.tests {
@@ -5982,7 +5982,8 @@ fn run_tests_inner(
 
 #[cfg(test)]
 mod test_runner_tests {
-    use super::{run_test_case, TestHarness};
+    use super::{matches_test_filters, run_test_case, TestHarness};
+    use regex::RegexSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -6021,6 +6022,19 @@ mod test_runner_tests {
 
         assert!(!outcome.killed);
         assert!(!outcome.success);
+    }
+
+    #[test]
+    fn repeated_test_filters_are_ored() {
+        let filters = RegexSet::new(["^parser::", "empty$"]).unwrap();
+
+        assert!(matches_test_filters(&filters, "parser::accepts_input"));
+        assert!(matches_test_filters(&filters, "lexer::accepts_empty"));
+        assert!(!matches_test_filters(&filters, "lexer::accepts_input"));
+        assert!(matches_test_filters(
+            &RegexSet::new(Vec::<String>::new()).unwrap(),
+            "any::test"
+        ));
     }
 
     #[test]

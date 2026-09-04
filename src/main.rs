@@ -95,7 +95,7 @@ fn real_main() -> Result<()> {
                              clippy_args: Vec<String>,
                              force_tests: bool,
                              test_timeout: Option<std::time::Duration>,
-                             test_filter: Option<String>,
+                             test_filters: Vec<String>,
                              exec_args: Vec<String>| {
                 if args.all_features {
                     anyhow::bail!(
@@ -123,7 +123,7 @@ fn real_main() -> Result<()> {
                         no_incremental: args.no_incremental,
                         force_tests,
                         test_timeout,
-                        test_filter,
+                        test_filters,
                         exec_args,
                     },
                 )
@@ -139,7 +139,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     false,
                     None,
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 ),
                 cli::Command::Bench(mut args) => {
@@ -159,7 +159,7 @@ fn real_main() -> Result<()> {
                         Vec::new(),
                         false,
                         None,
-                        None,
+                        Vec::new(),
                         args.exec_args,
                     )
                 }
@@ -173,7 +173,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     false,
                     None,
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 ),
                 cli::Command::Clippy(args) => run_build(
@@ -186,7 +186,7 @@ fn real_main() -> Result<()> {
                     args.clippy_args,
                     false,
                     None,
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 ),
                 cli::Command::Run(args) => run_build(
@@ -199,7 +199,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     false,
                     None,
-                    None,
+                    Vec::new(),
                     args.exec_args,
                 ),
                 cli::Command::Test(args) => run_build(
@@ -212,7 +212,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     args.force,
                     args.timeout.map(std::time::Duration::from_secs),
-                    args.filter,
+                    args.filters,
                     args.exec_args,
                 ),
                 cli::Command::Fmt(mut args) => {

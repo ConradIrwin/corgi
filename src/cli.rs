@@ -2,6 +2,19 @@ use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+fn parse_test_filter(value: &str) -> Result<String, String> {
+    regex::Regex::new(value)
+        .map(|_| value.to_string())
+        .map_err(|error| format!("invalid test-name regex: {error}"))
+}
+
+fn reject_filterset(_: &str) -> Result<String, String> {
+    Err(
+        "filtersets are not supported; pass one or more positional REGEX filters instead"
+            .to_string(),
+    )
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "corgi",
@@ -213,9 +226,13 @@ pub struct TestArgs {
     #[arg(long, value_name = "SECONDS")]
     pub timeout: Option<u64>,
 
-    /// Name filter passed to every test harness
-    #[arg(value_name = "TESTNAME")]
-    pub filter: Option<String>,
+    /// Regular expressions matched against fully qualified test names
+    #[arg(value_name = "REGEX", value_parser = parse_test_filter)]
+    pub filters: Vec<String>,
+
+    /// Unsupported; pass positional regular expressions instead
+    #[arg(short = 'E', value_name = "FILTERSET", value_parser = reject_filterset, hide = true)]
+    pub filterset: Option<String>,
 
     /// Arguments passed to every test harness
     #[arg(last = true, value_name = "ARGS")]
@@ -328,6 +345,26 @@ mod tests {
             panic!("test command not parsed");
         };
         assert_eq!(args.timeout, Some(15));
+    }
+
+    #[test]
+    fn test_filters_are_repeatable_regular_expressions() {
+        let cli = Cli::try_parse_from(["corgi", "test", "^parser::", "empty$"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert_eq!(args.filters, ["^parser::", "empty$"]);
+
+        let error = Cli::try_parse_from(["corgi", "test", "["]).unwrap_err();
+        assert!(error.to_string().contains("invalid test-name regex"));
+    }
+
+    #[test]
+    fn nextest_filtersets_point_to_positional_regexes() {
+        let error = Cli::try_parse_from(["corgi", "test", "-E", "test(foo)"]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pass one or more positional REGEX filters instead"));
     }
 
     #[test]
@@ -562,7 +599,7 @@ mod tests {
         let Some(Command::Test(args)) = cli.command else {
             panic!("test command not parsed");
         };
-        assert_eq!(args.filter.as_deref(), Some("parser"));
+        assert_eq!(args.filters, ["parser"]);
         assert_eq!(args.exec_args, ["--nocapture"]);
         assert!(Cli::try_parse_from(["corgi", "run", "--port", "8080"]).is_err());
     }

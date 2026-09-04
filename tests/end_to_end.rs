@@ -507,6 +507,24 @@ fn package_target_selectors_reach_cargo_planning() {
         );
     }
 
+    let filtered_custom_harness = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--benches", "selected"])
+        .output()
+        .expect("failed to test custom harness filter validation");
+    assert_failure(
+        &filtered_custom_harness,
+        "corgi test --benches with a test-name filter",
+    );
+    assert!(
+        String::from_utf8_lossy(&filtered_custom_harness.stderr)
+            .contains("pass arguments to test harnesses with --"),
+        "{}",
+        String::from_utf8_lossy(&filtered_custom_harness.stderr)
+    );
+
     run_corgi(&directory.path, "build", ["--examples"]);
     let example = Command::new(
         directory
@@ -684,6 +702,67 @@ fn adding_an_implicit_test_invalidates_the_cached_plan() {
     assert_success(&updated, "corgi test after adding an implicit target");
     assert!(String::from_utf8_lossy(&updated.stderr).contains("Resolving"));
     assert_eq!(fs::read_to_string(marker).unwrap(), "ran");
+}
+
+#[test]
+fn positional_test_filters_are_ored_regular_expressions() {
+    let directory = TestDirectory::new("test-filter-regexes");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/lib.rs"),
+        r#"
+fn mark(name: &str) {
+    std::fs::write(
+        std::path::Path::new(&std::env::var("CORGI_TEST_MARKER_DIR").unwrap()).join(name),
+        "ran",
+    )
+    .unwrap();
+}
+
+#[test]
+fn alpha_selected() {
+    mark("alpha");
+}
+
+#[test]
+fn beta_selected() {
+    mark("beta");
+}
+
+#[test]
+fn gamma_skipped() {
+    mark("gamma");
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["^alpha_selected$", "^beta_selected$"])
+        .env("CORGI_TEST_MARKER_DIR", &directory.path)
+        .output()
+        .expect("failed to invoke corgi test with regular expressions");
+
+    assert_success(&output, "corgi test with regular expressions");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Running 2 tests"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(directory.path.join("alpha").is_file());
+    assert!(directory.path.join("beta").is_file());
+    assert!(!directory.path.join("gamma").exists());
 }
 
 #[test]
