@@ -209,6 +209,10 @@ pub struct TestArgs {
     #[arg(short = 'f', long, visible_alias = "no-cache")]
     pub force: bool,
 
+    /// Kill a test after this many seconds (no timeout by default)
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
+
     /// Name filter passed to every test harness
     #[arg(value_name = "TESTNAME")]
     pub filter: Option<String>,
@@ -304,10 +308,26 @@ mod tests {
             "--benches",
             "--examples",
             "--features",
+            "--timeout",
             "--cache",
         ] {
             assert!(help.contains(expected), "help omitted {expected}");
         }
+    }
+
+    #[test]
+    fn test_timeout_is_optional_and_measured_in_seconds() {
+        let cli = Cli::try_parse_from(["corgi", "test"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert_eq!(args.timeout, None);
+
+        let cli = Cli::try_parse_from(["corgi", "test", "--timeout", "15"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert_eq!(args.timeout, Some(15));
     }
 
     #[test]

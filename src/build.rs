@@ -12,7 +12,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TOOL_VERSION: &str = "corgi/0.30";
-const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! status {
@@ -3016,6 +3015,8 @@ pub struct BuildOpts {
     pub no_incremental: bool,
     /// Ignore cached successful test results while retaining build cache hits.
     pub force_tests: bool,
+    /// Per-test timeout. `None` waits indefinitely, matching Cargo.
+    pub test_timeout: Option<Duration>,
     /// Test-name filter (cargo's positional TESTNAME), passed to every
     /// harness.
     pub test_filter: Option<String>,
@@ -3311,6 +3312,7 @@ fn build_inner(
         timings,
         no_incremental,
         force_tests,
+        test_timeout,
         test_filter,
         exec_args,
     } = opts;
@@ -4373,10 +4375,16 @@ fn build_inner(
                 &mut test_harnesses,
                 test_filter.as_deref(),
                 &exec_args,
+                test_timeout,
                 canonical_run,
             )?;
         }
-        run_opaque_tests(&opaque_test_executables, test_filter.as_deref(), &exec_args)?;
+        run_opaque_tests(
+            &opaque_test_executables,
+            test_filter.as_deref(),
+            &exec_args,
+            test_timeout,
+        )?;
         finish_report_stage(&recorder, "test", test_stage_start);
     }
     if matches!(mode, Mode::Bench) {
@@ -5545,6 +5553,7 @@ fn run_opaque_tests(
     executables: &[BenchmarkExecutable],
     filter: Option<&str>,
     exec_args: &[String],
+    timeout: Option<Duration>,
 ) -> Result<()> {
     for executable in executables {
         status!("Running", "test {}", executable.name);
@@ -5555,10 +5564,18 @@ fn run_opaque_tests(
         if let Some(filter) = filter {
             command.arg(filter);
         }
-        let status = command
+        let mut child = command
             .args(exec_args)
-            .status()
+            .spawn()
             .with_context(|| format!("running test {}", executable.name))?;
+        let (status, killed) = wait_for_test(&mut child, timeout)?;
+        if killed {
+            bail!(
+                "test {} timed out after {:.3}s",
+                executable.name,
+                timeout.unwrap().as_secs_f64()
+            );
+        }
         if !status.success() {
             bail!("test {} failed with {status}", executable.name);
         }
@@ -5600,7 +5617,13 @@ fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
     parse_test_list(&output.stdout, &harness.name)
 }
 
-fn wait_for_test(child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool)> {
+fn wait_for_test(child: &mut Child, timeout: Option<Duration>) -> Result<(ExitStatus, bool)> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait()
+            .context("waiting for test process")
+            .map(|status| (status, false));
+    };
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().context("waiting for test process")? {
@@ -5624,7 +5647,7 @@ fn run_test_case(
     harness: &TestHarness,
     name: &str,
     exec_args: &[String],
-    timeout: Duration,
+    timeout: Option<Duration>,
     capture_directory: &Path,
 ) -> Result<TestOutcome> {
     let started = Instant::now();
@@ -5655,9 +5678,10 @@ fn run_tests(
     harnesses: &mut [TestHarness],
     filter: Option<&str>,
     exec_args: &[String],
+    timeout: Option<Duration>,
     canonical_run: bool,
 ) -> Result<()> {
-    let result = run_tests_inner(ctx, harnesses, filter, exec_args, canonical_run);
+    let result = run_tests_inner(ctx, harnesses, filter, exec_args, timeout, canonical_run);
     ctx.report.update(|report| {
         let recorded_unit_ids = report
             .test_harnesses
@@ -5712,6 +5736,7 @@ fn run_tests_inner(
     harnesses: &mut [TestHarness],
     filter: Option<&str>,
     exec_args: &[String],
+    timeout: Option<Duration>,
     canonical_run: bool,
 ) -> Result<()> {
     let started = Instant::now();
@@ -5800,7 +5825,7 @@ fn run_tests_inner(
                     &harnesses[test.harness],
                     &test.name,
                     exec_args,
-                    TEST_TIMEOUT,
+                    timeout,
                     &capture_directory,
                 )
                 .map(|mut outcome| {
@@ -5971,7 +5996,7 @@ mod test_runner_tests {
             &harness,
             "build::test_runner_tests::sleeps_longer_than_timeout",
             &["--ignored".to_string()],
-            Duration::from_millis(50),
+            Some(Duration::from_millis(50)),
             captures.path(),
         )
         .unwrap();
@@ -5989,7 +6014,7 @@ mod test_runner_tests {
             &harness,
             "build::test_runner_tests::aborts",
             &["--ignored".to_string()],
-            Duration::from_secs(2),
+            None,
             captures.path(),
         )
         .unwrap();

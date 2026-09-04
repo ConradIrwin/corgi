@@ -94,6 +94,7 @@ fn real_main() -> Result<()> {
                              targets: cli::TargetSelectionArgs,
                              clippy_args: Vec<String>,
                              force_tests: bool,
+                             test_timeout: Option<std::time::Duration>,
                              test_filter: Option<String>,
                              exec_args: Vec<String>| {
                 if args.all_features {
@@ -121,6 +122,7 @@ fn real_main() -> Result<()> {
                         timings: args.timings,
                         no_incremental: args.no_incremental,
                         force_tests,
+                        test_timeout,
                         test_filter,
                         exec_args,
                     },
@@ -136,6 +138,7 @@ fn real_main() -> Result<()> {
                     args.targets,
                     Vec::new(),
                     false,
+                    None,
                     None,
                     Vec::new(),
                 ),
@@ -156,6 +159,7 @@ fn real_main() -> Result<()> {
                         Vec::new(),
                         false,
                         None,
+                        None,
                         args.exec_args,
                     )
                 }
@@ -169,6 +173,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     false,
                     None,
+                    None,
                     Vec::new(),
                 ),
                 cli::Command::Clippy(args) => run_build(
@@ -180,6 +185,7 @@ fn real_main() -> Result<()> {
                     args.build.targets,
                     args.clippy_args,
                     false,
+                    None,
                     None,
                     Vec::new(),
                 ),
@@ -193,6 +199,7 @@ fn real_main() -> Result<()> {
                     Vec::new(),
                     false,
                     None,
+                    None,
                     args.exec_args,
                 ),
                 cli::Command::Test(args) => run_build(
@@ -204,6 +211,7 @@ fn real_main() -> Result<()> {
                     args.targets,
                     Vec::new(),
                     args.force,
+                    args.timeout.map(std::time::Duration::from_secs),
                     args.filter,
                     args.exec_args,
                 ),
