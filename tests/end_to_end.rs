@@ -130,6 +130,7 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     let old_incremental = store.join("incr/old");
     let recent_incremental = store.join("incr/recent");
     let artifact = store.join("cache/aa/artifact");
+    let expired_artifact = store.join("cache/aa/expired");
     let report = store.join("reports/report.json");
     for path in [&old_incremental, &recent_incremental] {
         fs::create_dir_all(path).unwrap();
@@ -137,6 +138,11 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     }
     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     fs::write(&artifact, b"artifact").unwrap();
+    fs::write(&expired_artifact, b"expired").unwrap();
+    fs::File::open(&expired_artifact)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+        .unwrap();
     fs::create_dir_all(report.parent().unwrap()).unwrap();
     fs::write(&report, b"report").unwrap();
 
@@ -159,7 +165,103 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     assert!(!old_incremental.exists());
     assert!(recent_incremental.exists());
     assert!(artifact.exists());
+    assert!(!expired_artifact.exists());
     assert!(report.exists());
+}
+
+#[test]
+fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
+    for (duration, removes_two_days, removes_two_hours) in [
+        ("7d", false, false),
+        ("24h", true, false),
+        ("30m", true, true),
+    ] {
+        let directory = TestDirectory::new("clean-custom-retention");
+        let store = directory.path.join("store");
+        let now = SystemTime::now();
+        for (name, age) in [
+            ("two-days", Duration::from_secs(2 * 24 * 3600)),
+            ("two-hours", Duration::from_secs(2 * 3600)),
+            ("recent", Duration::ZERO),
+        ] {
+            for namespace in ["cache/aa", "reports", "incr", "outdirs", "tmp"] {
+                let path = store.join(namespace).join(name);
+                let marker = if matches!(namespace, "incr" | "outdirs" | "tmp") {
+                    fs::create_dir_all(&path).unwrap();
+                    let marker = path.join(".ok");
+                    fs::write(&marker, b"cached").unwrap();
+                    marker
+                } else {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, b"cached").unwrap();
+                    path.clone()
+                };
+                fs::File::open(&marker)
+                    .unwrap()
+                    .set_modified(now - age)
+                    .unwrap();
+                // OUT_DIR retention must use its sentinel, not its recent directory mtime.
+                if namespace != "outdirs" {
+                    fs::File::open(&path)
+                        .unwrap()
+                        .set_modified(now - age)
+                        .unwrap();
+                }
+            }
+        }
+
+        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .args(["clean", "--older-than", duration])
+            .env("CORGI_STORE", &store)
+            .env("CORGI_NO_ALIAS", "1")
+            .output()
+            .expect("failed to invoke corgi clean");
+        assert_success(&output, "corgi clean --older-than");
+
+        for namespace in ["cache/aa", "reports", "incr", "outdirs", "tmp"] {
+            for (name, removed) in [
+                ("two-days", namespace == "tmp" || removes_two_days),
+                ("two-hours", namespace != "tmp" && removes_two_hours),
+                ("recent", false),
+            ] {
+                let path = store.join(namespace).join(name);
+                assert_eq!(
+                    path.exists(),
+                    !removed,
+                    "{duration}: unexpected retention for {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clean_invalid_age_leaves_store_untouched() {
+    let directory = TestDirectory::new("clean-invalid-retention");
+    let store = directory.path.join("store");
+    let artifact = store.join("cache/aa/artifact");
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, b"artifact").unwrap();
+    fs::File::open(&artifact)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(10 * 24 * 3600))
+        .unwrap();
+
+    for duration in ["24", "18446744073709551615d", "18446744073709551615s"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .args(["clean", "--older-than", duration])
+            .env("CORGI_STORE", &store)
+            .env("CORGI_NO_ALIAS", "1")
+            .output()
+            .expect("failed to invoke corgi clean");
+        assert!(!output.status.success(), "accepted {duration}");
+        assert_eq!(fs::read(&artifact).unwrap(), b"artifact");
+        if duration.ends_with('s') {
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("cleanup duration is too large to calculate a cutoff"));
+        }
+    }
 }
 
 #[test]

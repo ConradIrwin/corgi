@@ -2,6 +2,28 @@ use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+fn parse_clean_age(value: &str) -> Result<std::time::Duration, &'static str> {
+    let unit_start = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or("expected a whole number followed by s, m, h, or d (e.g. 24h)")?;
+    let (amount, unit) = value.split_at(unit_start);
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => return Err("expected a whole number followed by s, m, h, or d (e.g. 24h)"),
+    };
+    if amount.is_empty() {
+        return Err("expected a whole number followed by s, m, h, or d (e.g. 24h)");
+    }
+    let amount: u64 = amount.parse().map_err(|_| "duration is too large")?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or("duration is too large")?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
 fn parse_test_filter(value: &str) -> Result<String, String> {
     regex::Regex::new(value)
         .map(|_| value.to_string())
@@ -293,6 +315,12 @@ pub struct CleanArgs {
     /// Delete the entire corgi store instead of trimming it
     #[arg(long)]
     pub cache: bool,
+
+    /// Trim entries older than DURATION using recorded timestamps (whole number + s, m, h, or d, e.g. 24h).
+    /// Use markers are refreshed at most hourly, so recently used entries can still expire.
+    /// Defaults to 5d, except incremental state (1d). Orphaned staging always uses 1d.
+    #[arg(long, value_name = "DURATION", value_parser = parse_clean_age, conflicts_with = "cache")]
+    pub older_than: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
@@ -327,6 +355,7 @@ mod tests {
             "--features",
             "--timeout",
             "--cache",
+            "--older-than",
         ] {
             assert!(help.contains(expected), "help omitted {expected}");
         }
@@ -416,6 +445,52 @@ mod tests {
         };
         assert!(args.cache);
         assert!(Cli::try_parse_from(["corgi", "clean", "-cache"]).is_err());
+    }
+
+    #[test]
+    fn clean_age_requires_explicit_units_and_checked_whole_numbers() {
+        for (value, seconds) in [
+            ("0s", 0),
+            ("30m", 1800),
+            ("24h", 86400),
+            ("7d", 604800),
+            ("18446744073709551615s", u64::MAX),
+        ] {
+            let cli = Cli::try_parse_from(["corgi", "clean", "--older-than", value]).unwrap();
+            let Some(Command::Clean(args)) = cli.command else {
+                panic!("clean command not parsed");
+            };
+            assert_eq!(
+                args.older_than,
+                Some(std::time::Duration::from_secs(seconds))
+            );
+        }
+        for value in [
+            "",
+            "24",
+            "-1h",
+            "+1h",
+            "1.5h",
+            "h",
+            "1w",
+            "1H",
+            "1h30m",
+            " 1h",
+            "18446744073709551616s",
+            "18446744073709551615d",
+        ] {
+            assert!(
+                Cli::try_parse_from(["corgi", "clean", "--older-than", value]).is_err(),
+                "accepted invalid duration {value:?}"
+            );
+        }
+        let cli = Cli::try_parse_from(["corgi", "clean"]).unwrap();
+        let Some(Command::Clean(args)) = cli.command else {
+            panic!("clean command not parsed");
+        };
+        assert_eq!(args.older_than, None);
+        assert!(Cli::try_parse_from(["corgi", "clean", "--cache", "--older-than", "24h"]).is_err());
+        assert!(Cli::try_parse_from(["corgi", "clean", "--older-than", "24h", "--cache"]).is_err());
     }
 
     #[test]
