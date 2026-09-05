@@ -278,7 +278,7 @@ pub struct BenchArgs {
 #[derive(Debug, Args)]
 pub struct FmtArgs {
     /// Format every workspace member
-    #[arg(long, conflicts_with = "packages")]
+    #[arg(long, visible_alias = "all", conflicts_with = "packages")]
     pub workspace: bool,
 
     /// Format a package; may be repeated

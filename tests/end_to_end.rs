@@ -764,6 +764,10 @@ fn fmt_discovers_targets_in_a_virtual_workspace() {
     let fixture = fixture_path("fmt-virtual-workspace");
 
     run_corgi(&fixture, "fmt", ["--check"]);
+    for selector in ["--all", "--workspace"] {
+        run_corgi(&fixture, "fmt", [selector]);
+        run_corgi(&fixture, "fmt", [selector, "--", "--check"]);
+    }
 }
 
 #[test]
