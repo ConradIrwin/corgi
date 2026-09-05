@@ -154,9 +154,7 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
         for name in names {
             let l = name.to_string_lossy().into_owned();
             // Never let build outputs or vcs state into the source hash.
-            if rel.as_os_str().is_empty()
-                && matches!(l.as_str(), "target" | "dtarget" | "Cargo.lock")
-            {
+            if rel.as_os_str().is_empty() && matches!(l.as_str(), "target" | "Cargo.lock") {
                 continue;
             }
             if l == ".git" {

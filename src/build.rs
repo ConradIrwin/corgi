@@ -3256,8 +3256,12 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
 }
 
 /// Cargo package targets selected as roots of the resolved unit graph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetSelection {
+    pub named_bins: Vec<String>,
+    pub named_tests: Vec<String>,
+    pub named_benches: Vec<String>,
+    pub named_examples: Vec<String>,
     pub lib: bool,
     pub bins: bool,
     pub tests: bool,
@@ -3267,15 +3271,50 @@ pub struct TargetSelection {
 }
 
 impl TargetSelection {
-    fn is_explicit(self) -> bool {
-        self.lib || self.bins || self.tests || self.benches || self.examples || self.all_targets
+    fn is_explicit(&self) -> bool {
+        self.lib
+            || self.bins
+            || self.tests
+            || self.benches
+            || self.examples
+            || self.all_targets
+            || !self.named_bins.is_empty()
+            || !self.named_tests.is_empty()
+            || !self.named_benches.is_empty()
+            || !self.named_examples.is_empty()
     }
 
-    fn includes_harnesses(self) -> bool {
-        self.tests || self.benches || self.all_targets
+    fn includes_harnesses(&self) -> bool {
+        self.tests
+            || self.benches
+            || self.all_targets
+            || !self.named_tests.is_empty()
+            || !self.named_benches.is_empty()
     }
 
-    fn apply_to(self, command: &mut Command) {
+    fn normalize(&mut self) {
+        for names in [
+            &mut self.named_bins,
+            &mut self.named_tests,
+            &mut self.named_benches,
+            &mut self.named_examples,
+        ] {
+            names.sort();
+            names.dedup();
+        }
+    }
+
+    fn apply_to(&self, command: &mut Command) {
+        for (names, argument) in [
+            (&self.named_bins, "--bin"),
+            (&self.named_tests, "--test"),
+            (&self.named_benches, "--bench"),
+            (&self.named_examples, "--example"),
+        ] {
+            for name in names {
+                command.args([argument, name]);
+            }
+        }
         for (selected, argument) in [
             (self.lib, "--lib"),
             (self.bins, "--bins"),
@@ -3302,8 +3341,6 @@ pub struct BuildOpts {
     pub workspace: bool,
     /// Cargo package names selected by `-p` or `--package`.
     pub packages: Vec<String>,
-    pub bin: Option<String>,
-    pub benches: Vec<String>,
     pub features: Vec<String>,
     pub target: Option<String>,
     pub target_dir: Option<PathBuf>,
@@ -3606,14 +3643,12 @@ fn build_inner(
         profile,
         workspace,
         packages,
-        bin,
-        benches,
         features,
         target: requested_target,
         target_dir,
         root,
         mode,
-        targets,
+        mut targets,
         clippy_args,
         timings,
         no_incremental,
@@ -3803,10 +3838,8 @@ fn build_inner(
     // replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
     let features_id = sha256_hex(format!("{selected_features:?}").as_bytes());
-    let mut selected_benches = benches.clone();
-    selected_benches.sort();
-    selected_benches.dedup();
-    let target_set = format!("{targets:?};bin={bin:?};benches={selected_benches:?}");
+    targets.normalize();
+    let target_set = format!("{targets:?}");
     let requested_profile = profile
         .as_deref()
         .unwrap_or(if matches!(mode, Mode::Bench) {
@@ -3823,12 +3856,11 @@ fn build_inner(
     };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
             features_id,
-            bin.as_deref().unwrap_or(""),
         )
         .as_bytes(),
     );
@@ -3930,7 +3962,7 @@ fn build_inner(
             // Corgi does not support rustdoc tests yet. Preserve its existing
             // default of Rust test targets instead of asking Cargo for the
             // unqualified graph, which would also contain doctest roots.
-            if matches!(mode, Mode::Test) && !targets.is_explicit() && bin.is_none() {
+            if matches!(mode, Mode::Test) && !targets.is_explicit() {
                 ug_cmd.arg("--tests");
             }
             targets.apply_to(&mut ug_cmd);
@@ -3941,12 +3973,6 @@ fn build_inner(
             }
             if let Some(t) = &target {
                 ug_cmd.args(["--target", t]);
-            }
-            if let Some(bin) = &bin {
-                ug_cmd.args(["--bin", bin]);
-            }
-            for bench in &selected_benches {
-                ug_cmd.args(["--bench", bench]);
             }
             match &resolution_roots {
                 Some(members) => {
@@ -4047,9 +4073,9 @@ fn build_inner(
         .iter()
         .flat_map(|packages| packages.iter())
         .filter(|package| {
-            !units
-                .iter()
-                .any(|unit| unit.is_root && unit.pkg == **package)
+            resolution_roots
+                .as_ref()
+                .is_some_and(|members| !members.contains(&meta.packages[**package].name))
         })
         .map(|package| meta.packages[*package].name.as_str())
         .collect::<Vec<_>>();
@@ -4061,6 +4087,37 @@ fn build_inner(
         bail!(
             "selected packages [{}] are not part of {root_name}",
             missing_root_packages.join(", "),
+        );
+    }
+    let unmatched_packages = root_packages
+        .iter()
+        .flat_map(|packages| packages.iter())
+        .filter(|package| {
+            !units
+                .iter()
+                .any(|unit| unit.is_root && unit.pkg == **package)
+        })
+        .map(|package| &meta.packages[*package])
+        .collect::<Vec<_>>();
+    if !unmatched_packages.is_empty() {
+        let details = unmatched_packages
+            .iter()
+            .map(|package| {
+                let available = package
+                    .targets
+                    .iter()
+                    .filter(|target| !target.kind.iter().any(|kind| kind == "custom-build"))
+                    .map(|target| format!("{} `{}`", target.kind.join("/"), target.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("package `{}`: {available}", package.name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        bail!(
+            "selected packages have no matching enabled targets\n\
+             available targets:\n  {details}\n\
+             check your target selectors and any required features"
         );
     }
     let profile_name = units
@@ -4543,16 +4600,11 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "export");
 
     let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
-        || (matches!(mode, Mode::Build)
-            && (!selected_benches.is_empty() || targets.includes_harnesses()));
+        || (matches!(mode, Mode::Build) && targets.includes_harnesses());
     if exports_harnesses {
         fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
     }
 
-    let dtarget = ctx.target.as_ref().map_or_else(
-        || ctx.target_dir.clone(),
-        |target| ctx.target_dir.join(target),
-    );
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
     let mut opaque_test_executables = Vec::new();
@@ -4704,14 +4756,21 @@ fn build_inner(
             .map(|&i| &ctx.meta.packages[ctx.units[i].pkg])
             .context("selected package has no runnable binary target")?;
         let bin_index = select_run_binary(
-            package.default_run.as_deref(),
+            if targets.is_explicit() {
+                None
+            } else {
+                package.default_run.as_deref()
+            },
             root_bins
                 .iter()
                 .map(|&i| (i, ctx.units[i].target.name.as_str())),
         )?;
-        let dest = dtarget
-            .join(&ctx.profile_name)
-            .join(&ctx.units[bin_index].target.name);
+        let output = results[bin_index]
+            .get()
+            .and_then(|result| result.main.as_ref())
+            .context("selected executable has no binary output")?;
+        let relative = binary_export_path(&ctx, bin_index, &output.name);
+        let dest = ctx.target_dir.join(relative.strip_prefix("target")?);
         status!("Running", "`{}`", dest.display());
         let execution_start = begin_report_stage(&recorder, "execute");
         // Exactly a manual run of the exported binary: ambient env, the
@@ -5644,10 +5703,7 @@ fn collect_rust_source_files(root: &Path) -> Result<Vec<PathBuf>> {
         for entry in entries {
             let name = entry.file_name();
             let name_lossy = name.to_string_lossy();
-            if name_lossy == ".git"
-                || (relative.as_os_str().is_empty()
-                    && matches!(name_lossy.as_ref(), "target" | "dtarget"))
-            {
+            if name_lossy == ".git" || (relative.as_os_str().is_empty() && name_lossy == "target") {
                 continue;
             }
 
@@ -5839,7 +5895,7 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     deny_roots.sort();
     deny_roots.dedup();
     for r in &deny_roots {
-        for d in [".git", "target", "dtarget"] {
+        for d in [".git", "target"] {
             prof.push_str(&format!("  (subpath \"{r}/{d}\")\n"));
         }
         prof.push_str(&format!("  (literal \"{r}/Cargo.lock\")\n"));

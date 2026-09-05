@@ -149,10 +149,6 @@ pub struct BuildArgs {
     #[arg(short = 'p', long = "package", value_name = "PACKAGE")]
     pub packages: Vec<String>,
 
-    /// Build only the named binary
-    #[arg(long, value_name = "NAME")]
-    pub bin: Option<String>,
-
     /// Enable the given features
     #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
     pub features: Vec<String>,
@@ -184,6 +180,22 @@ pub struct BuildArgs {
 
 #[derive(Debug, Args, Default)]
 pub struct TargetSelectionArgs {
+    /// Select named binaries; may be repeated
+    #[arg(long = "bin", value_name = "NAME")]
+    pub named_bins: Vec<String>,
+
+    /// Select named integration tests; may be repeated
+    #[arg(long = "test", value_name = "NAME")]
+    pub named_tests: Vec<String>,
+
+    /// Select named benchmarks; may be repeated
+    #[arg(long = "bench", value_name = "NAME")]
+    pub named_benches: Vec<String>,
+
+    /// Select named examples; may be repeated
+    #[arg(long = "example", value_name = "NAME")]
+    pub named_examples: Vec<String>,
+
     /// Select the package's library target
     #[arg(long)]
     pub lib: bool,
@@ -220,10 +232,6 @@ pub struct WorkspaceBuildArgs {
     /// Select every workspace member
     #[arg(long, conflicts_with_all = ["packages", "root"])]
     pub workspace: bool,
-
-    /// Build only the named benchmark
-    #[arg(long = "bench", value_name = "NAME")]
-    pub benches: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -240,6 +248,14 @@ pub struct ClippyArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub build: BuildArgs,
+
+    /// Run the named binary
+    #[arg(long, value_name = "NAME", conflicts_with = "example")]
+    pub bin: Option<String>,
+
+    /// Run the named example
+    #[arg(long, value_name = "NAME")]
+    pub example: Option<String>,
 
     /// Arguments passed to the binary
     #[arg(last = true, value_name = "ARGS")]
@@ -600,7 +616,7 @@ mod tests {
         };
 
         assert_eq!(args.build.profile.as_deref(), Some("runner-dev"));
-        assert_eq!(args.build.bin.as_deref(), Some("runner"));
+        assert_eq!(args.targets.named_bins, ["runner"]);
     }
 
     #[test]
@@ -655,13 +671,78 @@ mod tests {
     }
 
     #[test]
+    fn run_selects_exactly_one_binary_or_example() {
+        for selector in ["--bin", "--example"] {
+            let cli =
+                Cli::try_parse_from(["corgi", "run", selector, "demo", "--", "argument"]).unwrap();
+            let Some(Command::Run(args)) = cli.command else {
+                panic!("run command not parsed");
+            };
+            if selector == "--bin" {
+                assert_eq!(args.bin.as_deref(), Some("demo"));
+                assert!(args.example.is_none());
+            } else {
+                assert_eq!(args.example.as_deref(), Some("demo"));
+                assert!(args.bin.is_none());
+            }
+            assert_eq!(args.exec_args, ["argument"]);
+            assert!(
+                Cli::try_parse_from(["corgi", "run", selector, "first", selector, "second",])
+                    .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["corgi", "run", "--bin", "first", "--example", "second",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn named_targets_are_shared_across_build_commands() {
+        for command in ["build", "check", "clippy", "test", "bench"] {
+            let cli = Cli::try_parse_from([
+                "corgi",
+                command,
+                "--bin",
+                "first",
+                "--bin",
+                "second",
+                "--test",
+                "integration",
+                "--test",
+                "second",
+                "--bench",
+                "throughput",
+                "--bench",
+                "latency",
+                "--example",
+                "demo",
+                "--example",
+                "other",
+            ])
+            .unwrap();
+            let targets = match cli.command.unwrap() {
+                Command::Build(args) | Command::Check(args) => args.targets,
+                Command::Clippy(args) => args.build.targets,
+                Command::Test(args) => args.targets,
+                Command::Bench(args) => args.build.targets,
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(targets.named_bins, ["first", "second"]);
+            assert_eq!(targets.named_tests, ["integration", "second"]);
+            assert_eq!(targets.named_benches, ["throughput", "latency"]);
+            assert_eq!(targets.named_examples, ["demo", "other"]);
+        }
+    }
+
+    #[test]
     fn check_and_bench_accept_benchmark_selection() {
         let cli =
             Cli::try_parse_from(["corgi", "check", "-p", "app", "--bench", "throughput"]).unwrap();
         let Some(Command::Check(args)) = cli.command else {
             panic!("check command not parsed");
         };
-        assert_eq!(args.benches, ["throughput"]);
+        assert_eq!(args.targets.named_benches, ["throughput"]);
 
         let cli = Cli::try_parse_from([
             "corgi",
@@ -681,7 +762,7 @@ mod tests {
         let Some(Command::Bench(args)) = cli.command else {
             panic!("bench command not parsed");
         };
-        assert_eq!(args.build.benches, ["throughput", "latency"]);
+        assert_eq!(args.build.targets.named_benches, ["throughput", "latency"]);
         assert_eq!(args.filter.as_deref(), Some("parse"));
         assert_eq!(args.exec_args, ["--sample-size", "10"]);
         let cli = Cli::try_parse_from([
@@ -696,8 +777,8 @@ mod tests {
         let Some(Command::Bench(args)) = cli.command else {
             panic!("bench command not parsed");
         };
-        assert_eq!(args.build.build.bin.as_deref(), Some("application"));
-        assert_eq!(args.build.benches, ["throughput"]);
+        assert_eq!(args.build.targets.named_bins, ["application"]);
+        assert_eq!(args.build.targets.named_benches, ["throughput"]);
     }
 
     #[test]

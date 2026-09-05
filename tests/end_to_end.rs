@@ -1238,6 +1238,229 @@ fn clippy_all_targets_checks_examples_tests_and_custom_benchmarks() {
 }
 
 #[test]
+fn mismatched_target_selection_reports_available_targets() {
+    let directory = TestDirectory::new("mismatched-target-selection");
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"library\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (package, source, content) in [
+        ("app", "main.rs", "fn main() {}\n"),
+        ("library", "lib.rs", "pub fn library() {}\n"),
+    ] {
+        let package_directory = directory.path.join(package);
+        fs::create_dir_all(package_directory.join("src")).unwrap();
+        fs::write(
+            package_directory.join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        fs::write(package_directory.join("src").join(source), content).unwrap();
+    }
+
+    for (package, selector, available) in [
+        ("app", "--lib", "bin `app`"),
+        ("library", "--bins", "lib `library`"),
+        ("library", "--bin", "lib `library`"),
+    ] {
+        let mut arguments = vec!["-p", package, selector];
+        if selector == "--bin" {
+            arguments.push("app");
+        }
+        for _ in 0..2 {
+            let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+                .arg("-C")
+                .arg(&directory.path)
+                .arg("check")
+                .args(&arguments)
+                .output()
+                .unwrap();
+            assert_failure(&output, "mismatched target selection");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("no matching enabled targets"), "{stderr}");
+            assert!(stderr.contains(available), "{stderr}");
+            assert!(!stderr.contains("not part of"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn named_targets_select_only_requested_targets() {
+    let directory = TestDirectory::new("named-target-selectors");
+    copy_directory(&fixture_path("benchmark-targets"), &directory.path);
+
+    for (selector, name) in [
+        ("--test", "integration"),
+        ("--bench", "custom"),
+        ("--example", "example"),
+    ] {
+        run_corgi(&directory.path, "check", [selector, name]);
+        let missing = invoke_corgi(&directory.path, "check", [selector, "missing"]);
+        assert!(
+            !missing.status.success(),
+            "{selector} accepted a missing target"
+        );
+    }
+
+    // A named target must suppress the default selection, even with other
+    // integration tests present in the package.
+    fs::write(
+        directory.path.join("tests/unselected.rs"),
+        "compile_error!(\"unselected integration test was compiled\");\n",
+    )
+    .unwrap();
+    let marker = directory.path.join("selected-integration-ran");
+    let result = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--test", "integration", "--force"])
+        .env("CORGI_INTEGRATION_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert_success(&result, "corgi test --test integration");
+    assert!(marker.exists(), "selected integration test did not run");
+
+    run_corgi(&directory.path, "test", ["--bench", "custom", "--force"]);
+    run_corgi(&directory.path, "test", ["--example", "example", "--force"]);
+    run_corgi(
+        &directory.path,
+        "check",
+        [
+            "--test",
+            "integration",
+            "--example",
+            "example",
+            "--bench",
+            "custom",
+        ],
+    );
+}
+
+#[test]
+fn repeated_bin_selectors_build_and_check_only_the_named_binaries() {
+    let directory = TestDirectory::new("repeated-bin-selectors");
+    fs::create_dir_all(directory.path.join("src/bin")).unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautobins = false\n\
+             \n[[bin]]\nname = \"first\"\npath = \"src/bin/first.rs\"\n\
+             \n[[bin]]\nname = \"second\"\npath = \"src/bin/second.rs\"\n\
+             \n[[bin]]\nname = \"unselected\"\npath = \"src/bin/unselected.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/bin/first.rs"),
+        "fn main() { println!(\"first\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/bin/second.rs"),
+        "fn main() { println!(\"second\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/bin/unselected.rs"),
+        "compile_error!(\"unselected binary was compiled\");\n",
+    )
+    .unwrap();
+
+    for command in ["build", "check"] {
+        run_corgi(
+            &directory.path,
+            command,
+            ["--bin", "first", "--bin", "second"],
+        );
+    }
+
+    for binary in ["first", "second"] {
+        assert!(
+            directory
+                .path
+                .join("target/debug")
+                .join(executable_name(binary))
+                .is_file(),
+            "`corgi build` did not produce selected binary `{binary}`"
+        );
+    }
+    assert!(
+        !directory
+            .path
+            .join("target/debug")
+            .join(executable_name("unselected"))
+            .exists(),
+        "`corgi build` produced the unselected binary"
+    );
+}
+
+#[test]
+fn run_named_target_overrides_default_run_and_preserves_process_inputs() {
+    let directory = TestDirectory::new("run-named-target");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src/bin")).unwrap();
+    fs::create_dir_all(workspace.join("examples")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             default-run = \"default\"\nautobins = false\n\
+             \n[[bin]]\nname = \"default\"\npath = \"src/bin/default.rs\"\n\
+             \n[[bin]]\nname = \"explicit\"\npath = \"src/bin/explicit.rs\"\n\
+             \n[[example]]\nname = \"selected\"\npath = \"examples/selected.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/bin/default.rs"),
+        "fn main() { println!(\"default\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/bin/explicit.rs"),
+        "fn main() { println!(\"explicit\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("examples/selected.rs"),
+        r#"fn main() {
+    assert_eq!(std::fs::read_to_string("marker").unwrap(), "caller directory");
+    assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["first", "second"]);
+    println!("example");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(directory.path.join("marker"), "caller directory").unwrap();
+
+    let example = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .current_dir(&directory.path)
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(workspace.join("Cargo.toml"))
+        .args(["--example", "selected", "--", "first", "second"])
+        .output()
+        .unwrap();
+    assert_success(&example, "corgi run --example selected");
+    assert_eq!(String::from_utf8(example.stdout).unwrap(), "example\n");
+
+    let binary = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .current_dir(&directory.path)
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(workspace.join("Cargo.toml"))
+        .args(["--bin", "explicit"])
+        .output()
+        .unwrap();
+    assert_success(&binary, "corgi run --bin explicit");
+    assert_eq!(String::from_utf8(binary.stdout).unwrap(), "explicit\n");
+}
+
+#[test]
 fn package_target_selectors_reach_cargo_planning() {
     let directory = TestDirectory::new("target-selectors");
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);
