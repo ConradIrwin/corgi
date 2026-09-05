@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -261,8 +261,18 @@ pub enum UnitCacheResult {
 #[derive(Clone, Debug, Serialize)]
 pub struct UnitKey {
     pub hash: String,
+    pub resolution: UnitKeyResolution,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inputs: Option<ActionKeyInputs>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitKeyResolution {
+    Pending,
+    VerifiedManifest,
+    FreshCompile,
+    RegistryStatic,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -274,7 +284,10 @@ pub enum ActionKeyInputs {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CompileKeyInputs {
-    pub source_hash: String,
+    pub read_set_entry_hash: String,
+    pub manifest_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_layout_hash: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub declared_environment: Vec<EnvironmentInput>,
     pub effective_environment_hash: String,
@@ -289,6 +302,8 @@ pub struct CompileKeyInputs {
     pub cap_lints: bool,
     pub uses_toolchain: bool,
     pub compiler_identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_binary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -570,7 +585,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 4);
+        assert_eq!(persisted["schema_version"], 5);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }
@@ -694,8 +709,11 @@ mod tests {
             },
             key: UnitKey {
                 hash: "action-key".into(),
+                resolution: UnitKeyResolution::VerifiedManifest,
                 inputs: Some(ActionKeyInputs::Compile(Box::new(CompileKeyInputs {
-                    source_hash: "source".into(),
+                    read_set_entry_hash: "entry".into(),
+                    manifest_hash: "manifest".into(),
+                    source_layout_hash: Some("layout".into()),
                     declared_environment: vec![],
                     effective_environment_hash: "environment".into(),
                     link_dependencies: vec![],
@@ -705,6 +723,7 @@ mod tests {
                     cap_lints: false,
                     uses_toolchain: true,
                     compiler_identity: "compiler".into(),
+                    debug_binary: None,
                 }))),
             },
             timings: Some(UnitTimings::default()),

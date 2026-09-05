@@ -657,7 +657,7 @@ mod tests {
             &out_dir,
             &mut bytes,
             b"not-present",
-            &[dependency.clone()]
+            std::slice::from_ref(&dependency)
         )
         .unwrap()
         .is_none());
@@ -722,10 +722,14 @@ mod tests {
         std::os::unix::fs::symlink(&dependency, out_dir.join("dependency")).unwrap();
 
         let mut bytes = Vec::new();
-        let error =
-            archive_out_dir_scanning(&out_dir, &mut bytes, b"not-present", &[dependency.clone()])
-                .unwrap_err()
-                .to_string();
+        let error = archive_out_dir_scanning(
+            &out_dir,
+            &mut bytes,
+            b"not-present",
+            std::slice::from_ref(&dependency),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("escapes dereferenced directory"));
     }
 
@@ -782,7 +786,7 @@ mod tests {
                     header.set_link_name(link).unwrap();
                 }
                 header.set_cksum();
-                builder.append(&mut header, io::empty()).unwrap();
+                builder.append(&header, io::empty()).unwrap();
             }
             builder.finish().unwrap();
         }

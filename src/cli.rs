@@ -318,7 +318,8 @@ pub struct CleanArgs {
 
     /// Trim entries older than DURATION using recorded timestamps (whole number + s, m, h, or d, e.g. 24h).
     /// Use markers are refreshed at most hourly, so recently used entries can still expire.
-    /// Defaults to 5d, except incremental state (1d). Orphaned staging always uses 1d.
+    /// Defaults to 5d, except incremental state and read-set manifests (1d).
+    /// Orphaned staging always uses 1d.
     #[arg(long, value_name = "DURATION", value_parser = parse_clean_age, conflicts_with = "cache")]
     pub older_than: Option<std::time::Duration>,
 }
