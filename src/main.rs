@@ -228,7 +228,7 @@ fn real_main() -> Result<()> {
                         &args.args,
                     )
                 }
-                cli::Command::Clean(args) => build::clean(&store, args.cache),
+                cli::Command::Clean(args) => build::clean(&store, args.cache, args.older_than),
                 cli::Command::Audit(_) | cli::Command::Pin => unreachable!(),
             }
         }

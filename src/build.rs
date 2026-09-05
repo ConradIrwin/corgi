@@ -2265,14 +2265,14 @@ const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 *
 /// blobs are touched whenever a referencing action is used, so a stale
 /// blob implies only stale actions point at it. Deleting something in
 /// use is benign: probes self-heal by rebuilding.
-pub fn clean(store: &Store, all: bool) -> Result<()> {
+pub fn clean(store: &Store, all: bool, older_than: Option<std::time::Duration>) -> Result<()> {
     if all {
         fs::remove_dir_all(&store.root)
             .with_context(|| format!("removing cache {}", store.root.display()))?;
         eprintln!("{:>12} removed {}", "CLEAN", store.root.display());
         return Ok(());
     }
-    let (files, dirs, bytes) = clean_trim(store, CACHE_TTL)?;
+    let (files, dirs, bytes) = clean_trim(store, older_than)?;
     eprintln!(
         "{:>12} removed {files} files and {dirs} dirs ({:.1} MB) according to retention policy",
         "CLEAN",
@@ -2296,18 +2296,23 @@ fn maybe_auto_clean(store: &Store) {
             return; // clock skew: fine, skip
         }
     }
-    if let Err(e) = clean_trim(store, CACHE_TTL) {
+    if let Err(e) = clean_trim(store, None) {
         eprintln!("corgi warning: clean trim failed: {e:#}");
     }
     let _ = store.write_atomic(&marker, b"trimmed\n");
 }
 
-fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)> {
+fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<(u64, u64, u64)> {
     let now = std::time::SystemTime::now();
-    let cutoff = now.checked_sub(ttl).context("ttl too large")?;
+    let cutoff = now
+        .checked_sub(older_than.unwrap_or(CACHE_TTL))
+        .context("cleanup duration is too large to calculate a cutoff")?;
     let incremental_cutoff = now
-        .checked_sub(INCREMENTAL_TTL)
+        .checked_sub(older_than.unwrap_or(INCREMENTAL_TTL))
         .context("incremental ttl too large")?;
+    let staging_cutoff = now
+        .checked_sub(std::time::Duration::from_secs(24 * 3600))
+        .context("staging ttl too large")?;
     let stale = |p: &Path| -> bool {
         fs::metadata(p)
             .and_then(|m| m.modified())
@@ -2418,7 +2423,7 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
         }
     }
     // incr/: dev-loop incremental state — fat and rebuildable, so retain
-    // it for one day rather than the five days used by the artifact cache.
+    // it for one day by default, unless an explicit age overrides retention.
     // It is judged by dir mtime (rustc session writes refresh it on use).
     for p in read_dir_paths(&store.root.join("incr"))? {
         if p.is_dir() {
@@ -2485,13 +2490,10 @@ fn clean_trim(store: &Store, ttl: std::time::Duration) -> Result<(u64, u64, u64)
         }
     }
     // tmp/: anything older than a day is orphaned staging
-    let day = now
-        .checked_sub(std::time::Duration::from_secs(24 * 3600))
-        .unwrap_or(cutoff);
     for p in read_dir_paths(&store.root.join("tmp"))? {
         let old = fs::metadata(&p)
             .and_then(|m| m.modified())
-            .map(|m| m < day)
+            .map(|m| m < staging_cutoff)
             .unwrap_or(false);
         if old {
             if p.is_dir() {
