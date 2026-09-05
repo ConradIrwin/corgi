@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(short = 'C', long, global = true, value_name = "DIR")]
     pub dir: Option<PathBuf>,
 
+    /// Use the project containing this Cargo.toml, like -C on its directory
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "dir")]
+    pub manifest_path: Option<PathBuf>,
+
     /// Print commands and additional build detail
     #[arg(short, long, global = true)]
     pub verbose: bool,
@@ -68,6 +72,16 @@ pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
         }
         if argument == "-C" || argument == "--dir" {
             directory = arguments.next().map(PathBuf::from);
+        } else if argument == "--manifest-path" {
+            directory = arguments
+                .next()
+                .and_then(|value| std::path::Path::new(value).parent())
+                .map(PathBuf::from);
+        } else if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--manifest-path="))
+        {
+            directory = std::path::Path::new(value).parent().map(PathBuf::from);
         } else if let Some(value) = argument
             .to_str()
             .and_then(|argument| argument.strip_prefix("--dir="))
@@ -415,6 +429,19 @@ mod tests {
             vec!["corgi", "build", "--future-option", "-C", "project"],
             vec!["corgi", "build", "-Cproject", "--future-option"],
             vec!["corgi", "build", "--dir=project", "--future-option"],
+            vec![
+                "corgi",
+                "build",
+                "--manifest-path",
+                "project/Cargo.toml",
+                "--future-option",
+            ],
+            vec![
+                "corgi",
+                "build",
+                "--manifest-path=project/Cargo.toml",
+                "--future-option",
+            ],
         ] {
             let argv = arguments
                 .into_iter()

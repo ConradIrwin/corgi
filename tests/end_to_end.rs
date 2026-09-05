@@ -7,6 +7,103 @@ use std::{
 };
 
 #[test]
+fn manifest_path_selects_a_nested_workspace_without_parent_config() {
+    let directory = TestDirectory::new("manifest-path");
+    let nested = directory.path.join("scripts/helper");
+    fs::create_dir_all(directory.path.join(".cargo")).unwrap();
+    fs::create_dir_all(nested.join("src")).unwrap();
+    fs::write(directory.path.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(
+        directory.path.join(".cargo/config.toml"),
+        "[env]\nPARENT_WORKSPACE_SETTING = \"parent\"\n",
+    )
+    .unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        directory.path.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(
+        nested.join("Cargo.toml"),
+        "[package]\nname = \"manifest-helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("src/main.rs"),
+        r#"fn main() {
+    assert_eq!(option_env!("PARENT_WORKSPACE_SETTING"), None);
+    let path = std::env::args().nth(1).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "caller");
+    println!("{}", option_env!("HELPER_SETTING").unwrap_or("unset"));
+}
+"#,
+    )
+    .unwrap();
+    fs::write(directory.path.join("marker"), "caller").unwrap();
+
+    let absolute_manifest = nested.join("Cargo.toml");
+    for arguments in [
+        vec!["--manifest-path", "scripts/helper/Cargo.toml"],
+        vec!["--manifest-path=scripts/helper/Cargo.toml"],
+        vec!["--manifest-path", absolute_manifest.to_str().unwrap()],
+        vec!["-C", "scripts/helper"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .current_dir(&directory.path)
+            .arg("run")
+            .args(arguments)
+            .args(["--", "marker"])
+            .output()
+            .unwrap();
+        assert_success(&output, "running nested workspace without parent config");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "unset\n");
+    }
+
+    fs::create_dir_all(nested.join(".cargo")).unwrap();
+    fs::write(
+        nested.join(".cargo/config.toml"),
+        "[env]\nHELPER_SETTING = \"local\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .current_dir(&directory.path)
+        .args([
+            "run",
+            "--manifest-path",
+            "scripts/helper/Cargo.toml",
+            "--",
+            "marker",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output, "running nested workspace with its own config");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "local\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .current_dir(&nested)
+        .args(["check", "--manifest-path", "Cargo.toml"])
+        .output()
+        .unwrap();
+    assert_success(&output, "selecting a manifest in the current directory");
+
+    for arguments in [
+        vec!["--manifest-path", "scripts/helper/missing/Cargo.toml"],
+        vec!["--manifest-path", "scripts/helper/src/main.rs"],
+        vec!["--manifest-path", "scripts/helper/Cargo.toml", "-C", "."],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .current_dir(&directory.path)
+            .arg("check")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_failure(&output, "invalid or conflicting manifest selection");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--manifest-path"), "{stderr}");
+    }
+}
+
+#[test]
 fn package_selection_infers_its_feature_unification_root() {
     let output = run_test_compile("root-inference", ["-p", "app"]);
 

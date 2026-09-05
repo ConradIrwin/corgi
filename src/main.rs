@@ -49,9 +49,29 @@ fn real_main() -> Result<()> {
     self_update::update_if_required(&invocation_dir, &argv)?;
     let cli::Cli {
         dir,
+        manifest_path,
         verbose,
         command,
     } = cli::Cli::parse_from(argv);
+    let dir = if let Some(manifest) = manifest_path {
+        anyhow::ensure!(
+            manifest
+                .file_name()
+                .is_some_and(|name| name == "Cargo.toml")
+                && manifest.is_file(),
+            "--manifest-path must name an existing Cargo.toml: {}",
+            manifest.display()
+        );
+        Some(
+            manifest
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf(),
+        )
+    } else {
+        dir
+    };
     let dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,

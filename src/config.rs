@@ -56,24 +56,18 @@ impl CargoConfig {
     }
 }
 
-/// Walk up from the invocation directory, like cargo, to the nearest
-/// `.cargo/config.toml` (or legacy `.cargo/config`). Returns the parsed
-/// config and the directory it was found in; the caller verifies that hit
-/// is the workspace root once cargo metadata reveals it, so member-level
-/// or machine-local configs are hard errors instead of silent inputs.
+/// Only the selected project's configuration is an input to Corgi's actions.
+/// In particular, a standalone nested workspace does not inherit its parent's
+/// settings. Cargo's planning subprocesses still perform their own discovery.
 pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>)> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        for name in [".cargo/config.toml", ".cargo/config"] {
-            let p = d.join(name);
-            if p.is_file() {
-                let text = std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?;
-                let config = parse(&text).with_context(|| format!("parsing {}", p.display()))?;
-                return Ok((config, Some(d.to_path_buf())));
-            }
+    for name in [".cargo/config.toml", ".cargo/config"] {
+        let p = start.join(name);
+        if p.is_file() {
+            let text =
+                std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+            let config = parse(&text).with_context(|| format!("parsing {}", p.display()))?;
+            return Ok((config, Some(start.to_path_buf())));
         }
-        dir = d.parent();
     }
     Ok((
         CargoConfig {
