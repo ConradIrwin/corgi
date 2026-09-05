@@ -165,6 +165,10 @@ pub struct BuildArgs {
     #[arg(long, value_name = "TRIPLE")]
     pub target: Option<String>,
 
+    /// Export build outputs to DIR, relative to the caller's working directory
+    #[arg(long, value_name = "DIR")]
+    pub target_dir: Option<PathBuf>,
+
     /// Resolve with [roots.NAME] from corgi.toml
     #[arg(long, value_name = "NAME")]
     pub root: Option<String>,

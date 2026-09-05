@@ -135,6 +135,7 @@ fn real_main() -> Result<()> {
                         benches,
                         features: args.features,
                         target: args.target,
+                        target_dir: args.target_dir,
                         root: args.root,
                         mode,
                         targets: targets.into(),

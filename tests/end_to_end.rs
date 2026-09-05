@@ -7,6 +7,100 @@ use std::{
 };
 
 #[test]
+fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
+    let directory = TestDirectory::new("target-dir");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"{}\", std::fs::read_to_string(\"marker\").unwrap()); }\n",
+    )
+    .unwrap();
+    fs::write(directory.path.join("marker"), "caller directory").unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", [], &store),
+        "build with the default target directory",
+    );
+    let original = fs::read(
+        workspace
+            .join("target/debug")
+            .join(executable_name(&directory.package_name)),
+    )
+    .unwrap();
+    fs::remove_dir_all(workspace.join("target")).unwrap();
+
+    let absolute_output = directory.path.join("absolute output");
+    for output in ["relative output", absolute_output.to_str().unwrap()] {
+        let result = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .current_dir(&directory.path)
+            .arg("run")
+            .arg("--manifest-path")
+            .arg(workspace.join("Cargo.toml"))
+            .args(["--target-dir", output, "--timings"])
+            .env("CORGI_STORE", &store)
+            .env("CORGI_ALIAS", store.join("alias"))
+            .output()
+            .unwrap();
+        assert_success(&result, "run with a custom target directory");
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            "caller directory\n"
+        );
+        let output = directory.path.join(output);
+        let binary = output
+            .join("debug")
+            .join(executable_name(&directory.package_name));
+        assert_eq!(fs::read(&binary).unwrap(), original);
+        assert!(output.join("corgi-timings/corgi-timing.html").is_file());
+        assert!(!workspace.join("target").exists());
+        assert_unit_cache(
+            &report_for_workspace(&store, &workspace),
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            "hit",
+        );
+        #[cfg(target_os = "macos")]
+        assert!(output
+            .join("debug")
+            .join(format!("{}-debug", directory.package_name))
+            .is_dir());
+    }
+
+    let report = report_for_workspace(&store, &workspace);
+    let target = report["run"]["tool"]["host"].as_str().unwrap();
+    assert_success(
+        &invoke_corgi_with_store(
+            &workspace,
+            "build",
+            [
+                "--target-dir",
+                absolute_output.to_str().unwrap(),
+                "--target",
+                target,
+            ],
+            &store,
+        ),
+        "build an explicit target in a custom directory",
+    );
+    assert!(absolute_output
+        .join(target)
+        .join("debug")
+        .join(executable_name(&directory.package_name))
+        .is_file());
+    assert!(!workspace.join("target").exists());
+}
+
+#[test]
 fn manifest_path_selects_a_nested_workspace_without_parent_config() {
     let directory = TestDirectory::new("manifest-path");
     let nested = directory.path.join("scripts/helper");
@@ -1938,13 +2032,13 @@ fn debug_objects_follow_each_non_root_executable_output_directory() {
         })
         .expect("missing proc-macro dylib");
 
-    for binary in [test_binary, example_binary, build_script, proc_macro] {
+    for binary in [&test_binary, &example_binary, &build_script, &proc_macro] {
         assert!(binary.is_file(), "missing output {}", binary.display());
         let debug_directory = binary.with_file_name(format!(
             "{}-debug",
             binary.file_name().unwrap().to_string_lossy()
         ));
-        let objects = debug_map_objects(&binary, &workspace);
+        let objects = debug_map_objects(binary, &workspace);
         assert!(
             !objects.is_empty(),
             "{} records no relative debug objects",
@@ -1975,6 +2069,46 @@ fn debug_objects_follow_each_non_root_executable_output_directory() {
             binary.display()
         );
     }
+
+    let custom_target = directory.path.join("custom target");
+    let output = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        [
+            "--all-targets",
+            "--workspace",
+            "--target-dir",
+            custom_target.to_str().unwrap(),
+        ],
+        &store,
+    );
+    assert_success(&output, "export all targets to a custom directory");
+    for binary in [&test_binary, &example_binary, &main_binary] {
+        let exported = custom_target.join(binary.strip_prefix(workspace.join("target")).unwrap());
+        assert!(exported.is_file(), "missing export {}", exported.display());
+        assert_eq!(fs::read(&exported).unwrap(), fs::read(binary).unwrap());
+        let debug_directory = exported.with_file_name(format!(
+            "{}-debug",
+            exported.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            debug_directory.is_dir(),
+            "missing {}",
+            debug_directory.display()
+        );
+    }
+    let output = invoke_corgi_with_store(
+        &workspace,
+        "test",
+        [
+            "--tests",
+            "--no-cache",
+            "--target-dir",
+            custom_target.to_str().unwrap(),
+        ],
+        &store,
+    );
+    assert_success(&output, "run test harnesses from a custom directory");
 }
 
 #[cfg(target_os = "macos")]

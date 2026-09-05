@@ -452,6 +452,7 @@ pub struct Ctx {
     cargo_home: String,
     base_env: Vec<(String, String)>,
     workspace_root: String,
+    target_dir: PathBuf,
     sysroot: String,
     rustup_home: String,
     devdir: String,
@@ -3305,6 +3306,7 @@ pub struct BuildOpts {
     pub benches: Vec<String>,
     pub features: Vec<String>,
     pub target: Option<String>,
+    pub target_dir: Option<PathBuf>,
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
     pub root: Option<String>,
     pub mode: Mode,
@@ -3511,6 +3513,11 @@ pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
     )?;
     opts.packages.sort();
     opts.packages.dedup();
+    if let Some(target_dir) = &mut opts.target_dir {
+        if target_dir.is_relative() {
+            *target_dir = std::env::current_dir()?.join(&*target_dir);
+        }
+    }
     let store_root = store.root.clone();
     let started_at = std::time::SystemTime::now();
     let monotonic_started_at = Instant::now();
@@ -3603,6 +3610,7 @@ fn build_inner(
         benches,
         features,
         target: requested_target,
+        target_dir,
         root,
         mode,
         targets,
@@ -4459,6 +4467,7 @@ fn build_inner(
         units.iter().map(|unit| unit.pkg),
         Path::new(&workspace_root),
     )?;
+    let target_dir = target_dir.unwrap_or_else(|| Path::new(&workspace_root).join("target"));
     let mut ctx = Ctx {
         store,
         verbose,
@@ -4474,6 +4483,7 @@ fn build_inner(
         cargo_home,
         base_env,
         workspace_root,
+        target_dir,
         sysroot,
         rustup_home,
         devdir,
@@ -4539,13 +4549,10 @@ fn build_inner(
         fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
     }
 
-    // Exports anchor at the WORKSPACE root (cargo's target/ convention):
-    // building any member from any directory lands artifacts in one place.
-    let target_dir = Path::new(&ctx.workspace_root).join("target");
-    let dtarget = ctx
-        .target
-        .as_ref()
-        .map_or_else(|| target_dir.clone(), |target| target_dir.join(target));
+    let dtarget = ctx.target.as_ref().map_or_else(
+        || ctx.target_dir.clone(),
+        |target| ctx.target_dir.join(target),
+    );
     let mut written = Vec::new();
     let mut test_harnesses = Vec::new();
     let mut opaque_test_executables = Vec::new();
@@ -5417,7 +5424,10 @@ impl Ctx {
                         .outputs
                         .iter()
                         .any(|output| is_debug_object(&output.name))
-                        && !Path::new(&self.workspace_root).join(binary).try_exists()?
+                        && !self
+                            .target_dir
+                            .join(binary.strip_prefix("target")?)
+                            .try_exists()?
                     {
                         return Ok(());
                     }
@@ -5450,7 +5460,7 @@ impl Ctx {
         if !objects.is_empty() && spec.debug_binary.as_ref() != Some(&relative) {
             bail!("export path does not match the binary's recorded debug-object directory");
         }
-        let destination = Path::new(&self.workspace_root).join(relative);
+        let destination = self.target_dir.join(relative.strip_prefix("target")?);
         self.store
             .export_with_debug(&output.hash, &destination, true, &objects)?;
         Ok(destination)
@@ -7405,7 +7415,7 @@ table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;pa
         sum_finish as f64 / 1e9,
         cached_walk_ns as f64 / 1e9,
     );
-    let dir = Path::new(&ctx.workspace_root).join("target/corgi-timings");
+    let dir = ctx.target_dir.join("corgi-timings");
     fs::create_dir_all(&dir)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
