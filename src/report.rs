@@ -75,6 +75,7 @@ pub struct Command {
     pub target: Option<String>,
     pub features: Vec<String>,
     pub incremental: bool,
+    pub no_run: bool,
     pub force_tests: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_filters: Vec<String>,
@@ -644,6 +645,7 @@ mod tests {
                 target: None,
                 features: vec![],
                 incremental: true,
+                no_run: false,
                 force_tests: false,
                 test_filters: vec![],
                 exec_args: vec![],

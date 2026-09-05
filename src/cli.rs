@@ -230,7 +230,7 @@ pub struct WorkspaceBuildArgs {
     pub targets: TargetSelectionArgs,
 
     /// Select every workspace member
-    #[arg(long, conflicts_with_all = ["packages", "root"])]
+    #[arg(long, visible_alias = "all", conflicts_with_all = ["packages", "root"])]
     pub workspace: bool,
 }
 
@@ -271,8 +271,12 @@ pub struct TestArgs {
     pub targets: TargetSelectionArgs,
 
     /// Select every workspace member
-    #[arg(long, conflicts_with_all = ["packages", "root"])]
+    #[arg(long, visible_alias = "all", conflicts_with_all = ["packages", "root"])]
     pub workspace: bool,
+
+    /// Build test executables without running them
+    #[arg(long)]
+    pub no_run: bool,
 
     /// Run tests even if a successful result is cached
     #[arg(short = 'f', long, visible_alias = "no-cache")]
@@ -299,6 +303,10 @@ pub struct TestArgs {
 pub struct BenchArgs {
     #[command(flatten)]
     pub build: WorkspaceBuildArgs,
+
+    /// Build benchmark executables without running them
+    #[arg(long)]
+    pub no_run: bool,
 
     /// Run only benchmarks containing this string in their names
     #[arg(value_name = "BENCHNAME")]
@@ -668,6 +676,43 @@ mod tests {
             panic!("clippy command not parsed");
         };
         assert!(args.build.build.all_features);
+    }
+
+    #[test]
+    fn all_alias_selects_workspace_and_preserves_conflicts() {
+        for command in ["build", "check", "clippy", "test", "bench"] {
+            let cli = Cli::try_parse_from(["corgi", command, "--all"]).unwrap();
+            let workspace = match cli.command.unwrap() {
+                Command::Build(args) | Command::Check(args) => args.workspace,
+                Command::Clippy(args) => args.build.workspace,
+                Command::Test(args) => args.workspace,
+                Command::Bench(args) => args.build.workspace,
+                _ => panic!("unexpected command"),
+            };
+            assert!(workspace);
+            for selector in ["-p", "--root"] {
+                assert!(
+                    Cli::try_parse_from(["corgi", command, "--all", selector, "app",]).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_run_is_available_only_for_tests_and_benchmarks() {
+        let cli = Cli::try_parse_from(["corgi", "test", "--no-run"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert!(args.no_run);
+        let cli = Cli::try_parse_from(["corgi", "bench", "--no-run"]).unwrap();
+        let Some(Command::Bench(args)) = cli.command else {
+            panic!("bench command not parsed");
+        };
+        assert!(args.no_run);
+        for command in ["build", "check", "clippy", "run"] {
+            assert!(Cli::try_parse_from(["corgi", command, "--no-run"]).is_err());
+        }
     }
 
     #[test]

@@ -1680,6 +1680,130 @@ fn benchmark_targets_support_built_in_and_custom_harnesses() {
 }
 
 #[test]
+fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
+    let directory = TestDirectory::new("test-no-run");
+    copy_directory(&fixture_path("benchmark-targets"), &directory.path);
+    let marker = directory.path.join("custom-test-benchmark-ran");
+    let integration_marker = directory.path.join("integration-ran");
+    let isolated_store = TestDirectory::new("no-run-store");
+    let store = &isolated_store.path;
+
+    let built = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "custom", "--test", "integration", "--no-run"])
+        .env("CORGI_STORE", &store)
+        .env("CORGI_ALIAS", store.join("alias"))
+        .env("CORGI_TEST_BENCH_MARKER", &marker)
+        .env("CORGI_INTEGRATION_MARKER", &integration_marker)
+        .output()
+        .expect("failed to build the custom test harness");
+    assert_success(&built, "corgi test --no-run");
+    for target in ["custom", "integration"] {
+        assert!(
+            fs::read_dir(directory.path.join("target/debug/deps"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .any(|path| path.is_file()
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(&format!("{target}-"))),
+            "test executable {target} was not exported"
+        );
+    }
+    assert!(!marker.exists(), "test --no-run executed the test harness");
+    assert!(
+        !integration_marker.exists(),
+        "test --no-run executed the integration test"
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("test")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "custom", "--test", "integration"])
+        .env("CORGI_STORE", &store)
+        .env("CORGI_ALIAS", store.join("alias"))
+        .env("CORGI_TEST_BENCH_MARKER", &marker)
+        .env("CORGI_INTEGRATION_MARKER", &integration_marker)
+        .output()
+        .expect("failed to run the previously built custom test harness");
+    assert_success(&run, "corgi test after test --no-run");
+    assert!(
+        integration_marker.exists(),
+        "test --no-run cached a false test pass"
+    );
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        "",
+        "the custom test harness received unexpected arguments"
+    );
+}
+
+#[test]
+fn bench_no_run_exports_built_in_and_custom_executables_without_running_them() {
+    let directory = TestDirectory::new("bench-no-run");
+    copy_directory(&fixture_path("benchmark-targets"), &directory.path);
+    let marker = directory.path.join("custom-benchmark-ran");
+
+    let built = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("bench")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "built_in", "--bench", "custom", "--no-run"])
+        .env("CORGI_BENCHMARK_MARKER", &marker)
+        .output()
+        .expect("failed to build benchmark executables");
+    assert_success(&built, "corgi bench --no-run");
+    for target in ["built_in", "custom"] {
+        assert!(
+            fs::read_dir(directory.path.join("target/release/deps"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .any(|path| path.is_file()
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(&format!("{target}-"))),
+            "benchmark executable {target} was not exported"
+        );
+    }
+    assert!(!marker.exists(), "bench --no-run executed a benchmark");
+
+    let custom = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        .arg("bench")
+        .arg("-C")
+        .arg(&directory.path)
+        .args(["--bench", "custom"])
+        .env("CORGI_BENCHMARK_MARKER", &marker)
+        .output()
+        .expect("failed to run the previously built custom benchmark");
+    assert_success(&custom, "corgi bench after bench --no-run");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "--bench\n");
+
+    let built_in = invoke_corgi(
+        &directory.path,
+        "bench",
+        ["--bench", "built_in", "built_in_harness"],
+    );
+    assert_success(&built_in, "built-in benchmark after bench --no-run");
+    assert!(
+        String::from_utf8_lossy(&built_in.stderr).contains("Running benchmark built_in")
+            && String::from_utf8_lossy(&built_in.stdout).contains("running 1 test"),
+        "the built-in benchmark harness did not run:\n{}\n{}",
+        String::from_utf8_lossy(&built_in.stdout),
+        String::from_utf8_lossy(&built_in.stderr)
+    );
+
+    let all = invoke_corgi(&directory.path, "bench", ["--all", "--no-run"]);
+    assert_success(&all, "corgi bench --all --no-run");
+}
+
+#[test]
 fn fmt_discovers_targets_in_a_virtual_workspace() {
     let fixture = fixture_path("fmt-virtual-workspace");
 

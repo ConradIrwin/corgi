@@ -3351,6 +3351,7 @@ pub struct BuildOpts {
     pub clippy_args: Vec<String>,
     pub timings: bool,
     pub no_incremental: bool,
+    pub no_run: bool,
     /// Ignore cached successful test results while retaining build cache hits.
     pub force_tests: bool,
     /// Per-test timeout. `None` waits indefinitely, matching Cargo.
@@ -3429,6 +3430,7 @@ fn report_run(
             target: opts.target.clone(),
             features: selected_features,
             incremental: !opts.no_incremental,
+            no_run: opts.no_run,
             force_tests: opts.force_tests,
             test_filters: opts.test_filters.clone(),
             exec_args: opts.exec_args.clone(),
@@ -3652,6 +3654,7 @@ fn build_inner(
         clippy_args,
         timings,
         no_incremental,
+        no_run,
         force_tests,
         test_timeout,
         test_filters,
@@ -4621,6 +4624,10 @@ fn build_inner(
             // Export the harness before running it, so even a failing test
             // leaves a debuggable binary behind.
             let dest = ctx.export_binary(i, m, &r.res)?;
+            if no_run {
+                written.push(dest);
+                continue;
+            }
             let name = u.target.name.clone();
             let cwd = ctx.meta.packages[u.pkg].root();
             let ActionSpec::Compile(spec) = &r.action.spec else {
@@ -4711,7 +4718,7 @@ fn build_inner(
             Err(_) => status!("Output", "`{}`", path.display()),
         }
     }
-    if matches!(mode, Mode::Test) {
+    if matches!(mode, Mode::Test) && !no_run {
         let test_stage_start = begin_report_stage(&recorder, "test");
         let canonical_run = test_filters.is_empty() && exec_args.is_empty();
         let test_filter_set =
@@ -4735,7 +4742,7 @@ fn build_inner(
         run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
         finish_report_stage(&recorder, "test", test_stage_start);
     }
-    if matches!(mode, Mode::Bench) {
+    if matches!(mode, Mode::Bench) && !no_run {
         let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
         run_benchmarks(&benchmark_executables, &exec_args)?;
         finish_report_stage(&recorder, "benchmark", benchmark_stage_start);
