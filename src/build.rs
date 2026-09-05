@@ -9735,7 +9735,6 @@ mod dep_info_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod zig_target_tests {
     use super::zig_target_for_build;
 
