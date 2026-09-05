@@ -1,4 +1,5 @@
 use crate::meta::{self, Metadata, Package, Target};
+use crate::report::UnitKeyResolution as KeyResolution;
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use regex::RegexSet;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const TOOL_VERSION: &str = "corgi/0.30";
+const TOOL_VERSION: &str = "corgi/0.31";
 static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! status {
@@ -28,8 +29,8 @@ macro_rules! status {
 // coexist and never evict each other. Deliberate divergences:
 // - lto is not supported yet (warned once, built without);
 // - darwin linking units always get split-debuginfo=unpacked, whatever
-//   the profile says: their DWARF stays in store-owned object files that
-//   the debug map names (see debug_objects_dir);
+//   the profile says: their DWARF stays in cached object files exported
+//   alongside the binary under the relative paths its debug map names;
 // - incremental and rpath are ignored.
 
 #[derive(Clone, Copy, PartialEq)]
@@ -180,8 +181,9 @@ impl CacheMiss {
 #[derive(Clone)]
 /// Early (meta-ready) result of a pipelined lib compile: published the
 /// moment rustc reports the rmeta written, while its codegen continues.
-/// Action keys are already planned; this lets dependent execution start.
+/// Dep-info resolves the producer identity before dependent execution starts.
 struct MetaOut {
+    action: Arc<ResolvedAction>,
     /// Pool-addressed (key-spliced) file name of the rmeta.
     file: String,
 }
@@ -193,7 +195,11 @@ fn unit_crate_type(unit: &Unit) -> String {
             if unit.target.kind.iter().any(|k| k == "proc-macro") {
                 "proc-macro".to_string()
             } else if unit.is_root && unit.target.crate_types.iter().any(|c| c == "cdylib") {
-                unit.target.crate_types.join(",")
+                // rustc's archive step can consume the objects' debug info.
+                // Link images before packaging the same objects into archives.
+                let mut crate_types = unit.target.crate_types.clone();
+                crate_types.sort_by_key(|kind| matches!(kind.as_str(), "rlib" | "staticlib"));
+                crate_types.join(",")
             } else {
                 "lib".to_string()
             }
@@ -240,6 +246,77 @@ fn is_linking(ctx: &Ctx, idx: usize) -> bool {
     unit_links(&ctx.units[idx]) && !is_checked(ctx, idx)
 }
 
+/// Later rustflags can enable debug information even when the profile disables it,
+/// so every Mach-O link gets a relocatable staging path.
+fn macos_linked_image(ctx: &Ctx, index: usize) -> bool {
+    let unit = &ctx.units[index];
+    let platform = if unit.host {
+        ctx.host.as_str()
+    } else {
+        ctx.target.as_deref().unwrap_or(&ctx.host)
+    };
+    is_linking(ctx, index) && platform.contains("apple")
+}
+
+/// Both staging and export use this path: changing the recorded debug-map
+/// location without changing the action identity would alias different binaries.
+fn binary_export_path(ctx: &Ctx, index: usize, output_name: &str) -> PathBuf {
+    let unit = &ctx.units[index];
+    let mut directory = PathBuf::from("target");
+    if !unit.host {
+        if let Some(target) = &ctx.target {
+            directory.push(target);
+        }
+    }
+    directory.push(&ctx.profile_name);
+    match unit.kind {
+        Kind::Bin => {
+            if unit.target.kind.iter().any(|kind| kind == "example") {
+                directory.push("examples");
+            }
+            directory.push(if output_name.ends_with(".exe") {
+                format!("{}.exe", unit.target.name)
+            } else {
+                unit.target.name.clone()
+            });
+        }
+        Kind::Test => {
+            directory.push("deps");
+            directory.push(output_name);
+        }
+        Kind::Bsc => {
+            directory.push("build");
+            directory.push(&ctx.idents[index]);
+            directory.push(output_name);
+        }
+        Kind::Lib | Kind::Bsr => directory.push(output_name),
+    }
+    directory
+}
+
+fn validate_debug_export_paths(ctx: &Ctx) -> Result<()> {
+    let binaries = ctx
+        .action_plans
+        .iter()
+        .filter_map(|plan| match &plan.template {
+            ActionSpec::Compile(spec) => spec.debug_binary.as_deref(),
+            ActionSpec::BuildScriptRun(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for binary in &binaries {
+        let debug_directory = Store::debug_dir(binary)?;
+        if binaries.contains(debug_directory.as_path()) {
+            bail!(
+                "binary export {} conflicts with the debug-object directory for {}; \
+                 rename one of these targets",
+                debug_directory.display(),
+                binary.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A pinned tool ready for scoped injection into build-script runs.
 struct ToolRt {
     name: String,
@@ -274,6 +351,7 @@ struct Phases {
 }
 
 struct UnitResult {
+    action: Arc<ResolvedAction>,
     cached: bool,
     res: ActionResult,
     main: Option<OutputFile>,
@@ -462,6 +540,12 @@ struct PackageReadInputs {
     immutable_source_roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum PackageReadPhase {
+    Compile,
+    BuildScriptRun,
+}
+
 fn archive_out_dir(
     store: &Store,
     out_dir: &Path,
@@ -506,15 +590,21 @@ impl Ctx {
         Ok(paths)
     }
 
-    fn package_read_inputs(&self, package_index: usize) -> Result<PackageReadInputs> {
+    fn package_read_inputs(
+        &self,
+        package_index: usize,
+        phase: PackageReadPhase,
+    ) -> Result<PackageReadInputs> {
         let pkg = &self.meta.packages[package_index];
         let mut inputs = if pkg.source.is_some() {
             vec![pkg.root().canonicalize()?]
-        } else {
+        } else if matches!(phase, PackageReadPhase::Compile) {
             self.source_files_for(package_index)?
                 .into_iter()
                 .map(|relative_path| pkg.root().join(relative_path).canonicalize())
                 .collect::<std::io::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
         inputs.push(PathBuf::from(&pkg.manifest_path).canonicalize()?);
         inputs.extend(
@@ -543,8 +633,11 @@ impl Ctx {
         let mut roots = Vec::new();
         for dependency in dependency_closure(self, [index]) {
             roots.extend(
-                self.package_read_inputs(self.units[dependency].pkg)?
-                    .immutable_source_roots,
+                self.package_read_inputs(
+                    self.units[dependency].pkg,
+                    PackageReadPhase::BuildScriptRun,
+                )?
+                .immutable_source_roots,
             );
         }
         roots.sort();
@@ -913,9 +1006,11 @@ struct PlannedActionTarget {
     test_harness: bool,
 }
 
-#[derive(Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Serialize)]
 struct PlannedActionDependency {
     producer: String,
+    #[serde(skip)]
+    producer_unit: usize,
     filename: Option<String>,
     extern_name: Option<String>,
 }
@@ -932,8 +1027,8 @@ struct PlannedTool {
 #[derive(Clone, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ActionSpec {
-    Compile(CompileActionSpec),
-    BuildScriptRun(BuildScriptRunActionSpec),
+    Compile(Box<CompileActionSpec>),
+    BuildScriptRun(Box<BuildScriptRunActionSpec>),
 }
 
 #[derive(Clone, Serialize)]
@@ -943,7 +1038,8 @@ struct CompileActionSpec {
     rustc: String,
     host: String,
     package: (String, String, String),
-    source_hash: String,
+    #[serde(flatten)]
+    source_inputs: CompileSourceInputs,
     crate_name: String,
     crate_type: String,
     source: String,
@@ -961,51 +1057,220 @@ struct CompileActionSpec {
     clippy_args: Vec<String>,
     cap_lints: bool,
     toolchain: Option<String>,
+    debug_binary: Option<PathBuf>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum CompileSourceInputs {
+    Static {
+        source_hash: String,
+    },
+    Local {
+        read_set: Vec<(String, String)>,
+        source_layout_hash: String,
+        manifest_hash: String,
+        declared_inputs: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone, Serialize)]
 struct BuildScriptRunActionSpec {
     tool: &'static str,
     package: (String, String, String),
-    source_hash: String,
+    #[serde(flatten)]
+    source_inputs: BuildScriptRunSourceInputs,
     dependencies: Vec<PlannedActionDependency>,
     environment: Vec<(String, String)>,
     tools: Vec<PlannedTool>,
     toolchain: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum BuildScriptRunSourceInputs {
+    Static {
+        source_hash: String,
+    },
+    Local {
+        manifest_hash: String,
+        declared_inputs: Vec<(String, String)>,
+    },
+}
+
 struct ActionPlan {
-    key: String,
-    spec: ActionSpec,
+    template: ActionSpec,
+    candidate: Option<Arc<ResolvedAction>>,
     outputs: Vec<String>,
     main_output: Option<String>,
     declared_environment: Vec<(String, String)>,
 }
 
-impl ActionPlan {
-    fn compile_spec(&self) -> Result<&CompileActionSpec> {
-        match &self.spec {
-            ActionSpec::Compile(spec) => Ok(spec),
-            ActionSpec::BuildScriptRun(_) => bail!("compile action plan expected"),
-        }
-    }
+struct ResolvedAction {
+    key: String,
+    spec: ActionSpec,
+    resolution: KeyResolution,
+}
 
-    fn build_script_run_spec(&self) -> Result<&BuildScriptRunActionSpec> {
-        match &self.spec {
-            ActionSpec::BuildScriptRun(spec) => Ok(spec),
-            ActionSpec::Compile(_) => bail!("build-script action plan expected"),
+impl ActionSpec {
+    fn local_read_set_mut(&mut self) -> Option<&mut HashedReadSet> {
+        match self {
+            Self::Compile(spec) => match &mut spec.source_inputs {
+                CompileSourceInputs::Local { read_set, .. } => Some(read_set),
+                CompileSourceInputs::Static { .. } => None,
+            },
+            Self::BuildScriptRun(_) => None,
         }
     }
 }
 
-/// Compute every cache identity from declared inputs and producer action
-/// identities. No action result is loaded here: output bytes and build-script
-/// directives are resolved only if an action later needs to execute.
+impl ActionPlan {
+    fn compile_spec(&self) -> Result<&CompileActionSpec> {
+        match &self.template {
+            ActionSpec::Compile(spec) => Ok(spec),
+            ActionSpec::BuildScriptRun(_) => bail!("compile action plan expected"),
+        }
+    }
+}
+
+type HashedReadSet = Vec<(String, String)>;
+
+fn action_spec_with_producer_keys(
+    ctx: &Ctx,
+    index: usize,
+    template: &ActionSpec,
+    producer: impl Fn(usize) -> Option<(String, Option<String>)>,
+) -> Result<Option<ActionSpec>> {
+    let mut spec = template.clone();
+    let dependencies = match &mut spec {
+        ActionSpec::Compile(spec) => &mut spec.dependencies,
+        ActionSpec::BuildScriptRun(spec) => &mut spec.dependencies,
+    };
+    for dependency in dependencies.iter_mut() {
+        let Some((key, _)) = producer(dependency.producer_unit) else {
+            return Ok(None);
+        };
+        dependency.producer = key;
+    }
+    dependencies.sort_by(|left, right| {
+        (&left.producer, &left.filename, &left.extern_name).cmp(&(
+            &right.producer,
+            &right.filename,
+            &right.extern_name,
+        ))
+    });
+
+    if let ActionSpec::Compile(spec) = &mut spec {
+        spec.environment
+            .retain(|(name, _)| !name.starts_with("CARGO_BIN_EXE_"));
+        for dependency in &ctx.units[index].deps {
+            if !matches!(dependency.role, DependencyRole::BinaryExecutable) {
+                continue;
+            }
+            let (key, output) = producer(dependency.unit).context("binary producer key missing")?;
+            let output = output.context("binary dependency artifact missing")?;
+            spec.environment.push((
+                format!("CARGO_BIN_EXE_{}", ctx.units[dependency.unit].target.name),
+                ctx.pool_logical
+                    .join(Store::pool_file_name(&output, &key))
+                    .display()
+                    .to_string(),
+            ));
+        }
+        spec.environment.sort();
+    }
+    Ok(Some(spec))
+}
+
+fn manifest_key_for_action_spec(spec: &ActionSpec) -> Result<Option<String>> {
+    let mut manifest_spec = spec.clone();
+    let Some(read_set) = manifest_spec.local_read_set_mut() else {
+        return Ok(None);
+    };
+    read_set.clear();
+    Ok(Some(sha256_hex(&serde_json::to_vec(&manifest_spec)?)))
+}
+
+fn verified_manifest_read_set(
+    ctx: &Ctx,
+    package_index: usize,
+    manifest_key: &str,
+) -> Result<Option<HashedReadSet>> {
+    let package_root = ctx.meta.packages[package_index].root();
+    for (entry_hash, entry) in ctx.store.list_manifest_entries(manifest_key)? {
+        let relative_paths = entry
+            .files
+            .iter()
+            .map(|(path, _)| PathBuf::from(path))
+            .collect::<Vec<_>>();
+        let Ok(current) = ctx
+            .store
+            .hash_file_set_cached(&package_root, &relative_paths)
+        else {
+            continue;
+        };
+        if current == entry.files {
+            ctx.store.touch_manifest_entry(manifest_key, &entry_hash);
+            return Ok(Some(entry.files));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_action(spec: ActionSpec, resolution: KeyResolution) -> Result<Arc<ResolvedAction>> {
+    Ok(Arc::new(ResolvedAction {
+        key: sha256_hex(&serde_json::to_vec(&spec)?),
+        spec,
+        resolution,
+    }))
+}
+
+fn candidate_action(
+    ctx: &Ctx,
+    index: usize,
+    mut spec: ActionSpec,
+) -> Result<Option<Arc<ResolvedAction>>> {
+    let manifest_key = manifest_key_for_action_spec(&spec)?;
+    let resolution = if let Some(read_set) = spec.local_read_set_mut() {
+        let Some(files) = verified_manifest_read_set(
+            ctx,
+            ctx.units[index].pkg,
+            &manifest_key.context("local compile manifest key missing")?,
+        )?
+        else {
+            return Ok(None);
+        };
+        *read_set = files;
+        KeyResolution::VerifiedManifest
+    } else {
+        KeyResolution::RegistryStatic
+    };
+    resolve_action(spec, resolution).map(Some)
+}
+
+/// Verified read-set manifests let requested cache hits skip their build
+/// dependencies. Missing manifests leave the key unresolved until compilation.
 fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
     fn plan_action(ctx: &Ctx, index: usize, plans: &[OnceLock<ActionPlan>]) -> Result<ActionPlan> {
         let unit = &ctx.units[index];
         let package = &ctx.meta.packages[unit.pkg];
-        let source_hash = ctx.pkg_src_hash(unit.pkg)?;
+        let source_hash = package
+            .source
+            .as_ref()
+            .map(|_| ctx.immutable_source_hash(unit.pkg))
+            .transpose()?;
+        let manifest_hash = crate::store::sha256_file(Path::new(&package.manifest_path))?;
+        let source_layout_hash = if package.source.is_none() {
+            Some(rust_source_layout_hash(&ctx.source_files_for(unit.pkg)?))
+        } else {
+            None
+        };
+        let declared_inputs = ctx
+            .extra_inputs
+            .for_package(unit.pkg)
+            .iter()
+            .map(|input| Ok((input.label.clone(), crate::store::sha256_file(&input.path)?)))
+            .collect::<Result<Vec<_>>>()?;
         let mut features = unit.features.clone();
         features.sort();
         let (crate_name, crate_type, source) = compile_identity(ctx, index);
@@ -1039,20 +1304,20 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             };
             if include {
                 dependencies.push(PlannedActionDependency {
-                    producer: producer.key.clone(),
+                    producer: String::new(),
+                    producer_unit: dependency.unit,
                     filename,
                     extern_name: dependency.role.extern_name().map(str::to_string),
                 });
             }
         }
-        dependencies.sort();
 
         let platform = if unit.host {
             ctx.host.clone()
         } else {
             ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
         };
-        let (spec, declared_environment) = if matches!(unit.kind, Kind::Bsr) {
+        let (mut spec, declared_environment) = if matches!(unit.kind, Kind::Bsr) {
             let (environment, declared_environment, visible_tools) =
                 build_script_environment(ctx, unit, package);
             let mut tools = visible_tools
@@ -1066,7 +1331,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 })
                 .collect::<Vec<_>>();
             tools.sort_by(|left, right| left.identity.cmp(&right.identity));
-            let spec = ActionSpec::BuildScriptRun(BuildScriptRunActionSpec {
+            let spec = ActionSpec::BuildScriptRun(Box::new(BuildScriptRunActionSpec {
                 tool: TOOL_VERSION,
                 package: (
                     package.name.clone(),
@@ -1076,36 +1341,25 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                         .clone()
                         .unwrap_or_else(|| "local".to_string()),
                 ),
-                source_hash,
+                source_inputs: if let Some(source_hash) = &source_hash {
+                    BuildScriptRunSourceInputs::Static {
+                        source_hash: source_hash.clone(),
+                    }
+                } else {
+                    BuildScriptRunSourceInputs::Local {
+                        manifest_hash: manifest_hash.clone(),
+                        declared_inputs: declared_inputs.clone(),
+                    }
+                },
                 dependencies,
                 environment,
                 tools,
                 toolchain: ctx.toolchain.clone(),
-            });
+            }));
             (spec, declared_environment)
         } else {
             let mut environment = ctx.pkg_env(package);
             environment.extend(ctx.config_env.iter().cloned());
-            for dependency in &unit.deps {
-                if !matches!(dependency.role, DependencyRole::BinaryExecutable) {
-                    continue;
-                }
-                let binary = &ctx.units[dependency.unit];
-                let producer = plans[dependency.unit]
-                    .get()
-                    .context("binary dependency action plan missing")?;
-                let output = producer
-                    .main_output
-                    .as_ref()
-                    .context("binary dependency artifact missing")?;
-                environment.push((
-                    format!("CARGO_BIN_EXE_{}", binary.target.name),
-                    ctx.pool_logical
-                        .join(Store::pool_file_name(output, &producer.key))
-                        .display()
-                        .to_string(),
-                ));
-            }
             if matches!(unit.kind, Kind::Bin) {
                 environment.push(("CARGO_BIN_NAME".to_string(), unit.target.name.clone()));
             }
@@ -1132,7 +1386,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             } else {
                 ctx.lints[unit.pkg].rustc_only.clone()
             };
-            let spec = ActionSpec::Compile(CompileActionSpec {
+            let spec = ActionSpec::Compile(Box::new(CompileActionSpec {
                 kind: compile_action_kind(ctx, index).to_string(),
                 tool: TOOL_VERSION,
                 rustc: ctx.rustc_version.clone(),
@@ -1145,7 +1399,20 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                         .clone()
                         .unwrap_or_else(|| "local".to_string()),
                 ),
-                source_hash,
+                source_inputs: if let Some(source_hash) = &source_hash {
+                    CompileSourceInputs::Static {
+                        source_hash: source_hash.clone(),
+                    }
+                } else {
+                    CompileSourceInputs::Local {
+                        read_set: Vec::new(),
+                        source_layout_hash: source_layout_hash
+                            .clone()
+                            .context("local compile source layout missing")?,
+                        manifest_hash: manifest_hash.clone(),
+                        declared_inputs: declared_inputs.clone(),
+                    }
+                },
                 crate_name,
                 crate_type,
                 source,
@@ -1173,17 +1440,17 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 },
                 cap_lints: package.source.is_some(),
                 toolchain: is_linking(ctx, index).then(|| ctx.toolchain.clone()),
-            });
+                debug_binary: None,
+            }));
             (spec, ctx.config_env.clone())
         };
-        let key = sha256_hex(&serde_json::to_vec(&spec)?);
         let outputs = match &spec {
             ActionSpec::Compile(spec) => {
                 let extra = action_extra_filename(ctx, index);
                 if is_checked(ctx, index) {
                     vec![format!("lib{}-{extra}.rmeta", spec.crate_name)]
                 } else {
-                    expected_outputs(ctx, &spec.crate_name, &extra, &spec.crate_type, unit.host)?
+                    expected_outputs(ctx, &spec.crate_name, extra, &spec.crate_type, unit.host)?
                 }
             }
             ActionSpec::BuildScriptRun(_) => Vec::new(),
@@ -1193,16 +1460,39 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             .find(|output| output.ends_with(".rlib"))
             .or_else(|| outputs.first())
             .cloned();
+        if macos_linked_image(ctx, index) {
+            if let ActionSpec::Compile(spec) = &mut spec {
+                let binary = outputs
+                    .iter()
+                    .find(|output| {
+                        !output.ends_with(".rlib")
+                            && !output.ends_with(".rmeta")
+                            && !output.ends_with(".a")
+                    })
+                    .context("linked compile has no binary output")?;
+                spec.debug_binary = Some(binary_export_path(ctx, index, binary));
+            }
+        }
+        let candidate = action_spec_with_producer_keys(ctx, index, &spec, |producer| {
+            let producer = plans[producer].get()?;
+            Some((
+                producer.candidate.as_ref()?.key.clone(),
+                producer.main_output.clone(),
+            ))
+        })?
+        .map(|spec| candidate_action(ctx, index, spec))
+        .transpose()?
+        .flatten();
         Ok(ActionPlan {
-            key,
-            spec,
+            template: spec,
+            candidate,
             outputs,
             main_output,
             declared_environment,
         })
     }
 
-    // Source hashes are package-scoped. Populate the memo once before unit
+    // Immutable source hashes are package-scoped. Populate the memo before unit
     // planning so sibling host/target/profile actions cannot duplicate a
     // package scan when their keys are computed concurrently. Package scans
     // are independent and include potentially large declared input trees, so
@@ -1211,6 +1501,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         .units
         .iter()
         .map(|unit| unit.pkg)
+        .filter(|&package| ctx.meta.packages[package].source.is_some())
         .collect::<BTreeSet<_>>();
     let package_count = package_indices.len();
     let package_indices = Mutex::new(package_indices.into_iter().collect::<VecDeque<_>>());
@@ -1225,7 +1516,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 let Some(package_index) = package_indices.lock().unwrap().pop_front() else {
                     return;
                 };
-                if let Err(error) = ctx.pkg_src_hash(package_index) {
+                if let Err(error) = ctx.immutable_source_hash(package_index) {
                     source_hash_errors.lock().unwrap().push(error);
                 }
             });
@@ -2259,6 +2550,7 @@ fn is_concrete_channel(c: &str) -> bool {
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
 const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const READ_SET_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// Go-style cache expiry: every file is judged by its own mtime, which
 /// use-sites keep fresh with throttled touches. No reference counting —
@@ -2313,6 +2605,9 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     let staging_cutoff = now
         .checked_sub(std::time::Duration::from_secs(24 * 3600))
         .context("staging ttl too large")?;
+    let read_set_manifest_cutoff = now
+        .checked_sub(older_than.unwrap_or(READ_SET_MANIFEST_TTL))
+        .context("read-set manifest ttl too large")?;
     let stale = |p: &Path| -> bool {
         fs::metadata(p)
             .and_then(|m| m.modified())
@@ -2342,6 +2637,9 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
             }
         }
     }
+    let (manifest_files, manifest_bytes) = store.trim_manifest_entries(read_set_manifest_cutoff)?;
+    files += manifest_files;
+    bytes += manifest_bytes;
     // pool/* : hardlinks share the blob's inode (and mtime) — same verdict
     for f in read_dir_paths(&store.root.join("pool"))? {
         if stale(&f) && fs::remove_file(&f).is_ok() {
@@ -2408,10 +2706,8 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
             dirs += 1;
         }
     }
-    // debug/: split debug-info objects of linked images, judged by dir
-    // mtime (materializing an action refreshes it). Lock files go once
-    // their directory has been reclaimed. Losing a directory costs only
-    // source-level debugging of an image that a rebuild restores.
+    // Older versions materialized debug objects in the store. Keep retiring
+    // those directories until their cached images have aged out.
     for p in read_dir_paths(&store.root.join("debug"))? {
         if p.extension().is_some_and(|e| e == "lock") {
             let entry = p.with_extension("");
@@ -4222,6 +4518,7 @@ fn build_inner(
         report: Arc::clone(&recorder),
     };
     ctx.action_plans = compute_action_plans(&ctx)?;
+    validate_debug_export_paths(&ctx)?;
 
     register_report_units(&ctx);
     finish_report_stage(&recorder, "prepare", report_stage_start);
@@ -4264,12 +4561,13 @@ fn build_inner(
             let m = r.main.as_ref().context("test artifact missing")?;
             // Export the harness before running it, so even a failing test
             // leaves a debuggable binary behind.
-            let dest = dtarget.join(&ctx.profile_name).join("deps").join(&m.name);
-            ctx.store.export(&m.hash, &dest, true)?;
+            let dest = ctx.export_binary(i, m, &r.res)?;
             let name = u.target.name.clone();
             let cwd = ctx.meta.packages[u.pkg].root();
-            let binary_environment = ctx.action_plans[i]
-                .compile_spec()?
+            let ActionSpec::Compile(spec) = &r.action.spec else {
+                bail!("test harness compile action expected");
+            };
+            let binary_environment = spec
                 .environment
                 .iter()
                 .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
@@ -4277,7 +4575,7 @@ fn build_inner(
                 .collect();
             if matches!(mode, Mode::Test) {
                 if u.test_harness {
-                    let pass_key = test_pass_key(&ctx.action_plans[i].key)?;
+                    let pass_key = test_pass_key(&r.action.key)?;
                     let cached_test_count = if canonical_run && !force_tests {
                         load_test_pass(&ctx.store, &pass_key)
                     } else {
@@ -4316,37 +4614,26 @@ fn build_inner(
     }
 
     for (i, u) in ctx.units.iter().enumerate() {
-        if !matches!(mode, Mode::Build | Mode::Run) {
+        if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
             break;
         }
-        if matches!(u.kind, Kind::Bin) && u.is_root {
-            let t = &u.target;
-            let r = results[i].get().context("bin not built")?;
-            let m = r.main.as_ref().context("bin artifact missing")?;
-            let mut dest = dtarget.join(&ctx.profile_name);
-            if t.kind.iter().any(|kind| kind == "example") {
-                dest.push("examples");
+        if matches!(u.kind, Kind::Bin) {
+            // Integration tests can demand normal binaries through CARGO_BIN_EXE
+            // even when those binaries were not selected as roots.
+            if let Some(r) = results[i].get() {
+                let m = r.main.as_ref().context("bin artifact missing")?;
+                let dest = ctx.export_binary(i, m, &r.res)?;
+                written.push(dest);
             }
-            let executable_name = if m.name.ends_with(".exe") {
-                format!("{}.exe", t.name)
-            } else {
-                t.name.clone()
-            };
-            let dest = dest.join(executable_name);
-            ctx.store.export(&m.hash, &dest, true)?;
-            written.push(dest);
         }
         if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
             if let Some(r) = results[i].get() {
-                let k16 = &ctx.action_plans[i].key[..16];
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm")
                         || o.name.ends_with(".dylib")
                         || o.name.ends_with(".so")
                     {
-                        let clean = o.name.replace(&format!("-{k16}"), "");
-                        let dest = dtarget.join(&ctx.profile_name).join(&clean);
-                        ctx.store.export(&o.hash, &dest, true)?;
+                        let dest = ctx.export_binary(i, o, &r.res)?;
                         written.push(dest);
                     }
                 }
@@ -5111,20 +5398,62 @@ impl Ctx {
             .join("out")
     }
 
-    /// Lay out an action's cached compiler outputs where consumers expect them:
-    /// artifacts rustc links against go in the shared pool, while debug objects
-    /// of a linked image go under the paths its debug map records.
-    fn materialize_action(&self, action_key: &str, res: &ActionResult) -> Result<()> {
+    /// Loose debug objects are exported with their binary, never into the
+    /// dependency pool that rustc scans for linkable libraries.
+    fn materialize_action(&self, index: usize, action_key: &str, res: &ActionResult) -> Result<()> {
         for o in &res.outputs {
-            if is_debug_object(&o.name) {
-                self.store
-                    .materialize_debug_object(action_key, &o.name, &o.hash)?;
-            } else {
+            if !is_debug_object(&o.name) {
                 let pool_name = Store::pool_file_name(&o.name, action_key);
                 self.store.materialize_pool(&o.hash, &pool_name, o.exe)?;
             }
         }
+        // Build scripts and host libraries have no final root-export step.
+        // Give their debug maps a matching workspace materialization too.
+        let unit = &self.units[index];
+        if matches!(unit.kind, Kind::Bsc) || (matches!(unit.kind, Kind::Lib) && unit.host) {
+            if let ActionSpec::Compile(spec) = &self.action_plans[index].template {
+                if let Some(binary) = &spec.debug_binary {
+                    if !res
+                        .outputs
+                        .iter()
+                        .any(|output| is_debug_object(&output.name))
+                        && !Path::new(&self.workspace_root).join(binary).try_exists()?
+                    {
+                        return Ok(());
+                    }
+                    let output = res
+                        .outputs
+                        .iter()
+                        .find(|output| binary_export_path(self, index, &output.name) == *binary)
+                        .context("debug binary missing from compiler outputs")?;
+                    self.export_binary(index, output, res)?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn export_binary(
+        &self,
+        index: usize,
+        output: &OutputFile,
+        res: &ActionResult,
+    ) -> Result<PathBuf> {
+        let relative = binary_export_path(self, index, &output.name);
+        let spec = self.action_plans[index].compile_spec()?;
+        let objects = res
+            .outputs
+            .iter()
+            .filter(|output| spec.debug_binary.is_some() && is_debug_object(&output.name))
+            .map(|output| (output.name.as_str(), output.hash.as_str()))
+            .collect::<Vec<_>>();
+        if !objects.is_empty() && spec.debug_binary.as_ref() != Some(&relative) {
+            bail!("export path does not match the binary's recorded debug-object directory");
+        }
+        let destination = Path::new(&self.workspace_root).join(relative);
+        self.store
+            .export_with_debug(&output.hash, &destination, true, &objects)?;
+        Ok(destination)
     }
 
     fn materialize_out_dir(&self, key: &str, archive: &OutDirArchive) -> Result<()> {
@@ -5204,9 +5533,9 @@ impl Ctx {
         Ok(Ok(res))
     }
 
-    fn pkg_src_hash(&self, pi: usize) -> Result<String> {
+    fn immutable_source_hash(&self, pi: usize) -> Result<String> {
         let started = Instant::now();
-        let result = self.pkg_src_hash_inner(pi);
+        let result = self.immutable_source_hash_inner(pi);
         self.src_hash_nanos.fetch_add(
             started.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -5214,23 +5543,20 @@ impl Ctx {
         result
     }
 
-    fn pkg_src_hash_inner(&self, pi: usize) -> Result<String> {
+    fn immutable_source_hash_inner(&self, pi: usize) -> Result<String> {
         if let Some(h) = self.src_hash_memo.lock().unwrap().get(&pi) {
             return Ok(h.clone());
         }
         let pkg = &self.meta.packages[pi];
-        let immutable = pkg
+        let source = pkg
             .source
             .as_ref()
-            .map(|src| format!("{src}|{}|{}", pkg.name, pkg.version));
-        let mut h = if immutable.is_some() {
-            self.store
-                .hash_dir_cached(&pkg.root(), immutable.as_deref())
-        } else {
-            self.store
-                .hash_files_cached(&pkg.root(), &self.source_files_for(pi)?)
-        }
-        .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
+            .context("immutable package source missing")?;
+        let immutable = format!("{source}|{}|{}", pkg.name, pkg.version);
+        let mut h = self
+            .store
+            .hash_dir_cached(&pkg.root(), Some(&immutable))
+            .with_context(|| format!("hashing sources of {} v{}", pkg.name, pkg.version))?;
         let extras = self.extra_inputs.for_package(pi);
         if !extras.is_empty() {
             let mut acc = h;
@@ -5334,6 +5660,20 @@ fn collect_rust_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
+    let mut normalized_paths = paths
+        .iter()
+        .map(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect::<Vec<_>>();
+    normalized_paths.sort();
+    sha256_hex(normalized_paths.join("\0").as_bytes())
+}
+
 /// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
 /// system dirs, the toolchain, the store, and keyed inputs; writes limited
 /// to the action's output and scratch dirs; no network. Children inherit it.
@@ -5361,6 +5701,7 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     let mut exec_lits = vec![
         format!("{}/bin/rustc", ctx.cargo_home),
         format!("{}/bin/rustc", ctx.sysroot),
+        format!("{}/usr/bin/xcodebuild", ctx.devdir),
     ];
     if let Some(r) = find_in_path(&ctx.rustc) {
         exec_lits.push(r.display().to_string());
@@ -5387,6 +5728,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
     // the Apple tool group, keyed collectively via the Xcode identity in
     // the toolchain hash
+    // /bin/sh dispatches to the variant selected in /private/var/select/sh,
+    // so each system-provided implementation must retain the dispatcher's
+    // process-exec capability.
     for p in [
         "/usr/bin/ar",
         "/usr/bin/ranlib",
@@ -5397,6 +5741,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         "/usr/bin/xcodebuild",
         "/usr/bin/xcode-select",
         "/bin/sh",
+        "/bin/bash",
+        "/bin/dash",
+        "/bin/zsh",
     ] {
         prof.push_str(&format!("  (literal \"{p}\")\n"));
     }
@@ -5433,6 +5780,7 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     ] {
         prof.push_str(&format!("  (subpath \"{p}\")\n"));
     }
+    let workspace_root = Path::new(&ctx.workspace_root);
     let mut reads: Vec<String> = vec![
         ctx.sysroot.clone(),
         ctx.cargo_home.clone(),
@@ -5440,20 +5788,22 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         ctx.devdir.clone(),
         ctx.store.root.display().to_string(),
     ];
+    // A workspace may itself live under the per-user temp directory. In that
+    // case a broad cache grant would make every workspace file readable.
     for d in &ctx.darwin_dirs {
-        reads.push(d.clone());
+        if !workspace_root.starts_with(d) {
+            reads.push(d.clone());
+        } else {
+            reads.push(Path::new(d).join("xcrun_db").display().to_string());
+        }
     }
     for r in reads {
         prof.push_str(&format!("  (subpath \"{r}\")\n"));
     }
-    let workspace_root = Path::new(&ctx.workspace_root);
     let mut input_directories = std::collections::BTreeSet::new();
     for path in extra_reads {
         let mut ancestor = path.parent();
         while let Some(directory) = ancestor {
-            if !directory.starts_with(workspace_root) {
-                break;
-            }
             input_directories.insert(directory);
             ancestor = directory.parent();
         }
@@ -6194,7 +6544,11 @@ fn dependency_closure(ctx: &Ctx, roots: impl IntoIterator<Item = usize>) -> Vec<
     closure
 }
 
-fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::ActionKeyInputs> {
+fn planned_report_key_inputs(
+    ctx: &Ctx,
+    index: usize,
+    action: &ResolvedAction,
+) -> Result<crate::report::ActionKeyInputs> {
     let plan = &ctx.action_plans[index];
     let declared_environment = plan
         .declared_environment
@@ -6204,8 +6558,24 @@ fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::A
             value: value.clone(),
         })
         .collect();
-    match &plan.spec {
+    match &action.spec {
         ActionSpec::Compile(spec) => {
+            let (read_set_entry_hash, manifest_hash, source_layout_hash) = match &spec.source_inputs
+            {
+                CompileSourceInputs::Static { source_hash } => {
+                    (source_hash.clone(), String::new(), None)
+                }
+                CompileSourceInputs::Local {
+                    read_set,
+                    source_layout_hash,
+                    manifest_hash,
+                    ..
+                } => (
+                    sha256_hex(&serde_json::to_vec(read_set)?),
+                    manifest_hash.clone(),
+                    Some(source_layout_hash.clone()),
+                ),
+            };
             let mut link_dependencies = if spec.toolchain.is_some() {
                 dependency_closure(
                     ctx,
@@ -6229,7 +6599,9 @@ fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::A
                 .map(|dependency| ctx.report_unit_keys[dependency.unit].clone());
             Ok(crate::report::ActionKeyInputs::Compile(Box::new(
                 crate::report::CompileKeyInputs {
-                    source_hash: spec.source_hash.clone(),
+                    read_set_entry_hash,
+                    manifest_hash,
+                    source_layout_hash,
                     declared_environment,
                     effective_environment_hash: sha256_hex(
                         serde_json::to_string(&spec.environment)?.as_bytes(),
@@ -6241,10 +6613,21 @@ fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::A
                     cap_lints: spec.cap_lints,
                     uses_toolchain: spec.toolchain.is_some(),
                     compiler_identity: spec.compiler_identity.clone(),
+                    debug_binary: spec
+                        .debug_binary
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
                 },
             )))
         }
         ActionSpec::BuildScriptRun(spec) => {
+            let source_hash = match &spec.source_inputs {
+                BuildScriptRunSourceInputs::Static { source_hash } => source_hash.clone(),
+                BuildScriptRunSourceInputs::Local {
+                    manifest_hash,
+                    declared_inputs,
+                } => sha256_hex(&serde_json::to_vec(&(manifest_hash, declared_inputs))?),
+            };
             let script = ctx.units[index]
                 .deps
                 .iter()
@@ -6253,7 +6636,7 @@ fn planned_report_key_inputs(ctx: &Ctx, index: usize) -> Result<crate::report::A
                 .context("build script compile dependency missing")?;
             Ok(crate::report::ActionKeyInputs::BuildScriptRun(Box::new(
                 crate::report::BuildScriptRunKeyInputs {
-                    source_hash: spec.source_hash.clone(),
+                    source_hash,
                     script,
                     declared_environment,
                     effective_environment_hash: sha256_hex(
@@ -6348,7 +6731,7 @@ fn register_report_units(ctx: &Ctx) {
                 root: package.root().display().to_string(),
             },
             action: crate::report::UnitAction {
-                kind: if matches!(unit.kind, Kind::Bsr) {
+                kind: if matches!(unit.kind, Kind::Bsr | Kind::Bsc) {
                     action_kind.to_string()
                 } else {
                     compile_action_kind(ctx, id).replace('-', "_")
@@ -6389,7 +6772,8 @@ fn register_report_units(ctx: &Ctx) {
                 probe: None,
             },
             key: crate::report::UnitKey {
-                hash: ctx.action_plans[id].key.clone(),
+                hash: String::new(),
+                resolution: crate::report::UnitKeyResolution::Pending,
                 inputs: None,
             },
             timings: None,
@@ -6399,63 +6783,85 @@ fn register_report_units(ctx: &Ctx) {
     }
 }
 
-fn populate_report_key_inputs(ctx: &Ctx, index: usize) -> Result<()> {
-    let inputs = planned_report_key_inputs(ctx, index)?;
+fn record_resolved_action(ctx: &Ctx, index: usize, action: &ResolvedAction) -> Result<()> {
+    let inputs = planned_report_key_inputs(ctx, index, action)?;
     ctx.report.update(|report| {
-        report.units[index].key.inputs = Some(inputs);
+        report.units[index].key = crate::report::UnitKey {
+            hash: action.key.clone(),
+            resolution: action.resolution,
+            inputs: Some(inputs),
+        };
     });
     Ok(())
 }
 
-fn cached_unit_result(
+fn lookup_cached_unit(
     ctx: &Ctx,
     index: usize,
-    result: ActionResult,
+    action: Arc<ResolvedAction>,
     probe: &str,
-    phases: Phases,
 ) -> Result<Option<UnitResult>> {
+    let started = Instant::now();
     let plan = &ctx.action_plans[index];
-    if matches!(ctx.units[index].kind, Kind::Bsr) {
-        if result.bs.is_none() || result.out_dir.is_none() {
+    let unit = &ctx.units[index];
+    let build_script = matches!(unit.kind, Kind::Bsr);
+    let lookup = ctx.lookup_action(&action.key)?.and_then(|result| {
+        // Additional auxiliary outputs are fine, but every predicted output
+        // must be present for a cached action to replace execution.
+        let valid = if build_script {
+            result.bs.is_some() && result.out_dir.is_some()
+        } else {
+            plan.outputs
+                .iter()
+                .all(|name| result.outputs.iter().any(|output| &output.name == name))
+        };
+        if valid {
+            Ok(result)
+        } else {
+            fs::remove_file(ctx.store.action_path(&action.key)).ok();
+            Err(CacheMiss::OutputMismatch)
+        }
+    });
+    let result = match lookup {
+        Ok(result) => result,
+        Err(miss) => {
+            ctx.report.update(|report| {
+                report.units[index].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Miss,
+                    probe: Some(miss.name().to_string()),
+                };
+            });
             return Ok(None);
         }
-        ctx.report.update(|report| {
-            report.units[index].cache = crate::report::UnitCache {
-                result: crate::report::UnitCacheResult::Hit,
-                probe: Some(probe.to_string()),
-            };
-        });
-        return Ok(Some(UnitResult {
-            cached: true,
-            res: result,
-            main: None,
-            phases,
-        }));
+    };
+    if !build_script {
+        ctx.materialize_action(index, &action.key, &result)?;
+        if !result.stderr.is_empty() && ctx.meta.packages[unit.pkg].source.is_none() {
+            eprint!("{}", result.stderr);
+        }
     }
-
-    let unit = &ctx.units[index];
-    let package = &ctx.meta.packages[unit.pkg];
-    // The action key predicts the outputs that make a record usable. Require
-    // those outputs even for `check` actions, while permitting rustc to add
-    // auxiliary outputs that are harmless to retain in the record.
-    if !plan
-        .outputs
-        .iter()
-        .all(|name| result.outputs.iter().any(|output| &output.name == name))
-    {
-        return Ok(None);
-    }
-    ctx.materialize_action(&plan.key, &result)?;
-    if !result.stderr.is_empty() && package.source.is_none() {
-        eprint!("{}", result.stderr);
-    }
+    record_resolved_action(ctx, index, &action)?;
     ctx.report.update(|report| {
         report.units[index].cache = crate::report::UnitCache {
             result: crate::report::UnitCacheResult::Hit,
             probe: Some(probe.to_string()),
         };
     });
-    finish_compile(plan, true, result, phases).map(Some)
+    let phases = Phases {
+        cache_ns: started.elapsed().as_nanos() as u64,
+        ..Phases::default()
+    };
+    if build_script {
+        Ok(Some(UnitResult {
+            action,
+            cached: true,
+            res: result,
+            main: None,
+            phases,
+        }))
+    } else {
+        finish_compile(plan, action, true, result, phases).map(Some)
+    }
 }
 
 fn requested_units(ctx: &Ctx) -> Vec<usize> {
@@ -6494,7 +6900,7 @@ fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bo
     fn demand(
         ctx: &Ctx,
         index: usize,
-        descend: bool,
+        mut descend: bool,
         needed: &mut [bool],
         expanded: &mut [bool],
         results: &[OnceLock<UnitResult>],
@@ -6502,47 +6908,22 @@ fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bo
     ) -> Result<()> {
         if !needed[index] {
             needed[index] = true;
-            populate_report_key_inputs(ctx, index)?;
-            let started = Instant::now();
-            let lookup = ctx.lookup_action(&ctx.action_plans[index].key)?;
-            let phases = Phases {
-                cache_ns: started.elapsed().as_nanos() as u64,
-                ..Phases::default()
-            };
-            let miss = match lookup {
-                Ok(action) => match cached_unit_result(ctx, index, action, "found", phases)? {
-                    Some(mut result) => {
-                        result.phases.cache_ns = started.elapsed().as_nanos() as u64;
-                        let _ = results[index].set(result);
-                        *cached += 1;
-                        None
-                    }
-                    None => {
-                        fs::remove_file(ctx.store.action_path(&ctx.action_plans[index].key)).ok();
-                        Some(CacheMiss::OutputMismatch)
-                    }
-                },
-                Err(miss) => Some(miss),
-            };
-            if let Some(miss) = miss {
+            let result = if let Some(candidate) = &ctx.action_plans[index].candidate {
+                lookup_cached_unit(ctx, index, candidate.clone(), "found")?
+            } else {
                 ctx.report.update(|report| {
                     report.units[index].cache = crate::report::UnitCache {
                         result: crate::report::UnitCacheResult::Miss,
-                        probe: Some(miss.name().to_string()),
+                        probe: Some("pending".to_string()),
                     };
                 });
-                expanded[index] = true;
-                for dependency in &ctx.units[index].deps {
-                    demand(
-                        ctx,
-                        dependency.unit,
-                        true,
-                        needed,
-                        expanded,
-                        results,
-                        cached,
-                    )?;
-                }
+                None
+            };
+            if let Some(result) = result {
+                let _ = results[index].set(result);
+                *cached += 1;
+            } else {
+                descend = true;
             }
         }
 
@@ -6596,8 +6977,8 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
-    // linker consumes every rlib). Cache identity was already established
-    // from producer action keys during planning.
+    // linker consumes every rlib). Metadata events carry resolved producer
+    // identities as well as artifacts.
     let mut rdeps_meta: Vec<Vec<usize>> = vec![vec![]; n];
     let mut rdeps_full: Vec<Vec<usize>> = vec![vec![]; n];
     let mut indeg = vec![0usize; n];
@@ -6652,7 +7033,8 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             .find(|output| output.name.ends_with(".rmeta"))
         {
             let _ = metas[index].set(MetaOut {
-                file: Store::pool_file_name(&metadata.name, &ctx.action_plans[index].key),
+                action: result.action.clone(),
+                file: Store::pool_file_name(&metadata.name, &result.action.key),
             });
         }
     }
@@ -6762,10 +7144,8 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                                 ur.res.outputs.iter().find(|o| o.name.ends_with(".rmeta"))
                             {
                                 let _ = metas[idx].set(MetaOut {
-                                    file: Store::pool_file_name(
-                                        &rm.name,
-                                        &ctx.action_plans[idx].key,
-                                    ),
+                                    action: ur.action.clone(),
+                                    file: Store::pool_file_name(&rm.name, &ur.action.key),
                                 });
                             }
                             for &j in &rdeps_meta[idx] {
@@ -7053,9 +7433,35 @@ fn run_unit(
     metas: &[OnceLock<MetaOut>],
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
 ) -> Result<UnitResult> {
+    let plan = &ctx.action_plans[idx];
+    let execution_spec = action_spec_with_producer_keys(ctx, idx, &plan.template, |producer| {
+        let action = metas[producer]
+            .get()
+            .map(|metadata| metadata.action.as_ref())
+            .or_else(|| results[producer].get().map(|result| result.action.as_ref()))?;
+        Some((
+            action.key.clone(),
+            ctx.action_plans[producer].main_output.clone(),
+        ))
+    })?
+    .context("producer action missing when unit became ready")?;
+    let candidate = candidate_action(ctx, idx, execution_spec.clone())?;
+    if let Some(candidate) = &candidate {
+        if let Some(result) = lookup_cached_unit(ctx, idx, candidate.clone(), "found_after_wait")? {
+            return Ok(result);
+        }
+        if matches!(candidate.resolution, KeyResolution::RegistryStatic) {
+            record_resolved_action(ctx, idx, candidate)?;
+        }
+    }
     match ctx.units[idx].kind {
-        Kind::Bsr => run_build_script(ctx, idx, results),
-        _ => compile(ctx, idx, results, metas, fire_meta),
+        Kind::Bsr => run_build_script(
+            ctx,
+            idx,
+            results,
+            candidate.context("build-script action identity missing")?,
+        ),
+        _ => compile(ctx, idx, results, metas, fire_meta, execution_spec),
     }
 }
 
@@ -7154,9 +7560,9 @@ fn run_rustc_streaming(
     cmd: &mut Command,
     uidx: usize,
     pkg_name: &str,
-    action_key: &str,
+    finalize_action: &(dyn Fn() -> Result<Arc<ResolvedAction>> + Sync),
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
-) -> Result<(bool, String)> {
+) -> Result<(bool, String, Option<Arc<ResolvedAction>>)> {
     use std::io::BufRead;
     let mut child = cmd
         .stdout(Stdio::null())
@@ -7164,6 +7570,7 @@ fn run_rustc_streaming(
         .spawn()
         .with_context(|| format!("spawning rustc for {pkg_name}"))?;
     let mut rendered = String::new();
+    let mut resolved_action = None;
     let reader = std::io::BufReader::new(child.stderr.take().unwrap());
     for line in reader.lines() {
         let line = line?;
@@ -7172,15 +7579,23 @@ fn run_rustc_streaming(
                 let artifact = v.get("artifact").and_then(|a| a.as_str());
                 let emit = v.get("emit").and_then(|e| e.as_str());
                 if let (Some(path), Some("metadata")) = (artifact, emit) {
+                    let action = finalize_action()?;
                     let bytes = fs::read(path).with_context(|| format!("reading rmeta {path}"))?;
                     let hash = ctx.store.insert_bytes(&bytes)?;
                     let file = Path::new(path)
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let pool_name = Store::pool_file_name(&file, action_key);
+                    let pool_name = Store::pool_file_name(&file, &action.key);
                     ctx.store.materialize_pool(&hash, &pool_name, false)?;
-                    fire_meta(uidx, MetaOut { file: pool_name });
+                    fire_meta(
+                        uidx,
+                        MetaOut {
+                            action: action.clone(),
+                            file: pool_name,
+                        },
+                    );
+                    resolved_action = Some(action);
                 } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
                     rendered.push_str(r);
                 }
@@ -7192,7 +7607,7 @@ fn run_rustc_streaming(
         }
     }
     let status = child.wait()?;
-    Ok((status.success(), rendered))
+    Ok((status.success(), rendered, resolved_action))
 }
 
 /// Location-independent package identities. Cargo identifies path packages
@@ -7581,6 +7996,7 @@ mod ident_tests {
 
 fn finish_compile(
     plan: &ActionPlan,
+    action: Arc<ResolvedAction>,
     cached: bool,
     res: ActionResult,
     phases: Phases,
@@ -7599,11 +8015,37 @@ fn finish_compile(
     let main_name = plan.main_output.as_ref().context("no expected outputs")?;
     let main = res.outputs.iter().find(|o| &o.name == main_name).cloned();
     Ok(UnitResult {
+        action,
         cached,
         res,
         main,
         phases,
     })
+}
+
+fn finalize_compile_action(
+    ctx: &Ctx,
+    index: usize,
+    execution_spec: &ActionSpec,
+    dep_file: &Path,
+    compile_dir: &Path,
+    allowed_inputs: &[PathBuf],
+) -> Result<Arc<ResolvedAction>> {
+    let dep_info = fs::read_to_string(dep_file)
+        .with_context(|| format!("reading dep-info {}", dep_file.display()))?;
+    let package_root = ctx.meta.packages[ctx.units[index].pkg].root();
+    let package_files =
+        dep_info_package_files(&dep_info, compile_dir, &package_root, allowed_inputs)?;
+    let mut spec = execution_spec.clone();
+    let resolution = if let Some(read_set) = spec.local_read_set_mut() {
+        *read_set = ctx
+            .store
+            .hash_file_set_cached(&package_root, &package_files)?;
+        KeyResolution::FreshCompile
+    } else {
+        KeyResolution::RegistryStatic
+    };
+    resolve_action(spec, resolution)
 }
 
 fn compile(
@@ -7612,12 +8054,15 @@ fn compile(
     results: &[OnceLock<UnitResult>],
     metas: &[OnceLock<MetaOut>],
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+    execution_spec: ActionSpec,
 ) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
     let plan = &ctx.action_plans[uidx];
-    let spec = plan.compile_spec()?;
+    let ActionSpec::Compile(spec) = &execution_spec else {
+        bail!("compile action plan expected");
+    };
     let target: &Target = &unit.target;
     let crate_name = &spec.crate_name;
     let crate_type = spec.crate_type.as_str();
@@ -7640,14 +8085,14 @@ fn compile(
         if let DependencyRole::Extern(name) = &d.role {
             if self_pipelined && is_pipelined(ctx, d.unit) {
                 // A pipelined edge executes against the dependency's rmeta.
-                // Its producer action key and predictable filename were
-                // already incorporated into this action key during planning.
+                // Its resolved producer key and predictable filename are
+                // incorporated into the consumer's execution specification.
                 let m = metas[d.unit].get().context("dependency rmeta missing")?;
                 externs.push((name.clone(), m.file.clone()));
             } else {
                 let r = results[d.unit].get().context("dependency result missing")?;
                 let m = r.main.as_ref().context("dependency artifact missing")?;
-                let file = Store::pool_file_name(&m.name, &ctx.action_plans[d.unit].key);
+                let file = Store::pool_file_name(&m.name, &r.action.key);
                 externs.push((name.clone(), file));
             }
         } else if matches!(d.role, DependencyRole::BuildScriptOutput) {
@@ -7657,10 +8102,10 @@ fn compile(
                 .out_dir
                 .as_ref()
                 .context("build script OUT_DIR archive missing")?;
-            ctx.materialize_out_dir(&ctx.action_plans[d.unit].key, archive)?;
+            ctx.materialize_out_dir(&r.action.key, archive)?;
             if let Some(b) = &r.res.bs {
                 bs = b;
-                out_key = ctx.action_plans[d.unit].key.clone();
+                out_key = r.action.key.clone();
             }
         }
     }
@@ -7693,7 +8138,7 @@ fn compile(
                             .out_dir
                             .as_ref()
                             .context("native build script OUT_DIR archive missing")?;
-                        ctx.materialize_out_dir(&ctx.action_plans[i].key, archive)?;
+                        ctx.materialize_out_dir(&r.action.key, archive)?;
                     }
                     for s in &b.link_search {
                         if !link_search.contains(s) {
@@ -7711,14 +8156,6 @@ fn compile(
     let mut phases = Phases::default();
     let cap_lints = spec.cap_lints;
 
-    // Per-unit resolved profile straight from cargo's unit graph.
-    // Checked units skip debug info: they emit metadata only.
-    let prof = &unit.profile;
-    let debuginfo = if self_checked {
-        "0".to_string()
-    } else {
-        prof.debuginfo_flag()
-    };
     let pflags = &spec.profile;
     // Lints and (in clippy mode) the executor swap. Like cargo's
     // workspace wrapper, clippy-driver runs for EVERY unit of local
@@ -7736,14 +8173,11 @@ fn compile(
     // incrementally (local packages under dev); --no-incremental changes
     // execution without changing the artifact's action identity.
     let incr_action = ctx.incremental && unit.profile.incremental;
-    // On darwin, a linking unit with debug info keeps its DWARF in the
-    // per-codegen-unit object files rather than in the linked image, and
-    // the image's debug map names them by path. This holds whatever
-    // split-debuginfo the profile asked for: the objects have to outlive
-    // the compile either way, so they are always the unpacked kind.
-    let unpacked_debug_objects =
-        debuginfo != "0" && is_linking(ctx, uidx) && unit_platform.contains("apple");
-    let key = plan.key.clone();
+    let debug_directory = spec
+        .debug_binary
+        .as_deref()
+        .map(Store::debug_dir)
+        .transpose()?;
     let ef16 = action_extra_filename(ctx, uidx);
     phases.key_ns = t_phase.elapsed().as_nanos() as u64;
 
@@ -7804,52 +8238,32 @@ fn compile(
     } else {
         None
     };
-    // Split debug info makes the codegen-unit objects part of the linked
-    // image's debug information, and the image names them by path, so they
-    // are written where they will stay: a store directory addressed by this
-    // action, rather than by this invocation, so that repeating the action
-    // reproduces the image byte for byte. The directory is wiped before use
-    // — ingestion scans all of it, and an earlier execution's objects carry
-    // different names — which would tear down the objects a concurrent
-    // build of the same action is about to link, hence the lock. It is only
-    // ever contended by a build doing this exact work, so the loser takes
-    // the winner's result rather than repeating it.
-    let debug_objects: Option<(PathBuf, fs::File)> = if unpacked_debug_objects {
-        let dir = ctx.store.debug_objects_dir(&key);
-        fs::create_dir_all(dir.parent().unwrap())?;
-        let lock = fs::File::create(dir.with_extension("lock"))?;
-        lock.lock()
-            .with_context(|| format!("locking debug objects for {crate_name}"))?;
-        if let Ok(res) = ctx.lookup_action(&key)? {
-            if let Some(result) = cached_unit_result(ctx, uidx, res, "found_after_wait", phases)? {
-                return Ok(result);
-            }
-        }
-        fs::remove_dir_all(&dir).ok();
-        Some((dir, lock))
-    } else {
-        None
-    };
-    // Everything else stages in a throwaway directory.
-    let outdir = match &debug_objects {
-        Some((dir, _)) => dir.clone(),
-        None => ctx.store.tmp_path("rustc"),
-    };
+    // The linker strips only the staging prefix. The remaining path is
+    // known before compilation, unlike the eventual dep-info action key.
+    let stage_root = ctx.store.tmp_path("rustc");
+    let outdir = debug_directory.as_ref().map_or_else(
+        || stage_root.clone(),
+        |directory| stage_root.join(directory),
+    );
     fs::create_dir_all(&outdir)?;
-    // rustc records the output paths it is given, and every machine must
-    // read the same ones: hand it the canonical store spelling, while the
-    // sandbox rule above stays on the physical path the kernel resolves.
-    let outdir_spelling = match &debug_objects {
-        Some(_) => ctx.store.debug_objects_dir_logical(&key),
-        None => outdir.clone(),
-    };
     let scratch = if let Some(d) = &incr_dir {
         d.join("tmp")
     } else {
         ctx.store.tmp_path("scratch")
     };
     fs::create_dir_all(&scratch)?;
-    let package_inputs = ctx.package_read_inputs(unit.pkg)?;
+    let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
+    let mut allowed_inputs: Vec<PathBuf> = vec![
+        ctx.store.root.clone(),
+        ctx.store.logical_root().to_path_buf(),
+        PathBuf::from(&ctx.sysroot),
+    ];
+    if clippy_action {
+        if let Some(conf) = &ctx.clippy_conf {
+            allowed_inputs.push(conf.clone());
+        }
+    }
+    allowed_inputs.extend(package_inputs.paths.iter().cloned());
     let mut reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
@@ -7893,7 +8307,7 @@ fn compile(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.env("CARGO_CRATE_NAME", &crate_name);
+    cmd.env("CARGO_CRATE_NAME", crate_name);
     // Cargo-identical manifest env: absolute, and deliberately not part
     // of any action key. Sharing depends on artifacts being independent
     // of the checkout location, and the ingest byte-scan proves exactly
@@ -7918,9 +8332,9 @@ fn compile(
         .flatten();
     cmd.arg("--sysroot")
         .arg(target_sysroot.unwrap_or_else(|| Path::new(&ctx.sysroot)));
-    cmd.arg("--crate-name").arg(&crate_name);
+    cmd.arg("--crate-name").arg(crate_name);
     cmd.arg("--edition").arg(&target.edition);
-    cmd.arg(&src_rel);
+    cmd.arg(src_rel);
     cmd.arg("--crate-type").arg(crate_type);
     if self_checked {
         cmd.arg("--emit=metadata,dep-info");
@@ -7970,12 +8384,18 @@ fn compile(
             cmd.env("RUSTC_BOOTSTRAP", "1");
         }
     }
-    if unpacked_debug_objects {
+    if debug_directory.is_some() {
         cmd.arg("-Csplit-debuginfo=unpacked");
+        cmd.args([
+            "-Clink-arg=-Xlinker",
+            "-Clink-arg=-oso_prefix",
+            "-Clink-arg=-Xlinker",
+        ]);
+        cmd.arg(format!("-Clink-arg={}/", stage_root.display()));
     }
     cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
     cmd.arg(format!("-Cextra-filename=-{ef16}"));
-    cmd.arg("--out-dir").arg(&outdir_spelling);
+    cmd.arg("--out-dir").arg(&outdir);
     cmd.arg("-L")
         .arg(format!("dependency={}", ctx.pool_logical.display()));
     for (name, file) in &externs {
@@ -8055,9 +8475,26 @@ fn compile(
         .jobserver
         .acquire()
         .context("acquiring jobserver token")?;
+    let dep_file = outdir.join(format!("{crate_name}-{ef16}.d"));
+    let finalize_action = || {
+        finalize_compile_action(
+            ctx,
+            uidx,
+            &execution_spec,
+            &dep_file,
+            compile_dir,
+            &allowed_inputs,
+        )
+        .with_context(|| {
+            format!(
+                "validating compilation inputs for {} v{}",
+                pkg.name, pkg.version
+            )
+        })
+    };
     let t_rustc = Instant::now();
-    let (success, stderr) = if self_pipelined {
-        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &key, fire_meta)?
+    let (success, stderr, streamed_action) = if self_pipelined {
+        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &finalize_action, fire_meta)?
     } else {
         let out = cmd
             .output()
@@ -8065,13 +8502,14 @@ fn compile(
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
+            None,
         )
     };
     phases.rustc_ns = t_rustc.elapsed().as_nanos() as u64;
     drop(job_token); // compiler exited; hashing/ingestion is not codegen
     fs::remove_dir_all(&scratch).ok();
     if !success {
-        fs::remove_dir_all(&outdir).ok();
+        fs::remove_dir_all(&stage_root).ok();
         bail!(
             "rustc failed for {} v{} ({}):\n{}",
             pkg.name,
@@ -8084,36 +8522,15 @@ fn compile(
         eprint!("{stderr}");
     }
 
-    // Enforce input containment: rustc's dep-info lists every file it read
-    // for this crate (mod files, include!/include_str!/include_bytes!).
-    // All of them must lie inside the hashed package dir or a keyed
-    // location (OUT_DIR in the store, sysroot) — otherwise the action key
-    // is missing an input and we refuse to cache a lie.
-    let dep_file = outdir.join(format!("{crate_name}-{ef16}.d"));
-    if let Ok(d) = fs::read_to_string(&dep_file) {
-        let mut allowed: Vec<PathBuf> = vec![
-            ctx.store.root.clone(),
-            ctx.store.logical_root().to_path_buf(),
-            PathBuf::from(&ctx.sysroot),
-        ];
-        if clippy_action {
-            // clippy-driver reports its config in dep-info; the content is
-            // already keyed (clippy_id carries the clippy.toml hash).
-            if let Some(conf) = &ctx.clippy_conf {
-                allowed.push(conf.clone());
-            }
-        }
-        allowed.extend(package_inputs.paths.iter().cloned());
-        let t_val = Instant::now();
-        validate_dep_info(&d, compile_dir, &allowed).with_context(|| {
-            format!(
-                "hermeticity violation compiling {} v{}",
-                pkg.name, pkg.version
-            )
-        })?;
-        phases.validate_ns = t_val.elapsed().as_nanos() as u64;
-        fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
-    }
+    let t_val = Instant::now();
+    let action = match streamed_action {
+        Some(action) => action,
+        None => finalize_action()?,
+    };
+    record_resolved_action(ctx, uidx, &action)?;
+    phases.validate_ns = t_val.elapsed().as_nanos() as u64;
+    fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
+    let key = &action.key;
 
     let mut outputs = Vec::new();
     let mut entries: Vec<PathBuf> = fs::read_dir(&outdir)?
@@ -8123,6 +8540,16 @@ fn compile(
     let t_ingest = Instant::now();
     for p in entries {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // -Csave-temps retains private compilation directories as well as files.
+        // Our linkable artifacts and unpacked CGU objects are top-level files.
+        if p.is_dir() {
+            if name.ends_with(".dSYM") {
+                bail!(
+                    "packed debug information is unsupported; remove the split-debuginfo override"
+                );
+            }
+            continue;
+        }
         let exe = !name.contains('.')
             || name.ends_with(".dylib")
             || name.ends_with(".so")
@@ -8135,7 +8562,8 @@ fn compile(
         // recorded.
         let (hash, leaked) = ctx
             .store
-            .insert_file_scan(&p, ctx.workspace_root.as_bytes())?;
+            .insert_file_scan(&p, ctx.workspace_root.as_bytes())
+            .with_context(|| format!("ingesting compiler output {}", p.display()))?;
         if leaked {
             bail!(
                 "output {name} embeds the workspace path ({}); artifacts must be \
@@ -8146,9 +8574,7 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         outputs.push(OutputFile { name, hash, exe });
     }
     phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
-    // Ingestion moved every file into the cache; the debug objects come
-    // back under these same names when the action is materialized.
-    fs::remove_dir_all(&outdir).ok();
+    fs::remove_dir_all(&stage_root).context("removing compiler staging directory")?;
     // rustc is done with the session state, so another action of this unit
     // may take it over.
     incr_lock.take();
@@ -8170,21 +8596,34 @@ location-free — resolve paths at runtime instead of baking them in at build ti
             );
         }
     }
-    ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
-    ctx.materialize_action(&key, &res)?;
+    ctx.store.save_action(key, &serde_json::to_vec(&res)?)?;
+    let mut manifest_spec = action.spec.clone();
+    if let Some(read_set) = manifest_spec.local_read_set_mut() {
+        let files = std::mem::take(read_set);
+        let entry_hash = sha256_hex(&serde_json::to_vec(&files)?);
+        let manifest_key = sha256_hex(&serde_json::to_vec(&manifest_spec)?);
+        ctx.store.save_manifest_entry(
+            &manifest_key,
+            &entry_hash,
+            &crate::store::ReadSetManifestEntry { files },
+        )?;
+    }
+    ctx.materialize_action(uidx, key, &res)?;
     phases.finish_ns = t_finish.elapsed().as_nanos() as u64;
-    finish_compile(plan, false, res, phases)
+    finish_compile(plan, action, false, res, phases)
 }
+
+type BuildScriptEnvironment<'a> = (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<&'a ToolRt>,
+);
 
 fn build_script_environment<'a>(
     ctx: &'a Ctx,
     unit: &Unit,
     pkg: &Package,
-) -> (
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-    Vec<&'a ToolRt>,
-) {
+) -> BuildScriptEnvironment<'a> {
     let mut env = ctx.pkg_env(pkg);
     let mut declared_environment = ctx.config_env.clone();
     let platform = if unit.host {
@@ -8288,12 +8727,14 @@ fn run_build_script(
     ctx: &Ctx,
     uidx: usize,
     results: &[OnceLock<UnitResult>],
+    action: Arc<ResolvedAction>,
 ) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
     let pkg_root = pkg.root();
-    let plan = &ctx.action_plans[uidx];
-    let spec = plan.build_script_run_spec()?;
+    let ActionSpec::BuildScriptRun(spec) = &action.spec else {
+        bail!("build-script action expected");
+    };
 
     let mut script: Option<OutputFile> = None;
     let mut script_key = String::new();
@@ -8303,7 +8744,7 @@ fn run_build_script(
         match &d.role {
             DependencyRole::BuildScriptCompile => {
                 script = r.main.clone();
-                script_key = ctx.action_plans[d.unit].key.clone();
+                script_key = r.action.key.clone();
             }
             DependencyRole::BuildScriptMetadata => {
                 let dpkg = &ctx.meta.packages[ctx.units[d.unit].pkg];
@@ -8326,7 +8767,7 @@ fn run_build_script(
     dep_env.sort();
 
     let mut phases = Phases::default();
-    let key = plan.key.clone();
+    let key = action.key.clone();
 
     // The script runs *in place* at outdirs/<key>/out, so every path a tool
     // embeds -- literally or derived (cc names objects by a hash of their
@@ -8345,18 +8786,16 @@ fn run_build_script(
     // While we waited: a concurrent winner may have finished the work. This
     // lock is also the restoration lock, so restore without trying to acquire
     // it recursively.
-    if let Ok(res) = ctx.lookup_action(&key)? {
-        if let Some(result) = cached_unit_result(ctx, uidx, res, "found_after_wait", phases)? {
-            ctx.restore_out_dir_locked(
-                &key,
-                result
-                    .res
-                    .out_dir
-                    .as_ref()
-                    .context("cached build script OUT_DIR archive missing")?,
-            )?;
-            return Ok(result);
-        }
+    if let Some(result) = lookup_cached_unit(ctx, uidx, action.clone(), "found_after_wait")? {
+        ctx.restore_out_dir_locked(
+            &key,
+            result
+                .res
+                .out_dir
+                .as_ref()
+                .context("cached build script OUT_DIR archive missing")?,
+        )?;
+        return Ok(result);
     }
     if final_parent.exists() {
         // No sentinel (the cache probe above would have hit): crash leftover.
@@ -8370,7 +8809,7 @@ fn run_build_script(
         .join(Store::pool_file_name(&script.name, &script_key));
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
-    let package_inputs = ctx.package_read_inputs(unit.pkg)?;
+    let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::BuildScriptRun)?;
     let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
     let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
@@ -8473,6 +8912,7 @@ fn run_build_script(
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
     ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     Ok(UnitResult {
+        action,
         cached: false,
         res,
         main: None,
@@ -8480,7 +8920,14 @@ fn run_build_script(
     })
 }
 
-fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> Result<()> {
+fn dep_info_package_files(
+    dep: &str,
+    compile_dir: &Path,
+    package_root: &Path,
+    allowed_abs: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let package_root = normalize_path(package_root);
+    let mut package_files = BTreeSet::new();
     for line in dep.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -8511,9 +8958,12 @@ fn validate_dep_info(dep: &str, compile_dir: &Path, allowed_abs: &[PathBuf]) -> 
                     bail!("undeclared input read during compilation: {tok}");
                 }
             }
+            if let Ok(relative) = resolved.strip_prefix(&package_root) {
+                package_files.insert(relative.to_path_buf());
+            }
         }
     }
-    Ok(())
+    Ok(package_files.into_iter().collect())
 }
 
 /// Split one dep-info rule into the paths it lists. rustc writes these in
@@ -8559,14 +9009,16 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod dep_info_tests {
-    use super::validate_dep_info;
+    use super::dep_info_package_files;
     use std::path::{Path, PathBuf};
 
     #[test]
     fn relative_inputs_are_resolved_from_the_compile_directory() {
-        validate_dep_info(
-            "output: Cargo.toml src/../RELEASE_CHANNEL src/lib.rs",
-            Path::new("/workspace/crates/app"),
+        let package_root = Path::new("/workspace/crates/app");
+        let files = dep_info_package_files(
+            "output: Cargo.toml src/../RELEASE_CHANNEL src/lib.rs src/lib.rs",
+            package_root,
+            package_root,
             &[
                 PathBuf::from("/workspace/crates/app/Cargo.toml"),
                 PathBuf::from("/workspace/crates/app/RELEASE_CHANNEL"),
@@ -8574,63 +9026,85 @@ mod dep_info_tests {
             ],
         )
         .unwrap();
+        assert_eq!(
+            files,
+            ["Cargo.toml", "RELEASE_CHANNEL", "src/lib.rs"].map(PathBuf::from)
+        );
     }
 
     #[test]
     fn relative_inputs_outside_the_package_must_be_declared() {
         let dep_info = "output: src/../../../assets/icon.png";
         let package_root = Path::new("/workspace/crates/app");
-        let compile_dir = Path::new("/workspace/crates/app");
 
-        assert!(
-            validate_dep_info(dep_info, compile_dir, &[package_root.join("src/lib.rs")])
-                .unwrap_err()
-                .to_string()
-                .contains("undeclared input read during compilation")
-        );
-        validate_dep_info(
+        assert!(dep_info_package_files(
             dep_info,
-            compile_dir,
+            package_root,
+            package_root,
+            &[package_root.join("src/lib.rs")],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("undeclared input read during compilation"));
+        let files = dep_info_package_files(
+            dep_info,
+            package_root,
+            package_root,
             &[PathBuf::from("/workspace/assets/icon.png")],
         )
         .unwrap();
+        assert!(files.is_empty());
     }
 
     #[test]
     fn absolute_inputs_are_normalized_before_validation() {
         let dep_info = "output: /workspace/crates/app/../../assets/icon.png";
+        let package_root = Path::new("/workspace/crates/app");
 
-        assert!(
-            validate_dep_info(dep_info, Path::new("/workspace/crates/app"), &[],)
-                .unwrap_err()
-                .to_string()
-                .contains("undeclared input read during compilation")
-        );
+        assert!(dep_info_package_files(
+            dep_info,
+            package_root,
+            package_root,
+            &[package_root.to_path_buf()],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("undeclared input read during compilation"));
     }
 
     #[test]
     fn workspace_relative_inputs_cannot_escape_a_matching_package_prefix() {
         let dep_info = "output: crates/app/src/../../../assets/icon.png";
+        let package_root = Path::new("/workspace/crates/app");
 
-        assert!(validate_dep_info(dep_info, Path::new("/workspace"), &[],)
-            .unwrap_err()
-            .to_string()
-            .contains("undeclared input read during compilation"));
+        assert!(dep_info_package_files(
+            dep_info,
+            Path::new("/workspace"),
+            package_root,
+            &[package_root.to_path_buf()],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("undeclared input read during compilation"));
     }
 
     #[test]
     fn spaces_in_paths_are_read_as_rustc_escapes_them() {
-        validate_dep_info(
+        let package_root = Path::new("/Application Support/workspace");
+        let files = dep_info_package_files(
             "output: /Application\\ Support/workspace/src/lib.rs /Application\\ Support/workspace/icon.png",
-            Path::new("/Application Support/workspace"),
-            &[PathBuf::from("/Application Support/workspace")],
+            package_root,
+            package_root,
+            &[package_root.to_path_buf()],
         )
         .unwrap();
+        assert_eq!(files, ["icon.png", "src/lib.rs"].map(PathBuf::from));
 
-        assert!(validate_dep_info(
+        assert!(dep_info_package_files(
             "output: /Application\\ Support/elsewhere/icon.png",
-            Path::new("/Application Support/workspace"),
-            &[PathBuf::from("/Application Support/workspace")],
+            package_root,
+            package_root,
+            &[package_root.to_path_buf()],
         )
         .unwrap_err()
         .to_string()

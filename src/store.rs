@@ -1,9 +1,19 @@
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const DEBUG_MARKER: &str = ".corgi-debug.json";
+
+#[derive(Deserialize, PartialEq, Serialize)]
+struct DebugManifest {
+    destination: String,
+    objects: Vec<(String, String)>,
+}
 
 pub fn default_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("CORGI_STORE") {
@@ -23,6 +33,11 @@ pub static REHASHED_FILES: AtomicU64 = AtomicU64::new(0);
 pub static HINTED_DIRS: AtomicU64 = AtomicU64::new(0);
 pub static IMMUTABLE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static EXPORT_CHECK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ReadSetManifestEntry {
+    pub files: Vec<(String, String)>,
+}
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -187,17 +202,17 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
     Ok(hex(&h.finalize()))
 }
 
-fn hash_files_hinted(
+fn file_hashes_hinted(
     root: &Path,
     relative_paths: &[PathBuf],
     hints: &Hints,
     fresh: &mut Hints,
-) -> Result<String> {
+) -> Result<Vec<(String, String)>> {
     let mut relative_paths = relative_paths.to_vec();
     relative_paths.sort();
     relative_paths.dedup();
 
-    let mut hasher = Sha256::new();
+    let mut files = Vec::with_capacity(relative_paths.len());
     for relative_path in relative_paths {
         if relative_path.is_absolute()
             || relative_path
@@ -231,14 +246,10 @@ fn hash_files_hinted(
             }
         };
         fresh.insert(relative.clone(), (key.0, key.1, key.2, content.clone()));
-        hasher.update(b"F");
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        hasher.update(content.as_bytes());
-        hasher.update([0]);
+        files.push((relative, content));
     }
 
-    Ok(hex(&hasher.finalize()))
+    Ok(files)
 }
 
 /// Central machine-wide store. All mutations are write-to-temp + atomic
@@ -271,7 +282,13 @@ fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
 impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
         for d in [
-            "cache", "pool", "outdirs", "debug", "tmp", "reports", "metrics",
+            "cache",
+            "pool",
+            "outdirs",
+            "tmp",
+            "reports",
+            "metrics",
+            "manifests",
         ] {
             fs::create_dir_all(root.join(d))?;
         }
@@ -419,9 +436,22 @@ impl Store {
     pub fn write_atomic(&self, dest: &Path, data: &[u8]) -> Result<()> {
         fs::create_dir_all(dest.parent().unwrap())?;
         let tmp = self.tmp_path("w");
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, dest).with_context(|| format!("atomic write {}", dest.display()))?;
-        Ok(())
+        let result = fs::write(&tmp, data).and_then(|()| publish_atomic_file(&tmp, dest));
+        if let Err(error) = result {
+            let mut error =
+                anyhow::Error::from(error).context(format!("atomic write {}", dest.display()));
+            if let Err(cleanup_error) = fs::remove_file(&tmp) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    error = error.context(format!(
+                        "also failed to remove temporary file {}: {cleanup_error}",
+                        tmp.display()
+                    ));
+                }
+            }
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn action_path(&self, key: &str) -> PathBuf {
@@ -442,6 +472,88 @@ impl Store {
         self.write_atomic(&self.action_path(key), data)
     }
 
+    pub fn manifest_path(&self, manifest_key: &str, entry_hash: &str) -> PathBuf {
+        self.root
+            .join("manifests")
+            .join(manifest_key)
+            .join(format!("{entry_hash}.json"))
+    }
+
+    pub(crate) fn save_manifest_entry(
+        &self,
+        manifest_key: &str,
+        entry_hash: &str,
+        entry: &ReadSetManifestEntry,
+    ) -> Result<()> {
+        let path = self.manifest_path(manifest_key, entry_hash);
+        self.write_atomic(&path, &serde_json::to_vec(entry)?)
+    }
+
+    pub(crate) fn touch_manifest_entry(&self, manifest_key: &str, entry_hash: &str) {
+        Store::touch_used(&self.manifest_path(manifest_key, entry_hash));
+    }
+
+    pub(crate) fn list_manifest_entries(
+        &self,
+        manifest_key: &str,
+    ) -> Result<Vec<(String, ReadSetManifestEntry)>> {
+        let directory = self.root.join("manifests").join(manifest_key);
+        let mut entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let modified = entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let entry_hash = path.file_stem()?.to_str()?.to_string();
+                    let data = fs::read(&path).ok()?;
+                    let entry = serde_json::from_slice(&data).ok()?;
+                    Some((modified, path, entry_hash, entry))
+                })
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading manifests {}", directory.display()));
+            }
+        };
+        entries.sort_by(
+            |(left_modified, left_path, _, _), (right_modified, right_path, _, _)| {
+                right_modified
+                    .cmp(left_modified)
+                    .then_with(|| left_path.cmp(right_path))
+            },
+        );
+        Ok(entries
+            .into_iter()
+            .map(|(_, _, entry_hash, entry)| (entry_hash, entry))
+            .collect())
+    }
+
+    pub(crate) fn trim_manifest_entries(
+        &self,
+        cutoff: std::time::SystemTime,
+    ) -> Result<(u64, u64)> {
+        let manifests = self.root.join("manifests");
+        let mut files = 0;
+        let mut bytes = 0;
+        for directory in fs::read_dir(&manifests)
+            .with_context(|| format!("reading manifests {}", manifests.display()))?
+        {
+            let directory = directory?.path();
+            if !directory.is_dir() {
+                continue;
+            }
+            let (removed_files, removed_bytes) = trim_manifest_directory(&directory, cutoff)?;
+            files += removed_files;
+            bytes += removed_bytes;
+        }
+        Ok((files, bytes))
+    }
+
     /// A pool spelling for a produced file: the producing action's key
     /// spliced into the name before the extension, so a pool name only ever
     /// refers to outputs of one action. Rustc uses one source-independent
@@ -460,45 +572,6 @@ impl Store {
             Some((stem, extension)) => format!("{stem}-{key16}.{extension}"),
             None => format!("{name}-{key16}"),
         }
-    }
-
-    /// Where one action's split debug-info objects live. A linked image
-    /// records these paths in its debug map, so they are addressed by the
-    /// action that produced the image: each compile owns its own directory,
-    /// and reclaiming it costs only source-level debugging of a binary that
-    /// can be rebuilt.
-    pub fn debug_objects_dir(&self, action_key: &str) -> PathBuf {
-        self.root.join("debug").join(&action_key[..16])
-    }
-
-    /// The same directory as every machine spells it. Paths a compiler bakes
-    /// into its output must use this spelling, never the physical one.
-    pub fn debug_objects_dir_logical(&self, action_key: &str) -> PathBuf {
-        self.logical_root().join("debug").join(&action_key[..16])
-    }
-
-    /// Hard-link a debug object back into its action's directory under the
-    /// name the debug map records, so a cached image stays debuggable
-    /// without recompiling. The directory's mtime doubles as its use marker
-    /// for expiry.
-    pub fn materialize_debug_object(
-        &self,
-        action_key: &str,
-        file_name: &str,
-        hash: &str,
-    ) -> Result<()> {
-        let dir = self.debug_objects_dir(action_key);
-        fs::create_dir_all(&dir)?;
-        let dest = dir.join(file_name);
-        if fs::symlink_metadata(&dest).is_err() {
-            match fs::hard_link(self.cache_path(hash), &dest) {
-                Ok(()) => {}
-                Err(_) if dest.exists() => {}
-                Err(e) => return Err(e).with_context(|| format!("materialize {}", dest.display())),
-            }
-        }
-        Store::touch_used(&dir);
-        Ok(())
     }
 
     /// Hard-link a CAS blob into the pool under its rustc-visible file name.
@@ -572,8 +645,11 @@ impl Store {
         Ok(h)
     }
 
-    /// Content hash of a selected set of files with store-persisted caching.
-    pub fn hash_files_cached(&self, root: &Path, relative_paths: &[PathBuf]) -> Result<String> {
+    pub fn hash_file_set_cached(
+        &self,
+        root: &Path,
+        relative_paths: &[PathBuf],
+    ) -> Result<Vec<(String, String)>> {
         let hint_path = self.root.join("hints").join(format!(
             "{}.json",
             sha256_hex(format!("files:{}", root.display()).as_bytes())
@@ -585,16 +661,16 @@ impl Store {
         Store::touch_used(&hint_path);
         let mut fresh = Hints::new();
         HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
-        let hash = hash_files_hinted(root, relative_paths, &hints, &mut fresh)?;
+        let files = file_hashes_hinted(root, relative_paths, &hints, &mut fresh)?;
         if fresh != hints {
             self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
         }
-        Ok(hash)
+        Ok(files)
     }
 
     /// Copy a CAS blob out to a destination in the worktree.
     /// Skips the write when the destination already has identical content.
-    pub fn export(&self, hash: &str, dest: &Path, executable: bool) -> Result<bool> {
+    pub fn export(&self, hash: &str, dest: &Path, executable: bool) -> Result<()> {
         // A stat hint (size/mtime/inode -> content hash) makes the unchanged
         // case free: re-reading a ~1 GiB binary to decide "already correct"
         // dominated warm zed builds (1.85s of a 2.0s no-op).
@@ -609,14 +685,14 @@ impl Store {
                 .and_then(|b| serde_json::from_slice(&b).ok());
             if let Some((size, mtime, inode, hinted_hash)) = hinted {
                 if (size, mtime, inode) == key && hinted_hash == hash {
-                    return Ok(false);
+                    return Ok(());
                 }
             }
             EXPORT_CHECK_BYTES.fetch_add(md.len(), Ordering::Relaxed);
             if let Ok(existing) = sha256_file(dest) {
                 if existing == hash {
                     self.write_export_hint(&hint_path, dest, hash);
-                    return Ok(false);
+                    return Ok(());
                 }
             }
         }
@@ -634,7 +710,301 @@ impl Store {
         }
         fs::rename(&tmp, dest)?;
         self.write_export_hint(&hint_path, dest, hash);
-        Ok(true)
+        Ok(())
+    }
+
+    pub fn debug_dir(dest: &Path) -> Result<PathBuf> {
+        let file_name = dest
+            .file_name()
+            .context("debug export destination has no file name")?;
+        let mut debug_name = file_name.to_os_string();
+        debug_name.push("-debug");
+        Ok(dest.with_file_name(debug_name))
+    }
+
+    /// Export a binary and replace its owned split-debug directory.
+    pub fn export_with_debug(
+        &self,
+        hash: &str,
+        dest: &Path,
+        executable: bool,
+        objects: &[(&str, &str)],
+    ) -> Result<()> {
+        let parent = dest
+            .parent()
+            .context("export destination has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        let parent_lock =
+            fs::File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+        parent_lock
+            .lock()
+            .with_context(|| format!("lock {}", parent.display()))?;
+
+        let mut names = BTreeSet::new();
+        let mut manifest = DebugManifest {
+            destination: dest
+                .file_name()
+                .context("debug export destination has no file name")?
+                .to_string_lossy()
+                .into_owned(),
+            objects: Vec::with_capacity(objects.len()),
+        };
+        for &(file_name, blob_hash) in objects {
+            let path = Path::new(file_name);
+            if file_name.is_empty()
+                || path.components().count() != 1
+                || !matches!(
+                    path.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+                || file_name == DEBUG_MARKER
+                || !names.insert(file_name)
+            {
+                return Err(anyhow!("unsafe debug object file name {file_name:?}"));
+            }
+            manifest
+                .objects
+                .push((file_name.to_string(), blob_hash.to_string()));
+        }
+        manifest.objects.sort();
+
+        let debug_dir = Store::debug_dir(dest)?;
+        let debug_path_is_directory = match fs::symlink_metadata(&debug_dir) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    if objects.is_empty() {
+                        false
+                    } else {
+                        return Err(anyhow!(
+                            "refusing to replace non-owned debug path {}",
+                            debug_dir.display()
+                        ));
+                    }
+                } else {
+                    true
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", debug_dir.display()))
+            }
+        };
+        let old_manifest = if debug_path_is_directory {
+            let marker = debug_dir.join(DEBUG_MARKER);
+            match fs::read(&marker)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<DebugManifest>(&bytes).ok())
+                .filter(|old_manifest| old_manifest.destination == manifest.destination)
+            {
+                Some(old_manifest) => Some(old_manifest),
+                None if objects.is_empty() => None,
+                None => {
+                    return Err(anyhow!(
+                        "refusing to replace debug directory without a valid ownership marker {}",
+                        marker.display()
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let debug_exists = old_manifest.is_some();
+
+        let unchanged = !objects.is_empty()
+            && old_manifest.as_ref() == Some(&manifest)
+            && debug_directory_is_complete(self, &debug_dir, &manifest)?;
+        let mut owned_stage = None;
+        if !objects.is_empty() && !unchanged {
+            let stage = self.create_debug_work_directory(&debug_dir, "stage", &manifest)?;
+            owned_stage = Some(stage.clone());
+            let stage_result = (|| -> Result<()> {
+                for (file_name, blob_hash) in &manifest.objects {
+                    let source = self.cache_path(blob_hash);
+                    let destination = stage.join(file_name);
+                    // Both names share the CAS inode. Prevent an accidental
+                    // in-place write through the exported name from corrupting it.
+                    let mut permissions = fs::metadata(&source)?.permissions();
+                    permissions.set_readonly(true);
+                    fs::set_permissions(&source, permissions)?;
+                    match fs::hard_link(&source, &destination) {
+                        Ok(()) => {}
+                        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                            fs::copy(&source, &destination)?;
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("materialize debug object {}", destination.display())
+                            });
+                        }
+                    }
+                }
+                fs::write(stage.join(DEBUG_MARKER), serde_json::to_vec(&manifest)?)?;
+                Ok(())
+            })();
+            if let Err(error) = stage_result {
+                return match fs::remove_dir_all(&stage) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(error.context(format!(
+                        "also failed to remove debug stage {}: {cleanup_error}",
+                        stage.display()
+                    ))),
+                };
+            }
+        }
+
+        if unchanged {
+            self.export(hash, dest, executable)?;
+            self.remove_abandoned_debug_work_directories(parent, &manifest.destination)?;
+            return Ok(());
+        }
+
+        let backup = if debug_exists {
+            let backup = self.create_debug_work_directory(&debug_dir, "backup", &manifest)?;
+            if let Err(rename_error) = fs::rename(&debug_dir, backup.join("previous")) {
+                let mut error = anyhow!(rename_error)
+                    .context(format!("back up debug directory {}", debug_dir.display()));
+                if let Err(cleanup_error) = fs::remove_dir_all(&backup) {
+                    error = error.context(format!(
+                        "also failed to remove debug backup {}: {cleanup_error}",
+                        backup.display()
+                    ));
+                }
+                return Err(error);
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        let install_result = if objects.is_empty() {
+            Ok(())
+        } else {
+            let stage = owned_stage.as_ref().context("missing owned debug stage")?;
+            fs::rename(stage, &debug_dir)
+        };
+        if let Err(error) = install_result {
+            let mut error = anyhow!(error).context(format!("install {}", debug_dir.display()));
+            if let Some(backup) = &backup {
+                if let Err(restore_error) = fs::rename(backup.join("previous"), &debug_dir) {
+                    error = error.context(format!(
+                        "also failed to restore debug directory {}: {restore_error}",
+                        debug_dir.display()
+                    ));
+                } else if let Err(cleanup_error) = fs::remove_dir_all(backup) {
+                    error = error.context(format!(
+                        "also failed to remove debug backup {}: {cleanup_error}",
+                        backup.display()
+                    ));
+                }
+            }
+            if let Some(stage) = owned_stage {
+                if let Err(cleanup_error) = fs::remove_dir_all(&stage) {
+                    error = error.context(format!(
+                        "also failed to remove debug stage {}: {cleanup_error}",
+                        stage.display()
+                    ));
+                }
+            }
+            return Err(error);
+        }
+
+        match self.export(hash, dest, executable) {
+            Ok(()) => {}
+            Err(error) => {
+                let mut error = error.context("export binary after installing debug directory");
+                if !objects.is_empty() {
+                    if let Err(remove_error) = fs::remove_dir_all(&debug_dir) {
+                        error = error.context(format!(
+                            "also failed to remove newly installed debug directory {}: {remove_error}",
+                            debug_dir.display()
+                        ));
+                        return Err(error);
+                    }
+                }
+                if let Some(backup) = &backup {
+                    if let Err(restore_error) = fs::rename(backup.join("previous"), &debug_dir) {
+                        error = error.context(format!(
+                            "also failed to restore debug directory {}: {restore_error}",
+                            debug_dir.display()
+                        ));
+                    } else if let Err(cleanup_error) = fs::remove_dir_all(backup) {
+                        error = error.context(format!(
+                            "also failed to remove debug backup {}: {cleanup_error}",
+                            backup.display()
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Some(backup) = backup {
+            fs::remove_dir_all(&backup)
+                .with_context(|| format!("remove old debug directory {}", backup.display()))?;
+        }
+        self.remove_abandoned_debug_work_directories(parent, &manifest.destination)?;
+        Ok(())
+    }
+
+    fn create_debug_work_directory(
+        &self,
+        debug_dir: &Path,
+        kind: &str,
+        manifest: &DebugManifest,
+    ) -> Result<PathBuf> {
+        loop {
+            let path = self.debug_work_path(debug_dir, kind);
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    if let Err(error) =
+                        fs::write(path.join(DEBUG_MARKER), serde_json::to_vec(manifest)?)
+                    {
+                        fs::remove_dir_all(&path).ok();
+                        return Err(error)
+                            .with_context(|| format!("mark debug {kind} {}", path.display()));
+                    }
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create debug {kind} {}", path.display()))
+                }
+            }
+        }
+    }
+
+    fn remove_abandoned_debug_work_directories(
+        &self,
+        parent: &Path,
+        destination: &str,
+    ) -> Result<()> {
+        for entry in fs::read_dir(parent).with_context(|| format!("read {}", parent.display()))? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with(".corgi-debug-stage-") && !name.starts_with(".corgi-debug-backup-")
+            {
+                continue;
+            }
+            let path = entry.path();
+            let owned = fs::read(path.join(DEBUG_MARKER))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<DebugManifest>(&bytes).ok())
+                .is_some_and(|manifest| manifest.destination == destination);
+            if owned {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("remove abandoned debug work {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn debug_work_path(&self, debug_dir: &Path, kind: &str) -> PathBuf {
+        debug_dir.with_file_name(format!(
+            ".corgi-debug-{kind}-{}-{}",
+            std::process::id(),
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Best-effort: record the just-verified/just-written destination stat.
@@ -645,6 +1015,556 @@ impl Store {
                 self.write_atomic(hint_path, &bytes).ok();
             }
         }
+    }
+}
+
+fn publish_atomic_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    match fs::rename(temporary, destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Cleanup can remove the empty parent between its creation and publication.
+            let parent = destination.parent().ok_or(error)?;
+            fs::create_dir_all(parent)?;
+            fs::rename(temporary, destination)
+        }
+        result => result,
+    }
+}
+
+fn trim_manifest_directory(directory: &Path, cutoff: std::time::SystemTime) -> Result<(u64, u64)> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading manifests {}", directory.display()));
+        }
+    };
+    let mut files = 0;
+    let mut bytes = 0;
+    for entry in entries {
+        let path = entry?.path();
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file()
+            && metadata.modified().is_ok_and(|modified| modified < cutoff)
+            && fs::remove_file(&path).is_ok()
+        {
+            files += 1;
+            bytes += metadata.len();
+        }
+    }
+    match fs::remove_dir(directory) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("removing manifest directory {}", directory.display()));
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn debug_directory_is_complete(
+    store: &Store,
+    directory: &Path,
+    manifest: &DebugManifest,
+) -> Result<bool> {
+    if !directory.is_dir() {
+        return Ok(false);
+    }
+    let expected: BTreeSet<&str> = manifest
+        .objects
+        .iter()
+        .map(|(file_name, _)| file_name.as_str())
+        .chain(std::iter::once(DEBUG_MARKER))
+        .collect();
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(directory).with_context(|| format!("read {}", directory.display()))? {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            return Ok(false);
+        };
+        if !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+        actual.insert(file_name);
+    }
+    if actual.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Ok(false);
+    }
+    for (file_name, expected_hash) in &manifest.objects {
+        let source = fs::metadata(store.cache_path(expected_hash))?;
+        let exported = fs::metadata(directory.join(file_name))?;
+        use std::os::unix::fs::MetadataExt;
+        if (source.dev(), source.ino()) != (exported.dev(), exported.ino())
+            && sha256_file(&directory.join(file_name))? != *expected_hash
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod manifest_publication_tests {
+    use super::{publish_atomic_file, trim_manifest_directory, ReadSetManifestEntry, Store};
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn publication_recovers_after_cleanup_removes_the_parent() {
+        let fixture = TestStore::new();
+        let store = &fixture.store;
+        let destination = store.manifest_path("key", "entry");
+        let parent = destination.parent().unwrap();
+        let entry = ReadSetManifestEntry {
+            files: vec![("src/lib.rs".into(), "hash".into())],
+        };
+        fs::create_dir_all(parent).unwrap();
+        let temporary = store.tmp_path("manifest");
+        fs::write(&temporary, serde_json::to_vec(&entry).unwrap()).unwrap();
+
+        assert_eq!(
+            store.trim_manifest_entries(SystemTime::now()).unwrap(),
+            (0, 0)
+        );
+        assert!(!parent.exists());
+        publish_atomic_file(&temporary, &destination).unwrap();
+
+        assert!(!temporary.exists());
+        let entries = store.list_manifest_entries("key").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "entry");
+        assert_eq!(entries[0].1.files, entry.files);
+    }
+
+    #[test]
+    fn cleanup_preserves_a_newly_published_manifest() {
+        let fixture = TestStore::new();
+        let store = &fixture.store;
+        let entry = ReadSetManifestEntry { files: Vec::new() };
+        store.save_manifest_entry("key", "old", &entry).unwrap();
+        let old_path = store.manifest_path("key", "old");
+        let old_bytes = fs::metadata(&old_path).unwrap().len();
+        fs::File::open(&old_path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        store.save_manifest_entry("key", "new", &entry).unwrap();
+
+        let cutoff = SystemTime::now() - Duration::from_secs(24 * 3600);
+        assert_eq!(store.trim_manifest_entries(cutoff).unwrap(), (1, old_bytes));
+
+        assert!(!old_path.exists());
+        let entries = store.list_manifest_entries("key").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "new");
+        assert_eq!(entries[0].1.files, entry.files);
+    }
+
+    #[test]
+    fn cleanup_tolerates_a_directory_removed_by_another_cleaner() {
+        let fixture = TestStore::new();
+        let directory = fixture.store.root.join("manifests/key");
+        fs::create_dir_all(&directory).unwrap();
+        fs::remove_dir(&directory).unwrap();
+
+        assert_eq!(
+            trim_manifest_directory(&directory, SystemTime::now()).unwrap(),
+            (0, 0)
+        );
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn publication_returns_an_error_if_the_retry_fails() {
+        let fixture = TestStore::new();
+        let destination = fixture.store.manifest_path("key", "entry");
+        let missing_temporary = fixture.store.tmp_path("missing");
+
+        let error = publish_atomic_file(&missing_temporary, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(destination.parent().unwrap().is_dir());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn failed_atomic_write_removes_the_temporary_file() {
+        let fixture = TestStore::new();
+        let destination = fixture.store.manifest_path("key", "entry");
+        fs::create_dir_all(&destination).unwrap();
+
+        let error = fixture
+            .store
+            .write_atomic(&destination, b"manifest")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("atomic write"));
+        assert!(destination.is_dir());
+        assert!(fs::read_dir(fixture.store.root.join("tmp"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn cleanup_propagates_errors_other_than_a_missing_directory() {
+        let fixture = TestStore::new();
+        let directory = fixture.store.root.join("manifests/key");
+        fs::write(&directory, b"not a directory").unwrap();
+
+        assert!(trim_manifest_directory(&directory, SystemTime::now()).is_err());
+        assert_eq!(fs::read(directory).unwrap(), b"not a directory");
+    }
+
+    struct TestStore {
+        store: Store,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "corgi-manifest-publication-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(root.join("tmp")).unwrap();
+            fs::create_dir_all(root.join("manifests")).unwrap();
+            Self {
+                store: Store {
+                    root,
+                    alias: None,
+                    counter: AtomicU64::new(0),
+                },
+            }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.store.root).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_export_tests {
+    use super::{sha256_hex, DebugManifest, Store, DEBUG_MARKER};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_objects_are_hard_links_to_cas() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let object_hash = add_blob(&store, b"object");
+        let destination = root.join("bin/program");
+        store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)],
+            )
+            .unwrap();
+
+        let source = fs::metadata(store.cache_path(&object_hash)).unwrap();
+        let exported =
+            fs::metadata(Store::debug_dir(&destination).unwrap().join("object.o")).unwrap();
+        assert_eq!(source.ino(), exported.ino());
+        assert!(source.permissions().readonly());
+        assert!(exported.permissions().readonly());
+        // Root bypasses Unix permission bits, unlike a normal developer process.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(fs::write(
+                Store::debug_dir(&destination).unwrap().join("object.o"),
+                b"corrupt"
+            )
+            .is_err());
+        }
+        assert_eq!(fs::read(store.cache_path(&object_hash)).unwrap(), b"object");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protects_unowned_paths_and_rolls_back_on_binary_failure() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let object_hash = add_blob(&store, b"object");
+        let destination = root.join("bin/program");
+        let debug_dir = Store::debug_dir(&destination).unwrap();
+        fs::create_dir_all(&debug_dir).unwrap();
+        fs::write(debug_dir.join("mine"), b"keep").unwrap();
+        assert!(store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)]
+            )
+            .is_err());
+        assert_eq!(fs::read(debug_dir.join("mine")).unwrap(), b"keep");
+
+        fs::remove_dir_all(&debug_dir).unwrap();
+        store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)],
+            )
+            .unwrap();
+        assert!(store
+            .export_with_debug(
+                &"0".repeat(64),
+                &destination,
+                false,
+                &[("replacement.o", &object_hash)]
+            )
+            .is_err());
+        assert!(debug_dir.join("object.o").is_file());
+        assert!(!debug_dir.join("replacement.o").exists());
+        assert!(debug_dir.join(DEBUG_MARKER).is_file());
+
+        assert!(store
+            .export_with_debug(&"0".repeat(64), &destination, false, &[])
+            .is_err());
+        assert!(debug_dir.join("object.o").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repairs_corrupted_warm_debug_object() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let object_hash = add_blob(&store, b"object");
+        let destination = root.join("bin/program");
+        store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)],
+            )
+            .unwrap();
+
+        let debug_dir = Store::debug_dir(&destination).unwrap();
+        fs::remove_file(debug_dir.join("object.o")).unwrap();
+        fs::write(debug_dir.join("object.o"), b"corrupt").unwrap();
+        store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)],
+            )
+            .unwrap();
+        assert_eq!(fs::read(debug_dir.join("object.o")).unwrap(), b"object");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_stores_serialize_exports_to_one_parent() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let first_hash = add_blob(&store, b"first");
+        let second_hash = add_blob(&store, b"second");
+        let destination = root.join("bin/program");
+        let second_store = Store {
+            root: store.root.clone(),
+            alias: None,
+            counter: AtomicU64::new(0),
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                store
+                    .export_with_debug(
+                        &binary_hash,
+                        &destination,
+                        false,
+                        &[("first.o", &first_hash)],
+                    )
+                    .unwrap();
+            });
+            scope.spawn(|| {
+                second_store
+                    .export_with_debug(
+                        &binary_hash,
+                        &destination,
+                        false,
+                        &[("second.o", &second_hash)],
+                    )
+                    .unwrap();
+            });
+        });
+
+        let debug_dir = Store::debug_dir(&destination).unwrap();
+        let first_won = debug_dir.join("first.o").is_file();
+        let second_won = debug_dir.join("second.o").is_file();
+        assert_ne!(first_won, second_won);
+        let marker = fs::read(debug_dir.join(DEBUG_MARKER)).unwrap();
+        let marker = String::from_utf8(marker).unwrap();
+        assert_eq!(marker.contains("first.o"), first_won);
+        assert_eq!(marker.contains("second.o"), second_won);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_colliding_unowned_stage_directory() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let object_hash = add_blob(&store, b"object");
+        let destination = root.join("bin/program");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let colliding_stage = destination
+            .parent()
+            .unwrap()
+            .join(format!(".corgi-debug-stage-{}-0", std::process::id()));
+        fs::create_dir(&colliding_stage).unwrap();
+        fs::write(colliding_stage.join("unowned"), b"keep").unwrap();
+
+        store
+            .export_with_debug(
+                &binary_hash,
+                &destination,
+                false,
+                &[("object.o", &object_hash)],
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(colliding_stage.join("unowned")).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removes_abandoned_work_only_for_export_destination() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let destination = root.join("bin/program");
+        let parent = destination.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+
+        let abandoned_stage = parent.join(".corgi-debug-stage-abandoned");
+        let abandoned_backup = parent.join(".corgi-debug-backup-abandoned");
+        let unrelated_stage = parent.join(".corgi-debug-stage-unrelated");
+        let unowned_backup = parent.join(".corgi-debug-backup-unowned");
+        for path in [
+            &abandoned_stage,
+            &abandoned_backup,
+            &unrelated_stage,
+            &unowned_backup,
+        ] {
+            fs::create_dir(path).unwrap();
+        }
+        write_work_marker(&abandoned_stage, "program");
+        write_work_marker(&abandoned_backup, "program");
+        write_work_marker(&unrelated_stage, "other-program");
+        fs::write(unowned_backup.join("keep"), b"keep").unwrap();
+
+        store
+            .export_with_debug(&binary_hash, &destination, false, &[])
+            .unwrap();
+
+        assert!(!abandoned_stage.exists());
+        assert!(!abandoned_backup.exists());
+        assert!(unrelated_stage.exists());
+        assert_eq!(fs::read(unowned_backup.join("keep")).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_debug_export_preserves_unowned_debug_paths() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+
+        for (destination, directory) in [
+            (root.join("bin/directory"), true),
+            (root.join("bin/file"), false),
+        ] {
+            let debug_dir = Store::debug_dir(&destination).unwrap();
+            if directory {
+                fs::create_dir_all(&debug_dir).unwrap();
+                fs::write(debug_dir.join("keep"), b"keep").unwrap();
+            } else {
+                fs::write(&debug_dir, b"keep").unwrap();
+            }
+            store
+                .export_with_debug(&binary_hash, &destination, false, &[])
+                .unwrap();
+            if directory {
+                assert_eq!(fs::read(debug_dir.join("keep")).unwrap(), b"keep");
+            } else {
+                assert_eq!(fs::read(debug_dir).unwrap(), b"keep");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_object_names() {
+        let (store, root) = test_store();
+        let binary_hash = add_blob(&store, b"binary");
+        let destination = root.join("bin/program");
+        for name in ["", "../escape.o", "nested/object.o", DEBUG_MARKER] {
+            assert!(store
+                .export_with_debug(&binary_hash, &destination, false, &[(name, &binary_hash)])
+                .is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_store() -> (Store, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "corgi-store-debug-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::create_dir_all(root.join("hints")).unwrap();
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        (
+            Store {
+                root: root.clone(),
+                alias: None,
+                counter: AtomicU64::new(0),
+            },
+            root,
+        )
+    }
+
+    fn add_blob(store: &Store, bytes: &[u8]) -> String {
+        let hash = sha256_hex(bytes);
+        let path = store.cache_path(&hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        hash
+    }
+
+    fn write_work_marker(path: &std::path::Path, destination: &str) {
+        let manifest = DebugManifest {
+            destination: destination.to_string(),
+            objects: Vec::new(),
+        };
+        fs::write(
+            path.join(DEBUG_MARKER),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 }
 

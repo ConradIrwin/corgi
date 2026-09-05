@@ -124,6 +124,487 @@ fn non_incremental_results_satisfy_incremental_actions() {
 }
 
 #[test]
+fn local_compile_read_sets_isolate_package_targets() {
+    let directory = TestDirectory::new("local-read-sets");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    write_read_set_workspace(&workspace);
+
+    let initial = invoke_corgi_with_store(&workspace, "test", ["--workspace"], &store);
+    assert_success(&initial, "initial corgi test");
+    let initial_build = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
+    assert_success(&initial_build, "initial corgi build");
+    let warm_build = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
+    assert_success(&warm_build, "warm corgi build");
+    let warm_report = report_for_workspace(&store, &workspace);
+    for package in ["lib_a", "lib_b", "app"] {
+        assert_unit_cache(&warm_report, package, "compile", package, "hit");
+    }
+
+    fs::write(
+        workspace.join("lib_a/tests/integration.rs"),
+        "#[test]\nfn edited_integration_test() { assert_eq!(lib_a::value(), 1); }\n",
+    )
+    .unwrap();
+    let integration_edit = invoke_corgi_with_store(&workspace, "test", ["--workspace"], &store);
+    assert_success(&integration_edit, "corgi test after integration test edit");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_not_executed(&report, "lib_a", "compile", "lib_a");
+    assert_unit_not_executed(&report, "lib_b", "compile", "lib_b");
+    assert_unit_not_executed(&report, "app", "compile", "app");
+    assert_unit_cache(&report, "lib_a", "compile_test", "integration", "miss");
+
+    fs::write(
+        workspace.join("lib_a/src/tests.rs"),
+        "#[test]\nfn edited_unit_test() { assert_eq!(super::value(), 1); }\n",
+    )
+    .unwrap();
+    let unit_test_edit = invoke_corgi_with_store(&workspace, "test", ["--workspace"], &store);
+    assert_success(&unit_test_edit, "corgi test after unit test module edit");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_not_executed(&report, "lib_a", "compile", "lib_a");
+    assert_unit_cache(&report, "lib_a", "compile_test", "lib_a", "miss");
+    assert_unit_not_executed(&report, "lib_b", "compile", "lib_b");
+
+    fs::write(
+        workspace.join("app/src/main.rs"),
+        "fn main() { println!(\"edited {}\", app::value()); }\n",
+    )
+    .unwrap();
+    let binary_edit = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
+    assert_success(&binary_edit, "corgi build after binary edit");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(&report, "app", "compile", "app", "hit");
+    assert_unit_cache(&report, "app", "compile", "app-bin", "miss");
+
+    let mut library_source = fs::read_to_string(workspace.join("lib_a/src/lib.rs")).unwrap();
+    library_source.push_str("\npub fn edited_library_value() -> u32 { 2 }\n");
+    fs::write(workspace.join("lib_a/src/lib.rs"), library_source).unwrap();
+    let library_edit = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
+    assert_success(&library_edit, "corgi build after library edit");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(
+        &report,
+        "lib_a",
+        "compile_build_script",
+        "build-script-build",
+        "hit",
+    );
+    assert_unit_cache(
+        &report,
+        "lib_a",
+        "run_build_script",
+        "build-script-build",
+        "hit",
+    );
+    assert_unit_cache(&report, "lib_a", "compile", "lib_a", "miss");
+}
+
+#[test]
+fn local_compile_manifest_learns_a_growing_read_set() {
+    let directory = TestDirectory::new("growing-read-set");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let initial = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&initial, "initial build for growing read set");
+
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "include!(\"extra.rs\");\npub fn value() -> u32 { extra() }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/extra.rs"), "fn extra() -> u32 { 2 }\n").unwrap();
+    let grown = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&grown, "build after growing read set");
+    let grown_report = report_for_workspace(&store, &workspace);
+    let grown_unit = report_unit(&grown_report, &directory.package_name, "compile");
+    assert_eq!(grown_unit["cache"]["result"], "miss");
+    assert_eq!(grown_unit["key"]["resolution"], "fresh_compile");
+
+    let warm = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&warm, "warm build using the learned read set");
+    let warm_report = report_for_workspace(&store, &workspace);
+    let warm_unit = report_unit(&warm_report, &directory.package_name, "compile");
+    assert_eq!(warm_unit["cache"]["result"], "hit");
+    assert_eq!(warm_unit["key"]["resolution"], "verified_manifest");
+
+    fs::write(workspace.join("src/extra.rs"), "fn extra() -> u32 { 3 }\n").unwrap();
+    let included_edit = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&included_edit, "build after editing learned input");
+    let included_report = report_for_workspace(&store, &workspace);
+    let included_unit = report_unit(&included_report, &directory.package_name, "compile");
+    assert_eq!(included_unit["cache"]["result"], "miss");
+    assert_eq!(included_unit["key"]["resolution"], "fresh_compile");
+}
+
+#[test]
+fn registry_dependency_builds_from_a_cold_isolated_store_and_reuses_cache() {
+    let directory = TestDirectory::new("cold-registry-dependency");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\nmemchr = \"=2.8.3\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    let binary = workspace
+        .join("target/debug")
+        .join(executable_name(&directory.package_name));
+    for (needle, expected_output, application_cache, dependency_cache) in [
+        ('x', "None\n", "miss", "miss"),
+        ('x', "None\n", "hit", "not_checked"),
+        ('g', "Some(2)\n", "miss", "hit"),
+    ] {
+        fs::write(
+            workspace.join("src/main.rs"),
+            format!("fn main() {{ println!(\"{{:?}}\", memchr::memchr(b'{needle}', b\"registry\")); }}\n"),
+        )
+        .unwrap();
+        let build = invoke_corgi_with_store(&workspace, "build", [], &store);
+        assert_success(&build, "registry dependency build");
+        let report = report_for_workspace(&store, &workspace);
+        assert_unit_cache(&report, "memchr", "compile", "memchr", dependency_cache);
+        assert_unit_cache(
+            &report,
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            application_cache,
+        );
+        let run = Command::new(&binary).output().unwrap();
+        assert_success(&run, "registry application");
+        assert_eq!(String::from_utf8(run.stdout).unwrap(), expected_output);
+    }
+}
+
+#[test]
+fn unread_sibling_dependency_source_does_not_churn_the_root_key() {
+    let directory = TestDirectory::new("precise-dependency-order");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    for package in ["app", "left", "right"] {
+        fs::create_dir_all(workspace.join(package).join("src")).unwrap();
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"app\", \"left\", \"right\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [dependencies]\nleft = { path = \"../left\" }\nright = { path = \"../right\" }\n",
+    )
+    .unwrap();
+    for package in ["left", "right"] {
+        fs::write(
+            workspace.join(package).join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        workspace.join("left/src/lib.rs"),
+        "pub fn value() -> u32 { 20 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("right/src/lib.rs"),
+        "pub fn value() -> u32 { 22 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/main.rs"),
+        "fn main() { println!(\"{}\", left::value() + right::value()); }\n",
+    )
+    .unwrap();
+    let unread_source = workspace.join("left/src/unread.rs");
+    fs::write(&unread_source, "pub fn unused() -> u32 { 0 }\n").unwrap();
+
+    let initial = invoke_corgi_with_store(&workspace, "build", ["-p", "app"], &store);
+    assert_success(&initial, "initial sibling dependency build");
+    let initial_report = report_for_workspace(&store, &workspace);
+    let root_key = report_unit(&initial_report, "app", "compile")["key"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for revision in 1..=16 {
+        fs::write(
+            &unread_source,
+            format!("pub fn unused() -> u32 {{ {revision} }}\n"),
+        )
+        .unwrap();
+        let build = invoke_corgi_with_store(&workspace, "build", ["-p", "app"], &store);
+        assert_success(&build, "build after unread dependency source edit");
+        let report = report_for_workspace(&store, &workspace);
+        let root = report_unit(&report, "app", "compile");
+        assert_eq!(root["key"]["hash"], root_key, "revision {revision}");
+        assert_eq!(root["cache"]["result"], "hit", "revision {revision}");
+        let run = Command::new(workspace.join("target/debug").join(executable_name("app")))
+            .output()
+            .unwrap();
+        assert_success(&run, "application with sibling dependencies");
+        assert_eq!(String::from_utf8(run.stdout).unwrap(), "42\n");
+    }
+}
+
+#[test]
+fn local_compile_detects_an_ambiguous_module_layout() {
+    let directory = TestDirectory::new("ambiguous-module-layout");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(workspace.join("src/lib.rs"), "mod foo;\n").unwrap();
+    fs::write(
+        workspace.join("src/foo.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let initial = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&initial, "initial build for module layout");
+    let warm = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&warm, "warm build for module layout");
+    let warm_report = report_for_workspace(&store, &workspace);
+    let warm_unit = report_unit(&warm_report, &directory.package_name, "compile");
+    assert_eq!(warm_unit["cache"]["result"], "hit");
+
+    fs::create_dir_all(workspace.join("src/foo")).unwrap();
+    fs::write(
+        workspace.join("src/foo/mod.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let ambiguous = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_failure(&ambiguous, "build with ambiguous module layout");
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(
+        stderr.contains("E0761") || stderr.contains("found at both"),
+        "expected rustc to report the ambiguous module layout:\n{stderr}"
+    );
+}
+
+#[test]
+fn build_script_cfg_does_not_reuse_a_manifest_from_another_configuration() {
+    let directory = TestDirectory::new("build-script-cfg-read-set");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() { println!(\"cargo::rustc-check-cfg=cfg(use_extra)\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[cfg(use_extra)]\nmod extra;\n\
+         #[cfg(use_extra)]\npub use extra::value;\n\
+         #[cfg(not(use_extra))]\npub fn value() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/extra.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let base = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&base, "build without build-script cfg");
+
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() {\n\
+         \tprintln!(\"cargo::rustc-check-cfg=cfg(use_extra)\");\n\
+         \tprintln!(\"cargo::rustc-cfg=use_extra\");\n\
+         }\n",
+    )
+    .unwrap();
+    let expanded = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&expanded, "build after enabling build-script cfg");
+    let expanded_report = report_for_workspace(&store, &workspace);
+    let expanded_unit = report_unit(&expanded_report, &directory.package_name, "compile");
+    assert_eq!(expanded_unit["cache"]["result"], "miss");
+    assert_eq!(expanded_unit["key"]["resolution"], "fresh_compile");
+
+    fs::write(
+        workspace.join("src/extra.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let edited = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&edited, "build after editing cfg-selected source");
+    let edited_report = report_for_workspace(&store, &workspace);
+    let edited_unit = report_unit(&edited_report, &directory.package_name, "compile");
+    assert_eq!(
+        edited_unit["cache"]["result"], "miss",
+        "editing a source selected by the current build-script cfg must compile it again: {edited_unit:#}"
+    );
+    assert_eq!(edited_unit["key"]["resolution"], "fresh_compile");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn build_script_runtime_reads_require_extra_inputs() {
+    let directory = TestDirectory::new("build-script-runtime-input");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() { std::fs::read_to_string(\"src/data.rs\").expect(\"src/data.rs\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/data.rs"), "runtime input\n").unwrap();
+
+    let denied = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_failure(&denied, "build script with undeclared runtime input");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("src/data.rs"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n\"{}\" = [\"src/data.rs\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    let declared = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&declared, "build script with declared runtime input");
+
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    let source_edit = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&source_edit, "build after unrelated library edit");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(
+        &report,
+        &directory.package_name,
+        "run_build_script",
+        "build-script-build",
+        "hit",
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_compiler_cold_lookup_executes_only_required_tools() {
+    let directory = TestDirectory::new("apple-compiler-cold-lookup");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        r#"use std::path::Path;
+use std::process::Command;
+
+fn main() {
+    match Command::new("/usr/bin/true").status() {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        result => panic!("unrelated executable was not denied: {result:?}"),
+    }
+
+    let developer_directory = Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .expect("failed to query the selected developer directory");
+    assert!(developer_directory.status.success());
+    let developer_directory =
+        String::from_utf8(developer_directory.stdout).expect("developer directory is not UTF-8");
+    let xcodebuild = Path::new(developer_directory.trim()).join("usr/bin/xcodebuild");
+    let sdkroot = std::env::var_os("SDKROOT").expect("SDKROOT is not set");
+    let lookup_command = if xcodebuild.is_file() {
+        "\"$1\" -sdk \"$2\" -find clang++ >/dev/null"
+    } else {
+        ":"
+    };
+    let lookup = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(lookup_command)
+        .arg("sh")
+        .arg(xcodebuild)
+        .arg(sdkroot)
+        .status()
+        .expect("failed to start the Apple compiler lookup");
+    assert!(lookup.success(), "Apple compiler lookup failed: {lookup}");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&output, "build with a cold Apple compiler lookup");
+}
+
+#[test]
 fn clean_expires_incremental_state_before_other_cached_data() {
     let directory = TestDirectory::new("clean-retention");
     let store = directory.path.join("store");
@@ -132,6 +613,8 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     let artifact = store.join("cache/aa/artifact");
     let expired_artifact = store.join("cache/aa/expired");
     let report = store.join("reports/report.json");
+    let old_manifest = store.join("manifests/key/old.json");
+    let recent_manifest = store.join("manifests/key/recent.json");
     for path in [&old_incremental, &recent_incremental] {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join("state"), b"incremental").unwrap();
@@ -145,6 +628,9 @@ fn clean_expires_incremental_state_before_other_cached_data() {
         .unwrap();
     fs::create_dir_all(report.parent().unwrap()).unwrap();
     fs::write(&report, b"report").unwrap();
+    fs::create_dir_all(old_manifest.parent().unwrap()).unwrap();
+    fs::write(&old_manifest, b"{\"files\":[]}").unwrap();
+    fs::write(&recent_manifest, b"{\"files\":[]}").unwrap();
 
     let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
     for path in [&old_incremental, &artifact, &report] {
@@ -153,6 +639,10 @@ fn clean_expires_incremental_state_before_other_cached_data() {
             .set_modified(two_days_ago)
             .unwrap();
     }
+    fs::File::open(&old_manifest)
+        .unwrap()
+        .set_modified(two_days_ago)
+        .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
         .arg("clean")
@@ -167,6 +657,8 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     assert!(artifact.exists());
     assert!(!expired_artifact.exists());
     assert!(report.exists());
+    assert!(!old_manifest.exists());
+    assert!(recent_manifest.exists());
 }
 
 #[test]
@@ -184,7 +676,14 @@ fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
             ("two-hours", Duration::from_secs(2 * 3600)),
             ("recent", Duration::ZERO),
         ] {
-            for namespace in ["cache/aa", "reports", "incr", "outdirs", "tmp"] {
+            for namespace in [
+                "cache/aa",
+                "reports",
+                "incr",
+                "outdirs",
+                "manifests/key",
+                "tmp",
+            ] {
                 let path = store.join(namespace).join(name);
                 let marker = if matches!(namespace, "incr" | "outdirs" | "tmp") {
                     fs::create_dir_all(&path).unwrap();
@@ -218,7 +717,14 @@ fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
             .expect("failed to invoke corgi clean");
         assert_success(&output, "corgi clean --older-than");
 
-        for namespace in ["cache/aa", "reports", "incr", "outdirs", "tmp"] {
+        for namespace in [
+            "cache/aa",
+            "reports",
+            "incr",
+            "outdirs",
+            "manifests/key",
+            "tmp",
+        ] {
             for (name, removed) in [
                 ("two-days", namespace == "tmp" || removes_two_days),
                 ("two-hours", namespace != "tmp" && removes_two_hours),
@@ -898,7 +1404,7 @@ fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
             .arg("-C")
             .arg(&directory.path)
             .args(arguments)
-            .env("CORGI_STORE", &store)
+            .env("CORGI_STORE", store)
             .env("CORGI_TEST_MARKER", &marker)
             .output()
             .expect("failed to invoke corgi test")
@@ -1104,10 +1610,10 @@ fn extra_input_globs_must_match_something() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn debug_objects_of_a_linked_binary_live_in_the_store() {
+fn debug_objects_are_exported_beside_the_binary_and_restored_from_cache() {
     let directory = TestDirectory::new("debug-objects");
-    let store = directory.path.join("store");
-    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store, with spaces");
+    let workspace = directory.path.join("workspace, with spaces");
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -1118,6 +1624,9 @@ fn debug_objects_of_a_linked_binary_live_in_the_store() {
     )
     .unwrap();
 
+    let profile = workspace.join("target/debug");
+    let binary = profile.join(executable_name(&directory.package_name));
+    let debug_directory = profile.join(format!("{}-debug", directory.package_name));
     for revision in 0..2 {
         fs::write(
             workspace.join("src/main.rs"),
@@ -1128,9 +1637,12 @@ fn debug_objects_of_a_linked_binary_live_in_the_store() {
             &invoke_corgi_with_store(&workspace, "build", [], &store),
             "corgi build",
         );
+        assert!(!debug_directory.join("obsolete.o").exists());
+        if revision == 0 {
+            fs::write(debug_directory.join("obsolete.o"), b"old generation").unwrap();
+        }
     }
 
-    let profile = workspace.join("target/debug");
     let stray_objects = fs::read_dir(&profile)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -1141,20 +1653,26 @@ fn debug_objects_of_a_linked_binary_live_in_the_store() {
         "rebuilds left debug objects in the worktree: {stray_objects:?}"
     );
 
-    let binary = profile.join(executable_name(&directory.package_name));
-    let objects = debug_map_objects(&binary, &store);
+    let objects = debug_map_objects(&binary, &workspace);
     assert!(
         !objects.is_empty(),
-        "the binary records no debug objects in the store"
+        "the binary records no relative debug objects"
     );
     for object in &objects {
+        assert_eq!(object.parent(), Some(debug_directory.as_path()));
         assert!(object.exists(), "missing debug object {}", object.display());
     }
+    let signature = Command::new("codesign")
+        .args(["--verify", "--verbose=2"])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert_success(&signature, "verify unmodified linker signature");
 
     // The objects are cached outputs like any other: a build that hits the
     // cache has to restore them, or the binary it exports loses its debug
     // info without anything recompiling.
-    fs::remove_dir_all(objects[0].parent().unwrap()).unwrap();
+    fs::remove_file(&objects[0]).unwrap();
     assert_success(
         &invoke_corgi_with_store(&workspace, "build", [], &store),
         "corgi rebuild",
@@ -1165,6 +1683,423 @@ fn debug_objects_of_a_linked_binary_live_in_the_store() {
             "a cached build did not restore {}",
             object.display()
         );
+    }
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(
+        &report,
+        &directory.package_name,
+        "compile",
+        &directory.package_name,
+        "hit",
+    );
+    let debugger = Command::new("lldb")
+        .current_dir(&workspace)
+        .args(["--batch", "-o", "breakpoint set --file main.rs --line 1"])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert_success(&debugger, "read restored debug information in LLDB");
+    let debugger_output = String::from_utf8_lossy(&debugger.stdout);
+    assert!(!debugger_output.contains("pending"), "{debugger_output}");
+    assert!(debugger_output.contains("main.rs:1"), "{debugger_output}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn debug_objects_follow_each_non_root_executable_output_directory() {
+    let directory = TestDirectory::new("debug-output-layouts");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    for path in ["src", "tests", "examples", "fixture_macro/src"] {
+        fs::create_dir_all(workspace.join(path)).unwrap();
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[workspace]\nmembers = [\"fixture_macro\"]\nresolver = \"2\"\n\
+             [package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n\
+             [dependencies]\nfixture_macro = {{ path = \"fixture_macro\" }}\n\
+             [profile.dev.build-override]\ndebug = 2\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("fixture_macro/Cargo.toml"),
+        "[package]\nname = \"fixture_macro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\nproc-macro = true\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("fixture_macro/src/lib.rs"),
+        "use proc_macro::TokenStream;\n\
+         #[proc_macro]\npub fn fixture_value(_: TokenStream) -> TokenStream {\n\
+         \"41u32\".parse().expect(\"valid fixture tokens\")\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { fixture_macro::fixture_value!() + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        format!(
+            "fn main() {{ println!(\"{{}}\", {}::value()); }}\n",
+            directory.package_name.replace('-', "_"),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("tests/harness.rs"),
+        format!(
+            "#[test]\nfn generated_value() {{\n\
+             assert_eq!({}::value(), 42);\n\
+             let output = std::process::Command::new(env!(\"CARGO_BIN_EXE_{}\")).output().unwrap();\n\
+             assert!(output.status.success());\n\
+             }}\n",
+            directory.package_name.replace('-', "_"),
+            directory.package_name,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("examples/showcase.rs"),
+        format!(
+            "fn main() {{ println!(\"{{}}\", {}::value()); }}\n",
+            directory.package_name.replace('-', "_")
+        ),
+    )
+    .unwrap();
+
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "test", ["--tests"], &store),
+        "corgi test with a binary dependency",
+    );
+    let main_binary = workspace.join("target/debug").join(&directory.package_name);
+    assert!(main_binary.is_file());
+    let main_objects = debug_map_objects(&main_binary, &workspace);
+    assert!(!main_objects.is_empty());
+    assert!(main_objects.iter().all(|object| object.is_file()));
+
+    let output = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        ["--all-targets", "--workspace"],
+        &store,
+    );
+    assert_success(&output, "corgi build --all-targets");
+
+    let profile = workspace.join("target/debug");
+    let package_crate_name = directory.package_name.replace('-', "_");
+    let test_binary = fs::read_dir(profile.join("deps"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{package_crate_name}-"))
+                && path.extension().is_none()
+        })
+        .expect("missing test harness executable");
+    let example_binary = profile.join("examples/showcase");
+    let build_script = fs::read_dir(profile.join("build"))
+        .unwrap()
+        .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("build_script_build-")
+        })
+        .expect("missing build script executable");
+    let proc_macro = fs::read_dir(&profile)
+        .unwrap()
+        .chain(fs::read_dir(profile.join("deps")).unwrap())
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("libfixture_macro-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "dylib")
+        })
+        .expect("missing proc-macro dylib");
+
+    for binary in [test_binary, example_binary, build_script, proc_macro] {
+        assert!(binary.is_file(), "missing output {}", binary.display());
+        let debug_directory = binary.with_file_name(format!(
+            "{}-debug",
+            binary.file_name().unwrap().to_string_lossy()
+        ));
+        let objects = debug_map_objects(&binary, &workspace);
+        assert!(
+            !objects.is_empty(),
+            "{} records no relative debug objects",
+            binary.display()
+        );
+        for object in objects {
+            assert_eq!(
+                object.parent(),
+                Some(debug_directory.as_path()),
+                "{} records an object outside its sibling debug directory",
+                binary.display()
+            );
+            assert!(
+                object.is_file(),
+                "missing debug object {}",
+                object.display()
+            );
+        }
+        assert!(
+            !fs::read_dir(binary.parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "o")),
+            "{} has loose objects mixed beside it",
+            binary.display()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn debug_objects_are_exported_for_dylibs_when_crate_type_order_changes() {
+    let directory = TestDirectory::new("debug-crate-type-order");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn exported_value() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    for crate_types in ["\"staticlib\", \"cdylib\"", "\"cdylib\", \"staticlib\""] {
+        fs::write(
+            workspace.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 [lib]\ncrate-type = [{crate_types}]\n",
+                directory.package_name
+            ),
+        )
+        .unwrap();
+
+        let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+        assert_success(&output, "corgi build with staticlib and cdylib outputs");
+        let profile = workspace.join("target/debug");
+        let report = report_for_workspace(&store, &workspace);
+        let unit = report_unit(&report, &directory.package_name, "compile");
+        let dylib_name = unit["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|output| output["name"].as_str())
+            .find(|name| name.ends_with(".dylib"))
+            .expect("missing exported dylib");
+        let dylib = profile.join(dylib_name);
+        let debug_directory = dylib.with_file_name(format!(
+            "{}-debug",
+            dylib.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(dylib.is_file(), "missing dylib {}", dylib.display());
+        let objects = debug_map_objects(&dylib, &workspace);
+        assert!(
+            !objects.is_empty(),
+            "{} records no relative debug objects for crate types [{crate_types}]",
+            dylib.display()
+        );
+        for object in objects {
+            assert_eq!(object.parent(), Some(debug_directory.as_path()));
+            assert!(
+                object.is_file(),
+                "missing debug object {}",
+                object.display()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rustflags_debuginfo_exports_debug_objects_when_profile_debug_is_disabled() {
+    let directory = TestDirectory::new("rustflags-debuginfo");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [profile.dev]\ndebug = 0\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"-C\", \"debuginfo=2\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"debug from rustflags\"); }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(
+        &output,
+        "corgi build with profile debug disabled and rustflags debuginfo",
+    );
+
+    let binary = workspace
+        .join("target/debug")
+        .join(executable_name(&directory.package_name));
+    let debug_directory = binary.with_file_name(format!("{}-debug", directory.package_name));
+    let objects = debug_map_objects(&binary, &workspace);
+    assert!(
+        !objects.is_empty(),
+        "{} records no relative debug objects",
+        binary.display()
+    );
+    for object in objects {
+        assert_eq!(object.parent(), Some(debug_directory.as_path()));
+        assert!(
+            object.is_file(),
+            "missing debug object {}",
+            object.display()
+        );
+    }
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n",
+    )
+    .unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", [], &store),
+        "corgi build with debug information disabled",
+    );
+    assert!(!debug_directory.exists());
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"-C\", \"debuginfo=0\", \"-C\", \"save-temps\"]\n",
+    )
+    .unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", [], &store),
+        "corgi build with saved auxiliary objects",
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn binary_export_cannot_overlap_another_binarys_debug_directory() {
+    let directory = TestDirectory::new("debug-export-collision");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [[bin]]\nname = \"foo\"\npath = \"src/foo.rs\"\n\
+             [[bin]]\nname = \"foo-debug\"\npath = \"src/foo-debug.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(workspace.join("src/foo.rs"), "fn main() {}\n").unwrap();
+    fs::write(workspace.join("src/foo-debug.rs"), "fn main() {}\n").unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_failure(&output, "corgi build with colliding binary exports");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("conflicts with the debug-object directory"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!workspace.join("target/debug/foo").exists());
+    assert!(!workspace.join("target/debug/foo-debug").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unrelated_source_edits_do_not_change_recompiled_debug_binary_bytes() {
+    let directory = TestDirectory::new("debug-precise-key");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"hello\"); }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/tests.rs"), "// unrelated test source\n").unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", ["--no-incremental"], &store),
+        "initial debug build",
+    );
+    let report = report_for_workspace(&store, &workspace);
+    let unit = report_unit(&report, &directory.package_name, "compile");
+    let key = unit["key"]["hash"].as_str().unwrap();
+    let record_path = store
+        .join("cache")
+        .join(&key[..2])
+        .join(format!("{key}.json"));
+    let binary = workspace.join("target/debug").join(&directory.package_name);
+    let first_image = fs::read(&binary).unwrap();
+    let first_debug_objects = debug_map_objects(&binary, &workspace)
+        .into_iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+
+    fs::remove_file(&record_path).unwrap();
+    fs::write(
+        workspace.join("src/tests.rs"),
+        "// changed unrelated test source\n",
+    )
+    .unwrap();
+    assert_success(
+        &invoke_corgi_with_store(&workspace, "build", ["--no-incremental"], &store),
+        "recompile after unrelated source edit",
+    );
+    let report = report_for_workspace(&store, &workspace);
+    let unit = report_unit(&report, &directory.package_name, "compile");
+    assert_eq!(unit["key"]["hash"], key);
+    assert_eq!(unit["cache"]["result"], "miss");
+    assert_eq!(first_image, fs::read(&binary).unwrap());
+    for (path, bytes) in first_debug_objects {
+        assert_eq!(bytes, fs::read(path).unwrap());
     }
 }
 
@@ -1569,6 +2504,7 @@ fn invoke_corgi_with_store<const ARGUMENT_COUNT: usize>(
         .arg(fixture)
         .args(arguments)
         .env("CORGI_STORE", store)
+        .env("CORGI_ALIAS", store.join("alias"))
         .output()
         .expect("failed to invoke corgi")
 }
@@ -1641,25 +2577,21 @@ fn initialize_git_repository(path: &Path, remote: &str) {
 /// The object files a Mach-O image names in its debug map, as recorded in
 /// its symbol table.
 #[cfg(target_os = "macos")]
-fn debug_map_objects(binary: &Path, store: &Path) -> Vec<PathBuf> {
-    let recorded_prefix = format!("{}/debug/", store.canonicalize().unwrap().display());
-    let image = fs::read(binary).unwrap();
-    let mut objects = Vec::new();
-    let mut offset = 0;
-    while let Some(position) = image[offset..]
-        .windows(recorded_prefix.len())
-        .position(|window| window == recorded_prefix.as_bytes())
-    {
-        let start = offset + position;
-        let end = image[start..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .map_or(image.len(), |terminator| start + terminator);
-        objects.push(PathBuf::from(
-            String::from_utf8_lossy(&image[start..end]).into_owned(),
-        ));
-        offset = end;
-    }
+fn debug_map_objects(binary: &Path, workspace: &Path) -> Vec<PathBuf> {
+    let dump = Command::new("dsymutil")
+        .arg("-s")
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert_success(&dump, "dump Mach-O debug map");
+    let mut objects = String::from_utf8(dump.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("N_OSO"))
+        .filter_map(|line| line.split('\'').nth(1))
+        .filter(|path| Path::new(path).starts_with("target") && path.ends_with(".o"))
+        .map(|path| workspace.join(path))
+        .collect::<Vec<_>>();
     objects.sort();
     objects.dedup();
     objects
@@ -1699,6 +2631,121 @@ fn report_unit<'a>(
         .iter()
         .find(|unit| unit["package"]["name"] == package && unit["action"]["kind"] == action)
         .unwrap_or_else(|| panic!("missing {action} unit for {package}"))
+}
+
+fn assert_unit_cache(
+    report: &serde_json::Value,
+    package: &str,
+    action: &str,
+    target: &str,
+    expected_cache: &str,
+) {
+    let unit = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == package
+                && unit["action"]["kind"] == action
+                && unit["target"]["name"] == target
+        })
+        .unwrap_or_else(|| panic!("missing {package} {action} target {target}"));
+    assert_eq!(
+        unit["cache"]["result"], expected_cache,
+        "unexpected cache result for {package} {action} target {target}: {unit:#}"
+    );
+    let expected_outcome = if expected_cache == "not_checked" {
+        "skipped"
+    } else {
+        "success"
+    };
+    assert_eq!(unit["outcome"]["status"], expected_outcome, "{unit:#}");
+}
+
+fn assert_unit_not_executed(report: &serde_json::Value, package: &str, action: &str, target: &str) {
+    let unit = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| {
+            unit["package"]["name"] == package
+                && unit["action"]["kind"] == action
+                && unit["target"]["name"] == target
+        })
+        .unwrap_or_else(|| panic!("missing {package} {action} target {target}"));
+    assert!(
+        matches!(
+            unit["cache"]["result"].as_str(),
+            Some("hit" | "not_checked")
+        ),
+        "unit unexpectedly executed: {unit:#}"
+    );
+    let expected_resolution = if unit["cache"]["result"] == "hit" {
+        "verified_manifest"
+    } else {
+        "pending"
+    };
+    assert_eq!(unit["key"]["resolution"], expected_resolution, "{unit:#}");
+}
+
+fn write_read_set_workspace(workspace: &Path) {
+    for path in ["lib_a/src", "lib_a/tests", "lib_b/src", "app/src"] {
+        fs::create_dir_all(workspace.join(path)).unwrap();
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"lib_a\", \"lib_b\", \"app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("lib_a/Cargo.toml"),
+        "[package]\nname = \"lib_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("lib_a/build.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        workspace.join("lib_a/src/lib.rs"),
+        "#[cfg(test)]\nmod tests;\n\npub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("lib_a/src/tests.rs"),
+        "#[test]\nfn unit_test() { assert_eq!(super::value(), 1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("lib_a/tests/integration.rs"),
+        "#[test]\nfn integration_test() { assert_eq!(lib_a::value(), 1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("lib_b/Cargo.toml"),
+        "[package]\nname = \"lib_b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [dependencies]\nlib_a = { path = \"../lib_a\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("lib_b/src/lib.rs"),
+        "pub fn value() -> u32 { lib_a::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [[bin]]\nname = \"app-bin\"\npath = \"src/main.rs\"\n\
+         [dependencies]\nlib_b = { path = \"../lib_b\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/lib.rs"),
+        "pub fn value() -> u32 { lib_b::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/main.rs"),
+        "fn main() { println!(\"{}\", app::value()); }\n",
+    )
+    .unwrap();
 }
 
 fn write_non_git_package_fixture(root: &Path, checkout: &str) {
