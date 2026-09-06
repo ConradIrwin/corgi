@@ -61,6 +61,23 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+pub fn explain_parse_error(error: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    if error.kind() == ErrorKind::InvalidSubcommand
+        && matches!(
+            error.get(ContextKind::InvalidSubcommand),
+            Some(ContextValue::String(command)) if command == "nextest"
+        )
+    {
+        return clap::Error::raw(
+            ErrorKind::InvalidSubcommand,
+            "Use `corgi test` to run tests in parallel (`corgi nextest` is not supported)\n\n  corgi test -p my_crate 'test_a|test_b*'\n\nFilters are positional regexes matched against fully qualified test names.\n",
+        );
+    }
+    error
+}
+
 /// Resolve the global project directory before strict parsing so toolchain
 /// selection can hand newer command-line syntax to the requested corgi.
 pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
@@ -437,6 +454,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("pass one or more positional REGEX filters instead"));
+    }
+
+    #[test]
+    fn nextest_command_points_to_corgi_test() {
+        for arguments in [
+            vec!["corgi", "nextest"],
+            vec![
+                "corgi",
+                "nextest",
+                "run",
+                "-p",
+                "my_crate",
+                "-E",
+                "test(foo)",
+            ],
+            vec!["corgi", "-C", "project", "nextest", "run"],
+        ] {
+            let error = explain_parse_error(Cli::try_parse_from(arguments).unwrap_err());
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                "error: Use `corgi test` to run tests in parallel (`corgi nextest` is not supported)\n\n  corgi test -p my_crate 'test_a|test_b*'\n\nFilters are positional regexes matched against fully qualified test names.\n",
+            );
+        }
+    }
+
+    #[test]
+    fn nextest_hint_does_not_change_other_arguments() {
+        let cli = Cli::try_parse_from(["corgi", "test", "nextest"]).unwrap();
+        let Some(Command::Test(args)) = cli.command else {
+            panic!("test command not parsed");
+        };
+        assert_eq!(args.filters, ["nextest"]);
+
+        for arguments in [
+            vec!["corgi", "unknown"],
+            vec!["corgi", "test", "--unknown"],
+            vec!["corgi", "--help"],
+        ] {
+            let error = Cli::try_parse_from(arguments).unwrap_err();
+            let original = error.to_string();
+            assert_eq!(explain_parse_error(error).to_string(), original);
+        }
     }
 
     #[test]

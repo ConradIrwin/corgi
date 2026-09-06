@@ -56,7 +56,9 @@ fn real_main() -> Result<()> {
         manifest_path,
         verbose,
         command,
-    } = cli::Cli::parse_from(argv);
+    } = cli::Cli::try_parse_from(argv)
+        .map_err(cli::explain_parse_error)
+        .unwrap_or_else(|error| error.exit());
     let dir = if let Some(manifest) = manifest_path {
         anyhow::ensure!(
             manifest
