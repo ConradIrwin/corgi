@@ -456,6 +456,7 @@ pub struct Ctx {
     sysroot: String,
     rustup_home: String,
     devdir: String,
+    metal_toolchain_roots: Vec<PathBuf>,
     sandbox: bool,
     darwin_dirs: Vec<String>,
     sdkroot: String,
@@ -3747,6 +3748,12 @@ fn build_inner(
         target_rustflags.clone()
     };
     let config_env = cargo_config.env;
+    // Actions never see the ambient environment. Tool discovery must use this
+    // same base plus configured environment so xcrun selects the same tools.
+    let mut base_env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    if let Ok(value) = std::env::var("HOME") {
+        base_env.push(("HOME".to_string(), value));
+    }
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()
@@ -4232,12 +4239,11 @@ fn build_inner(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let devdir = capture(
-        Command::new("/usr/bin/xcode-select").arg("-p"),
-        "xcode-select -p",
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
+    let mut xcode_select = hermetic_apple_command("/usr/bin/xcode-select", &base_env, &config_env);
+    xcode_select.arg("-p");
+    let devdir = capture(&mut xcode_select, "xcode-select -p")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
     // toolchain identity beyond rustc: the linker chain shapes final bits
     let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
         .ok()
@@ -4256,26 +4262,29 @@ fn build_inner(
         })
         .unwrap_or_default();
     let sdk_v = if host.contains("apple") {
-        capture(
-            Command::new("/usr/bin/xcrun").arg("--show-sdk-version"),
-            "xcrun --show-sdk-version",
-        )
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+        let mut command = hermetic_apple_command("/usr/bin/xcrun", &base_env, &config_env);
+        command.arg("--show-sdk-version");
+        capture(&mut command, "xcrun --show-sdk-version")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
     } else {
         String::new()
     };
-    // one Xcode identity pin covers the whole Apple tool group
-    // (ar, ranlib, clang, ld, metal, xcrun) — they ship together
+    // Metal can be installed independently of Xcode through DVTDownloads,
+    // so its identity and sandbox roots are discovered separately.
     let xcode_v = if host.contains("apple") {
-        capture(
-            Command::new("/usr/bin/xcodebuild").arg("-version"),
-            "xcodebuild -version",
-        )
-        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
+        let mut command = hermetic_apple_command("/usr/bin/xcodebuild", &base_env, &config_env);
+        command.arg("-version");
+        capture(&mut command, "xcodebuild -version")
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
     } else {
         String::new()
+    };
+    let (metal_toolchain_roots, metal_identity) = if host.contains("apple") {
+        discover_metal_toolchains(&devdir, &base_env, &config_env)?
+    } else {
+        (Vec::new(), String::new())
     };
     let zig_runtime = zig_target
         .as_deref()
@@ -4285,8 +4294,9 @@ fn build_inner(
         .as_ref()
         .map(|runtime| runtime.identity.as_str())
         .unwrap_or("");
-    let toolchain =
-        format!("cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nzig: {zig_identity}");
+    let toolchain = format!(
+        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nmetal: {metal_identity}\nzig: {zig_identity}"
+    );
     let report_toolchain = crate::report::ToolchainInput {
         cc: cc_v,
         ld: ld_v,
@@ -4321,12 +4331,11 @@ fn build_inner(
     // resolve the SDK once, outside the sandbox, instead of letting every
     // rustc link shell out to xcrun (slow and an untracked probe)
     let sdkroot = if host.contains("apple") {
-        capture(
-            Command::new("/usr/bin/xcrun").arg("--show-sdk-path"),
-            "xcrun --show-sdk-path",
-        )
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+        let mut command = hermetic_apple_command("/usr/bin/xcrun", &base_env, &config_env);
+        command.arg("--show-sdk-path");
+        capture(&mut command, "xcrun --show-sdk-path")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -4472,14 +4481,6 @@ fn build_inner(
             probe.profiles.clone(),
         ));
     }
-    // Actions never see the ambient PATH: they get [shims:]/usr/bin:/bin,
-    // where the shim dir (built per visible tool subset in
-    // run_build_script) resolves bare-name spawns to keyed content.
-    let mut base_env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
-    if let Ok(v) = std::env::var("HOME") {
-        base_env.push(("HOME".to_string(), v));
-    }
-
     {
         let building = match root_packages.as_ref() {
             None if let Some(root) = root.as_deref() => format!("root set {root}"),
@@ -4547,6 +4548,7 @@ fn build_inner(
         sysroot,
         rustup_home,
         devdir,
+        metal_toolchain_roots,
         sandbox,
         darwin_dirs,
         sdkroot,
@@ -5747,6 +5749,271 @@ fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
     sha256_hex(normalized_paths.join("\0").as_bytes())
 }
 
+/// Finds Metal toolchains installed outside the selected Xcode bundle.
+fn discover_metal_toolchains(
+    developer_directory: &str,
+    base_env: &[(String, String)],
+    config_env: &[(String, String)],
+) -> Result<(Vec<PathBuf>, String)> {
+    let xcode_toolchains = selected_xcode_toolchains(developer_directory);
+    let mut discovered = Vec::new();
+    for tool in ["metal", "metallib"] {
+        let mut command = hermetic_apple_command("/usr/bin/xcrun", base_env, config_env);
+        command.args(["-sdk", "macosx", "--find", tool]);
+        let Ok(path) = capture(&mut command, &format!("locating {tool}")) else {
+            continue;
+        };
+        let executable = fs::canonicalize(path.trim())
+            .with_context(|| format!("resolving {tool} executable at {}", path.trim()))?;
+        let root = xcode_toolchain_root(&executable)
+            .with_context(|| format!("no .xctoolchain root for {}", executable.display()))?;
+        if xcode_toolchains
+            .as_ref()
+            .is_none_or(|xcode_toolchains| !root.starts_with(xcode_toolchains))
+        {
+            discovered.push((tool, root.to_path_buf()));
+        }
+    }
+
+    let mut root_identities = BTreeMap::new();
+    let mut identity = String::new();
+    for (tool, root) in &discovered {
+        let root_identity = match root_identities.get(root) {
+            Some(identity) => identity,
+            None => {
+                let root_identity = sealed_apfs_volume_identity(root, base_env, config_env)?
+                    .with_context(|| {
+                        format!(
+                            "Metal toolchain {} is outside Xcode but is not on a sealed, read-only APFS volume",
+                            root.display()
+                        )
+                    })?;
+                root_identities.insert(root.clone(), root_identity);
+                root_identities.get(root).unwrap()
+            }
+        };
+        identity.push_str(&format!("{tool}: {root_identity}\n"));
+    }
+    Ok((root_identities.into_keys().collect(), identity))
+}
+
+fn selected_xcode_toolchains(developer_directory: &str) -> Option<PathBuf> {
+    fs::canonicalize(Path::new(developer_directory).join("Toolchains")).ok()
+}
+
+fn sealed_apfs_volume_identity(
+    root: &Path,
+    base_env: &[(String, String)],
+    config_env: &[(String, String)],
+) -> Result<Option<String>> {
+    let device = filesystem_device(root)?;
+    let mut diskutil = hermetic_apple_command("/usr/sbin/diskutil", base_env, config_env);
+    diskutil.args(["info", "-plist", &device]);
+    let Ok(plist) = capture(&mut diskutil, "reading Metal toolchain volume identity") else {
+        return Ok(None);
+    };
+    let Some(uuid) = sealed_apfs_volume_uuid(&plist) else {
+        return Ok(None);
+    };
+    let manifest = root.join("ToolchainInfo.plist");
+    let manifest_hash = crate::store::sha256_file(&manifest)
+        .with_context(|| format!("hashing {}", manifest.display()))?;
+    Ok(Some(format!("sealed-apfs:{uuid}:{manifest_hash}")))
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_device(path: &Path) -> Result<String> {
+    use std::ffi::{CStr, CString};
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).context("filesystem path contains NUL")?;
+    let mut filesystem = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated, and statfs initializes `filesystem`
+    // before returning success.
+    if unsafe { libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading filesystem identity");
+    }
+    // SAFETY: the successful statfs call initialized the structure and its
+    // fixed-size mount-from field is NUL-terminated by macOS.
+    let filesystem = unsafe { filesystem.assume_init() };
+    let device = unsafe { CStr::from_ptr(filesystem.f_mntfromname.as_ptr()) };
+    Ok(device.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn filesystem_device(_path: &Path) -> Result<String> {
+    anyhow::bail!("Apple filesystem identity is only available on macOS")
+}
+
+fn sealed_apfs_volume_uuid(plist: &str) -> Option<&str> {
+    let filesystem = plist_string(plist, "FilesystemType")?;
+    let sealed = plist_string(plist, "Sealed")?;
+    let writable = plist_bool(plist, "Writable")?;
+    if filesystem == "apfs" && sealed == "Yes" && !writable {
+        plist_string(plist, "VolumeUUID")
+    } else {
+        None
+    }
+}
+
+fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
+    let value = plist.split_once(&format!("<key>{key}</key>"))?.1;
+    value
+        .split_once("<string>")?
+        .1
+        .split_once("</string>")
+        .map(|(value, _)| value)
+}
+
+fn plist_bool(plist: &str, key: &str) -> Option<bool> {
+    let value = plist
+        .split_once(&format!("<key>{key}</key>"))?
+        .1
+        .trim_start();
+    if value.starts_with("<true/>") {
+        Some(true)
+    } else if value.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn hermetic_apple_command(
+    program: &str,
+    base_env: &[(String, String)],
+    config_env: &[(String, String)],
+) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    command.envs(base_env.iter().map(|(name, value)| (name, value)));
+    command.envs(config_env.iter().map(|(name, value)| (name, value)));
+    command
+}
+
+fn xcode_toolchain_root(executable: &Path) -> Option<&Path> {
+    executable.ancestors().find(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "xctoolchain")
+    })
+}
+
+#[cfg(test)]
+mod metal_toolchain_tests {
+    use super::{
+        filesystem_device, hermetic_apple_command, plist_bool, plist_string,
+        sealed_apfs_volume_uuid, selected_xcode_toolchains, xcode_toolchain_root,
+    };
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn confines_downloaded_tool_access_to_its_toolchain() {
+        let root = Path::new(
+            "/Users/example/Library/Developer/DVTDownloads/MetalToolchain/mounts/version/Metal.xctoolchain",
+        );
+        let executable = root.join("usr/metal/current/bin/metal");
+        assert_eq!(xcode_toolchain_root(&executable), Some(root));
+    }
+
+    #[test]
+    fn supports_xcode_bundled_tools() {
+        let root = Path::new(
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain",
+        );
+        let executable = root.join("usr/bin/metallib");
+        assert_eq!(xcode_toolchain_root(&executable), Some(root));
+    }
+
+    #[test]
+    fn refuses_to_grant_an_unrelated_parent_directory() {
+        assert_eq!(
+            xcode_toolchain_root(Path::new("/Users/example/bin/metal")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filesystem_identity_follows_the_users_firmlink() {
+        assert_ne!(
+            filesystem_device(Path::new("/")).unwrap(),
+            filesystem_device(Path::new("/Users")).unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_xcode_toolchains_resolves_a_developer_directory_alias() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "corgi-xcode-alias-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed),
+        ));
+        let developer = temp.join("Xcode.app/Contents/Developer");
+        let toolchains = developer.join("Toolchains");
+        std::fs::create_dir_all(&toolchains).unwrap();
+        let alias = temp.join("SelectedDeveloper");
+        symlink(&developer, &alias).unwrap();
+
+        assert_eq!(
+            selected_xcode_toolchains(alias.to_str().unwrap()),
+            Some(std::fs::canonicalize(toolchains).unwrap())
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn reads_sealed_volume_identity_fields() {
+        let plist = r#"<?xml version="1.0"?>
+<plist><dict>
+<key>FilesystemType</key><string>apfs</string>
+<key>Sealed</key><string>Yes</string>
+<key>Writable</key><false/>
+<key>VolumeUUID</key><string>E9FD717E</string>
+</dict></plist>"#;
+        assert_eq!(plist_string(plist, "FilesystemType"), Some("apfs"));
+        assert_eq!(plist_string(plist, "Sealed"), Some("Yes"));
+        assert_eq!(plist_bool(plist, "Writable"), Some(false));
+        assert_eq!(plist_string(plist, "VolumeUUID"), Some("E9FD717E"));
+        assert_eq!(sealed_apfs_volume_uuid(plist), Some("E9FD717E"));
+        assert_eq!(
+            sealed_apfs_volume_uuid(&plist.replace("<false/>", "<true/>")),
+            None,
+        );
+    }
+
+    #[test]
+    fn discovery_uses_only_the_environment_actions_receive() {
+        let command = hermetic_apple_command(
+            "/usr/bin/env",
+            &[("PATH".into(), "/usr/bin:/bin".into())],
+            &[("TOOLCHAINS".into(), "selected".into())],
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("TOOLCHAINS".into(), "selected".into()),
+            ]),
+        );
+    }
+}
+
 /// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
 /// system dirs, the toolchain, the store, and keyed inputs; writes limited
 /// to the action's output and scratch dirs; no network. Children inherit it.
@@ -5799,8 +6066,12 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
     prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
-    // the Apple tool group, keyed collectively via the Xcode identity in
-    // the toolchain hash
+    for root in &ctx.metal_toolchain_roots {
+        let root = serde_json::to_string(&root.to_string_lossy()).unwrap();
+        prof.push_str(&format!("  (subpath {root})\n"));
+    }
+    // Apple tools bundled with Xcode are keyed collectively through its identity.
+    // Independently installed Metal tools were keyed and granted above.
     // /bin/sh dispatches to the variant selected in /private/var/select/sh,
     // so each system-provided implementation must retain the dispatcher's
     // process-exec capability.
@@ -5861,6 +6132,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         ctx.devdir.clone(),
         ctx.store.root.display().to_string(),
     ];
+    for root in &ctx.metal_toolchain_roots {
+        let root = serde_json::to_string(&root.to_string_lossy()).unwrap();
+        prof.push_str(&format!("  (subpath {root})\n"));
+    }
     // A workspace may itself live under the per-user temp directory. In that
     // case a broad cache grant would make every workspace file readable.
     for d in &ctx.darwin_dirs {

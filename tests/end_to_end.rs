@@ -795,6 +795,70 @@ fn main() {
     assert_success(&output, "build with a cold Apple compiler lookup");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn downloaded_metal_toolchain_executes_inside_the_sandbox() {
+    let metal = Command::new("/usr/bin/xcrun")
+        .args(["-sdk", "macosx", "--find", "metal"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|path| fs::canonicalize(path.trim()).ok());
+    let developer_toolchains = Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|path| fs::canonicalize(Path::new(path.trim()).join("Toolchains")).ok());
+    let Some(metal) = metal.filter(|metal| {
+        developer_toolchains
+            .as_ref()
+            .is_none_or(|toolchains| !metal.starts_with(toolchains))
+    }) else {
+        return;
+    };
+    assert!(metal.to_string_lossy().contains(".xctoolchain/"));
+
+    let directory = TestDirectory::new("downloaded-metal-toolchain");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        r#"use std::process::Command;
+
+fn main() {
+    for tool in ["metal", "metallib"] {
+        let status = Command::new("/usr/bin/xcrun")
+            .args(["-sdk", "macosx", tool, "--version"])
+            .status()
+            .unwrap_or_else(|error| panic!("failed to launch {tool}: {error}"));
+        assert!(status.success(), "{tool} failed with {status}");
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&output, "build using a downloaded Metal toolchain");
+}
+
 #[test]
 fn clean_expires_incremental_state_before_other_cached_data() {
     let directory = TestDirectory::new("clean-retention");
