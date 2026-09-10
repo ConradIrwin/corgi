@@ -1695,6 +1695,26 @@ struct ToolSpec {
     auth: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetalToolchainSpec {
+    #[serde(rename = "build-version")]
+    build_version: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AppleToolchains {
+    metal: Option<MetalToolchainSpec>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AppleSpec {
+    #[serde(default)]
+    toolchains: AppleToolchains,
+}
+
 #[derive(serde::Deserialize, Default)]
 struct EnvProbe {
     #[serde(skip)]
@@ -1724,6 +1744,8 @@ struct RootDef {
 struct CorgiToml {
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
+    #[serde(default)]
+    apple: AppleSpec,
     #[serde(default)]
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
@@ -3899,6 +3921,16 @@ fn build_inner(
     if let Ok(value) = std::env::var("HOME") {
         base_env.push(("HOME".to_string(), value));
     }
+    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
+    if host.contains("apple") {
+        if let Some(specification) = &corgi_toml.apple.toolchains.metal {
+            if config_env.iter().any(|(name, _)| name == "TOOLCHAINS") {
+                bail!("apple.toolchains.metal conflicts with TOOLCHAINS in .cargo/config.toml");
+            }
+            let toolchain = ensure_metal_component(specification, &base_env, &config_env)?;
+            base_env.push(("TOOLCHAINS".to_string(), toolchain));
+        }
+    }
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()
@@ -3977,7 +4009,6 @@ fn build_inner(
     // always-read inputs leads to an entry that re-validates the rest by
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
-    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
     let root_sets = corgi_toml.root_sets();
     let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
     let resolution_root_name = root.clone().or_else(|| {
@@ -6030,6 +6061,86 @@ fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>();
     normalized_paths.sort();
     sha256_hex(normalized_paths.join("\0").as_bytes())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XcodeComponentInfo {
+    build_version: String,
+    status: String,
+    toolchain_identifier: String,
+}
+
+fn installed_metal_component(
+    base_env: &[(String, String)],
+    config_env: &[(String, String)],
+) -> Result<Option<XcodeComponentInfo>> {
+    let mut command = hermetic_apple_command("/usr/bin/xcodebuild", base_env, config_env);
+    command.args(["-showComponent", "MetalToolchain", "-json"]);
+    let output = command
+        .output()
+        .context("querying the installed Metal toolchain")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("parsing xcodebuild Metal toolchain information")
+        .map(Some)
+}
+
+fn ensure_metal_component(
+    specification: &MetalToolchainSpec,
+    base_env: &[(String, String)],
+    config_env: &[(String, String)],
+) -> Result<String> {
+    if specification.build_version.is_empty() {
+        bail!("apple.toolchains.metal.build-version cannot be empty");
+    }
+    let installed = installed_metal_component(base_env, config_env)?;
+    let has_requested_build = installed.as_ref().is_some_and(|component| {
+        component.status == "installed" && component.build_version == specification.build_version
+    });
+    if !has_requested_build {
+        status!(
+            "Installing",
+            "Metal toolchain build {}",
+            specification.build_version
+        );
+        let mut command = hermetic_apple_command("/usr/bin/xcodebuild", base_env, config_env);
+        command.args([
+            "-downloadComponent",
+            "MetalToolchain",
+            "-buildVersion",
+            &specification.build_version,
+        ]);
+        let status = command
+            .status()
+            .context("starting the Metal toolchain download")?;
+        if !status.success() {
+            bail!(
+                "downloading Metal toolchain build {} failed with {status}",
+                specification.build_version
+            );
+        }
+    }
+
+    let component = installed_metal_component(base_env, config_env)?
+        .context("Metal toolchain is still unavailable after downloading it")?;
+    if component.status != "installed" || component.build_version != specification.build_version {
+        bail!(
+            "requested Metal toolchain build {}, but xcodebuild reports status `{}` and build `{}`",
+            specification.build_version,
+            component.status,
+            component.build_version
+        );
+    }
+    if component.toolchain_identifier.is_empty() {
+        bail!(
+            "Metal toolchain build {} has no toolchain identifier",
+            component.build_version
+        );
+    }
+    Ok(component.toolchain_identifier)
 }
 
 /// Finds Metal toolchains installed outside the selected Xcode bundle.

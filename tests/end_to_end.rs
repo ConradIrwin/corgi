@@ -898,28 +898,20 @@ fn main() {
 #[cfg(target_os = "macos")]
 #[test]
 fn downloaded_metal_toolchain_executes_inside_the_sandbox() {
-    let metal = Command::new("/usr/bin/xcrun")
-        .args(["-sdk", "macosx", "--find", "metal"])
+    let component = Command::new("/usr/bin/xcodebuild")
+        .args(["-showComponent", "MetalToolchain", "-json"])
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|path| fs::canonicalize(path.trim()).ok());
-    let developer_toolchains = Command::new("/usr/bin/xcode-select")
-        .arg("-p")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|path| fs::canonicalize(Path::new(path.trim()).join("Toolchains")).ok());
-    let Some(metal) = metal.filter(|metal| {
-        developer_toolchains
-            .as_ref()
-            .is_none_or(|toolchains| !metal.starts_with(toolchains))
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
+    let Some((build_version, identifier)) = component.as_ref().and_then(|component| {
+        Some((
+            component.get("buildVersion")?.as_str()?,
+            component.get("toolchainIdentifier")?.as_str()?,
+        ))
     }) else {
         return;
     };
-    assert!(metal.to_string_lossy().contains(".xctoolchain/"));
 
     let directory = TestDirectory::new("downloaded-metal-toolchain");
     let workspace = directory.path.join("workspace");
@@ -938,6 +930,9 @@ fn downloaded_metal_toolchain_executes_inside_the_sandbox() {
         r#"use std::process::Command;
 
 fn main() {
+    if let Ok(expected) = std::env::var("ASSERT_TOOLCHAINS") {
+        assert_eq!(std::env::var("TOOLCHAINS").as_deref(), Ok(expected.as_str()));
+    }
     for tool in ["metal", "metallib"] {
         let status = Command::new("/usr/bin/xcrun")
             .args(["-sdk", "macosx", tool, "--version"])
@@ -955,8 +950,21 @@ fn main() {
     )
     .unwrap();
 
+    let ambient = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(&ambient, "build using the ambient Metal toolchain");
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!("[apple.toolchains.metal]\nbuild-version = \"{build_version}\"\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        format!("[env]\nASSERT_TOOLCHAINS = \"{identifier}\"\n"),
+    )
+    .unwrap();
     let output = invoke_corgi_with_store(&workspace, "build", [], &store);
-    assert_success(&output, "build using a downloaded Metal toolchain");
+    assert_success(&output, "build using a configured Metal toolchain");
 }
 
 #[test]
