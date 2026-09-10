@@ -199,6 +199,105 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
 }
 
 #[test]
+fn workspace_member_uses_its_selected_project_config() {
+    let directory = TestDirectory::new("member-config");
+    let workspace = directory.path.join("workspace");
+    let member = workspace.join("member");
+    let store = directory.path.join("store");
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::create_dir_all(member.join(".cargo")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("corgi.toml"), "").unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[env]\nROOT_SETTING = \"root\"\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        member.join(".cargo/config.toml"),
+        "[env]\nSELECTED_PROJECT_SETTING = \"member\"\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("src/main.rs"),
+        "fn main() {\n    println!(\"{} {}\", env!(\"ROOT_SETTING\"), env!(\"SELECTED_PROJECT_SETTING\"));\n}\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&member, "run", [], &store);
+    assert_success(&output, "run workspace member with its own config");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "root member\n");
+}
+
+#[test]
+fn build_std_compiles_and_exports_a_wasm_library() {
+    let directory = TestDirectory::new("build-std");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(workspace.join("corgi.toml"), "").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\ncrate-type = [\"cdylib\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[target.wasm32-unknown-unknown]\n\
+         rustflags = [\"-C\", \"panic=unwind\"]\n\
+         [env]\n\
+         RUSTC_BOOTSTRAP = \"1\"\n\
+         [unstable]\n\
+         build-std = [\"std\", \"panic_abort\", \"panic_unwind\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi(
+        &workspace,
+        "build",
+        ["--release", "--target", "wasm32-unknown-unknown"],
+    );
+
+    assert_success(&output, "build std-backed Wasm library");
+    assert!(workspace
+        .join("target/wasm32-unknown-unknown/release")
+        .join(format!("{}.wasm", directory.package_name.replace('-', "_")))
+        .is_file());
+}
+
+#[test]
 fn package_selection_infers_its_feature_unification_root() {
     let output = run_test_compile("root-inference", ["-p", "app"]);
 
@@ -2552,14 +2651,19 @@ fn debug_objects_are_exported_for_dylibs_when_crate_type_order_changes() {
         let profile = workspace.join("target/debug");
         let report = report_for_workspace(&store, &workspace);
         let unit = report_unit(&report, &directory.package_name, "compile");
-        let dylib_name = unit["outputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|output| output["name"].as_str())
-            .find(|name| name.ends_with(".dylib"))
-            .expect("missing exported dylib");
-        let dylib = profile.join(dylib_name);
+        assert!(
+            unit["outputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|output| output["name"].as_str())
+                .any(|name| name.ends_with(".dylib")),
+            "missing dylib compiler output"
+        );
+        let dylib = profile.join(format!(
+            "lib{}.dylib",
+            directory.package_name.replace('-', "_")
+        ));
         let debug_directory = dylib.with_file_name(format!(
             "{}-debug",
             dylib.file_name().unwrap().to_string_lossy()

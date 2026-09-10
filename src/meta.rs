@@ -92,6 +92,8 @@ pub struct UgUnit {
     pub platform: Option<String>,
     pub mode: String,
     #[serde(default)]
+    pub is_std: bool,
+    #[serde(default)]
     pub features: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<UgDep>,
@@ -188,6 +190,12 @@ impl UgProfile {
 pub struct UgDep {
     pub index: usize,
     pub extern_crate_name: String,
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub noprelude: bool,
+    #[serde(default)]
+    pub nounused: bool,
 }
 
 pub fn lib_target(p: &Package) -> Option<&Target> {

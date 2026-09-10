@@ -1,11 +1,12 @@
 //! Workspace `.cargo/config.toml` resolution.
 //!
 //! corgi honors the narrow slice of cargo configuration that changes what
-//! gets compiled: `build.rustflags`, `target.<spec>.rustflags`, and `[env]`.
+//! gets compiled: rustflags, configured environment, and `build-std`.
 //! Everything else that would alter build semantics is a hard error, so a
 //! config the tool cannot faithfully reproduce never builds silently wrong.
-//! Only the workspace's own `.cargo/config.toml` is read: configs in parent
-//! directories or CARGO_HOME are machine-local state and stay invisible.
+//! Configuration is bounded by the Corgi project: the root config is the
+//! baseline and the selected directory's config is the override. Configs above
+//! that boundary and in CARGO_HOME are machine-local state and stay invisible.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -16,9 +17,37 @@ pub struct CargoConfig {
     target_rustflags: Vec<(String, Vec<String>)>,
     /// `[env]` entries, sorted by name.
     pub env: Vec<(String, String)>,
+    /// Standard-library crates requested through `[unstable].build-std`.
+    pub build_std: Vec<String>,
 }
 
 impl CargoConfig {
+    /// Applies a more specific Cargo configuration.
+    pub fn merge(&mut self, overlay: Self) {
+        self.build_rustflags.extend(overlay.build_rustflags);
+        for (spec, flags) in overlay.target_rustflags {
+            if let Some((_, existing)) = self
+                .target_rustflags
+                .iter_mut()
+                .find(|(existing, _)| *existing == spec)
+            {
+                existing.extend(flags);
+            } else {
+                self.target_rustflags.push((spec, flags));
+            }
+        }
+        for (name, value) in overlay.env {
+            if let Some((_, existing)) = self.env.iter_mut().find(|(existing, _)| *existing == name)
+            {
+                *existing = value;
+            } else {
+                self.env.push((name, value));
+            }
+        }
+        self.env.sort();
+        self.build_std.extend(overlay.build_std);
+    }
+
     /// Rustflags for a compilation target triple, with cargo's precedence:
     /// all matching `target.<triple>` and `target.'cfg(...)'` entries are
     /// concatenated; `build.rustflags` applies only when no target entry
@@ -56,9 +85,7 @@ impl CargoConfig {
     }
 }
 
-/// Only the selected project's configuration is an input to Corgi's actions.
-/// In particular, a standalone nested workspace does not inherit its parent's
-/// settings. Cargo subprocesses receive the returned path explicitly.
+/// Reads the Cargo configuration directly inside `start`.
 pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>)> {
     // Cargo prefers the legacy extensionless name when both exist.
     for name in [".cargo/config", ".cargo/config.toml"] {
@@ -75,6 +102,7 @@ pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>
             build_rustflags: Vec::new(),
             target_rustflags: Vec::new(),
             env: Vec::new(),
+            build_std: Vec::new(),
         },
         None,
     ))
@@ -86,6 +114,7 @@ fn parse(text: &str) -> Result<CargoConfig> {
     let mut build_rustflags = Vec::new();
     let mut target_rustflags = Vec::new();
     let mut env = Vec::new();
+    let mut build_std = Vec::new();
     for (section, value) in table {
         match section.as_str() {
             "build" => {
@@ -142,6 +171,17 @@ fn parse(text: &str) -> Result<CargoConfig> {
                     env.push((name.clone(), val.to_string()));
                 }
             }
+            "unstable" => {
+                let entries = value.as_table().context("[unstable] is not a table")?;
+                for (key, value) in entries {
+                    match key.as_str() {
+                        "build-std" => {
+                            build_std = string_list(value, "unstable.build-std")?;
+                        }
+                        other => bail!("unsupported .cargo/config key unstable.{other}"),
+                    }
+                }
+            }
             // Command aliases and network/UI preferences never change what
             // gets compiled.
             "alias"
@@ -163,6 +203,7 @@ fn parse(text: &str) -> Result<CargoConfig> {
         build_rustflags,
         target_rustflags,
         env,
+        build_std,
     })
 }
 
@@ -181,6 +222,19 @@ fn flag_list(value: &toml::Value) -> Result<Vec<String>> {
             .collect(),
         _ => bail!("rustflags must be a string or an array of strings"),
     }
+}
+
+fn string_list(value: &toml::Value, name: &str) -> Result<Vec<String>> {
+    value
+        .as_array()
+        .with_context(|| format!("{name} must be an array of strings"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .with_context(|| format!("{name} entries must be strings"))
+        })
+        .collect()
 }
 
 /// The target-triple facts simple `cfg()` predicates can ask about.
@@ -532,6 +586,70 @@ mod tests {
                 ("ZED_B".to_string(), "two".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn build_std_crates_are_parsed() {
+        let config = parse(
+            r#"
+            [unstable]
+            build-std = ["std", "panic_abort", "panic_unwind"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.build_std, ["std", "panic_abort", "panic_unwind"]);
+    }
+
+    #[test]
+    fn specific_config_extends_arrays_and_overrides_environment() {
+        let mut root = parse(
+            r#"
+            [build]
+            rustflags = ["--cfg", "root"]
+            [target.wasm32-unknown-unknown]
+            rustflags = ["-C", "target-feature=+bulk-memory"]
+            [env]
+            SHARED = "root"
+            ROOT_ONLY = "root"
+            [unstable]
+            build-std = ["std"]
+            "#,
+        )
+        .unwrap();
+        let selected = parse(
+            r#"
+            [build]
+            rustflags = ["--cfg", "selected"]
+            [target.wasm32-unknown-unknown]
+            rustflags = ["-C", "panic=unwind"]
+            [env]
+            SHARED = "selected"
+            SELECTED_ONLY = "selected"
+            [unstable]
+            build-std = ["panic_unwind"]
+            "#,
+        )
+        .unwrap();
+
+        root.merge(selected);
+
+        assert_eq!(
+            root.rustflags_for("aarch64-apple-darwin").unwrap(),
+            ["--cfg", "root", "--cfg", "selected"]
+        );
+        assert_eq!(
+            root.rustflags_for("wasm32-unknown-unknown").unwrap(),
+            ["-C", "target-feature=+bulk-memory", "-C", "panic=unwind"]
+        );
+        assert_eq!(
+            root.env,
+            [
+                ("ROOT_ONLY".to_string(), "root".to_string()),
+                ("SELECTED_ONLY".to_string(), "selected".to_string()),
+                ("SHARED".to_string(), "selected".to_string()),
+            ]
+        );
+        assert_eq!(root.build_std, ["std", "panic_unwind"]);
     }
 
     #[test]

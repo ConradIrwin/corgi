@@ -76,7 +76,7 @@ struct UnitDep {
     role: DependencyRole,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum DependencyRole {
     Extern(String),
     BuildScriptCompile,
@@ -114,6 +114,7 @@ struct Unit {
     /// false = compiled for --target
     host: bool,
     is_root: bool,
+    is_std: bool,
     target: Target,
     features: Vec<String>,
     deps: Vec<UnitDep>,
@@ -288,6 +289,10 @@ fn binary_export_path(ctx: &Ctx, index: usize, output_name: &str) -> PathBuf {
             directory.push("build");
             directory.push(&ctx.idents[index]);
             directory.push(output_name);
+        }
+        Kind::Lib if unit.is_root => {
+            let extra_filename = format!("-{}", action_extra_filename(ctx, index));
+            directory.push(output_name.replace(&extra_filename, ""));
         }
         Kind::Lib | Kind::Bsr => directory.push(output_name),
     }
@@ -474,6 +479,8 @@ pub struct Ctx {
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
+    /// Build standard-library units from this toolchain's pinned rust-src.
+    build_std: bool,
     zig: Option<ZigRuntime>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
@@ -1378,11 +1385,33 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 ));
             }
             environment.sort();
-            let rustflags = if unit.host {
+            let mut rustflags = if unit.host {
                 ctx.host_rustflags.clone()
             } else {
                 ctx.target_rustflags.clone()
             };
+            if ctx.build_std {
+                rustflags.extend(["-Z".to_string(), "unstable-options".to_string()]);
+            }
+            if unit.is_std {
+                rustflags.extend(["-Z".to_string(), "force-unstable-if-unmarked".to_string()]);
+                if unit.target.name == "std" {
+                    rustflags.extend([
+                        "--cfg".to_string(),
+                        "backtrace_in_libstd".to_string(),
+                        "--check-cfg".to_string(),
+                        "cfg(netbsd10)".to_string(),
+                        "--check-cfg".to_string(),
+                        "cfg(no_global_oom_handling)".to_string(),
+                        "--check-cfg".to_string(),
+                        "cfg(restricted_std)".to_string(),
+                        "--check-cfg".to_string(),
+                        "cfg(backtrace_in_libstd)".to_string(),
+                        "--check-cfg".to_string(),
+                        "cfg(vxworks_lt_25_09)".to_string(),
+                    ]);
+                }
+            }
             let lint_flags = if ctx.clippy && package.source.is_none() {
                 ctx.lints[unit.pkg].with_clippy.clone()
             } else {
@@ -1864,6 +1893,30 @@ fn find_corgi_toml(dir: &Path) -> Option<PathBuf> {
         cur = d.parent();
     }
     None
+}
+
+fn cargo_config_root(dir: &Path, manifest: &Path, corgi_toml: Option<&Path>) -> Result<PathBuf> {
+    let contents =
+        fs::read_to_string(manifest).with_context(|| format!("reading {}", manifest.display()))?;
+    let parsed: toml::Value =
+        toml::from_str(&contents).with_context(|| format!("parsing {}", manifest.display()))?;
+    if parsed.get("workspace").is_some() {
+        return Ok(dir.to_path_buf());
+    }
+    if let Some(workspace) = parsed
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        return dir
+            .join(workspace)
+            .canonicalize()
+            .with_context(|| format!("resolving package.workspace `{workspace}`"));
+    }
+    Ok(corgi_toml
+        .and_then(Path::parent)
+        .unwrap_or(dir)
+        .to_path_buf())
 }
 
 fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
@@ -2857,13 +2910,20 @@ fn touch_tool_marker(dir: &Path) {
 
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
 /// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
-fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBuf> {
+fn ensure_toolchain(
+    store: &Store,
+    channel: &str,
+    triple: &str,
+    build_std: bool,
+) -> Result<PathBuf> {
+    let suffix = if build_std { "-build-std" } else { "" };
     let dest = store
         .root
         .join("tools")
-        .join(format!("rust-{channel}-{triple}"));
+        .join(format!("rust-{channel}-{triple}{suffix}"));
     let bin = dest.join("bin");
     if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
+        ensure_build_std_linker_runtime(&dest, triple, build_std)?;
         touch_tool_marker(&dest);
         return Ok(bin);
     }
@@ -2891,12 +2951,31 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
     let work = store.tmp_path("toolchain");
     let install = work.join("install");
     fs::create_dir_all(&install)?;
-    for (comp, payload) in [
-        ("rustc", "rustc".to_string()),
-        ("rust-std", format!("rust-std-{triple}")),
-        ("cargo", "cargo".to_string()),
-    ] {
-        let name = format!("{comp}-{ver}-{triple}");
+    let mut components = vec![
+        (
+            "rustc",
+            format!("rustc-{ver}-{triple}"),
+            "rustc".to_string(),
+        ),
+        (
+            "rust-std",
+            format!("rust-std-{ver}-{triple}"),
+            format!("rust-std-{triple}"),
+        ),
+        (
+            "cargo",
+            format!("cargo-{ver}-{triple}"),
+            "cargo".to_string(),
+        ),
+    ];
+    if build_std {
+        components.push((
+            "rust-src",
+            format!("rust-src-{ver}"),
+            "rust-src".to_string(),
+        ));
+    }
+    for (comp, name, payload) in components {
         let url = format!("{base}/{name}.tar.xz");
         let tarball = work.join(format!("{name}.tar.xz"));
         let st = Command::new("curl")
@@ -2943,9 +3022,41 @@ fn ensure_toolchain(store: &Store, channel: &str, triple: &str) -> Result<PathBu
         Err(_) if dest.join("bin/rustc").is_file() => {} // concurrent racer won
         Err(e) => return Err(e).context("publishing toolchain"),
     }
+    ensure_build_std_linker_runtime(&dest, triple, build_std)?;
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join("bin"))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_build_std_linker_runtime(dest: &Path, triple: &str, build_std: bool) -> Result<()> {
+    if build_std {
+        let runtime = dest.join("lib/libLLVM.dylib");
+        if !runtime.exists() {
+            return Ok(());
+        }
+        let link = dest
+            .join("lib/rustlib")
+            .join(triple)
+            .join("lib/libLLVM.dylib");
+        if fs::symlink_metadata(&link).is_err() {
+            match std::os::unix::fs::symlink("../../../libLLVM.dylib", &link) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("linking build-std linker runtime at {}", link.display())
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_build_std_linker_runtime(_: &Path, _: &str, _: bool) -> Result<()> {
+    Ok(())
 }
 
 /// Install the rust-src component as its OWN tools/ entry — never inside
@@ -3021,11 +3132,11 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
 
 /// Add the clippy component's driver to an installed toolchain (single
 /// atomic file rename; presence = complete). Only clippy mode pays for it.
-fn ensure_clippy(store: &Store, channel: &str, triple: &str) -> Result<()> {
-    let toolchain = store
-        .root
-        .join("tools")
-        .join(format!("rust-{channel}-{triple}"));
+fn ensure_clippy(store: &Store, channel: &str, triple: &str, build_std: bool) -> Result<()> {
+    let toolchain = store.root.join("tools").join(format!(
+        "rust-{channel}-{triple}{}",
+        if build_std { "-build-std" } else { "" }
+    ));
     let driver = toolchain.join("bin/clippy-driver");
     if driver.is_file() {
         return Ok(());
@@ -3484,11 +3595,12 @@ fn finish_report_stage(recorder: &crate::report::Recorder, name: &str, start_ns:
 }
 
 /// Start a Cargo planning command without discovering config beside or above
-/// the workspace. The selected workspace config is supplied explicitly.
+/// the workspace. Project configs are supplied explicitly from least to most
+/// specific.
 fn isolated_cargo_command(
     cargo: &Path,
     cargo_home: &Path,
-    cargo_config_path: Option<&Path>,
+    cargo_config_paths: &[PathBuf],
 ) -> Command {
     let mut command = Command::new(cargo);
     command
@@ -3496,7 +3608,7 @@ fn isolated_cargo_command(
         // Cargo discovers config from cwd rather than --manifest-path. The
         // filesystem root has no project ancestors to inspect.
         .current_dir(Path::new("/"));
-    if let Some(path) = cargo_config_path {
+    for path in cargo_config_paths {
         command.arg("--config").arg(path);
     }
     command
@@ -3524,7 +3636,7 @@ pub fn fmt(
 
     let channel = read_toolchain_pin(&dir)?;
     let host = host_triple()?;
-    let toolchain_bin = ensure_toolchain(&store, &channel, &host)?;
+    let toolchain_bin = ensure_toolchain(&store, &channel, &host, false)?;
     let rustfmt_bin = ensure_rustfmt(&store, &channel, &host)?;
     let cargo = toolchain_bin.join("cargo");
     let rustc = toolchain_bin.join("rustc");
@@ -3708,7 +3820,15 @@ fn build_inner(
             bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
     }
-    let (cargo_config, cargo_config_path) = crate::config::discover(&dir)?;
+    let corgi_toml_path = find_corgi_toml(&dir);
+    let config_root = cargo_config_root(&dir, &manifest, corgi_toml_path.as_deref())?;
+    let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
+    let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
+    if config_root != dir {
+        let (selected_config, selected_config_path) = crate::config::discover(&dir)?;
+        cargo_config.merge(selected_config);
+        cargo_config_paths.extend(selected_config_path);
+    }
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
@@ -3727,19 +3847,25 @@ fn build_inner(
         Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
         None => requested_target,
     };
-    ensure_toolchain(&store, &channel, &host_guess)?;
-    // Debugger convenience, deliberately outside the sysroot (see
-    // ensure_rust_src). Failure is non-fatal: builds don't need sources.
-    if let Err(e) = ensure_rust_src(&store, &channel) {
-        eprintln!("corgi warning: rust-src install failed ({e}); std source display in debuggers unavailable");
+    let build_std = !cargo_config.build_std.is_empty();
+    ensure_toolchain(&store, &channel, &host_guess, build_std)?;
+    if !build_std {
+        // Debugger convenience, deliberately outside the sysroot (see
+        // ensure_rust_src). Failure is non-fatal: builds don't need sources.
+        if let Err(e) = ensure_rust_src(&store, &channel) {
+            eprintln!(
+                "corgi warning: rust-src install failed ({e}); \
+                 std source display in debuggers unavailable"
+            );
+        }
     }
     // Hand actions only the *logical* toolchain path (via the store alias):
     // physical per-store paths leak into ld's UUID (it hashes the link
     // command line, including libstd rlib paths) and into build-script keys.
-    let toolchain_logical = store
-        .logical_root()
-        .join("tools")
-        .join(format!("rust-{channel}-{host_guess}"));
+    let toolchain_logical = store.logical_root().join("tools").join(format!(
+        "rust-{channel}-{host_guess}{}",
+        if build_std { "-build-std" } else { "" }
+    ));
     let rustc = toolchain_logical.join("bin/rustc").display().to_string();
     let cargo_bin = toolchain_logical.join("bin/cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
@@ -3802,7 +3928,7 @@ fn build_inner(
     let cfg_env = cargo_cfg_env(&cfg_out);
     let mut target_std_libdir: Option<String> = None;
     if let Some(t) = &target {
-        if t != &host_guess {
+        if t != &host_guess && !build_std {
             ensure_target_std(&store, &channel, t)?;
             target_std_libdir = Some(
                 store
@@ -3934,13 +4060,10 @@ fn build_inner(
             // is pinned (cargo otherwise resolves `rustc` from PATH, and a
             // rustup shim picks its toolchain by cwd). Run from the filesystem
             // root so Cargo cannot discover workspace or parent configs, then
-            // explicitly provide the one workspace config corgi parsed.
+            // explicitly provide the bounded project configs Corgi parsed.
             let cargo_command = || {
-                let mut command = isolated_cargo_command(
-                    &cargo_bin,
-                    Path::new(&cargo_home),
-                    cargo_config_path.as_deref(),
-                );
+                let mut command =
+                    isolated_cargo_command(&cargo_bin, Path::new(&cargo_home), &cargo_config_paths);
                 command.env("RUSTC", &rustc);
                 command
             };
@@ -3948,10 +4071,16 @@ fn build_inner(
             fetch_locked
                 .args(["fetch", "--locked", "--manifest-path"])
                 .arg(&manifest);
+            if build_std {
+                fetch_locked.env("RUSTC_BOOTSTRAP", "1");
+            }
             if capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked").is_err() {
                 status!("Updating", "Cargo.lock");
                 let mut fetch = cargo_command();
                 fetch.args(["fetch", "--manifest-path"]).arg(&manifest);
+                if build_std {
+                    fetch.env("RUSTC_BOOTSTRAP", "1");
+                }
                 capture_with_live_stderr(&mut fetch, "cargo fetch")?;
             }
             // metadata for package details only (paths, links, metadata tables);
@@ -3959,7 +4088,25 @@ fn build_inner(
             let mut meta_cmd = cargo_command();
             meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
             meta_cmd.arg("--manifest-path").arg(&manifest);
-            let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
+            if build_std {
+                meta_cmd.env("RUSTC_BOOTSTRAP", "1");
+            }
+            let mut meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
+            if build_std {
+                let rust_library_manifest =
+                    toolchain_logical.join("lib/rustlib/src/rust/library/Cargo.toml");
+                let mut standard_library_metadata = cargo_command();
+                standard_library_metadata
+                    .args(["metadata", "--format-version", "1", "--locked"])
+                    .arg("--manifest-path")
+                    .arg(&rust_library_manifest)
+                    .env("RUSTC_BOOTSTRAP", "1");
+                let standard_library_json = capture_with_live_stderr(
+                    &mut standard_library_metadata,
+                    "cargo metadata for build-std",
+                )?;
+                meta_json = merge_package_metadata(&meta_json, &standard_library_json)?;
+            }
             let meta: Metadata =
                 serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
             // Feature unification over fixed roots (the whole workspace, or
@@ -4013,6 +4160,18 @@ fn build_inner(
                 &mut ug_cmd,
                 &format!("cargo {unit_graph_command} --unit-graph"),
             )?;
+            if build_std {
+                meta_json = add_missing_unit_packages(
+                    meta_json,
+                    &ug_json,
+                    &cargo_bin,
+                    Path::new(&cargo_home),
+                    &cargo_config_paths,
+                    &rustc,
+                )?;
+            }
+            let meta: Metadata =
+                serde_json::from_str(&meta_json).context("parsing complete cargo metadata")?;
             save_plan(&store, &plan_ptr, &dir, &meta, &meta_json, &ug_json)?;
             Ok((meta_json, ug_json))
         }
@@ -4026,6 +4185,16 @@ fn build_inner(
         None => resolve_now()?,
     };
     let mut meta: Metadata = serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
+    if let Some(corgi_toml_path) = &corgi_toml_path {
+        if Path::new(&meta.workspace_root) != config_root {
+            bail!(
+                "{} identifies the Corgi project root as {}, but Cargo found workspace root {}",
+                corgi_toml_path.display(),
+                config_root.display(),
+                meta.workspace_root
+            );
+        }
+    }
     // A cached plan says nothing about dependency sources still being
     // extracted in the store (clean may have trimmed them); verify cheaply
     // and re-resolve once if anything is missing.
@@ -4357,7 +4526,7 @@ fn build_inner(
     let mut clippy_id = String::new();
     let mut clippy_conf: Option<PathBuf> = None;
     if matches!(mode, Mode::Clippy) {
-        ensure_clippy(&store, &channel, &host_guess)?;
+        ensure_clippy(&store, &channel, &host_guess, build_std)?;
         clippy_driver = format!("{}/bin/clippy-driver", toolchain_logical.display());
         let version = capture(Command::new(&clippy_driver).arg("-V"), "clippy-driver -V")?;
         let mut conf_hash = String::new();
@@ -4523,19 +4692,6 @@ fn build_inner(
     let pool_logical = store.logical_root().join("pool");
     let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
-    if let Some(config_path) = &cargo_config_path {
-        let config_location = config_path
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace cargo config has .cargo parent");
-        if config_location != Path::new(&workspace_root) {
-            bail!(
-                ".cargo/config found at {} but the workspace root is {}; corgi only honors the workspace's own config",
-                config_location.display(),
-                workspace_root
-            );
-        }
-    }
     let report_unit_keys = report_unit_keys(&meta, &units, &logical_pkg_ids);
     let extra_inputs = ExtraInputs::resolve(
         &corgi_toml.extra_inputs,
@@ -4576,6 +4732,7 @@ fn build_inner(
         tools: tools_rt,
         env_probes,
         target,
+        build_std,
         zig: zig_runtime,
         timings,
         incremental: !no_incremental,
@@ -5140,6 +5297,101 @@ fn save_plan(
     store.save_action(plan_ptr, serde_json::to_string(&entry)?.as_bytes())
 }
 
+/// Adds Cargo's separately reported standard-library packages to workspace metadata.
+fn merge_package_metadata(primary: &str, additional: &str) -> Result<String> {
+    let mut primary: serde_json::Value =
+        serde_json::from_str(primary).context("parsing primary cargo metadata")?;
+    let additional: serde_json::Value =
+        serde_json::from_str(additional).context("parsing additional cargo metadata")?;
+    let primary_packages = primary
+        .get_mut("packages")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("primary cargo metadata has no packages array")?;
+    let additional_packages = additional
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .context("additional cargo metadata has no packages array")?;
+    let mut package_ids = primary_packages
+        .iter()
+        .filter_map(|package| package.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for package in additional_packages {
+        let id = package
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("cargo metadata package has no id")?;
+        if package_ids.insert(id.to_string()) {
+            primary_packages.push(package.clone());
+        }
+    }
+    serde_json::to_string(&primary).context("serializing merged cargo metadata")
+}
+
+fn add_missing_unit_packages(
+    mut metadata: String,
+    unit_graph: &str,
+    cargo: &Path,
+    cargo_home: &Path,
+    cargo_config_paths: &[PathBuf],
+    rustc: &str,
+) -> Result<String> {
+    let graph: meta::UnitGraph =
+        serde_json::from_str(unit_graph).context("parsing unit graph for package metadata")?;
+    let parsed: Metadata =
+        serde_json::from_str(&metadata).context("parsing cargo metadata for package lookup")?;
+    let known = parsed
+        .packages
+        .iter()
+        .map(|package| package.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut missing = graph
+        .units
+        .iter()
+        .map(|unit| unit.pkg_id.as_str())
+        .filter(|id| !known.contains(id))
+        .collect::<BTreeSet<_>>();
+    while let Some(id) = missing.pop_first() {
+        let coordinate = id
+            .strip_prefix("registry+")
+            .and_then(|id| id.rsplit_once('#').map(|(_, coordinate)| coordinate))
+            .and_then(|coordinate| coordinate.rsplit_once('@'))
+            .with_context(|| format!("unit-graph package {id} missing from metadata"))?;
+        let directory_name = format!("{}-{}", coordinate.0, coordinate.1);
+        let registry_sources = cargo_home.join("registry/src");
+        let manifest = fs::read_dir(&registry_sources)
+            .with_context(|| format!("reading {}", registry_sources.display()))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join(&directory_name).join("Cargo.toml"))
+            .find(|manifest| manifest.is_file())
+            .with_context(|| format!("source for unit-graph package {id} is not downloaded"))?;
+        let mut command = isolated_cargo_command(cargo, cargo_home, cargo_config_paths);
+        command
+            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .env("RUSTC", rustc);
+        let package_metadata =
+            capture_with_live_stderr(&mut command, "cargo metadata for build-std dependency")?;
+        let mut package_metadata: serde_json::Value = serde_json::from_str(&package_metadata)
+            .context("parsing build-std dependency metadata")?;
+        let package = package_metadata
+            .get_mut("packages")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|packages| packages.first_mut())
+            .context("build-std dependency metadata has no package")?;
+        package["id"] = serde_json::Value::String(id.to_string());
+        package["source"] = serde_json::Value::String(
+            id.split_once('#')
+                .map(|(source, _)| source)
+                .unwrap_or(id)
+                .to_string(),
+        );
+        metadata = merge_package_metadata(&metadata, &serde_json::to_string(&package_metadata)?)?;
+    }
+    Ok(metadata)
+}
+
 fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd.output().with_context(|| format!("running {what}"))?;
     if !out.status.success() {
@@ -5340,6 +5592,7 @@ fn translate_unit_graph(
             test_harness,
             host: u.platform.is_none(),
             is_root: false,
+            is_std: u.is_std,
             target: u.target.clone(),
             features: u.features.clone(),
             deps: vec![],
@@ -5351,7 +5604,22 @@ fn translate_unit_graph(
         let mut deps = Vec::new();
         for d in &u.dependencies {
             let role = if matches!(kinds[d.index], Kind::Lib) && !matches!(kinds[i], Kind::Bsr) {
-                DependencyRole::Extern(d.extern_crate_name.clone())
+                let mut modifiers = Vec::new();
+                if units[i].is_std && !d.public {
+                    modifiers.push("priv");
+                }
+                if d.noprelude {
+                    modifiers.push("noprelude");
+                }
+                if d.nounused {
+                    modifiers.push("nounused");
+                }
+                let extern_name = if modifiers.is_empty() {
+                    d.extern_crate_name.clone()
+                } else {
+                    format!("{}:{}", modifiers.join(","), d.extern_crate_name)
+                };
+                DependencyRole::Extern(extern_name)
             } else {
                 match (kinds[i], kinds[d.index]) {
                     (Kind::Bsr, Kind::Bsc) => DependencyRole::BuildScriptCompile,
@@ -8686,7 +8954,7 @@ fn compile(
         cmd.env("OUT_DIR", ctx.out_dir_logical(&out_key));
     }
 
-    let target_sysroot = (!unit.host)
+    let target_sysroot = (!unit.host && !ctx.build_std)
         .then(|| {
             ctx.target_std_libdir
                 .as_deref()
@@ -9907,5 +10175,60 @@ mod unit_graph_tests {
             integration_test.deps[0].role,
             DependencyRole::BinaryExecutable
         ));
+    }
+
+    #[test]
+    fn build_std_units_preserve_cargo_extern_modifiers() {
+        let graph: UnitGraph = serde_json::from_value(serde_json::json!({
+            "roots": [0],
+            "units": [
+                {
+                    "pkg_id": "std",
+                    "target": {
+                        "name": "std",
+                        "kind": ["rlib"],
+                        "crate_types": ["rlib"],
+                        "src_path": "library/std/src/lib.rs",
+                        "edition": "2024"
+                    },
+                    "platform": "wasm32-unknown-unknown",
+                    "mode": "build",
+                    "is_std": true,
+                    "features": [],
+                    "dependencies": [{
+                        "index": 1,
+                        "extern_crate_name": "core",
+                        "public": false,
+                        "noprelude": true,
+                        "nounused": true
+                    }]
+                },
+                {
+                    "pkg_id": "core",
+                    "target": {
+                        "name": "core",
+                        "kind": ["rlib"],
+                        "crate_types": ["rlib"],
+                        "src_path": "library/core/src/lib.rs",
+                        "edition": "2024"
+                    },
+                    "platform": "wasm32-unknown-unknown",
+                    "mode": "build",
+                    "is_std": true,
+                    "features": [],
+                    "dependencies": []
+                }
+            ]
+        }))
+        .unwrap();
+        let packages = HashMap::from([("std".to_string(), 0), ("core".to_string(), 1)]);
+
+        let units = translate_unit_graph(&graph, &packages, None, &HashSet::new()).unwrap();
+
+        assert!(units[0].is_std);
+        assert_eq!(
+            units[0].deps[0].role,
+            DependencyRole::Extern("priv,noprelude,nounused:core".to_string())
+        );
     }
 }
