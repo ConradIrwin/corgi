@@ -12,6 +12,7 @@
 //! translated by a per-host [`Sandbox`] implementation.
 
 use anyhow::Result;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,10 +35,51 @@ pub struct Environment {
     pub cargo_home: String,
     pub rustup_home: String,
     /// Active Xcode or Command Line Tools developer directory on macOS.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub developer_dir: String,
     /// Independently downloaded, identity-checked Metal toolchains on macOS.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub metal_toolchain_roots: Vec<PathBuf>,
+    /// Pinned host loader, libraries, and shell used by Linux actions.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub linux_runtime: Option<LinuxRuntime>,
     pub workspace_root: String,
+}
+
+#[derive(Clone)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub struct LinuxRuntime {
+    pub identity: String,
+    pub root: PathBuf,
+    pub loader: PathBuf,
+    pub library_dirs: Vec<PathBuf>,
+    pub shell: PathBuf,
+}
+
+impl LinuxRuntime {
+    /// Run a GNU/Linux tool through the pinned loader. This also works before
+    /// Bubblewrap exists, which is necessary for Cargo's planning probes on
+    /// hosts such as NixOS that have no ambient FHS loader.
+    pub fn command(&self, program: &Path) -> Command {
+        let mut command = Command::new(&self.loader);
+        command
+            .arg("--library-path")
+            .arg(self.library_path())
+            .arg(program);
+        command
+    }
+
+    /// Cargo launches rustc itself while resolving unit graphs. Route that
+    /// child through the same loader rather than relying on the host.
+    pub fn configure_cargo(&self, command: &mut Command) {
+        command
+            .env("LD_LIBRARY_PATH", self.library_path())
+            .env("RUSTC_WRAPPER", &self.loader);
+    }
+
+    fn library_path(&self) -> OsString {
+        std::env::join_paths(&self.library_dirs).expect("runtime paths contain no separator")
+    }
 }
 
 impl Environment {

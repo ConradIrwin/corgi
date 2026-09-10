@@ -16,11 +16,9 @@ use std::process::Command;
 
 const BWRAP: &str = "bwrap";
 
-/// System directories an action may read. These hold the dynamic loader and
-/// the C library that the toolchain's own binaries need, plus the machine
-/// description tools consult (`/proc`, `/sys`, `/etc`). Deliberately absent:
-/// `/usr/bin` and friends, so no ambient tool is runnable.
-const SYSTEM_READS: [&str; 6] = ["/etc", "/sys", "/usr/lib", "/usr/lib64", "/lib", "/lib64"];
+/// Host configuration and machine description. Executables, the dynamic
+/// loader, and libraries come from the pinned managed runtime below.
+const SYSTEM_READS: [&str; 2] = ["/etc", "/sys"];
 
 fn executable() -> Result<PathBuf> {
     std::env::var_os("PATH")
@@ -87,9 +85,36 @@ impl Sandbox for Bubblewrap {
         for directory in SYSTEM_READS {
             bind(&mut arguments, READ_ONLY, Path::new(directory));
         }
-        // Shell-based build steps are as keyed as the script that spawns
-        // them; the shell finds nothing on PATH that is not already keyed.
-        bind(&mut arguments, READ_ONLY, Path::new("/bin/sh"));
+        let runtime = environment
+            .linux_runtime
+            .as_ref()
+            .expect("Linux sandbox requires a managed runtime");
+        for directory in ["/lib", "/lib64", "/usr", "/usr/lib", "/bin"] {
+            make_directory(&mut arguments, Path::new(directory));
+        }
+        for source in &runtime.library_dirs {
+            let relative = source
+                .strip_prefix(&runtime.root)
+                .expect("runtime library lies below its root");
+            let destination = Path::new("/").join(relative);
+            bind_at(&mut arguments, REQUIRED_READ_ONLY, source, &destination);
+        }
+        let loader_name = runtime
+            .loader
+            .file_name()
+            .expect("runtime loader has a file name");
+        bind_at(
+            &mut arguments,
+            REQUIRED_READ_ONLY,
+            &runtime.loader,
+            &Path::new("/lib64").join(loader_name),
+        );
+        bind_at(
+            &mut arguments,
+            REQUIRED_READ_ONLY,
+            &runtime.shell,
+            Path::new("/bin/sh"),
+        );
 
         // The store carries every keyed input: the pinned toolchain, the
         // dependency sources under its cargo home, pinned tools, and the
@@ -147,14 +172,24 @@ impl Sandbox for Bubblewrap {
 }
 
 const READ_ONLY: &str = "--ro-bind-try";
+const REQUIRED_READ_ONLY: &str = "--ro-bind";
 const READ_WRITE: &str = "--bind";
 
 /// Make `path` visible at its own spelling inside the namespace. Order
 /// matters: a later bind over a subpath of an earlier one wins, which is how
 /// an action's output directories become writable inside the read-only store.
 fn bind(arguments: &mut Vec<OsString>, mode: &str, path: &Path) {
+    bind_at(arguments, mode, path, path);
+}
+
+fn bind_at(arguments: &mut Vec<OsString>, mode: &str, source: &Path, destination: &Path) {
     arguments.push(mode.into());
-    arguments.push(path.into());
+    arguments.push(source.into());
+    arguments.push(destination.into());
+}
+
+fn make_directory(arguments: &mut Vec<OsString>, path: &Path) {
+    arguments.push("--dir".into());
     arguments.push(path.into());
 }
 

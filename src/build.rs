@@ -494,6 +494,7 @@ pub struct Ctx {
     target_dir: PathBuf,
     sysroot: String,
     sandbox: Box<dyn crate::sandbox::Sandbox>,
+    linux_runtime: Option<crate::sandbox::LinuxRuntime>,
     sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
@@ -1089,6 +1090,7 @@ enum ActionSpec {
 struct CompileActionSpec {
     kind: String,
     tool: &'static str,
+    host_runtime: Option<String>,
     rustc: String,
     host: String,
     package: (String, String, String),
@@ -1132,6 +1134,7 @@ enum CompileSourceInputs {
 #[derive(Clone, Serialize)]
 struct BuildScriptRunActionSpec {
     tool: &'static str,
+    host_runtime: Option<String>,
     package: (String, String, String),
     #[serde(flatten)]
     source_inputs: BuildScriptRunSourceInputs,
@@ -1389,6 +1392,10 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             tools.sort_by(|left, right| left.identity.cmp(&right.identity));
             let spec = ActionSpec::BuildScriptRun(Box::new(BuildScriptRunActionSpec {
                 tool: TOOL_VERSION,
+                host_runtime: ctx
+                    .linux_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.identity.clone()),
                 package: (
                     package.name.clone(),
                     package.version.clone(),
@@ -1446,6 +1453,10 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             let spec = ActionSpec::Compile(Box::new(CompileActionSpec {
                 kind: compile_action_kind(ctx, index).to_string(),
                 tool: TOOL_VERSION,
+                host_runtime: ctx
+                    .linux_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.identity.clone()),
                 rustc: ctx.rustc_version.clone(),
                 host: ctx.host.clone(),
                 package: (
@@ -2442,6 +2453,167 @@ fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
         bail!("tar exited with {status}");
     }
     Ok(())
+}
+
+type LinuxRuntimePackage = (&'static str, &'static str);
+
+struct LinuxRuntimeSpec {
+    debian_arch: &'static str,
+    multiarch: &'static str,
+    loader_name: &'static str,
+    packages: &'static [LinuxRuntimePackage],
+}
+
+const AMD64_RUNTIME_PACKAGES: &[LinuxRuntimePackage] = &[
+    (
+        "pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb",
+        "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf",
+    ),
+    (
+        "pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb",
+        "3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7",
+    ),
+    (
+        "pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_amd64.deb",
+        "5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d",
+    ),
+    (
+        "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb",
+        "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4",
+    ),
+    (
+        "pool/main/d/dash/dash_0.5.12-2_amd64.deb",
+        "33ea40061da2f1a861ec46212b2b6a34f0776a049b1a3f0abce2fb8cb994258f",
+    ),
+];
+
+const ARM64_RUNTIME_PACKAGES: &[LinuxRuntimePackage] = &[
+    (
+        "pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb",
+        "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4",
+    ),
+    (
+        "pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_arm64.deb",
+        "576926b283613db80168ddf76380a3bd877602778cf0d226caa7bfbfa71eacf3",
+    ),
+    (
+        "pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_arm64.deb",
+        "26e138c677a985775331373828a6c286c551ff397cb735d00e2383cb273d1cb2",
+    ),
+    (
+        "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb",
+        "52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913",
+    ),
+    (
+        "pool/main/d/dash/dash_0.5.12-2_arm64.deb",
+        "c1358e2a8054eb93efd460adf480224a16ea9e0b4d7b4c6cbcf8c8c91902a1d7",
+    ),
+];
+
+fn linux_runtime_spec(host: &str) -> Result<LinuxRuntimeSpec> {
+    match host {
+        "x86_64-unknown-linux-gnu" => Ok(LinuxRuntimeSpec {
+            debian_arch: "amd64",
+            multiarch: "x86_64-linux-gnu",
+            loader_name: "ld-linux-x86-64.so.2",
+            packages: AMD64_RUNTIME_PACKAGES,
+        }),
+        "aarch64-unknown-linux-gnu" => Ok(LinuxRuntimeSpec {
+            debian_arch: "arm64",
+            multiarch: "aarch64-linux-gnu",
+            loader_name: "ld-linux-aarch64.so.1",
+            packages: ARM64_RUNTIME_PACKAGES,
+        }),
+        _ => bail!("no managed Linux runtime for host `{host}`"),
+    }
+}
+
+/// Install the small GNU userspace needed to execute Corgi's pinned Linux
+/// tools. The runtime is independent of the host distribution: Ubuntu and
+/// NixOS mount the same loader, libc, C++ runtime, zlib, and shell.
+fn ensure_linux_runtime(store: &Store, host: &str) -> Result<Option<crate::sandbox::LinuxRuntime>> {
+    if !host.contains("linux") {
+        return Ok(None);
+    }
+    let spec = linux_runtime_spec(host)?;
+    let identity = sha256_hex(
+        format!("debian-bookworm\0{}\0{:?}", spec.debian_arch, spec.packages).as_bytes(),
+    );
+    let destination =
+        store
+            .root
+            .join("runtimes")
+            .join(format!("linux-{}-{}", spec.debian_arch, &identity[..16]));
+    if !destination.join(".corgi-runtime").exists() {
+        status!("Installing", "managed Linux runtime ({})", spec.debian_arch);
+        let work = store.tmp_path("linux-runtime");
+        let assembled = work.join("assembled");
+        fs::create_dir_all(&assembled)?;
+        for (index, (path, expected)) in spec.packages.iter().enumerate() {
+            let archive = work.join(format!("{index}.deb"));
+            let url = format!("https://deb.debian.org/debian/{path}");
+            download_tool_archive("Linux runtime", &url, "", &archive)?;
+            let actual = crate::store::sha256_file(&archive)?;
+            if actual != *expected {
+                bail!(
+                    "Linux runtime archive {url}: sha256 mismatch: expected {expected}, got {actual}"
+                );
+            }
+            unpack_archive(&archive, &assembled)
+                .with_context(|| format!("unpacking Linux runtime archive {url}"))?;
+        }
+        fs::write(assembled.join(".corgi-runtime"), format!("{identity}\n"))?;
+        fs::create_dir_all(destination.parent().unwrap())?;
+        match fs::rename(&assembled, &destination) {
+            Ok(()) => {}
+            Err(_) if destination.join(".corgi-runtime").exists() => {}
+            Err(error) => return Err(error).context("publishing managed Linux runtime"),
+        }
+        fs::remove_dir_all(work).ok();
+    }
+    let library_dirs = [
+        destination.join("lib").join(spec.multiarch),
+        destination.join("usr/lib").join(spec.multiarch),
+    ]
+    .into_iter()
+    .filter(|path| path.is_dir())
+    .collect::<Vec<_>>();
+    let loader = library_dirs
+        .iter()
+        .map(|directory| directory.join(spec.loader_name))
+        .find(|path| path.is_file())
+        .with_context(|| format!("managed Linux runtime has no {}", spec.loader_name))?;
+    let shell = [
+        destination.join("bin/dash"),
+        destination.join("usr/bin/dash"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .context("managed Linux runtime has no dash")?;
+    Ok(Some(crate::sandbox::LinuxRuntime {
+        identity,
+        root: destination,
+        loader,
+        library_dirs,
+        shell,
+    }))
+}
+
+fn host_tool_command(runtime: Option<&crate::sandbox::LinuxRuntime>, program: &Path) -> Command {
+    runtime.map_or_else(|| Command::new(program), |runtime| runtime.command(program))
+}
+
+fn cargo_host_command(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
+    cargo: &Path,
+    rustc: &str,
+) -> Command {
+    let mut command = host_tool_command(runtime, cargo);
+    command.env("RUSTC", rustc);
+    if let Some(runtime) = runtime {
+        runtime.configure_cargo(&mut command);
+    }
+    command
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4108,6 +4280,7 @@ fn build_inner(
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
+    let linux_runtime = ensure_linux_runtime(&store, &host_guess)?;
     let zig_target = zig_target_for_build(&host_guess, requested_target.as_deref())?;
     if zig_target.is_some() {
         crate::zig::raise_file_descriptor_limit()?;
@@ -4131,7 +4304,10 @@ fn build_inner(
         .join(format!("rust-{channel}-{host_guess}"));
     let rustc = toolchain_logical.join("bin/rustc").display().to_string();
     let cargo_bin = toolchain_logical.join("bin/cargo");
-    let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
+    let rustc_version = capture(
+        host_tool_command(linux_runtime.as_ref(), Path::new(&rustc)).arg("-vV"),
+        "rustc -vV",
+    )?;
     let host = rustc_version
         .lines()
         .find_map(|l| l.strip_prefix("host: "))
@@ -4175,7 +4351,7 @@ fn build_inner(
     });
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
-    let mut cfg_probe = Command::new(&rustc);
+    let mut cfg_probe = host_tool_command(linux_runtime.as_ref(), Path::new(&rustc));
     cfg_probe.args(["--print", "cfg"]);
     cfg_probe.args(&host_rustflags);
     let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
@@ -4207,7 +4383,7 @@ fn build_inner(
         }
     }
     let cfg_env_target = if let Some(t) = &target {
-        let mut probe = Command::new(&rustc);
+        let mut probe = host_tool_command(linux_runtime.as_ref(), Path::new(&rustc));
         probe.args(["--print", "cfg", "--target", t]);
         probe.args(&target_rustflags);
         let o = capture(&mut probe, "rustc --print cfg --target")?;
@@ -4330,11 +4506,10 @@ fn build_inner(
             // and a rustup shim picks its toolchain by cwd), and cwd is the
             // build dir so cargo's own config discovery sees the workspace.
             if capture_with_live_stderr(
-                Command::new(&cargo_bin)
+                cargo_host_command(linux_runtime.as_ref(), &cargo_bin, &rustc)
                     .args(["fetch", "--locked", "--manifest-path"])
                     .arg(&manifest)
                     .env("CARGO_HOME", &cargo_home)
-                    .env("RUSTC", &rustc)
                     .current_dir(&dir),
                 "cargo fetch --locked",
             )
@@ -4342,21 +4517,19 @@ fn build_inner(
             {
                 status!("Updating", "Cargo.lock");
                 capture_with_live_stderr(
-                    Command::new(&cargo_bin)
+                    cargo_host_command(linux_runtime.as_ref(), &cargo_bin, &rustc)
                         .args(["fetch", "--manifest-path"])
                         .arg(&manifest)
                         .env("CARGO_HOME", &cargo_home)
-                        .env("RUSTC", &rustc)
                         .current_dir(&dir),
                     "cargo fetch",
                 )?;
             }
             // metadata for package details only (paths, links, metadata tables);
             // the actual per-unit resolution comes from cargo's unit-graph below
-            let mut meta_cmd = Command::new(&cargo_bin);
+            let mut meta_cmd = cargo_host_command(linux_runtime.as_ref(), &cargo_bin, &rustc);
             meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
             meta_cmd.env("CARGO_HOME", &cargo_home);
-            meta_cmd.env("RUSTC", &rustc);
             meta_cmd.current_dir(&dir);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
@@ -4367,10 +4540,9 @@ fn build_inner(
             // requested package, so a dependency's features don't depend on
             // which package is selected from the resulting graph.
             let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
-            let mut ug_cmd = Command::new(&cargo_bin);
+            let mut ug_cmd = cargo_host_command(linux_runtime.as_ref(), &cargo_bin, &rustc);
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
             ug_cmd.env("CARGO_HOME", &cargo_home);
-            ug_cmd.env("RUSTC", &rustc);
             ug_cmd.current_dir(&dir);
             let unit_graph_command = match mode {
                 Mode::Test => "test",
@@ -4745,6 +4917,7 @@ fn build_inner(
         rustup_home,
         developer_dir: devdir,
         metal_toolchain_roots,
+        linux_runtime: linux_runtime.clone(),
         workspace_root: meta.workspace_root.clone(),
     })?;
     if verbose {
@@ -4774,7 +4947,10 @@ fn build_inner(
     if matches!(mode, Mode::Clippy) {
         ensure_clippy(&store, &channel, &host_guess)?;
         clippy_driver = format!("{}/bin/clippy-driver", toolchain_logical.display());
-        let version = capture(Command::new(&clippy_driver).arg("-V"), "clippy-driver -V")?;
+        let version = capture(
+            host_tool_command(linux_runtime.as_ref(), Path::new(&clippy_driver)).arg("-V"),
+            "clippy-driver -V",
+        )?;
         let mut conf_hash = String::new();
         for name in ["clippy.toml", ".clippy.toml"] {
             let candidate = Path::new(&meta.workspace_root).join(name);
@@ -4981,6 +5157,7 @@ fn build_inner(
         target_dir,
         sysroot,
         sandbox,
+        linux_runtime,
         sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         source_files_memo: Mutex::new(HashMap::new()),
@@ -5172,12 +5349,21 @@ fn build_inner(
                 canonical_run,
             )?;
         }
-        run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
+        run_opaque_tests(
+            ctx.linux_runtime.as_ref(),
+            &opaque_test_executables,
+            &exec_args,
+            test_timeout,
+        )?;
         finish_report_stage(&recorder, "test", test_stage_start);
     }
     if matches!(mode, Mode::Bench) && !no_run {
         let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
-        run_benchmarks(&benchmark_executables, &exec_args)?;
+        run_benchmarks(
+            ctx.linux_runtime.as_ref(),
+            &benchmark_executables,
+            &exec_args,
+        )?;
         finish_report_stage(&recorder, "benchmark", benchmark_stage_start);
     }
     let cleanup_stage_start = begin_report_stage(&recorder, "cleanup");
@@ -5217,7 +5403,7 @@ fn build_inner(
         // caller's cwd, inherited stdio; corgi sets nothing (no CARGO_*
         // vars). The exit status is the child's, signals reported the way
         // a shell would (128 + signal).
-        let status = Command::new(&dest)
+        let status = host_tool_command(ctx.linux_runtime.as_ref(), &dest)
             .args(&exec_args)
             .status()
             .with_context(|| format!("running {}", dest.display()))?;
@@ -6461,20 +6647,27 @@ fn save_test_pass(store: &Store, key: &str, test_count: u64) -> Result<()> {
     )
 }
 
-fn configure_test_command(harness: &TestHarness) -> Command {
-    let mut command = Command::new(&harness.path);
+fn configure_test_command(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
+    harness: &TestHarness,
+) -> Command {
+    let mut command = host_tool_command(runtime, &harness.path);
     command.current_dir(&harness.cwd);
     command.envs(harness.binary_environment.iter().cloned());
     command
 }
 
-fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> Result<()> {
+fn run_benchmarks(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
+    benchmarks: &[BenchmarkExecutable],
+    exec_args: &[String],
+) -> Result<()> {
     if benchmarks.is_empty() {
         bail!("no benchmarks found");
     }
     for benchmark in benchmarks {
         status!("Running", "benchmark {}", benchmark.name);
-        let status = Command::new(&benchmark.path)
+        let status = host_tool_command(runtime, &benchmark.path)
             .current_dir(&benchmark.cwd)
             .envs(benchmark.binary_environment.iter().cloned())
             .args(exec_args)
@@ -6489,13 +6682,14 @@ fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> R
 }
 
 fn run_opaque_tests(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
     executables: &[BenchmarkExecutable],
     exec_args: &[String],
     timeout: Option<Duration>,
 ) -> Result<()> {
     for executable in executables {
         status!("Running", "test {}", executable.name);
-        let mut command = Command::new(&executable.path);
+        let mut command = host_tool_command(runtime, &executable.path);
         command
             .current_dir(&executable.cwd)
             .envs(executable.binary_environment.iter().cloned());
@@ -6539,8 +6733,12 @@ fn matches_test_filters(filters: &RegexSet, test_name: &str) -> bool {
     filters.patterns().is_empty() || filters.is_match(test_name)
 }
 
-fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
-    let mut command = configure_test_command(harness);
+fn list_tests(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
+    harness: &TestHarness,
+    ignored: bool,
+) -> Result<Vec<String>> {
+    let mut command = configure_test_command(runtime, harness);
     command.args(["--list", "--format", "terse"]);
     if ignored {
         command.arg("--ignored");
@@ -6583,6 +6781,7 @@ fn terminate_test_process(child: &mut Child) -> Result<()> {
 }
 
 fn run_test_case(
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
     harness: &TestHarness,
     name: &str,
     exec_args: &[String],
@@ -6590,7 +6789,7 @@ fn run_test_case(
     capture_directory: &Path,
 ) -> Result<TestOutcome> {
     let started = Instant::now();
-    let mut command = configure_test_command(harness);
+    let mut command = configure_test_command(runtime, harness);
     command.args(["--exact", name, "--nocapture"]);
     command.args(exec_args);
     let (stdout_capture, stdout_file) = TestCaptureFile::create(capture_directory, "stdout")?;
@@ -6699,8 +6898,10 @@ fn run_tests_inner(
             continue;
         }
         let discovery_started = Instant::now();
-        let all_tests = list_tests(harness, false)?;
-        let ignored: BTreeSet<String> = list_tests(harness, true)?.into_iter().collect();
+        let all_tests = list_tests(ctx.linux_runtime.as_ref(), harness, false)?;
+        let ignored: BTreeSet<String> = list_tests(ctx.linux_runtime.as_ref(), harness, true)?
+            .into_iter()
+            .collect();
         let candidates: Vec<String> = if ignored_only {
             ignored.iter().cloned().collect()
         } else if include_ignored {
@@ -6761,6 +6962,7 @@ fn run_tests_inner(
                     }
                 };
                 let result = run_test_case(
+                    ctx.linux_runtime.as_ref(),
                     &harnesses[test.harness],
                     &test.name,
                     exec_args,
@@ -6933,6 +7135,7 @@ mod test_runner_tests {
         let harness = current_test_harness();
         let captures = CaptureDirectory::new();
         let outcome = run_test_case(
+            None,
             &harness,
             "build::test_runner_tests::sleeps_longer_than_timeout",
             &["--ignored".to_string()],
@@ -6951,6 +7154,7 @@ mod test_runner_tests {
         let harness = current_test_harness();
         let captures = CaptureDirectory::new();
         let outcome = run_test_case(
+            None,
             &harness,
             "build::test_runner_tests::aborts",
             &["--ignored".to_string()],
@@ -8087,7 +8291,8 @@ fn expected_outputs(
             let p = match from_store {
                 Some(p) => p,
                 None => {
-                    let mut cmd = Command::new(&ctx.rustc);
+                    let mut cmd =
+                        host_tool_command(ctx.linux_runtime.as_ref(), Path::new(&ctx.rustc));
                     cmd.args([
                         "--print",
                         "file-names",
@@ -9752,6 +9957,41 @@ mod zig_target_tests {
         assert_eq!(
             zig_target_for_build("aarch64-apple-darwin", Some("aarch64-apple-darwin")).unwrap(),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod linux_runtime_tests {
+    use super::linux_runtime_spec;
+
+    #[test]
+    fn runtime_packages_are_pinned_for_supported_hosts() {
+        for host in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let spec = linux_runtime_spec(host).unwrap();
+            assert_eq!(spec.packages.len(), 5);
+            assert!(spec
+                .packages
+                .iter()
+                .all(|(path, hash)| path.ends_with(".deb")
+                    && hash.len() == 64
+                    && hash.chars().all(|character| character.is_ascii_hexdigit())));
+        }
+    }
+
+    #[test]
+    fn runtime_uses_the_architectures_loader_name() {
+        assert_eq!(
+            linux_runtime_spec("x86_64-unknown-linux-gnu")
+                .unwrap()
+                .loader_name,
+            "ld-linux-x86-64.so.2"
+        );
+        assert_eq!(
+            linux_runtime_spec("aarch64-unknown-linux-gnu")
+                .unwrap()
+                .loader_name,
+            "ld-linux-aarch64.so.1"
         );
     }
 }

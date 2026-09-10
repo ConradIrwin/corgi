@@ -70,6 +70,7 @@ impl Seatbelt {
         let executables = vec![
             format!("{}/bin/rustc", environment.cargo_home),
             format!("{}/bin/rustc", environment.sysroot),
+            format!("{}/usr/bin/xcodebuild", environment.developer_dir),
         ];
         let toolchain_bin = Path::new(&environment.sysroot).join("bin");
         if let Ok(canonical) = fs::canonicalize(&toolchain_bin) {
@@ -154,7 +155,14 @@ impl Seatbelt {
                 .store_roots()
                 .map(|root| root.display().to_string()),
         );
-        allowed_reads.extend(self.per_user_dirs.iter().cloned());
+        let workspace_root = Path::new(&environment.workspace_root);
+        allowed_reads.extend(self.per_user_dirs.iter().map(|directory| {
+            if workspace_root.starts_with(directory) {
+                Path::new(directory).join("xcrun_db").display().to_string()
+            } else {
+                directory.clone()
+            }
+        }));
         allowed_reads.extend(
             environment
                 .metal_toolchain_roots
@@ -164,14 +172,10 @@ impl Seatbelt {
         for read in allowed_reads {
             profile.push_str(&format!("  (subpath \"{read}\")\n"));
         }
-        let workspace_root = Path::new(&environment.workspace_root);
         let mut input_directories = std::collections::BTreeSet::new();
         for path in reads {
             let mut ancestor = path.parent();
             while let Some(directory) = ancestor {
-                if !directory.starts_with(workspace_root) {
-                    break;
-                }
                 input_directories.insert(directory);
                 ancestor = directory.parent();
             }
