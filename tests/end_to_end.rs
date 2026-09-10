@@ -109,7 +109,8 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
     fs::write(directory.path.join("Cargo.toml"), "[workspace]\n").unwrap();
     fs::write(
         directory.path.join(".cargo/config.toml"),
-        "[env]\nPARENT_WORKSPACE_SETTING = \"parent\"\n",
+        "[build]\ntarget = \"parent-config-must-not-be-read\"\n\
+         [env]\nPARENT_WORKSPACE_SETTING = \"parent\"\n",
     )
     .unwrap();
     fs::copy(

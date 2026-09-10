@@ -58,15 +58,16 @@ impl CargoConfig {
 
 /// Only the selected project's configuration is an input to Corgi's actions.
 /// In particular, a standalone nested workspace does not inherit its parent's
-/// settings. Cargo's planning subprocesses still perform their own discovery.
+/// settings. Cargo subprocesses receive the returned path explicitly.
 pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>)> {
-    for name in [".cargo/config.toml", ".cargo/config"] {
+    // Cargo prefers the legacy extensionless name when both exist.
+    for name in [".cargo/config", ".cargo/config.toml"] {
         let p = start.join(name);
         if p.is_file() {
             let text =
                 std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
             let config = parse(&text).with_context(|| format!("parsing {}", p.display()))?;
-            return Ok((config, Some(start.to_path_buf())));
+            return Ok((config, Some(p)));
         }
     }
     Ok((

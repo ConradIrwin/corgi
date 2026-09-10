@@ -3483,6 +3483,25 @@ fn finish_report_stage(recorder: &crate::report::Recorder, name: &str, start_ns:
     });
 }
 
+/// Start a Cargo planning command without discovering config beside or above
+/// the workspace. The selected workspace config is supplied explicitly.
+fn isolated_cargo_command(
+    cargo: &Path,
+    cargo_home: &Path,
+    cargo_config_path: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .env("CARGO_HOME", cargo_home)
+        // Cargo discovers config from cwd rather than --manifest-path. The
+        // filesystem root has no project ancestors to inspect.
+        .current_dir(Path::new("/"));
+    if let Some(path) = cargo_config_path {
+        command.arg("--config").arg(path);
+    }
+    command
+}
+
 /// Format workspace sources with the exact rustfmt component matching the
 /// project's pinned toolchain. This deliberately bypasses build planning,
 /// sandboxing, and the CAS: formatting discovers Cargo targets and edits the
@@ -3689,7 +3708,7 @@ fn build_inner(
             bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
     }
-    let (cargo_config, config_dir) = crate::config::discover(&dir)?;
+    let (cargo_config, cargo_config_path) = crate::config::discover(&dir)?;
 
     let channel = read_toolchain_pin(&dir)?;
     let host_guess = host_triple()?;
@@ -3911,39 +3930,34 @@ fn build_inner(
             // first (it never writes), and when cargo rejects it, run once
             // unlocked so cargo brings Cargo.lock up to date, then continue.
             // The plan fingerprint hashes the lock *after* this step.
-            // The probes must not depend on the caller's environment:
-            // RUSTC is pinned (cargo otherwise resolves `rustc` from PATH,
-            // and a rustup shim picks its toolchain by cwd), and cwd is the
-            // build dir so cargo's own config discovery sees the workspace.
-            if capture_with_live_stderr(
-                Command::new(&cargo_bin)
-                    .args(["fetch", "--locked", "--manifest-path"])
-                    .arg(&manifest)
-                    .env("CARGO_HOME", &cargo_home)
-                    .env("RUSTC", &rustc)
-                    .current_dir(&dir),
-                "cargo fetch --locked",
-            )
-            .is_err()
-            {
+            // The probes must not depend on the caller's environment. RUSTC
+            // is pinned (cargo otherwise resolves `rustc` from PATH, and a
+            // rustup shim picks its toolchain by cwd). Run from the filesystem
+            // root so Cargo cannot discover workspace or parent configs, then
+            // explicitly provide the one workspace config corgi parsed.
+            let cargo_command = || {
+                let mut command = isolated_cargo_command(
+                    &cargo_bin,
+                    Path::new(&cargo_home),
+                    cargo_config_path.as_deref(),
+                );
+                command.env("RUSTC", &rustc);
+                command
+            };
+            let mut fetch_locked = cargo_command();
+            fetch_locked
+                .args(["fetch", "--locked", "--manifest-path"])
+                .arg(&manifest);
+            if capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked").is_err() {
                 status!("Updating", "Cargo.lock");
-                capture_with_live_stderr(
-                    Command::new(&cargo_bin)
-                        .args(["fetch", "--manifest-path"])
-                        .arg(&manifest)
-                        .env("CARGO_HOME", &cargo_home)
-                        .env("RUSTC", &rustc)
-                        .current_dir(&dir),
-                    "cargo fetch",
-                )?;
+                let mut fetch = cargo_command();
+                fetch.args(["fetch", "--manifest-path"]).arg(&manifest);
+                capture_with_live_stderr(&mut fetch, "cargo fetch")?;
             }
             // metadata for package details only (paths, links, metadata tables);
             // the actual per-unit resolution comes from cargo's unit-graph below
-            let mut meta_cmd = Command::new(&cargo_bin);
+            let mut meta_cmd = cargo_command();
             meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
-            meta_cmd.env("CARGO_HOME", &cargo_home);
-            meta_cmd.env("RUSTC", &rustc);
-            meta_cmd.current_dir(&dir);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             let meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
             let meta: Metadata =
@@ -3953,11 +3967,8 @@ fn build_inner(
             // requested package, so a dependency's features don't depend on
             // which package is selected from the resulting graph.
             let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
-            let mut ug_cmd = Command::new(&cargo_bin);
+            let mut ug_cmd = cargo_command();
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
-            ug_cmd.env("CARGO_HOME", &cargo_home);
-            ug_cmd.env("RUSTC", &rustc);
-            ug_cmd.current_dir(&dir);
             let unit_graph_command = match mode {
                 Mode::Test => "test",
                 Mode::Bench => "bench",
@@ -4512,7 +4523,11 @@ fn build_inner(
     let pool_logical = store.logical_root().join("pool");
     let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
-    if let Some(config_location) = &config_dir {
+    if let Some(config_path) = &cargo_config_path {
+        let config_location = config_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace cargo config has .cargo parent");
         if config_location != Path::new(&workspace_root) {
             bail!(
                 ".cargo/config found at {} but the workspace root is {}; corgi only honors the workspace's own config",
