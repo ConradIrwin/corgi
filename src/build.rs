@@ -2466,47 +2466,47 @@ struct LinuxRuntimeSpec {
 
 const AMD64_RUNTIME_PACKAGES: &[LinuxRuntimePackage] = &[
     (
-        "pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb",
-        "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf",
+        "pool/main/g/glibc/libc6_2.41-12+deb13u3_amd64.deb",
+        "8ffd13165b9ee3f067e2ee670df718e48c1bdaa18676ac93d1de761dbbb3913c",
     ),
     (
-        "pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb",
-        "3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7",
+        "pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb",
+        "3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150",
     ),
     (
-        "pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_amd64.deb",
-        "5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d",
+        "pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb",
+        "ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0",
     ),
     (
-        "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb",
-        "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4",
+        "pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_amd64.deb",
+        "015be740d6236ad114582dea500c1d907f29e16d6db00566ca32fb68d71ac90d",
     ),
     (
-        "pool/main/d/dash/dash_0.5.12-2_amd64.deb",
-        "33ea40061da2f1a861ec46212b2b6a34f0776a049b1a3f0abce2fb8cb994258f",
+        "pool/main/d/dash/dash_0.5.12-12_amd64.deb",
+        "a8902cb6d8650134764a25fb80aec8589d858ef71ece1680a62e84816c37bb04",
     ),
 ];
 
 const ARM64_RUNTIME_PACKAGES: &[LinuxRuntimePackage] = &[
     (
-        "pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb",
-        "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4",
+        "pool/main/g/glibc/libc6_2.41-12+deb13u3_arm64.deb",
+        "ff529924782d3286181188fc265a6a92e7fe28975fb3a925dc0e05c0ca66e52f",
     ),
     (
-        "pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_arm64.deb",
-        "576926b283613db80168ddf76380a3bd877602778cf0d226caa7bfbfa71eacf3",
+        "pool/main/g/gcc-14/libgcc-s1_14.2.0-19_arm64.deb",
+        "1108bc87879833d6d9a145f22a4a15cddb34e065b4b5f4b97bee586adbac2851",
     ),
     (
-        "pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_arm64.deb",
-        "26e138c677a985775331373828a6c286c551ff397cb735d00e2383cb273d1cb2",
+        "pool/main/g/gcc-14/libstdc++6_14.2.0-19_arm64.deb",
+        "6669b0c52a2e7c6af9adfdabce3ff6e286065cdfbc7b85280862b5f799daebee",
     ),
     (
-        "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb",
-        "52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913",
+        "pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb",
+        "209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef",
     ),
     (
-        "pool/main/d/dash/dash_0.5.12-2_arm64.deb",
-        "c1358e2a8054eb93efd460adf480224a16ea9e0b4d7b4c6cbcf8c8c91902a1d7",
+        "pool/main/d/dash/dash_0.5.12-12_arm64.deb",
+        "ce4c8688a1a3ea510186ba95aba74d4c49863094e47e1effc0b602839e840c04",
     ),
 ];
 
@@ -2529,16 +2529,16 @@ fn linux_runtime_spec(host: &str) -> Result<LinuxRuntimeSpec> {
 }
 
 /// Install the small GNU userspace needed to execute Corgi's pinned Linux
-/// tools. The runtime is independent of the host distribution: Ubuntu and
-/// NixOS mount the same loader, libc, C++ runtime, zlib, and shell.
+/// tools. The current Debian runtime accepts binaries built by contemporary
+/// distributions, while target sysroots remain independently pinned to the
+/// older ABI baseline desired for produced artifacts.
 fn ensure_linux_runtime(store: &Store, host: &str) -> Result<Option<crate::sandbox::LinuxRuntime>> {
     if !host.contains("linux") {
         return Ok(None);
     }
     let spec = linux_runtime_spec(host)?;
-    let identity = sha256_hex(
-        format!("debian-bookworm\0{}\0{:?}", spec.debian_arch, spec.packages).as_bytes(),
-    );
+    let identity =
+        sha256_hex(format!("debian-trixie\0{}\0{:?}", spec.debian_arch, spec.packages).as_bytes());
     let destination =
         store
             .root
