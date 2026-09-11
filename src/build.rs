@@ -4824,6 +4824,13 @@ fn build_inner(
     let mut test_harnesses = Vec::new();
     let mut opaque_test_executables = Vec::new();
     let mut benchmark_executables = Vec::new();
+    // Plain Cargo [env] entries are runtime defaults: the caller's environment wins.
+    let runtime_environment: Vec<_> = ctx
+        .config_env
+        .iter()
+        .filter(|(name, _)| std::env::var_os(name).is_none())
+        .cloned()
+        .collect();
 
     if exports_harnesses {
         let canonical_run = test_filters.is_empty() && exec_args.is_empty();
@@ -4849,6 +4856,7 @@ fn build_inner(
                 .environment
                 .iter()
                 .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
+                .chain(runtime_environment.iter())
                 .cloned()
                 .collect();
             if matches!(mode, Mode::Test) {
@@ -4992,12 +5000,12 @@ fn build_inner(
         let dest = ctx.target_dir.join(relative.strip_prefix("target")?);
         status!("Running", "`{}`", dest.display());
         let execution_start = begin_report_stage(&recorder, "execute");
-        // Exactly a manual run of the exported binary: ambient env, the
-        // caller's cwd, inherited stdio; corgi sets nothing (no CARGO_*
-        // vars). The exit status is the child's, signals reported the way
-        // a shell would (128 + signal).
+        // Preserve the caller's cwd, ambient environment, and stdio, adding only
+        // configured defaults (no build-only CARGO_* vars). The exit status is
+        // the child's, signals reported the way a shell would (128 + signal).
         let status = Command::new(&dest)
             .args(&exec_args)
+            .envs(runtime_environment.iter().cloned())
             .status()
             .with_context(|| format!("running {}", dest.display()))?;
         let execution_end = recorder.elapsed_ns();

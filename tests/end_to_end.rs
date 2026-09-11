@@ -1633,6 +1633,98 @@ fn run_named_target_overrides_default_run_and_preserves_process_inputs() {
 }
 
 #[test]
+fn cargo_config_environment_reaches_launched_programs() {
+    let directory = TestDirectory::new("runtime-config-env");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[env]\nTEST_CONFIG_VALUE = \"from-cargo-config\"\nRUST_MIN_STACK = \"8388608\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "app"
+path = "app.rs"
+
+[[test]]
+name = "checked"
+path = "app.rs"
+
+[[test]]
+name = "opaque"
+path = "app.rs"
+harness = false
+
+[[bench]]
+name = "custom"
+path = "app.rs"
+harness = false
+"#,
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app.rs"),
+        r#"#[test]
+fn configured_environment_matches() {
+    main();
+}
+
+fn main() {
+    assert_eq!(
+        std::env::var("TEST_CONFIG_VALUE").unwrap(),
+        std::env::var("EXPECTED_RUNTIME_VALUE").unwrap(),
+    );
+    assert_eq!(std::env::var("RUST_MIN_STACK").as_deref(), Ok("8388608"));
+    std::fs::write(std::env::var("RUNTIME_MARKER").unwrap(), "ran").unwrap();
+}
+"#,
+    )
+    .unwrap();
+
+    let store = directory.path.join("store");
+    let marker = directory.path.join("ran");
+    for shell_value in [None, Some("from-shell")] {
+        for arguments in [
+            vec!["run", "--bin", "app"],
+            vec!["test", "--test", "checked", "--force"],
+            vec!["test", "--test", "opaque", "--force"],
+            vec!["bench", "--bench", "custom"],
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
+            command
+                .current_dir(&workspace)
+                .args(&arguments)
+                .env("CORGI_STORE", &store)
+                .env("CORGI_ALIAS", store.join("alias"))
+                .env("RUNTIME_MARKER", &marker)
+                .env(
+                    "EXPECTED_RUNTIME_VALUE",
+                    shell_value.unwrap_or("from-cargo-config"),
+                )
+                .env_remove("RUST_MIN_STACK")
+                .env_remove("TEST_CONFIG_VALUE");
+            if let Some(value) = shell_value {
+                command.env("TEST_CONFIG_VALUE", value);
+            }
+            let output = command.output().unwrap();
+            assert_success(&output, &format!("corgi {}", arguments.join(" ")));
+            assert_eq!(fs::read_to_string(&marker).unwrap(), "ran");
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+}
+
+#[test]
 fn cargo_bin_name_follows_target_identity_including_test_harnesses() {
     let directory = TestDirectory::new("cargo-bin-name");
     fs::write(
