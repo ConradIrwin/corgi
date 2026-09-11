@@ -1,0 +1,3 @@
+[extra-inputs]
+# Integration tests execute these files; edits must invalidate cached test passes.
+corgi-build = ["tests/support/*.py"]

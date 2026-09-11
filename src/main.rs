@@ -12,6 +12,11 @@ mod zig;
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 
+/// Select an alternate curl executable without changing its arguments.
+fn curl() -> std::process::Command {
+    std::process::Command::new(std::env::var_os("CORGI_CURL").unwrap_or_else(|| "curl".into()))
+}
+
 impl From<cli::TargetSelectionArgs> for build::TargetSelection {
     fn from(args: cli::TargetSelectionArgs) -> Self {
         Self {

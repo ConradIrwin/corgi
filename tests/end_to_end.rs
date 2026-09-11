@@ -40,7 +40,7 @@ fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
 
     let absolute_output = directory.path.join("absolute output");
     for output in ["relative output", absolute_output.to_str().unwrap()] {
-        let result = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let result = corgi_command()
             .current_dir(&directory.path)
             .arg("run")
             .arg("--manifest-path")
@@ -143,7 +143,7 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
         vec!["--manifest-path", absolute_manifest.to_str().unwrap()],
         vec!["-C", "scripts/helper"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let output = corgi_command()
             .current_dir(&directory.path)
             .arg("run")
             .args(arguments)
@@ -160,7 +160,7 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
         "[env]\nHELPER_SETTING = \"local\"\n",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .current_dir(&directory.path)
         .args([
             "run",
@@ -174,7 +174,7 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
     assert_success(&output, "running nested workspace with its own config");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "local\n");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .current_dir(&nested)
         .args(["check", "--manifest-path", "Cargo.toml"])
         .output()
@@ -186,7 +186,7 @@ fn manifest_path_selects_a_nested_workspace_without_parent_config() {
         vec!["--manifest-path", "scripts/helper/src/main.rs"],
         vec!["--manifest-path", "scripts/helper/Cargo.toml", "-C", "."],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let output = corgi_command()
             .current_dir(&directory.path)
             .arg("check")
             .args(arguments)
@@ -1007,7 +1007,7 @@ fn clean_expires_incremental_state_before_other_cached_data() {
         .set_modified(two_days_ago)
         .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .arg("clean")
         .env("CORGI_STORE", &store)
         .env("CORGI_NO_ALIAS", "1")
@@ -1072,7 +1072,7 @@ fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
             }
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let output = corgi_command()
             .args(["clean", "--older-than", duration])
             .env("CORGI_STORE", &store)
             .env("CORGI_NO_ALIAS", "1")
@@ -1118,7 +1118,7 @@ fn clean_invalid_age_leaves_store_untouched() {
         .unwrap();
 
     for duration in ["24", "18446744073709551615d", "18446744073709551615s"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let output = corgi_command()
             .args(["clean", "--older-than", duration])
             .env("CORGI_STORE", &store)
             .env("CORGI_NO_ALIAS", "1")
@@ -1176,7 +1176,7 @@ fn early_build_failures_are_recorded() {
         Ok(env!("CARGO_BIN_EXE_corgi"))
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .arg("build")
         .arg("-C")
         .arg(&missing_workspace)
@@ -1217,14 +1217,12 @@ fn required_corgi_is_installed_executed_and_reused() {
     let workspace = TestDirectory::new("self-update-workspace");
     let store = TestDirectory::new("self-update-store");
     let payload = workspace.path.join("payload");
-    let fake_bin = workspace.path.join("fake-bin");
-    let fake_curl = fake_bin.join("curl");
+    let fake_curl = workspace.path.join("curl override");
     let archive = workspace.path.join("corgi-aarch64-apple-darwin.tar.gz");
     let checksum_file = workspace
         .path
         .join("corgi-aarch64-apple-darwin.tar.gz.sha256");
     fs::create_dir_all(&payload).unwrap();
-    fs::create_dir_all(&fake_bin).unwrap();
     fs::write(
         workspace.path.join("corgi.toml"),
         "corgi_version = \"99.0.0\"\n",
@@ -1256,58 +1254,43 @@ printf 'managed corgi: %s\n' "$*"
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let valid_checksum = format!("{checksum}  corgi-aarch64-apple-darwin.tar.gz\n");
-    fs::write(&checksum_file, &valid_checksum).unwrap();
     fs::write(
         &fake_curl,
         r#"#!/bin/sh
 set -eu
 output=
-url=
+source=
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --fail|--location|--silent|--show-error)
-            shift
-            ;;
-        --proto|--proto-redir)
-            test "$2" = '=https'
-            shift 2
-            ;;
         --output)
             output="$2"
-            shift 2
-            ;;
-        *)
-            test -z "$url"
-            url="$1"
             shift
             ;;
+        https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz)
+            source="$CORGI_TEST_ARCHIVE"
+            ;;
+        https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz.sha256)
+            source="$CORGI_TEST_CHECKSUM"
+            ;;
     esac
+    shift
 done
 test -n "$output"
-case "$url" in
-    https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz)
-        cp "$CORGI_TEST_ARCHIVE" "$output"
-        ;;
-    https://github.com/ConradIrwin/corgi/releases/download/v99.0.0/corgi-aarch64-apple-darwin.tar.gz.sha256)
-        cp "$CORGI_TEST_CHECKSUM" "$output"
-        ;;
-    *)
-        exit 97
-        ;;
-esac
+test -n "$source"
+cp "$source" "$output"
 "#,
     )
     .unwrap();
     fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o755)).unwrap();
 
     let invoke = || {
-        Command::new(env!("CARGO_BIN_EXE_corgi"))
+        corgi_command()
             .arg("--help")
             .current_dir(&workspace.path)
             .env("CORGI_STORE", &store.path)
+            .env("CORGI_CURL", &fake_curl)
             .env("CORGI_TEST_ARCHIVE", &archive)
             .env("CORGI_TEST_CHECKSUM", &checksum_file)
-            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
             .output()
             .expect("failed to invoke self-updating corgi")
     };
@@ -1441,7 +1424,7 @@ fn mismatched_target_selection_reports_available_targets() {
             arguments.push("app");
         }
         for _ in 0..2 {
-            let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+            let output = corgi_command()
                 .arg("-C")
                 .arg(&directory.path)
                 .arg("check")
@@ -1483,7 +1466,7 @@ fn named_targets_select_only_requested_targets() {
     )
     .unwrap();
     let marker = directory.path.join("selected-integration-ran");
-    let result = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let result = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -1609,7 +1592,7 @@ fn run_named_target_overrides_default_run_and_preserves_process_inputs() {
     .unwrap();
     fs::write(directory.path.join("marker"), "caller directory").unwrap();
 
-    let example = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let example = corgi_command()
         .current_dir(&directory.path)
         .arg("run")
         .arg("--manifest-path")
@@ -1620,7 +1603,7 @@ fn run_named_target_overrides_default_run_and_preserves_process_inputs() {
     assert_success(&example, "corgi run --example selected");
     assert_eq!(String::from_utf8(example.stdout).unwrap(), "example\n");
 
-    let binary = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let binary = corgi_command()
         .current_dir(&directory.path)
         .arg("run")
         .arg("--manifest-path")
@@ -1700,7 +1683,7 @@ fn main() {
             vec!["test", "--test", "opaque", "--force"],
             vec!["bench", "--bench", "custom"],
         ] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
+            let mut command = corgi_command();
             command
                 .current_dir(&workspace)
                 .args(&arguments)
@@ -1830,7 +1813,7 @@ fn package_target_selectors_reach_cargo_planning() {
     }
 
     let integration_marker = directory.path.join("integration-test-ran");
-    let library_test = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let library_test = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -1845,7 +1828,7 @@ fn package_target_selectors_reach_cargo_planning() {
     );
 
     let selected_integration_marker = directory.path.join("selected-integration-test-ran");
-    let integration_tests = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let integration_tests = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -1866,7 +1849,7 @@ fn package_target_selectors_reach_cargo_planning() {
         let custom_benchmark_marker = directory
             .path
             .join(format!("custom-benchmark-{}.ran", &selector[2..]));
-        let selected_tests = Command::new(env!("CARGO_BIN_EXE_corgi"))
+        let selected_tests = corgi_command()
             .arg("test")
             .arg("-C")
             .arg(&directory.path)
@@ -1882,7 +1865,7 @@ fn package_target_selectors_reach_cargo_planning() {
         );
     }
 
-    let filtered_custom_harness = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let filtered_custom_harness = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -1946,7 +1929,7 @@ fn benchmark_targets_support_built_in_and_custom_harnesses() {
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);
     let marker = directory.path.join("custom-benchmark-ran");
 
-    let checked = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let checked = corgi_command()
         .arg("check")
         .arg("-C")
         .arg(&directory.path)
@@ -1975,7 +1958,7 @@ fn benchmark_targets_support_built_in_and_custom_harnesses() {
     };
     assert_release_rejected();
 
-    let custom = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let custom = corgi_command()
         .arg("bench")
         .arg("-C")
         .arg(&directory.path)
@@ -2005,7 +1988,7 @@ fn benchmark_targets_support_built_in_and_custom_harnesses() {
     );
 
     fs::remove_file(&marker).unwrap();
-    let combined = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let combined = corgi_command()
         .arg("bench")
         .arg("-C")
         .arg(&directory.path)
@@ -2041,7 +2024,7 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
     let isolated_store = TestDirectory::new("no-run-store");
     let store = &isolated_store.path;
 
-    let built = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let built = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -2073,7 +2056,7 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
         "test --no-run executed the integration test"
     );
 
-    let run = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let run = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -2102,7 +2085,7 @@ fn bench_no_run_exports_built_in_and_custom_executables_without_running_them() {
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);
     let marker = directory.path.join("custom-benchmark-ran");
 
-    let built = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let built = corgi_command()
         .arg("bench")
         .arg("-C")
         .arg(&directory.path)
@@ -2127,7 +2110,7 @@ fn bench_no_run_exports_built_in_and_custom_executables_without_running_them() {
     }
     assert!(!marker.exists(), "bench --no-run executed a benchmark");
 
-    let custom = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let custom = corgi_command()
         .arg("bench")
         .arg("-C")
         .arg(&directory.path)
@@ -2248,7 +2231,7 @@ fn gamma_skipped() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .arg("test")
         .arg("-C")
         .arg(&directory.path)
@@ -2290,7 +2273,7 @@ fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
     .unwrap();
 
     let invoke = |arguments: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_corgi"))
+        corgi_command()
             .arg("test")
             .arg("-C")
             .arg(&directory.path)
@@ -3403,6 +3386,18 @@ fn run_test_compile_in<const ARGUMENT_COUNT: usize>(
     output
 }
 
+fn corgi_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
+    let curl = std::env::var_os("CORGI_CURL").unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap()
+            .join("tests/support/cached-curl.py")
+            .into_os_string()
+    });
+    command.env("CORGI_CURL", curl);
+    command
+}
+
 fn run_corgi<const ARGUMENT_COUNT: usize>(
     fixture: &Path,
     command: &str,
@@ -3418,7 +3413,7 @@ fn invoke_corgi<const ARGUMENT_COUNT: usize>(
     command: &str,
     arguments: [&str; ARGUMENT_COUNT],
 ) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_corgi"))
+    let output = corgi_command()
         .arg(command)
         .arg("-C")
         .arg(fixture)
@@ -3434,7 +3429,7 @@ fn invoke_corgi_with_store<const ARGUMENT_COUNT: usize>(
     arguments: [&str; ARGUMENT_COUNT],
     store: &Path,
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_corgi"))
+    corgi_command()
         .arg(command)
         .arg("-C")
         .arg(fixture)
@@ -3446,7 +3441,7 @@ fn invoke_corgi_with_store<const ARGUMENT_COUNT: usize>(
 }
 
 fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_corgi"));
+    let mut command = corgi_command();
     command.arg("test").arg("-C").arg(fixture).arg("--force");
     if let Some(marker) = marker {
         command.env("CORGI_TEST_MARKER", marker);

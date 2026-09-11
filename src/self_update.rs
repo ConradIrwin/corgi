@@ -89,7 +89,7 @@ fn release_asset(version: &Version, target: &str) -> (String, String, String) {
 }
 
 fn download(url: &str, destination: &Path) -> Result<()> {
-    let status = Command::new("curl")
+    let status = crate::curl()
         .args([
             "--fail",
             "--location",
