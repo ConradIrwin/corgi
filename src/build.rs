@@ -289,9 +289,26 @@ fn binary_export_path(ctx: &Ctx, index: usize, output_name: &str) -> PathBuf {
             directory.push(&ctx.idents[index]);
             directory.push(output_name);
         }
+        Kind::Lib if unit.is_root && !unit.host => {
+            directory.push(library_export_name(
+                output_name,
+                action_extra_filename(ctx, index),
+            ));
+        }
         Kind::Lib | Kind::Bsr => directory.push(output_name),
     }
     directory
+}
+
+/// Root shared libraries use Cargo-compatible names outside the content-addressed store.
+fn library_export_name(output_name: &str, extra_filename: &str) -> String {
+    let suffix = format!("-{extra_filename}.");
+    if let Some((name, extension)) = output_name.rsplit_once(&suffix) {
+        if matches!(extension, "wasm" | "so" | "dylib") {
+            return format!("{name}.{extension}");
+        }
+    }
+    output_name.to_string()
 }
 
 fn validate_debug_export_paths(ctx: &Ctx) -> Result<()> {
@@ -511,7 +528,8 @@ pub struct Ctx {
     /// Plan-time probe results: (name, value, packages, profiles).
     env_probes: Vec<(String, String, Vec<String>, Vec<String>)>,
     target: Option<String>,
-    zig: Option<ZigRuntime>,
+    target_zig: Option<ZigRuntime>,
+    host_zig: Option<ZigRuntime>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
@@ -565,8 +583,6 @@ pub struct Ctx {
 
 #[derive(Clone)]
 struct ZigRuntime {
-    /// The Rust triple this Zig runtime compiles and links for.
-    rust_target: String,
     cc: PathBuf,
     cxx: PathBuf,
     ar: PathBuf,
@@ -581,12 +597,11 @@ impl Ctx {
     /// platform. Cross builds do not apply their target toolchain to host
     /// build scripts and proc macros.
     fn zig_for_platform(&self, unit: &Unit) -> Option<&ZigRuntime> {
-        let platform = if unit.host {
-            &self.host
+        if unit.host {
+            self.host_zig.as_ref()
         } else {
-            self.target.as_deref().unwrap_or(&self.host)
-        };
-        self.zig.as_ref().filter(|zig| zig.rust_target == platform)
+            self.target_zig.as_ref()
+        }
     }
 }
 
@@ -2420,7 +2435,7 @@ fn download_tool_archive(name: &str, url: &str, auth: &str, archive: &Path) -> R
 }
 
 /// Unpack a downloaded tool archive. Debian packages carry their payload in a
-/// nested tarball, so unwrap that member before handing it to tar.
+/// nested tarball; decode zstd ourselves so tar needs no ambient zstd executable.
 fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
     let bytes = fs::read(archive)?;
     if bytes.starts_with(b"PK\x03\x04") {
@@ -2435,8 +2450,17 @@ fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    let tarball = if crate::deb::is_deb(&bytes) {
-        let data = crate::deb::data_member(&bytes)?;
+    let data = if crate::deb::is_deb(&bytes) {
+        crate::deb::data_member(&bytes)?
+    } else {
+        &bytes
+    };
+    let tarball = if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let extracted = archive.with_extension("decoded.tar");
+        let mut decoded = zstd::stream::read::Decoder::new(data)?;
+        io::copy(&mut decoded, &mut fs::File::create(&extracted)?)?;
+        extracted
+    } else if crate::deb::is_deb(&bytes) {
         let extracted = archive.with_extension("data.tar");
         fs::write(&extracted, data)?;
         extracted
@@ -2451,6 +2475,38 @@ fn unpack_archive(archive: &Path, into: &Path) -> Result<()> {
         .status()?;
     if !status.success() {
         bail!("tar exited with {status}");
+    }
+    Ok(())
+}
+
+/// Unpack a sysroot contribution into an empty directory, without package metadata.
+fn unpack_sysroot_archive(archive: &Path, into: &Path) -> Result<()> {
+    unpack_archive(archive, into)?;
+    let package_info = into.join(".PKGINFO");
+    match package_info.symlink_metadata() {
+        Ok(info) if info.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("reading Arch package metadata"),
+    }
+    let contents = fs::read(&package_info)?;
+    let contents = String::from_utf8_lossy(&contents);
+    if !["pkgname = ", "pkgver = "]
+        .iter()
+        .all(|field| contents.lines().any(|line| line.starts_with(field)))
+    {
+        return Ok(());
+    }
+    // Only Arch's reserved root metadata is omitted. Nested names and unrelated
+    // dotfiles are payload, and installation scripts are never interpreted.
+    for name in [".PKGINFO", ".BUILDINFO", ".MTREE", ".INSTALL", ".CHANGELOG"] {
+        match fs::remove_file(into.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing Arch metadata {name}"))
+            }
+        }
     }
     Ok(())
 }
@@ -2657,7 +2713,7 @@ fn ensure_target_sysroot(
 
             let extracted = work.join(format!("{name}.extracted"));
             fs::create_dir_all(&extracted)?;
-            unpack_archive(&archive, &extracted)
+            unpack_sysroot_archive(&archive, &extracted)
                 .with_context(|| format!("unpacking sysroot archive {name}"))?;
             let relative_root = if spec.path.is_empty() {
                 Path::new(".")
@@ -2967,7 +3023,6 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
             .unwrap_or(installed.as_path()),
     );
     Ok(ZigRuntime {
-        rust_target: target.rust.to_string(),
         cc: logical_wrapper_dir.join("cc"),
         cxx: logical_wrapper_dir.join("c++"),
         ar: logical_wrapper_dir.join("ar"),
@@ -4282,7 +4337,8 @@ fn build_inner(
     let host_guess = host_triple()?;
     let linux_runtime = ensure_linux_runtime(&store, &host_guess)?;
     let zig_target = zig_target_for_build(&host_guess, requested_target.as_deref())?;
-    if zig_target.is_some() {
+    let host_zig_target = zig_target_for_build(&host_guess, None)?;
+    if zig_target.is_some() || host_zig_target.is_some() {
         crate::zig::raise_file_descriptor_limit()?;
     }
     let target = match (&requested_target, zig_target.as_deref()) {
@@ -4892,12 +4948,26 @@ fn build_inner(
         .as_deref()
         .map(|target| ensure_zig(&store, &host_guess, target))
         .transpose()?;
+    // Host code must execute on this machine even when the target has the same
+    // Rust triple but requests a different libc ABI.
+    let host_zig_runtime = if host_zig_target == zig_target {
+        zig_runtime.clone()
+    } else {
+        host_zig_target
+            .as_deref()
+            .map(|target| ensure_zig(&store, &host_guess, target))
+            .transpose()?
+    };
     let zig_identity = zig_runtime
         .as_ref()
         .map(|runtime| runtime.identity.as_str())
         .unwrap_or("");
+    let host_zig_identity = host_zig_runtime
+        .as_ref()
+        .map(|runtime| runtime.identity.as_str())
+        .unwrap_or("");
     let toolchain = format!(
-        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nmetal: {metal_identity}\nzig: {zig_identity}"
+        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nmetal: {metal_identity}\nzig: {zig_identity}\nhost-zig: {host_zig_identity}"
     );
     let report_toolchain = crate::report::ToolchainInput {
         cc: cc_v,
@@ -5169,7 +5239,8 @@ fn build_inner(
         target_sysroot,
         env_probes,
         target,
-        zig: zig_runtime,
+        target_zig: zig_runtime,
+        host_zig: host_zig_runtime,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -8505,9 +8576,27 @@ fn normalize_git_remote(remote: &str) -> Option<String> {
 
 #[cfg(test)]
 mod run_selection_tests {
-    use super::{select_root_packages, select_run_binary, Mode};
+    use super::{library_export_name, select_root_packages, select_run_binary, Mode};
     use crate::meta::Metadata;
     use std::collections::HashMap;
+
+    #[test]
+    fn shared_library_exports_remove_only_the_exact_action_suffix() {
+        for extension in ["wasm", "so", "dylib"] {
+            assert_eq!(
+                library_export_name(&format!("some-name-abc123.{extension}"), "abc123"),
+                format!("some-name.{extension}")
+            );
+            assert_eq!(
+                library_export_name(&format!("some-name-other.{extension}"), "abc123"),
+                format!("some-name-other.{extension}")
+            );
+        }
+        assert_eq!(
+            library_export_name("libsome_name-abc123.rlib", "abc123"),
+            "libsome_name-abc123.rlib"
+        );
+    }
 
     #[test]
     fn run_uses_the_single_workspace_default_member() {
@@ -9087,7 +9176,7 @@ fn compile(
         .command(Path::new(executor), compile_dir, &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
-    if ctx.zig.is_some() {
+    if ctx.zig_for_platform(unit).is_some() {
         let zig_global_cache = scratch.join("zig-global-cache");
         let zig_local_cache = scratch.join("zig-local-cache");
         fs::create_dir_all(&zig_global_cache)?;
@@ -9426,6 +9515,44 @@ type BuildScriptEnvironment<'a> = (
     Vec<&'a ToolRt>,
 );
 
+/// Reuse native sysroot libraries without replacing the managed loader's runtime.
+fn build_script_library_paths(
+    host: &str,
+    target: &str,
+    runtime: Option<&crate::sandbox::LinuxRuntime>,
+    sysroot: Option<&TargetSysroot>,
+    tool_paths: Vec<String>,
+) -> Vec<String> {
+    let (Some(runtime), Some(sysroot)) = (runtime, sysroot) else {
+        return tool_paths;
+    };
+    if host != target {
+        return tool_paths;
+    }
+    // Bubblewrap mounts the managed runtime at these absolute paths. Using
+    // the physical store paths here would make action keys machine-specific.
+    runtime
+        .library_dirs
+        .iter()
+        .map(|path| {
+            Path::new("/")
+                .join(
+                    path.strip_prefix(&runtime.root)
+                        .expect("runtime library lies below its root"),
+                )
+                .display()
+                .to_string()
+        })
+        .chain(tool_paths)
+        .chain(
+            sysroot
+                .library_dirs
+                .iter()
+                .map(|path| path.display().to_string()),
+        )
+        .collect()
+}
+
 fn build_script_environment<'a>(
     ctx: &'a Ctx,
     unit: &Unit,
@@ -9496,12 +9623,26 @@ fn build_script_environment<'a>(
         .iter()
         .filter(|tool| tool.is_visible_to(&pkg.name, &platform))
         .collect::<Vec<_>>();
-    let mut tool_environment: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut tool_environment: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for tool in &visible_tools {
         tool_environment
             .entry(&tool.env)
             .or_default()
-            .push(&tool.value);
+            .push(tool.value.clone());
+    }
+    // A host-side build dependency during cross-compilation must not load
+    // libraries from the target sysroot, even though its own platform is HOST.
+    let library_paths = build_script_library_paths(
+        &ctx.host,
+        ctx.target.as_deref().unwrap_or(&ctx.host),
+        ctx.linux_runtime.as_ref(),
+        ctx.target_sysroot.as_ref(),
+        tool_environment
+            .remove("LD_LIBRARY_PATH")
+            .unwrap_or_default(),
+    );
+    if !library_paths.is_empty() {
+        tool_environment.insert("LD_LIBRARY_PATH", library_paths);
     }
     for (name, values) in tool_environment {
         env.push((name.to_string(), values.join(":")));
@@ -9629,7 +9770,7 @@ fn run_build_script(
         .command(&script_path, Path::new(&pkg_root), &reads, &writes);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
-    if ctx.zig.is_some() {
+    if ctx.zig_for_platform(unit).is_some() {
         let zig_global_cache = scratch.join("zig-global-cache");
         let zig_local_cache = scratch.join("zig-local-cache");
         fs::create_dir_all(&zig_global_cache)?;
@@ -9944,6 +10085,38 @@ mod zig_target_tests {
     use super::zig_target_for_build;
 
     #[test]
+    fn linux_host_toolchain_is_independent_of_the_cross_target() {
+        for host in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            for target in [
+                "wasm32-unknown-unknown",
+                "aarch64-unknown-linux-musl",
+                "x86_64-unknown-linux-gnu.2.28",
+            ] {
+                assert_eq!(
+                    zig_target_for_build(host, None).unwrap().as_deref(),
+                    Some(host)
+                );
+                assert_eq!(
+                    zig_target_for_build(host, Some(target)).unwrap().as_deref(),
+                    Some(target)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macos_cross_builds_keep_the_ambient_host_toolchain() {
+        let host = "aarch64-apple-darwin";
+        assert_eq!(zig_target_for_build(host, None).unwrap(), None);
+        assert_eq!(
+            zig_target_for_build(host, Some("wasm32-unknown-unknown"))
+                .unwrap()
+                .as_deref(),
+            Some("wasm32-unknown-unknown")
+        );
+    }
+
+    #[test]
     fn explicit_native_linux_target_uses_zig() {
         assert_eq!(
             zig_target_for_build("x86_64-unknown-linux-gnu", Some("x86_64-unknown-linux-gnu"))
@@ -9998,10 +10171,151 @@ mod linux_runtime_tests {
 
 #[cfg(test)]
 mod target_sysroot_tests {
-    use super::{discover_target_sysroot, CorgiToml};
+    use super::{
+        build_script_library_paths, discover_target_sysroot, merge_sysroot_tree, unpack_archive,
+        unpack_sysroot_archive, CorgiToml, TargetSysroot,
+    };
+    use crate::sandbox::LinuxRuntime;
     use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn arch_packages_merge_payloads_without_root_metadata() {
+        let root = temporary_directory();
+        let assembled = root.join("assembled");
+        fs::create_dir(&assembled).unwrap();
+        for (index, compression) in ["zstd", "xz"].iter().enumerate() {
+            let source = root.join(format!("source-{index}"));
+            fs::create_dir_all(source.join("usr/include")).unwrap();
+            fs::create_dir_all(source.join("usr/lib")).unwrap();
+            fs::write(
+                source.join(".PKGINFO"),
+                format!("pkgname = package-{index}\npkgver = 1.0-{index}\n"),
+            )
+            .unwrap();
+            for name in [".BUILDINFO", ".MTREE", ".INSTALL", ".CHANGELOG"] {
+                fs::write(source.join(name), format!("exit {}\n", index + 1)).unwrap();
+            }
+            fs::write(source.join(".keep"), "unrelated dotfile").unwrap();
+            fs::write(source.join("usr/include/.PKGINFO"), "nested payload").unwrap();
+            fs::write(
+                source.join(format!("usr/include/package-{index}.h")),
+                "header",
+            )
+            .unwrap();
+            let library = source.join(format!("usr/lib/libpackage-{index}.so.1"));
+            fs::write(&library, format!("library-{index}")).unwrap();
+            fs::set_permissions(&library, fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(
+                format!("libpackage-{index}.so.1"),
+                source.join(format!("usr/lib/libpackage-{index}.so")),
+            )
+            .unwrap();
+            let archive = root.join(format!("package-{index}.archive"));
+            if *compression == "xz" {
+                assert!(Command::new("tar")
+                    .arg("-cJf")
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(&source)
+                    .arg(".")
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                let mut tar = tar::Builder::new(Vec::new());
+                tar.follow_symlinks(false);
+                tar.append_dir_all(".", &source).unwrap();
+                let bytes = tar.into_inner().unwrap();
+                fs::write(&archive, zstd::encode_all(bytes.as_slice(), 0).unwrap()).unwrap();
+            }
+            let extracted = root.join(format!("extracted-{index}"));
+            fs::create_dir(&extracted).unwrap();
+            unpack_sysroot_archive(&archive, &extracted).unwrap();
+            merge_sysroot_tree(&extracted, &assembled, "test").unwrap();
+        }
+        for name in [".PKGINFO", ".BUILDINFO", ".MTREE", ".INSTALL", ".CHANGELOG"] {
+            assert!(!assembled.join(name).exists(), "{name}");
+        }
+        assert_eq!(
+            fs::read_to_string(assembled.join(".keep")).unwrap(),
+            "unrelated dotfile"
+        );
+        assert_eq!(
+            fs::read_to_string(assembled.join("usr/include/.PKGINFO")).unwrap(),
+            "nested payload"
+        );
+        for index in 0..2 {
+            assert_eq!(
+                fs::read_to_string(assembled.join(format!("usr/include/package-{index}.h")))
+                    .unwrap(),
+                "header"
+            );
+            let library = assembled.join(format!("usr/lib/libpackage-{index}.so.1"));
+            assert_eq!(
+                fs::read_to_string(&library).unwrap(),
+                format!("library-{index}")
+            );
+            assert_eq!(
+                fs::metadata(&library).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::read_link(assembled.join(format!("usr/lib/libpackage-{index}.so"))).unwrap(),
+                PathBuf::from(format!("libpackage-{index}.so.1"))
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_tar_and_debian_payloads_keep_unrelated_metadata_names() {
+        let root = temporary_directory();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        for name in [".PKGINFO", ".INSTALL", ".BUILDINFO", "header.h"] {
+            fs::write(source.join(name), "ordinary payload").unwrap();
+        }
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.append_dir_all(".", &source).unwrap();
+        let payload = tar.into_inner().unwrap();
+        for (index, bytes) in [
+            payload.clone(),
+            debian_archive("data.tar", &payload),
+            debian_archive(
+                "data.tar.zst",
+                &zstd::encode_all(payload.as_slice(), 0).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = root.join(format!("{index}.archive"));
+            fs::write(&archive, bytes).unwrap();
+            for (kind, unpack) in [
+                (
+                    "tool",
+                    unpack_archive as fn(&std::path::Path, &std::path::Path) -> anyhow::Result<()>,
+                ),
+                ("sysroot", unpack_sysroot_archive),
+            ] {
+                let extracted = root.join(format!("{index}-{kind}"));
+                fs::create_dir(&extracted).unwrap();
+                unpack(&archive, &extracted).unwrap();
+                for name in [".PKGINFO", ".INSTALL", ".BUILDINFO", "header.h"] {
+                    assert_eq!(
+                        fs::read_to_string(extracted.join(name)).unwrap(),
+                        "ordinary payload"
+                    );
+                }
+                assert!(!extracted.join("control").exists());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn nested_tables_group_archives_by_target() {
@@ -10037,6 +10351,90 @@ mod target_sysroot_tests {
             [PathBuf::from("sdk/lib/pkgconfig")]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_build_library_paths_are_store_independent_and_preserve_precedence() {
+        for root in ["/first-store/runtime", "/second-store/runtime"] {
+            let mut runtime = runtime();
+            runtime.root = root.into();
+            runtime.library_dirs = vec![runtime.root.join("lib")];
+            assert_eq!(
+                build_script_library_paths(
+                    "x86_64-unknown-linux-gnu",
+                    "x86_64-unknown-linux-gnu",
+                    Some(&runtime),
+                    Some(&sysroot()),
+                    vec!["/tool/lib".into()],
+                ),
+                ["/lib", "/tool/lib", "/sysroot/lib"]
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_sysroots_and_missing_native_configuration_leave_tool_paths_unchanged() {
+        let runtime = runtime();
+        let sysroot = sysroot();
+        for (target, runtime, sysroot) in [
+            ("aarch64-unknown-linux-gnu", Some(&runtime), Some(&sysroot)),
+            ("wasm32-unknown-unknown", Some(&runtime), Some(&sysroot)),
+            ("x86_64-unknown-linux-gnu", None, Some(&sysroot)),
+            ("x86_64-unknown-linux-gnu", Some(&runtime), None),
+        ] {
+            assert_eq!(
+                build_script_library_paths(
+                    "x86_64-unknown-linux-gnu",
+                    target,
+                    runtime,
+                    sysroot,
+                    vec!["/tool/lib".into()],
+                ),
+                ["/tool/lib"]
+            );
+        }
+    }
+
+    fn debian_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = b"!<arch>\n".to_vec();
+        for (name, body) in [
+            ("debian-binary", b"2.0\n".as_slice()),
+            ("control.tar", b"control".as_slice()),
+            (name, payload),
+        ] {
+            bytes.extend_from_slice(
+                format!(
+                    "{name:<16}0           0     0     100644  {:<10}`\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                bytes.push(b'\n');
+            }
+        }
+        bytes
+    }
+
+    fn runtime() -> LinuxRuntime {
+        LinuxRuntime {
+            identity: "runtime".into(),
+            root: "/runtime".into(),
+            loader: "/runtime/lib/ld-linux-x86-64.so.2".into(),
+            library_dirs: vec!["/runtime/lib".into()],
+            shell: "/runtime/bin/sh".into(),
+        }
+    }
+
+    fn sysroot() -> TargetSysroot {
+        TargetSysroot {
+            identity: "sysroot".into(),
+            root: "/sysroot".into(),
+            library_dirs: vec!["/sysroot/lib".into()],
+            pkg_config_dirs: vec![],
+            pkg_config: "/tools/pkg-config".into(),
+        }
     }
 
     fn temporary_directory() -> PathBuf {

@@ -6,6 +6,316 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(target_os = "linux")]
+#[test]
+fn wasm_build_keeps_native_build_dependencies_and_proc_macros() {
+    let directory = TestDirectory::new("wasm-host-toolchain");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    for path in ["src", ".cargo", "host_dependency/src", "fixture_macro/src"] {
+        fs::create_dir_all(workspace.join(path)).unwrap();
+    }
+    fs::copy("rust-toolchain.toml", workspace.join("rust-toolchain.toml")).unwrap();
+    for (path, contents) in [
+        (
+            "Cargo.toml",
+            r#"[workspace]
+members = ["host_dependency", "fixture_macro"]
+resolver = "2"
+[package]
+name = "wasm-fixture"
+version = "0.1.0"
+edition = "2024"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+fixture_macro = { path = "fixture_macro" }
+[build-dependencies]
+host_dependency = { path = "host_dependency" }
+"#,
+        ),
+        (
+            ".cargo/config.toml",
+            "[target.wasm32-unknown-unknown]\nrustflags = [\"--cfg\", \"target_marker\"]\n",
+        ),
+        (
+            "corgi.toml",
+            "[extra-inputs]\nwasm-fixture = [\"target.c\"]\nhost_dependency = [\"host.c\"]\n",
+        ),
+        (
+            "src/lib.rs",
+            r#"#[cfg(not(target_marker))]
+compile_error!("target flags missing");
+#[unsafe(no_mangle)]
+pub extern "C" fn answer() -> u32 { fixture_macro::answer!() }
+"#,
+        ),
+        (
+            "build.rs",
+            r#"fn main() {
+    assert_eq!(host_dependency::value(), 42);
+    assert_eq!(std::env::var("TARGET").unwrap(), "wasm32-unknown-unknown");
+    assert!(std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap().contains("target_marker"));
+    let compiler = std::env::var("CC_wasm32_unknown_unknown").unwrap();
+    assert!(std::process::Command::new(compiler)
+        .args(["-c", "target.c", "-o"])
+        .arg(std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("target.o"))
+        .status().unwrap().success());
+}
+"#,
+        ),
+        (
+            "target.c",
+            "_Static_assert(sizeof(void *) == 4, \"expected Wasm\");\n",
+        ),
+        (
+            "host_dependency/Cargo.toml",
+            "[package]\nname = \"host_dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        (
+            "host_dependency/src/lib.rs",
+            r#"#[cfg(target_marker)]
+compile_error!("target flags leaked into host dependency");
+pub fn value() -> u32 { env!("HOST_VALUE").parse().unwrap() }
+"#,
+        ),
+        (
+            "host_dependency/build.rs",
+            r#"fn main() {
+    let host = std::env::var("HOST").unwrap();
+    assert_eq!(std::env::var("TARGET").unwrap(), host);
+    assert_eq!(std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap(), "");
+    let compiler = std::env::var(format!("CC_{}", host.replace('-', "_"))).unwrap();
+    assert!(std::process::Command::new(compiler)
+        .args(["-c", "host.c", "-o"])
+        .arg(std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("host.o"))
+        .status().unwrap().success());
+    println!("cargo:rustc-env=HOST_VALUE=42");
+}
+"#,
+        ),
+        (
+            "host_dependency/host.c",
+            "_Static_assert(sizeof(void *) == 8, \"expected native host\");\n",
+        ),
+        (
+            "fixture_macro/Cargo.toml",
+            r#"[package]
+name = "fixture_macro"
+version = "0.1.0"
+edition = "2024"
+[lib]
+proc-macro = true
+[dependencies]
+host_dependency = { path = "../host_dependency" }
+"#,
+        ),
+        (
+            "fixture_macro/src/lib.rs",
+            r#"#[cfg(target_marker)]
+compile_error!("target flags leaked into proc macro");
+#[proc_macro]
+pub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    host_dependency::value().to_string().parse().unwrap()
+}
+"#,
+        ),
+    ] {
+        fs::write(workspace.join(path), contents).unwrap();
+    }
+    for command in ["check", "build"] {
+        assert_success(
+            &Command::new(env!("CARGO_BIN_EXE_corgi"))
+                .arg(command)
+                .args(["-C"])
+                .arg(&workspace)
+                .args(["--target", "wasm32-unknown-unknown", "-p", "wasm-fixture"])
+                .env("CORGI_STORE", &store)
+                .env("CORGI_ALIAS", directory.path.join("alias"))
+                .output()
+                .unwrap(),
+            &format!("corgi {command} Wasm with native build dependencies"),
+        );
+    }
+    let wasm =
+        fs::read(workspace.join("target/wasm32-unknown-unknown/debug/wasm_fixture.wasm")).unwrap();
+    assert!(wasm.starts_with(b"\0asm"));
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_sysroot_libraries_load_in_build_scripts_and_invalidate_cached_outputs() {
+    use sha2::{Digest, Sha256};
+
+    let directory = TestDirectory::new("build-sysroot");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    let libraries = directory.path.join("libraries");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_corgi"))
+            .args(["run", "-C"])
+            .arg(&workspace)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_ALIAS", directory.path.join("alias"))
+            .output()
+            .unwrap()
+    };
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(&libraries).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"build-sysroot\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::copy("rust-toolchain.toml", workspace.join("rust-toolchain.toml")).unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"SYSROOT_VALUE\")); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        r#"use std::ffi::{c_char, c_void, CStr, CString};
+#[link(name = "dl")]
+unsafe extern "C" {
+    fn dlopen(path: *const c_char, flags: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
+    fn dlclose(handle: *mut c_void) -> i32;
+}
+fn main() {
+    unsafe {
+        let path = CString::new(format!("{}/libtool.so", std::env::var("SYSROOT_TOOL").unwrap())).unwrap();
+        let handle = dlopen(path.as_ptr(), 2);
+        assert!(!handle.is_null(), "{}", CStr::from_ptr(dlerror()).to_string_lossy());
+        let symbol = dlsym(handle, c"tool_value".as_ptr());
+        assert!(!symbol.is_null());
+        let value: unsafe extern "C" fn() -> i32 = std::mem::transmute(symbol);
+        println!("cargo:rustc-env=SYSROOT_VALUE={}", value());
+        assert_eq!(dlclose(handle), 0);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let mut tool_config = String::new();
+    let mut override_config = String::new();
+    for value in [7, 9] {
+        let source = libraries.join("fixture.c");
+        let library = libraries.join("libsysroot_fixture.so");
+        fs::write(
+            &source,
+            format!("int sysroot_value(void) {{ return {value}; }}\n"),
+        )
+        .unwrap();
+        assert_success(
+            &Command::new("cc")
+                .args(["-shared", "-fPIC"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&library)
+                .output()
+                .unwrap(),
+            "compile the sysroot fixture library",
+        );
+
+        if tool_config.is_empty() {
+            let source = libraries.join("tool.c");
+            let tool = libraries.join("libtool.so");
+            fs::write(
+                &source,
+                "extern int sysroot_value(void);\nint tool_value(void) { return sysroot_value(); }\n",
+            )
+            .unwrap();
+            assert_success(
+                &Command::new("cc")
+                    .args(["-shared", "-fPIC"])
+                    .arg(&source)
+                    .arg("-L")
+                    .arg(&libraries)
+                    .arg("-lsysroot_fixture")
+                    .arg("-o")
+                    .arg(&tool)
+                    .output()
+                    .unwrap(),
+                "compile a tool with a transitive sysroot dependency",
+            );
+            let archive = directory.path.join("tool.tar");
+            let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+            builder.append_path_with_name(&tool, "libtool.so").unwrap();
+            builder.finish().unwrap();
+            drop(builder);
+            let checksum = Sha256::digest(fs::read(&archive).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            tool_config = format!(
+                "[tools.loader]\nversion = \"1\"\nurl = \"file://{}\"\nsha256 = \"{checksum}\"\npath = \".\"\nenv = \"SYSROOT_TOOL\"\n",
+                archive.display()
+            );
+        }
+
+        let archive = directory.path.join(format!("sysroot-{value}.tar"));
+        let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+        builder
+            .append_path_with_name(&library, "usr/lib/libsysroot_fixture.so")
+            .unwrap();
+        // A sysroot must not replace the managed libc used to execute tools.
+        let foreign_libc = libraries.join("libc.so.6");
+        fs::write(&foreign_libc, "not a compatible runtime").unwrap();
+        builder
+            .append_path_with_name(&foreign_libc, "usr/lib/libc.so.6")
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+        let checksum = Sha256::digest(fs::read(&archive).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if value == 7 {
+            override_config = format!(
+                "\n[tools.override]\nversion = \"1\"\nurl = \"file://{}\"\nsha256 = \"{checksum}\"\npath = \"usr/lib\"\nenv = \"LD_LIBRARY_PATH\"\n",
+                archive.display()
+            );
+        }
+        fs::write(
+            workspace.join("corgi.toml"),
+            format!(
+                "{tool_config}\n[sysroot.x86_64-unknown-linux-gnu.fixture]\nurl = \"file://{}\"\nsha256 = \"{checksum}\"\n",
+                archive.display()
+            ),
+        )
+        .unwrap();
+
+        let output = run();
+        assert_success(&output, "load the native sysroot library from build.rs");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{value}\n")
+        );
+    }
+
+    let warm = run();
+    assert_success(
+        &warm,
+        "reuse outputs built with the unchanged native sysroot",
+    );
+    assert_eq!(String::from_utf8(warm.stdout).unwrap(), "9\n");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(&report, "build-sysroot", "compile", "build-sysroot", "hit");
+
+    let config = workspace.join("corgi.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config).unwrap() + &override_config,
+    )
+    .unwrap();
+    let overridden = run();
+    assert_success(&overridden, "prefer explicitly declared tool libraries");
+    assert_eq!(String::from_utf8(overridden.stdout).unwrap(), "7\n");
+}
+
 #[test]
 fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
     let directory = TestDirectory::new("target-dir");
