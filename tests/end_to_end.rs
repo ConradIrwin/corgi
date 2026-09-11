@@ -1633,6 +1633,95 @@ fn run_named_target_overrides_default_run_and_preserves_process_inputs() {
 }
 
 #[test]
+fn cargo_bin_name_follows_target_identity_including_test_harnesses() {
+    let directory = TestDirectory::new("cargo-bin-name");
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "library.rs"
+
+[[bin]]
+name = "zed-like-bin"
+path = "binary.rs"
+
+[[example]]
+name = "executable-example"
+path = "example.rs"
+
+[[example]]
+name = "library-example"
+path = "library-example.rs"
+crate-type = ["lib"]
+
+[[test]]
+name = "integration"
+path = "integration.rs"
+
+[[bench]]
+name = "benchmark"
+path = "benchmark.rs"
+harness = false
+"#,
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    for (source, name) in [
+        ("binary.rs", "zed-like-bin"),
+        ("example.rs", "executable-example"),
+    ] {
+        fs::write(
+            directory.path.join(source),
+            format!(
+                r#"const APP_NAME_LOWERCASE: &str = "{name}";
+const _: () = assert!(
+    APP_NAME_LOWERCASE
+        .as_bytes()
+        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
+    "APP_NAME_LOWERCASE must match the binary name",
+);
+fn main() {{}}
+#[test]
+fn binary_name_matches() {{
+    assert_eq!(env!("CARGO_BIN_NAME"), APP_NAME_LOWERCASE);
+}}
+"#,
+            ),
+        )
+        .unwrap();
+    }
+    for source in [
+        "library.rs",
+        "library-example.rs",
+        "integration.rs",
+        "benchmark.rs",
+        "build.rs",
+    ] {
+        fs::write(
+            directory.path.join(source),
+            "const _: () = assert!(option_env!(\"CARGO_BIN_NAME\").is_none());\n\
+             fn main() {}\n",
+        )
+        .unwrap();
+    }
+
+    run_corgi(
+        &directory.path,
+        "test",
+        ["--bin", "zed-like-bin", "--force"],
+    );
+    run_corgi(&directory.path, "build", ["--all-targets"]);
+    run_corgi(&directory.path, "check", ["--all-targets"]);
+    run_corgi(&directory.path, "test", ["--all-targets", "--force"]);
+}
+
+#[test]
 fn package_target_selectors_reach_cargo_planning() {
     let directory = TestDirectory::new("target-selectors");
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);

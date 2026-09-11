@@ -1369,7 +1369,14 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         } else {
             let mut environment = ctx.pkg_env(package);
             environment.extend(ctx.config_env.iter().cloned());
-            if matches!(unit.kind, Kind::Bin) {
+            let is_binary = unit.target.kind.iter().any(|kind| kind == "bin");
+            let is_executable_example = unit.target.kind.iter().any(|kind| kind == "example")
+                && unit
+                    .target
+                    .crate_types
+                    .iter()
+                    .any(|crate_type| crate_type == "bin");
+            if is_binary || is_executable_example {
                 environment.push(("CARGO_BIN_NAME".to_string(), unit.target.name.clone()));
             }
             if matches!(unit.kind, Kind::Test)
