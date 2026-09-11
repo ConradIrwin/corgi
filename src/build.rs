@@ -2297,7 +2297,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let archive = work.join("archive");
     match t.auth.as_str() {
         "" => {
-            let st = Command::new("curl")
+            let st = crate::curl()
                 .args(["-sSfL", "-o"])
                 .arg(&archive)
                 .arg(&t.url)
@@ -3000,7 +3000,7 @@ fn ensure_toolchain(
     for (comp, name, payload) in components {
         let url = format!("{base}/{name}.tar.xz");
         let tarball = work.join(format!("{name}.tar.xz"));
-        let st = Command::new("curl")
+        let st = crate::curl()
             .args(["-sSfL", "-o"])
             .arg(&tarball)
             .arg(&url)
@@ -3010,7 +3010,7 @@ fn ensure_toolchain(
             bail!("download failed: {url}");
         }
         let expected = capture(
-            Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+            crate::curl().args(["-sSfL", &format!("{url}.sha256")]),
             "fetching sha256",
         )?;
         let expected = expected.split_whitespace().next().unwrap_or("").to_string();
@@ -3114,7 +3114,7 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl")
+    let st = crate::curl()
         .args(["-sSfL", "-o"])
         .arg(&tarball)
         .arg(&url)
@@ -3123,7 +3123,7 @@ fn ensure_rust_src(store: &Store, channel: &str) -> Result<()> {
         bail!("download failed: {url}");
     }
     let expected = capture(
-        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        crate::curl().args(["-sSfL", &format!("{url}.sha256")]),
         "sha256",
     )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
@@ -3185,7 +3185,7 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str, build_std: bool) ->
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl")
+    let st = crate::curl()
         .args(["-sSfL", "-o"])
         .arg(&tarball)
         .arg(&url)
@@ -3194,7 +3194,7 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str, build_std: bool) ->
         bail!("download failed: {url}");
     }
     let expected = capture(
-        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        crate::curl().args(["-sSfL", &format!("{url}.sha256")]),
         "sha256",
     )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
@@ -3258,7 +3258,7 @@ fn ensure_rustfmt(store: &Store, channel: &str, triple: &str) -> Result<PathBuf>
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl")
+    let st = crate::curl()
         .args(["-sSfL", "-o"])
         .arg(&tarball)
         .arg(&url)
@@ -3267,7 +3267,7 @@ fn ensure_rustfmt(store: &Store, channel: &str, triple: &str) -> Result<PathBuf>
         bail!("download failed: {url}");
     }
     let expected = capture(
-        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        crate::curl().args(["-sSfL", &format!("{url}.sha256")]),
         "sha256",
     )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
@@ -3351,7 +3351,7 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
     fs::create_dir_all(&work)?;
     let tarball = work.join("t.tar.xz");
     let url = format!("{base}/{name}.tar.xz");
-    let st = Command::new("curl")
+    let st = crate::curl()
         .args(["-sSfL", "-o"])
         .arg(&tarball)
         .arg(&url)
@@ -3360,7 +3360,7 @@ fn ensure_target_std(store: &Store, channel: &str, target: &str) -> Result<()> {
         bail!("download failed: {url}");
     }
     let expected = capture(
-        Command::new("curl").args(["-sSfL", &format!("{url}.sha256")]),
+        crate::curl().args(["-sSfL", &format!("{url}.sha256")]),
         "sha256",
     )?;
     let expected = expected.split_whitespace().next().unwrap_or("").to_string();
