@@ -84,6 +84,7 @@ impl Sandbox for Bubblewrap {
         working_directory: &Path,
         reads: &[&Path],
         writes: &[&Path],
+        library_path: Option<&str>,
     ) -> Command {
         let environment = &self.environment;
         let mut arguments: Vec<OsString> = Vec::new();
@@ -162,6 +163,9 @@ impl Sandbox for Bubblewrap {
             }
         }
         bind(&mut arguments, READ_ONLY, program);
+        if let Some(library_path) = library_path {
+            arguments.extend(["--setenv", "LD_LIBRARY_PATH", library_path].map(OsString::from));
+        }
 
         let mut command = Command::new(&self.executable);
         command

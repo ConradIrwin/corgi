@@ -226,6 +226,7 @@ impl Sandbox for Seatbelt {
         working_directory: &Path,
         reads: &[&Path],
         writes: &[&Path],
+        _library_path: Option<&str>,
     ) -> Command {
         let mut command = Command::new(SANDBOX_EXEC);
         command
