@@ -6578,9 +6578,11 @@ fn xcode_toolchain_root(executable: &Path) -> Option<&Path> {
 
 #[cfg(test)]
 mod metal_toolchain_tests {
+    #[cfg(target_os = "macos")]
+    use super::filesystem_device;
     use super::{
-        filesystem_device, hermetic_apple_command, plist_bool, plist_string,
-        sealed_apfs_volume_uuid, selected_xcode_toolchains, xcode_toolchain_root,
+        hermetic_apple_command, plist_bool, plist_string, sealed_apfs_volume_uuid,
+        selected_xcode_toolchains, xcode_toolchain_root,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
