@@ -42,13 +42,19 @@ pub fn ensure_available() -> Result<()> {
 pub struct Bubblewrap {
     environment: Environment,
     executable: PathBuf,
+    interpreter: Option<PathBuf>,
 }
 
 impl Bubblewrap {
     pub fn new(environment: Environment) -> Result<Self> {
+        let binary = std::fs::read(std::env::current_exe()?)?;
+        let interpreter = goblin::elf::Elf::parse(&binary)?
+            .interpreter
+            .map(PathBuf::from);
         Ok(Self {
             environment,
             executable: executable()?,
+            interpreter,
         })
     }
 
@@ -78,6 +84,7 @@ impl Sandbox for Bubblewrap {
         working_directory: &Path,
         reads: &[&Path],
         writes: &[&Path],
+        library_path: Option<&str>,
     ) -> Command {
         let environment = &self.environment;
         let mut arguments: Vec<OsString> = Vec::new();
@@ -109,6 +116,14 @@ impl Sandbox for Bubblewrap {
             &runtime.loader,
             &Path::new("/lib64").join(loader_name),
         );
+        if let Some(interpreter) = &self.interpreter {
+            bind_at(
+                &mut arguments,
+                REQUIRED_READ_ONLY,
+                &runtime.loader,
+                interpreter,
+            );
+        }
         bind_at(
             &mut arguments,
             REQUIRED_READ_ONLY,
@@ -148,6 +163,9 @@ impl Sandbox for Bubblewrap {
             }
         }
         bind(&mut arguments, READ_ONLY, program);
+        if let Some(library_path) = library_path {
+            arguments.extend(["--setenv", "LD_LIBRARY_PATH", library_path].map(OsString::from));
+        }
 
         let mut command = Command::new(&self.executable);
         command

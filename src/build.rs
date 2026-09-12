@@ -6578,9 +6578,11 @@ fn xcode_toolchain_root(executable: &Path) -> Option<&Path> {
 
 #[cfg(test)]
 mod metal_toolchain_tests {
+    #[cfg(target_os = "macos")]
+    use super::filesystem_device;
     use super::{
-        filesystem_device, hermetic_apple_command, plist_bool, plist_string,
-        sealed_apfs_volume_uuid, selected_xcode_toolchains, xcode_toolchain_root,
+        hermetic_apple_command, plist_bool, plist_string, sealed_apfs_volume_uuid,
+        selected_xcode_toolchains, xcode_toolchain_root,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -9173,7 +9175,7 @@ fn compile(
     }
     let mut cmd = ctx
         .sandbox
-        .command(Path::new(executor), compile_dir, &reads, &writes);
+        .command(Path::new(executor), compile_dir, &reads, &writes, None);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig_for_platform(unit).is_some() {
@@ -9765,9 +9767,18 @@ fn run_build_script(
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::BuildScriptRun)?;
     let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
-    let mut cmd = ctx
-        .sandbox
-        .command(&script_path, Path::new(&pkg_root), &reads, &writes);
+    let library_path = spec
+        .environment
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == "LD_LIBRARY_PATH").then_some(value.as_str()));
+    let mut cmd = ctx.sandbox.command(
+        &script_path,
+        Path::new(&pkg_root),
+        &reads,
+        &writes,
+        library_path,
+    );
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
     if ctx.zig_for_platform(unit).is_some() {
@@ -9813,6 +9824,9 @@ fn run_build_script(
     path.push("/bin".to_string());
     cmd.env("PATH", path.join(":"));
     for (key, value) in &spec.environment {
+        if cfg!(target_os = "linux") && key == "LD_LIBRARY_PATH" {
+            continue;
+        }
         cmd.env(key, value);
     }
     for (key, value) in &dep_env {

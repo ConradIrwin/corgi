@@ -102,6 +102,7 @@ pub trait Sandbox: Send + Sync {
         working_directory: &Path,
         reads: &[&Path],
         writes: &[&Path],
+        library_path: Option<&str>,
     ) -> Command;
 
     /// How the confinement is enforced, for `--verbose` output.

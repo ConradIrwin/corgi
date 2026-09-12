@@ -248,6 +248,7 @@ dependencies = [
  "cargo-zigbuild",
  "clap",
  "glob",
+ "goblin",
  "jobserver",
  "libc",
  "memchr",
