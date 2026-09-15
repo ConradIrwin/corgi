@@ -74,6 +74,7 @@ pub struct Command {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub features: Vec<String>,
+    pub no_default_features: bool,
     pub incremental: bool,
     pub no_run: bool,
     pub force_tests: bool,
@@ -644,6 +645,7 @@ mod tests {
                 profile: "dev".into(),
                 target: None,
                 features: vec![],
+                no_default_features: false,
                 incremental: true,
                 no_run: false,
                 force_tests: false,

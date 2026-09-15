@@ -329,6 +329,229 @@ fn features_enable_only_the_selected_packages_feature() {
 }
 
 #[test]
+fn no_default_features_preserves_other_workspace_defaults() {
+    let directory = TestDirectory::new("no-default-features");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    copy_directory(&fixture_path("no-default-features"), &workspace);
+
+    let scoped = "app: (false, false, false); sibling: (true, true, false)";
+    for (arguments, expected) in [
+        (
+            vec!["-p", "app"],
+            "app: (true, true, false); sibling: (true, true, false)",
+        ),
+        (vec!["-p", "app", "--no-default-features"], scoped),
+        (
+            vec!["-p", "app", "--no-default-features", "--features", "extra"],
+            "app: (false, false, true); sibling: (true, true, false)",
+        ),
+        (
+            vec![
+                "-p",
+                "app",
+                "--no-default-features",
+                "--features",
+                "default",
+            ],
+            "app: (true, true, false); sibling: (true, true, false)",
+        ),
+        // Without -p, the virtual workspace's default member is selected.
+        (vec!["--no-default-features"], scoped),
+    ] {
+        let output = corgi_command()
+            .current_dir(&workspace)
+            .arg("run")
+            .args(&arguments)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_ALIAS", store.join("alias"))
+            .output()
+            .unwrap();
+        assert_success(&output, &format!("corgi run {}", arguments.join(" ")));
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+
+    let member = invoke_corgi_with_store(
+        &workspace.join("app"),
+        "run",
+        ["--no-default-features"],
+        &store,
+    );
+    assert_success(&member, "run from a member without default features");
+    assert_eq!(String::from_utf8(member.stdout).unwrap().trim(), scoped);
+
+    let tested = corgi_command()
+        .current_dir(&workspace)
+        .args(["test", "-p", "app", "--no-default-features", "--force"])
+        .env("EXPECTED_FEATURES", scoped)
+        .env("CORGI_STORE", &store)
+        .env("CORGI_ALIAS", store.join("alias"))
+        .output()
+        .unwrap();
+    assert_success(&tested, "test without the selected package's defaults");
+    let report = report_for_workspace(&store, &workspace);
+    assert_eq!(report["run"]["command"]["no_default_features"], true);
+    assert_eq!(report["test_harnesses"].as_array().unwrap().len(), 1);
+    assert_eq!(report["test_harnesses"][0]["summary"]["passed"], 1);
+
+    let output = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        ["--workspace", "--no-default-features"],
+        &store,
+    );
+    assert_success(&output, "disable defaults for all workspace members");
+    let report = report_for_workspace(&store, &workspace);
+    for package in ["app", "sibling", "plain"] {
+        assert_package_features(&report, package, &[]);
+    }
+}
+
+#[test]
+fn no_default_features_separates_package_plans_with_configured_roots() {
+    let directory = TestDirectory::new("no-default-features-plans");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    copy_directory(&fixture_path("no-default-features"), &workspace);
+    fs::write(
+        workspace.join("corgi.toml"),
+        "[roots.all]\npackages = [\"app\", \"sibling\", \"plain\"]\n",
+    )
+    .unwrap();
+
+    let check = |arguments: &[&str], plan: &str, packages: &[(&str, &[&str])]| {
+        let output = corgi_command()
+            .current_dir(&workspace)
+            .arg("check")
+            .args(arguments)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_ALIAS", store.join("alias"))
+            .output()
+            .unwrap();
+        assert_success(&output, &format!("corgi check {}", arguments.join(" ")));
+        let report = report_for_workspace(&store, &workspace);
+        assert_eq!(report["cache"]["plan"]["result"], plan);
+        for (package, features) in packages {
+            assert_package_features(&report, package, features);
+        }
+    };
+    let defaults: &[&str] = &["default", "normal"];
+    // Normal builds continue sharing a plan regardless of output selection.
+    check(
+        &["-p", "app"],
+        "miss",
+        &[("app", defaults), ("sibling", defaults)],
+    );
+    check(&["-p", "sibling"], "hit", &[("sibling", defaults)]);
+    check(
+        &["-p", "app", "--no-default-features"],
+        "miss",
+        &[("app", &[]), ("sibling", defaults)],
+    );
+    // These share a resolution root and explicit features, but not defaults.
+    check(
+        &["-p", "sibling", "--no-default-features"],
+        "miss",
+        &[("sibling", &[])],
+    );
+    check(
+        &["--root", "all", "-p", "app", "--no-default-features"],
+        "hit",
+        &[("app", &[]), ("sibling", defaults)],
+    );
+    check(
+        &["-p", "app", "-p", "sibling", "--no-default-features"],
+        "miss",
+        &[("app", &[]), ("sibling", &[])],
+    );
+    check(
+        &["-p", "sibling", "-p", "app", "--no-default-features"],
+        "hit",
+        &[("app", &[]), ("sibling", &[])],
+    );
+    check(
+        &["--root", "all", "--no-default-features"],
+        "miss",
+        &[("app", &[]), ("sibling", &[]), ("plain", &[])],
+    );
+    check(
+        &["-p", "app"],
+        "hit",
+        &[("app", defaults), ("sibling", defaults)],
+    );
+
+    // Sibling is still a dependency, but no longer a resolution root: do not
+    // manufacture a default request for it.
+    fs::write(
+        workspace.join("corgi.toml"),
+        "[roots.app]\npackages = [\"app\", \"plain\"]\n",
+    )
+    .unwrap();
+    check(
+        &["-p", "app", "--no-default-features"],
+        "miss",
+        &[("app", &[]), ("sibling", &[])],
+    );
+}
+
+#[test]
+fn no_default_features_does_not_override_dependency_requests() {
+    let directory = TestDirectory::new("no-default-features-dependency");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    copy_directory(&fixture_path("no-default-features"), &workspace);
+
+    let check = |features: &[&str]| {
+        let output = invoke_corgi_with_store(
+            &workspace,
+            "check",
+            ["-p", "sibling", "--no-default-features"],
+            &store,
+        );
+        assert_success(
+            &output,
+            "check a dependency without root-requested defaults",
+        );
+        assert_package_features(
+            &report_for_workspace(&store, &workspace),
+            "sibling",
+            features,
+        );
+    };
+    check(&[]);
+    let manifest = workspace.join("app/Cargo.toml");
+    let original = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        original.replace(
+            "default-features = false",
+            "features = [\"extra\"], default-features = false",
+        ),
+    )
+    .unwrap();
+    check(&["extra"]);
+    fs::write(
+        &manifest,
+        original.replace("default-features = false", "default-features = true"),
+    )
+    .unwrap();
+    check(&["default", "normal"]);
+}
+
+fn assert_package_features(report: &serde_json::Value, package: &str, features: &[&str]) {
+    let units = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["package"]["name"] == package)
+        .collect::<Vec<_>>();
+    assert!(!units.is_empty(), "no units reported for {package}");
+    for unit in units {
+        assert_eq!(unit["features"], serde_json::json!(features), "{package}");
+    }
+}
+
+#[test]
 fn cfg_checking_uses_cargo_and_build_script_declarations() {
     let directory = TestDirectory::new("cfg-checking");
     copy_directory(&fixture_path("cfg-checking"), &directory.path);

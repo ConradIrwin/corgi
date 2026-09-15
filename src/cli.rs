@@ -170,6 +170,14 @@ pub struct BuildArgs {
     #[arg(short = 'F', long, value_name = "FEATURES", value_delimiter = ',')]
     pub features: Vec<String>,
 
+    /// Disable default features for the selected packages
+    ///
+    /// Other packages in the resolution root retain their defaults. Explicit
+    /// features and dependency requests can still enable the selected packages'
+    /// defaults, following Cargo's additive feature unification.
+    #[arg(long)]
+    pub no_default_features: bool,
+
     /// Unsupported; use corgi roots and test intentional feature combinations
     #[arg(long)]
     pub all_features: bool,
@@ -736,6 +744,30 @@ mod tests {
             panic!("clippy command not parsed");
         };
         assert!(args.build.build.all_features);
+    }
+
+    #[test]
+    fn no_default_features_is_shared_across_build_commands() {
+        for command in ["build", "check", "clippy", "run", "test", "bench"] {
+            for enabled in [false, true] {
+                let mut arguments = vec!["corgi", command, "-p", "app", "--features", "extra"];
+                if enabled {
+                    arguments.push("--no-default-features");
+                }
+                let cli = Cli::try_parse_from(arguments).unwrap();
+                let build = match cli.command.unwrap() {
+                    Command::Build(args) | Command::Check(args) => args.build,
+                    Command::Clippy(args) => args.build.build,
+                    Command::Run(args) => args.build,
+                    Command::Test(args) => args.build,
+                    Command::Bench(args) => args.build.build,
+                    _ => panic!("unexpected command"),
+                };
+                assert_eq!(build.no_default_features, enabled);
+                assert_eq!(build.packages, ["app"]);
+                assert_eq!(build.features, ["extra"]);
+            }
+        }
     }
 
     #[test]

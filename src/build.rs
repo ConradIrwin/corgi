@@ -3483,6 +3483,7 @@ pub struct BuildOpts {
     /// Cargo package names selected by `-p` or `--package`.
     pub packages: Vec<String>,
     pub features: Vec<String>,
+    pub no_default_features: bool,
     pub target: Option<String>,
     pub target_dir: Option<PathBuf>,
     /// Named `[roots.<name>]` set used to establish Cargo's resolved graph.
@@ -3528,6 +3529,33 @@ fn select_features(features: &[String], packages: &[String]) -> Vec<String> {
     selected
 }
 
+/// Cargo's --no-default-features applies to every resolution root. Restore
+/// defaults for roots outside Corgi's build selection, without changing the
+/// resolution universe or overriding any additive dependency feature requests.
+fn preserve_unselected_defaults(
+    metadata: &Metadata,
+    resolution_roots: Option<&[String]>,
+    selected_packages: Option<&BTreeSet<usize>>,
+    features: &[String],
+) -> Vec<String> {
+    let mut features = features.to_vec();
+    if let Some(selected_packages) = selected_packages {
+        for (index, package) in metadata.packages.iter().enumerate() {
+            let is_resolution_root = metadata.workspace_members.contains(&package.id)
+                && resolution_roots.is_none_or(|roots| roots.contains(&package.name));
+            if is_resolution_root
+                && !selected_packages.contains(&index)
+                && package.features.contains_key("default")
+            {
+                features.push(format!("{}/default", package.name));
+            }
+        }
+    }
+    features.sort();
+    features.dedup();
+    features
+}
+
 fn report_run(
     dir: &Path,
     opts: &BuildOpts,
@@ -3570,6 +3598,7 @@ fn report_run(
             }),
             target: opts.target.clone(),
             features: selected_features,
+            no_default_features: opts.no_default_features,
             incremental: !opts.no_incremental,
             no_run: opts.no_run,
             force_tests: opts.force_tests,
@@ -3807,6 +3836,7 @@ fn build_inner(
         workspace,
         packages,
         features,
+        no_default_features,
         target: requested_target,
         target_dir,
         root,
@@ -3825,6 +3855,7 @@ fn build_inner(
         bail!("`corgi run` accepts only one package");
     }
     let selected_features = select_features(&features, &packages);
+    let all_roots = workspace || (root.is_some() && packages.is_empty());
     let t0 = Instant::now();
     let mut report_stage_start = begin_report_stage(&recorder, "setup");
     let dir = dir
@@ -4026,11 +4057,15 @@ fn build_inner(
                 .map(|(name, _)| name.clone())
         })
     });
-    // Only the selected roots and requested features shape this plan; unrelated
-    // root definitions, tools, env probes, and comments must not even cost a
-    // replan.
+    // Without --no-default-features, package selection does not affect resolution.
+    // With it, the selection determines which defaults to restore. Include that
+    // request before metadata is available; manifest fingerprinting below covers
+    // changes to declared defaults and default members. Unrelated root definitions,
+    // tools, env probes, and comments must not even cost a replan.
     let roots_id = sha256_hex(format!("{resolution_roots:?}").as_bytes());
-    let features_id = sha256_hex(format!("{selected_features:?}").as_bytes());
+    let suppressed_defaults = no_default_features.then_some((&packages, all_roots));
+    let features_id =
+        sha256_hex(format!("{selected_features:?}\0{suppressed_defaults:?}").as_bytes());
     targets.normalize();
     let target_set = format!("{targets:?}");
     let requested_profile = profile
@@ -4148,9 +4183,8 @@ fn build_inner(
             let meta: Metadata =
                 serde_json::from_str(&meta_json).context("parsing cargo metadata")?;
             // Feature unification over fixed roots (the whole workspace, or
-            // the explicitly selected named set) — never scoped to the
-            // requested package, so a dependency's features don't depend on
-            // which package is selected from the resulting graph.
+            // the explicitly selected named set). Package selection can change
+            // requested features/defaults, but never the resolution universe.
             let ws_manifest = Path::new(&meta.workspace_root).join("Cargo.toml");
             let mut ug_cmd = cargo_command();
             ug_cmd.env("RUSTC_BOOTSTRAP", "1"); // planning only: unlock --unit-graph on stable
@@ -4190,7 +4224,26 @@ fn build_inner(
                     ug_cmd.arg("--workspace");
                 }
             }
-            for feature in &selected_features {
+            let effective_features = if no_default_features {
+                ug_cmd.arg("--no-default-features");
+                let package_indices = meta
+                    .packages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, package)| (package.id.clone(), index))
+                    .collect();
+                let selected =
+                    select_root_packages(&meta, &package_indices, all_roots, &packages, mode)?;
+                preserve_unselected_defaults(
+                    &meta,
+                    resolution_roots.as_deref(),
+                    selected.as_ref(),
+                    &selected_features,
+                )
+            } else {
+                selected_features.clone()
+            };
+            for feature in &effective_features {
                 ug_cmd.args(["--features", feature]);
             }
             ug_cmd.arg("--manifest-path").arg(&ws_manifest);
@@ -4289,11 +4342,7 @@ fn build_inner(
     for (i, p) in meta.packages.iter().enumerate() {
         pkgs.insert(p.id.clone(), i);
     }
-    let root_packages = if root.is_some() && packages.is_empty() {
-        None
-    } else {
-        select_root_packages(&meta, &pkgs, workspace, &packages, mode)?
-    };
+    let root_packages = select_root_packages(&meta, &pkgs, all_roots, &packages, mode)?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let targets_without_harness = targets_without_harness(&meta)?;
     let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref(), &targets_without_harness)?;
@@ -10205,7 +10254,9 @@ mod named_root_tests {
 
 #[cfg(test)]
 mod feature_selection_tests {
-    use super::select_features;
+    use super::{preserve_unselected_defaults, select_features};
+    use crate::meta::Metadata;
+    use std::collections::BTreeSet;
 
     #[test]
     fn package_selection_qualifies_unqualified_features() {
@@ -10240,6 +10291,60 @@ mod feature_selection_tests {
         );
 
         assert_eq!(selected, ["client/tls", "dependency/tracing", "server/tls"]);
+    }
+
+    #[test]
+    fn default_restoration_only_requests_declared_defaults_on_unselected_roots() {
+        let packages = [
+            ("app", "app", true),
+            ("sibling", "sibling", true),
+            ("plain", "plain", false),
+            ("outside", "outside", true),
+            // A same-named dependency must not restore the selected app's defaults.
+            ("remote-app", "app", true),
+        ]
+        .map(|(id, name, has_default)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "version": "0.1.0",
+                "manifest_path": format!("/workspace/{id}/Cargo.toml"),
+                "edition": "2021",
+                "features": if has_default {
+                    serde_json::json!({"default": []})
+                } else {
+                    serde_json::json!({})
+                },
+                "targets": [],
+            })
+        });
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": packages,
+            "workspace_members": ["app", "sibling", "plain", "outside"],
+            "workspace_root": "/workspace",
+            "resolve": {"root": null},
+        }))
+        .unwrap();
+        let selected = BTreeSet::from([0]);
+        let features = vec!["app/extra".to_string(), "sibling/default".to_string()];
+
+        assert_eq!(
+            preserve_unselected_defaults(&metadata, None, Some(&selected), &features),
+            ["app/extra", "outside/default", "sibling/default"]
+        );
+        let roots = [
+            "app".to_string(),
+            "sibling".to_string(),
+            "plain".to_string(),
+        ];
+        assert_eq!(
+            preserve_unselected_defaults(&metadata, Some(&roots), Some(&selected), &features),
+            ["app/extra", "sibling/default"]
+        );
+        assert_eq!(
+            preserve_unselected_defaults(&metadata, None, None, &features),
+            features
+        );
     }
 }
 

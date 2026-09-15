@@ -143,6 +143,7 @@ fn real_main() -> Result<()> {
                         workspace,
                         packages: args.packages,
                         features: args.features,
+                        no_default_features: args.no_default_features,
                         target: args.target,
                         target_dir: args.target_dir,
                         root: args.root,
