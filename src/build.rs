@@ -3733,6 +3733,46 @@ pub fn fmt(
     Ok(())
 }
 
+pub fn fetch(store: Store, dir: &Path) -> Result<()> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("bad directory {}", dir.display()))?;
+    let manifest = dir.join("Cargo.toml");
+    if !manifest.exists() {
+        bail!("no Cargo.toml in {}", dir.display());
+    }
+
+    let corgi_toml_path = find_corgi_toml(&dir);
+    let config_root = cargo_config_root(&dir, &manifest, corgi_toml_path.as_deref())?;
+    let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
+    let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
+    if config_root != dir {
+        let (selected_config, selected_config_path) = crate::config::discover(&dir)?;
+        cargo_config.merge(selected_config);
+        cargo_config_paths.extend(selected_config_path);
+    }
+
+    let channel = read_toolchain_pin(&dir)?;
+    let host = host_triple()?;
+    let build_std = !cargo_config.build_std.is_empty();
+    ensure_toolchain(&store, &channel, &host, build_std)?;
+    let toolchain = store.logical_root().join("tools").join(format!(
+        "rust-{channel}-{host}{}",
+        if build_std { "-build-std" } else { "" }
+    ));
+    let cargo_home = store.logical_root().join("cargo-home");
+
+    status!("Fetching", "dependencies via Cargo");
+    fetch_dependencies(
+        &toolchain.join("bin/cargo"),
+        &toolchain.join("bin/rustc"),
+        &cargo_home,
+        &cargo_config_paths,
+        &manifest,
+        build_std,
+    )
+}
+
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
     ensure_supported_build_platform(
         std::env::consts::OS,
@@ -4123,10 +4163,6 @@ fn build_inner(
     let resolve_now = || -> Result<(String, String)> {
         {
             status!("Resolving", "dependencies via Cargo (metadata only)");
-            // Never bother the user about a stale lockfile: try --locked
-            // first (it never writes), and when cargo rejects it, run once
-            // unlocked so cargo brings Cargo.lock up to date, then continue.
-            // The plan fingerprint hashes the lock *after* this step.
             // The probes must not depend on the caller's environment. RUSTC
             // is pinned (cargo otherwise resolves `rustc` from PATH, and a
             // rustup shim picks its toolchain by cwd). Run from the filesystem
@@ -4138,22 +4174,15 @@ fn build_inner(
                 command.env("RUSTC", &rustc);
                 command
             };
-            let mut fetch_locked = cargo_command();
-            fetch_locked
-                .args(["fetch", "--locked", "--manifest-path"])
-                .arg(&manifest);
-            if build_std {
-                fetch_locked.env("RUSTC_BOOTSTRAP", "1");
-            }
-            if capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked").is_err() {
-                status!("Updating", "Cargo.lock");
-                let mut fetch = cargo_command();
-                fetch.args(["fetch", "--manifest-path"]).arg(&manifest);
-                if build_std {
-                    fetch.env("RUSTC_BOOTSTRAP", "1");
-                }
-                capture_with_live_stderr(&mut fetch, "cargo fetch")?;
-            }
+            fetch_dependencies(
+                &cargo_bin,
+                Path::new(&rustc),
+                Path::new(&cargo_home),
+                &cargo_config_paths,
+                &manifest,
+                build_std,
+            )?;
+            // The plan fingerprint hashes Cargo.lock after Cargo can update it.
             // metadata for package details only (paths, links, metadata tables);
             // the actual per-unit resolution comes from cargo's unit-graph below
             let mut meta_cmd = cargo_command();
@@ -5491,6 +5520,40 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
         bail!("{what} failed:\n{}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn fetch_dependencies(
+    cargo: &Path,
+    rustc: &Path,
+    cargo_home: &Path,
+    cargo_config_paths: &[PathBuf],
+    manifest: &Path,
+    build_std: bool,
+) -> Result<()> {
+    // Try --locked first because it never writes. If the lockfile is stale,
+    // let Cargo update it, as a normal `cargo fetch` invocation does.
+    let cargo_command = || {
+        let mut command = isolated_cargo_command(cargo, cargo_home, cargo_config_paths);
+        command.env("RUSTC", rustc);
+        command
+    };
+    let mut fetch_locked = cargo_command();
+    fetch_locked
+        .args(["fetch", "--locked", "--manifest-path"])
+        .arg(manifest);
+    if build_std {
+        fetch_locked.env("RUSTC_BOOTSTRAP", "1");
+    }
+    if capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked").is_err() {
+        status!("Updating", "Cargo.lock");
+        let mut fetch = cargo_command();
+        fetch.args(["fetch", "--manifest-path"]).arg(manifest);
+        if build_std {
+            fetch.env("RUSTC_BOOTSTRAP", "1");
+        }
+        capture_with_live_stderr(&mut fetch, "cargo fetch")?;
+    }
+    Ok(())
 }
 
 fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {

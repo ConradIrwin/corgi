@@ -264,6 +264,7 @@ fn real_main() -> Result<()> {
                         &args.args,
                     )
                 }
+                cli::Command::Fetch => build::fetch(store, &dir),
                 cli::Command::Clean(args) => build::clean(&store, args.cache, args.older_than),
                 cli::Command::Audit(_) | cli::Command::Pin => unreachable!(),
             }
