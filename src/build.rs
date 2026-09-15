@@ -2952,7 +2952,7 @@ fn ensure_toolchain(
         .join(format!("rust-{channel}-{triple}{suffix}"));
     let bin = dest.join("bin");
     if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
-        ensure_build_std_linker_runtime(&dest, triple, build_std)?;
+        ensure_linker_runtime(&dest, triple)?;
         touch_tool_marker(&dest);
         return Ok(bin);
     }
@@ -3051,32 +3051,30 @@ fn ensure_toolchain(
         Err(_) if dest.join("bin/rustc").is_file() => {} // concurrent racer won
         Err(e) => return Err(e).context("publishing toolchain"),
     }
-    ensure_build_std_linker_runtime(&dest, triple, build_std)?;
+    ensure_linker_runtime(&dest, triple)?;
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join("bin"))
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_build_std_linker_runtime(dest: &Path, triple: &str, build_std: bool) -> Result<()> {
-    if build_std {
-        let runtime = dest.join("lib/libLLVM.dylib");
-        if !runtime.exists() {
-            return Ok(());
-        }
-        let link = dest
-            .join("lib/rustlib")
-            .join(triple)
-            .join("lib/libLLVM.dylib");
-        if fs::symlink_metadata(&link).is_err() {
-            match std::os::unix::fs::symlink("../../../libLLVM.dylib", &link) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("linking build-std linker runtime at {}", link.display())
-                    });
-                }
+fn ensure_linker_runtime(dest: &Path, triple: &str) -> Result<()> {
+    let runtime = dest.join("lib/libLLVM.dylib");
+    if !runtime.exists() {
+        return Ok(());
+    }
+    // rust-lld needs this runtime regardless of whether std is rebuilt.
+    let link = dest
+        .join("lib/rustlib")
+        .join(triple)
+        .join("lib/libLLVM.dylib");
+    if fs::symlink_metadata(&link).is_err() {
+        match std::os::unix::fs::symlink("../../../libLLVM.dylib", &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("linking linker runtime at {}", link.display()));
             }
         }
     }
@@ -3084,7 +3082,7 @@ fn ensure_build_std_linker_runtime(dest: &Path, triple: &str, build_std: bool) -
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ensure_build_std_linker_runtime(_: &Path, _: &str, _: bool) -> Result<()> {
+fn ensure_linker_runtime(_: &Path, _: &str) -> Result<()> {
     Ok(())
 }
 

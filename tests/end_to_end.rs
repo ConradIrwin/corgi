@@ -248,6 +248,52 @@ fn workspace_member_uses_its_selected_project_config() {
 }
 
 #[test]
+fn ordinary_build_compiles_and_exports_a_wasm_library() {
+    let directory = TestDirectory::new("ordinary-wasm");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    // Keep the compiler version from the reported rust-lld runtime failure.
+    fs::write(
+        workspace.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.98.1\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("corgi.toml"), "").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\ncrate-type = [\"cdylib\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    // Use a fresh store so an already-repaired compiler cannot hide the failure.
+    let output = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        ["--release", "--target", "wasm32-unknown-unknown"],
+        &store,
+    );
+
+    assert_success(&output, "build Wasm library without build-std");
+    let wasm = fs::read(
+        workspace
+            .join("target/wasm32-unknown-unknown/release")
+            .join(format!("{}.wasm", directory.package_name.replace('-', "_"))),
+    )
+    .unwrap();
+    assert!(wasm.starts_with(b"\0asm"), "expected a linked Wasm module");
+}
+
+#[test]
 fn build_std_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("build-std");
     let workspace = directory.path.join("workspace");
