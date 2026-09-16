@@ -1294,6 +1294,94 @@ fn clean_expires_incremental_state_before_other_cached_data() {
 }
 
 #[test]
+fn clean_pool_retires_metadata_with_its_library_without_removing_shared_metadata() {
+    for arguments in [vec!["clean"], vec!["clean", "--older-than", "24h"]] {
+        let directory = TestDirectory::new("clean-pool-pairs");
+        let store = directory.path.join("store");
+        let pool = store.join("pool");
+        let cache = store.join("cache/aa");
+        fs::create_dir_all(&pool).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let metadata = cache.join("shared-metadata");
+        let old_library = cache.join("old-library");
+        let recent_library = cache.join("recent-library");
+        fs::write(&metadata, b"shared metadata").unwrap();
+        fs::write(&old_library, b"old library").unwrap();
+        fs::write(&recent_library, b"recent library").unwrap();
+        fs::hard_link(&old_library, pool.join("libdemo-compiler-old.rlib")).unwrap();
+        fs::hard_link(&recent_library, pool.join("libdemo-compiler-recent.rlib")).unwrap();
+        for name in [
+            "libdemo-compiler-old.rmeta",
+            "libdemo-compiler-recent.rmeta",
+            "libdemo-compiler-check.rmeta",
+        ] {
+            fs::hard_link(&metadata, pool.join(name)).unwrap();
+        }
+        let unpaired_library = pool.join("libunpaired-compiler-old.rlib");
+        fs::write(&unpaired_library, b"library without separate metadata").unwrap();
+        for path in [&old_library, &unpaired_library] {
+            fs::File::open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+                .unwrap();
+        }
+
+        let output = corgi_command()
+            .args(&arguments)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_NO_ALIAS", "1")
+            .output()
+            .expect("failed to invoke corgi clean");
+        assert_success(&output, "corgi clean with shared pool metadata");
+
+        assert!(!old_library.exists());
+        assert!(!pool.join("libdemo-compiler-old.rlib").exists());
+        assert!(!pool.join("libdemo-compiler-old.rmeta").exists());
+        assert!(!unpaired_library.exists());
+        for path in [
+            metadata,
+            pool.join("libdemo-compiler-recent.rmeta"),
+            pool.join("libdemo-compiler-check.rmeta"),
+        ] {
+            assert_eq!(fs::read(path).unwrap(), b"shared metadata");
+        }
+        assert_eq!(fs::read(recent_library).unwrap(), b"recent library");
+        assert_eq!(
+            fs::read(pool.join("libdemo-compiler-recent.rlib")).unwrap(),
+            b"recent library"
+        );
+    }
+}
+
+#[test]
+fn clean_pool_preserves_the_library_when_paired_metadata_cannot_be_removed() {
+    let directory = TestDirectory::new("clean-pool-metadata-error");
+    let store = directory.path.join("store");
+    let pool = store.join("pool");
+    let library = pool.join("libdemo-compiler-old.rlib");
+    let metadata = pool.join("libdemo-compiler-old.rmeta");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(&library, b"library").unwrap();
+    fs::File::open(&library)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+        .unwrap();
+
+    let output = corgi_command()
+        .arg("clean")
+        .env("CORGI_STORE", &store)
+        .env("CORGI_NO_ALIAS", "1")
+        .output()
+        .expect("failed to invoke corgi clean");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("removing paired pool metadata"));
+    assert_eq!(fs::read(library).unwrap(), b"library");
+    assert!(metadata.is_dir());
+}
+
+#[test]
 fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
     for (duration, removes_two_days, removes_two_hours) in [
         ("7d", false, false),
@@ -2298,7 +2386,7 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
         .arg("-C")
         .arg(&directory.path)
         .args(["--bench", "custom", "--test", "integration", "--no-run"])
-        .env("CORGI_STORE", &store)
+        .env("CORGI_STORE", store)
         .env("CORGI_ALIAS", store.join("alias"))
         .env("CORGI_TEST_BENCH_MARKER", &marker)
         .env("CORGI_INTEGRATION_MARKER", &integration_marker)
@@ -2330,7 +2418,7 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
         .arg("-C")
         .arg(&directory.path)
         .args(["--bench", "custom", "--test", "integration"])
-        .env("CORGI_STORE", &store)
+        .env("CORGI_STORE", store)
         .env("CORGI_ALIAS", store.join("alias"))
         .env("CORGI_TEST_BENCH_MARKER", &marker)
         .env("CORGI_INTEGRATION_MARKER", &integration_marker)
