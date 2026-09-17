@@ -23,6 +23,17 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
+      # Corgi provisions this libclang unconditionally on Apple hosts, so a
+      # released Corgi is only functional once the artifact for the pinned Zig
+      # version exists. Reconcile it before building: the script is idempotent
+      # and exits in seconds when the artifact is already published, and only
+      # does real work (and installs zstd) after a Zig bump.
+      - name: Ensure libclang release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: ./ci/build-libclang.sh
+
       - name: Set per-push version
         id: version
         env:

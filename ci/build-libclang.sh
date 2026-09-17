@@ -56,6 +56,18 @@ else
   log "DRY_RUN=1: skipping existence check, building into ./dist"
 fi
 
+# Past the early-exit, we are going to build. zstd compresses the artifact, so
+# ensure it exists now — only on the build path, so the common no-op above never
+# touches Homebrew.
+if ! command -v zstd >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    log "zstd not found; installing via Homebrew"
+    brew install zstd || die "failed to install zstd"
+  else
+    die "zstd is required to build the libclang artifact but is not installed"
+  fi
+fi
+
 # --- 2. derive the LLVM version from Zig ------------------------------------
 #
 # `zig cc --version` prints e.g. "clang version 20.1.2". That is authoritative:
