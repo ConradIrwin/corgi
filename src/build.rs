@@ -482,6 +482,10 @@ pub struct Ctx {
     /// Build standard-library units from this toolchain's pinned rust-src.
     build_std: bool,
     zig: Option<ZigRuntime>,
+    /// Logical `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
+    /// so bindgen loads Corgi's pinned libclang. None when unsupported or when
+    /// the project set its own `LIBCLANG_PATH`.
+    libclang_path: Option<String>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
@@ -2489,6 +2493,101 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
     })
 }
 
+/// Fetch, verify, and unpack the pinned libclang artifact for `host`, and
+/// return the directory to expose as `LIBCLANG_PATH` (the one containing
+/// `libclang.dylib`).
+///
+/// The artifact is keyed on the pinned Zig version and downloaded from Corgi's
+/// own release repo (see [`crate::libclang`]). Integrity comes from the
+/// `.sha256` sidecar published beside the archive, not a committed hash: we
+/// fetch the sidecar, then verify the archive bytes against it. The unpacked
+/// tree is stored under `tools/libclang-{zig_version}`, so the sidecar hash
+/// also participates as that tool's on-disk identity.
+fn ensure_libclang(store: &Store, host: &str) -> Result<PathBuf> {
+    let dest = store
+        .root
+        .join("tools")
+        .join(format!("libclang-{}", crate::zig::VERSION));
+    let dylib = dest.join(crate::libclang::DYLIB_RELATIVE);
+    if dylib.exists() {
+        touch_tool_marker(&dest);
+        return Ok(logical_libclang_dir(store));
+    }
+    status!(
+        "Installing",
+        "libclang for Zig {} (sha256 sidecar-pinned)",
+        crate::zig::VERSION
+    );
+    let work = store.tmp_path("libclang");
+    let unpack = work.join("unpack");
+    fs::create_dir_all(&unpack)?;
+
+    // The sidecar is the pin: fetch it first, then hold the archive to it.
+    let sidecar_path = work.join("sha256");
+    let sidecar_url = crate::libclang::sha256_url(host)?;
+    let st = crate::curl()
+        .args(["-sSfL", "-o"])
+        .arg(&sidecar_path)
+        .arg(&sidecar_url)
+        .status()?;
+    if !st.success() {
+        bail!("downloading libclang sha256 sidecar failed: {sidecar_url}");
+    }
+    let expected = crate::libclang::parse_sha256_sidecar(&fs::read_to_string(&sidecar_path)?)?;
+
+    let archive = work.join("archive");
+    let archive_url = crate::libclang::url(host)?;
+    let st = crate::curl()
+        .args(["-sSfL", "-o"])
+        .arg(&archive)
+        .arg(&archive_url)
+        .status()?;
+    if !st.success() {
+        bail!("downloading libclang archive failed: {archive_url}");
+    }
+    let actual = crate::store::sha256_file(&archive)?;
+    if actual != expected {
+        bail!(
+            "sha256 mismatch for libclang: sidecar pins {expected}, archive is {actual} \
+             (from {archive_url})"
+        );
+    }
+
+    let st = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&unpack)
+        .status()?;
+    if !st.success() {
+        bail!("unpack failed for libclang archive {archive_url}");
+    }
+    if !unpack.join(crate::libclang::DYLIB_RELATIVE).exists() {
+        bail!(
+            "libclang archive is missing `{}` (from {archive_url})",
+            crate::libclang::DYLIB_RELATIVE
+        );
+    }
+    fs::create_dir_all(dest.parent().unwrap())?;
+    match fs::rename(&unpack, &dest) {
+        Ok(()) => {}
+        Err(_) if dylib.exists() => {}
+        Err(e) => return Err(e).context("publishing libclang"),
+    }
+    touch_tool_marker(&dest);
+    fs::remove_dir_all(&work).ok();
+    Ok(logical_libclang_dir(store))
+}
+
+/// Location-independent directory to hand bindgen as `LIBCLANG_PATH`.
+fn logical_libclang_dir(store: &Store) -> PathBuf {
+    store
+        .logical_root()
+        .join("tools")
+        .join(format!("libclang-{}", crate::zig::VERSION))
+        .join("lib")
+}
+
 /// Split a GitHub release-asset url into (owner/repo, tag, asset name):
 /// https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}.
 fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
@@ -3967,6 +4066,25 @@ fn build_inner(
             base_env.push(("TOOLCHAINS".to_string(), toolchain));
         }
     }
+    // Provision Corgi's pinned libclang on supported Apple hosts and hand its
+    // directory to build scripts as LIBCLANG_PATH (injected in
+    // build_script_environment). Keyed on the pinned Zig version, so any bindgen
+    // consumer parses headers with the Clang that matches the compiler Corgi
+    // ships rather than an ambient Xcode/CLT one. Unconditional rather than
+    // graph-gated: libclang is the smallest toolchain Corgi fetches (~35 MB,
+    // once per store), so detecting bindgen consumers would add more complexity
+    // than it saves. A project that sets its own LIBCLANG_PATH keeps it.
+    let project_set_libclang = config_env.iter().any(|(name, _)| name == "LIBCLANG_PATH");
+    let libclang_logical = if crate::libclang::is_supported(&host) && !project_set_libclang {
+        Some(
+            ensure_libclang(&store, &host)?
+                .to_str()
+                .context("libclang path is not UTF-8")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()
@@ -4819,6 +4937,7 @@ fn build_inner(
         target,
         build_std,
         zig: zig_runtime,
+        libclang_path: libclang_logical,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -9472,6 +9591,11 @@ fn build_script_environment<'a>(
                 env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
             }
         }
+    }
+    // bindgen consumers load Corgi's pinned libclang from here rather than an
+    // ambient Xcode/CLT one, keeping the header parser matched to Corgi's Clang.
+    if let Some(path) = &ctx.libclang_path {
+        env.push(("LIBCLANG_PATH".into(), path.clone()));
     }
     // Cargo hands build scripts the rustflags of the unit they configure,
     // joined with the 0x1f separator.

@@ -2,6 +2,7 @@ mod audit;
 mod build;
 mod cli;
 mod config;
+mod libclang;
 mod meta;
 mod out_dir_archive;
 mod report;

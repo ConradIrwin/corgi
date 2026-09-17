@@ -1236,6 +1236,158 @@ fn main() {
     assert_success(&output, "build using a configured Metal toolchain");
 }
 
+/// A bindgen consumer's build script loads Corgi's pinned libclang from the
+/// LIBCLANG_PATH Corgi injects, inside the build sandbox, and calls its C API.
+///
+/// This exercises the real path a bindgen `build.rs` takes — read
+/// `LIBCLANG_PATH`, `dlopen` `libclang.dylib`, drive the C API — against the
+/// artifact Corgi provisions, rather than a test-only entry point. It downloads
+/// the real published `libclang-0.15.2` release through the cached-curl harness.
+#[cfg(target_os = "macos")]
+#[test]
+fn provisioned_libclang_loads_in_a_build_script() {
+    if std::env::consts::ARCH != "aarch64" {
+        return; // libclang is published for Apple silicon only today.
+    }
+    let directory = TestDirectory::new("provisioned-libclang");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    // build.rs mirrors what bindgen's libclang loader does: take LIBCLANG_PATH,
+    // dlopen the dylib inside the sandbox, and call the C API. clang_getClangVersion
+    // returns a CXString { const char *spelling; unsigned flags }; clang_getCString
+    // turns it into a C string we assert names the pinned Clang.
+    fs::write(
+        workspace.join("build.rs"),
+        r####"use std::ffi::{c_char, c_void, CStr, CString};
+
+#[repr(C)]
+struct CXString {
+    data: *const c_void,
+    private_flags: u32,
+}
+
+unsafe extern "C" {
+    fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+fn main() {
+    let libclang_path = std::env::var("LIBCLANG_PATH")
+        .expect("corgi did not set LIBCLANG_PATH for the build script");
+    let dylib = std::path::Path::new(&libclang_path).join("libclang.dylib");
+    assert!(dylib.exists(), "libclang.dylib missing at {}", dylib.display());
+
+    let dylib_c = CString::new(dylib.to_str().unwrap()).unwrap();
+    // RTLD_NOW = 2: resolve every symbol up front, so a broken slice fails here.
+    let handle = unsafe { dlopen(dylib_c.as_ptr(), 2) };
+    assert!(!handle.is_null(), "dlopen({}) failed", dylib.display());
+
+    let get_version = CString::new("clang_getClangVersion").unwrap();
+    let get_cstring = CString::new("clang_getCString").unwrap();
+    let dispose = CString::new("clang_disposeString").unwrap();
+    let get_version = unsafe { dlsym(handle, get_version.as_ptr()) };
+    let get_cstring = unsafe { dlsym(handle, get_cstring.as_ptr()) };
+    let dispose = unsafe { dlsym(handle, dispose.as_ptr()) };
+    assert!(
+        !get_version.is_null() && !get_cstring.is_null() && !dispose.is_null(),
+        "libclang is missing expected C-API symbols"
+    );
+
+    let get_version: extern "C" fn() -> CXString = unsafe { std::mem::transmute(get_version) };
+    let get_cstring: extern "C" fn(CXString) -> *const c_char =
+        unsafe { std::mem::transmute(get_cstring) };
+    let dispose: extern "C" fn(CXString) = unsafe { std::mem::transmute(dispose) };
+
+    let version = get_version();
+    let text = unsafe { CStr::from_ptr(get_cstring(CXString { data: version.data, private_flags: version.private_flags })) }
+        .to_string_lossy()
+        .into_owned();
+    dispose(version);
+
+    assert!(
+        text.contains("clang version 20."),
+        "unexpected libclang version: {text}"
+    );
+    println!("cargo::warning=loaded {text}");
+}
+"####,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(
+        &output,
+        "build a bindgen-style consumer with provisioned libclang",
+    );
+
+    // The provisioned artifact is keyed on the pinned Zig version and cached in
+    // the store, so it is reused rather than refetched on a second build.
+    assert!(
+        store
+            .join("tools")
+            .join(format!("libclang-{}", corgi_zig_version()))
+            .join("lib/libclang.dylib")
+            .exists(),
+        "provisioned libclang was not cached under the store"
+    );
+
+    // Precedence: a project that sets its own LIBCLANG_PATH keeps it — Corgi does
+    // not override it. The build script asserts the value it sees is ours.
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    let own_path = directory.path.join("my-own-libclang");
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        format!("[env]\nLIBCLANG_PATH = \"{}\"\n", own_path.display()),
+    )
+    .unwrap();
+    // Now the build script's dlopen would fail (our path is bogus), so replace it
+    // with one that only checks LIBCLANG_PATH was left untouched.
+    fs::write(
+        workspace.join("build.rs"),
+        format!(
+            "fn main() {{\n    \
+             assert_eq!(std::env::var(\"LIBCLANG_PATH\").as_deref(), Ok({own:?}));\n}}\n",
+            own = own_path.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_success(
+        &output,
+        "a project-set LIBCLANG_PATH is honored, not overridden",
+    );
+}
+
+/// The pinned Zig version, read from src/zig.rs, so the test names the same
+/// store directory Corgi does without duplicating the constant.
+#[cfg(target_os = "macos")]
+fn corgi_zig_version() -> String {
+    let source = fs::read_to_string(std::env::current_dir().unwrap().join("src/zig.rs")).unwrap();
+    source
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("pub const VERSION: &str = \"")
+                .and_then(|rest| rest.strip_suffix("\";"))
+        })
+        .expect("could not read pinned Zig version from src/zig.rs")
+        .to_string()
+}
+
 #[test]
 fn clean_expires_incremental_state_before_other_cached_data() {
     let directory = TestDirectory::new("clean-retention");
