@@ -13,6 +13,9 @@ mod zig;
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 
+/// Exact Xcode build from which CI packages the Metal compiler.
+pub const METAL_XCODE_BUILD: &str = "16A242d";
+
 /// Select an alternate curl executable without changing its arguments.
 fn curl() -> std::process::Command {
     std::process::Command::new(std::env::var_os("CORGI_CURL").unwrap_or_else(|| "curl".into()))
