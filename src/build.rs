@@ -2735,11 +2735,11 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3
 const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const READ_SET_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-/// Go-style cache expiry: every file is judged by its own mtime, which
-/// use-sites keep fresh with throttled touches. No reference counting —
-/// blobs are touched whenever a referencing action is used, so a stale
-/// blob implies only stale actions point at it. Deleting something in
-/// use is benign: probes self-heal by rebuilding.
+/// Expire unused cache data by mtime, retiring paired pool artifacts together.
+///
+/// Use-sites refresh blob mtimes with throttled touches. Pool metadata aliases
+/// also expire with their matching libraries, even when another action keeps
+/// the shared metadata blob fresh.
 pub fn clean(store: &Store, all: bool, older_than: Option<std::time::Duration>) -> Result<()> {
     if all {
         fs::remove_dir_all(&store.root)
@@ -2823,9 +2823,26 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     let (manifest_files, manifest_bytes) = store.trim_manifest_entries(read_set_manifest_cutoff)?;
     files += manifest_files;
     bytes += manifest_bytes;
-    // pool/* : hardlinks share the blob's inode (and mtime) — same verdict
+    // Different actions can share metadata without sharing their libraries.
+    // Remove the paired metadata alias first: leaving it behind can make rustc
+    // select a metadata-only candidate instead of another action's complete pair.
     for f in read_dir_paths(&store.root.join("pool"))? {
-        if stale(&f) && fs::remove_file(&f).is_ok() {
+        if !stale(&f) {
+            continue;
+        }
+        if f.extension().is_some_and(|extension| extension == "rlib") {
+            let metadata = f.with_extension("rmeta");
+            match fs::remove_file(&metadata) {
+                Ok(()) => files += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("removing paired pool metadata {}", metadata.display())
+                    });
+                }
+            }
+        }
+        if fs::remove_file(&f).is_ok() {
             files += 1;
         }
     }
