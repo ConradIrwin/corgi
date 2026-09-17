@@ -70,9 +70,13 @@ fi
 
 # --- 2. derive the LLVM version from Zig ------------------------------------
 #
-# `zig cc --version` prints e.g. "clang version 20.1.2". That is authoritative:
-# it is the exact Clang built into the Zig we pin, so libclang sliced from the
-# matching LLVM release is guaranteed compatible with the headers Zig ships.
+# `zig cc --version` prints e.g. "clang version 21.1.0" — the exact Clang built
+# into the Zig we pin. Zig tracks an LLVM release branch (major.minor), but
+# upstream only publishes a macOS ARM64 binary for *some* patch releases
+# (e.g. 21.1.0 and 21.1.1 have none; 21.1.8 does). Since libclang's C API and
+# resource headers are stable across a major.minor branch, any patch on that
+# branch is a correct match. So we take Zig's major.minor and resolve it to the
+# newest upstream patch that actually ships a macOS ARM64 asset.
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -87,10 +91,37 @@ zig_bin="${work}/zig-${zig_host}-${zig_version}/zig"
 [ -x "$zig_bin" ] || die "zig binary not found after unpacking ${zig_tarball}"
 
 clang_line="$("$zig_bin" cc --version | head -n1)"
-llvm_version="$(printf '%s\n' "$clang_line" | sed -n 's/.*clang version \([0-9][0-9.]*\).*/\1/p')"
-[ -n "$llvm_version" ] || die "could not parse Clang version from: ${clang_line}"
-llvm_major="${llvm_version%%.*}"
-log "Zig ${zig_version} embeds Clang ${llvm_version} (LLVM ${llvm_major})"
+clang_version="$(printf '%s\n' "$clang_line" | sed -n 's/.*clang version \([0-9][0-9.]*\).*/\1/p')"
+[ -n "$clang_version" ] || die "could not parse Clang version from: ${clang_line}"
+llvm_major="${clang_version%%.*}"
+llvm_minor="$(printf '%s' "$clang_version" | cut -d. -f2)"
+log "Zig ${zig_version} embeds Clang ${clang_version} (LLVM ${llvm_major}.${llvm_minor} branch)"
+
+# Resolve major.minor -> newest upstream llvmorg-<major.minor.patch> that
+# publishes a macOS ARM64 asset. DRY_RUN skips the gh lookup: set LLVM_VERSION
+# to the patch whose tarball you passed via LLVM_TARBALL, else Clang's exact
+# version is assumed.
+if [ -n "${LLVM_VERSION:-}" ]; then
+  llvm_version="$LLVM_VERSION"
+  log "using overridden upstream LLVM ${llvm_version}"
+elif [ "${DRY_RUN:-0}" = "1" ]; then
+  llvm_version="$clang_version"
+else
+  llvm_version="$(
+    gh release list -R llvm/llvm-project -L 100 --json tagName \
+      --jq ".[].tagName | select(startswith(\"llvmorg-${llvm_major}.${llvm_minor}.\")) | ltrimstr(\"llvmorg-\")" \
+      | while read -r candidate; do
+          if gh release view "llvmorg-${candidate}" -R llvm/llvm-project --json assets \
+               --jq '.assets[].name' 2>/dev/null | grep -qx "LLVM-${candidate}-macOS-ARM64.tar.xz"; then
+            printf '%s\n' "$candidate"
+          fi
+        done \
+      | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1
+  )"
+  [ -n "$llvm_version" ] \
+    || die "no upstream LLVM ${llvm_major}.${llvm_minor}.x release ships a macOS ARM64 asset"
+  log "using upstream LLVM ${llvm_version} for Clang ${clang_version} (${llvm_major}.${llvm_minor} branch)"
+fi
 
 # --- 4b. create the artifact ------------------------------------------------
 #

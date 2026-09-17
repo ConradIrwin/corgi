@@ -9,7 +9,7 @@ use cargo_zigbuild::Zig;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-pub const VERSION: &str = "0.15.2";
+pub const VERSION: &str = "0.16.0";
 pub const DRIVER_VERSION: &str = "cargo-zigbuild-0.23.0+corgi.9";
 
 pub struct Asset {
@@ -28,19 +28,19 @@ pub fn asset(host: &str) -> Result<Asset> {
     let asset = match host {
         "aarch64-apple-darwin" => Asset {
             platform: "aarch64-macos",
-            sha256: "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b",
+            sha256: "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
         },
         "x86_64-apple-darwin" => Asset {
             platform: "x86_64-macos",
-            sha256: "375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f",
+            sha256: "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
         },
         "aarch64-unknown-linux-gnu" => Asset {
             platform: "aarch64-linux",
-            sha256: "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
+            sha256: "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
         },
         "x86_64-unknown-linux-gnu" => Asset {
             platform: "x86_64-linux",
-            sha256: "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239",
+            sha256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
         },
         _ => bail!("Zig {VERSION} has no pinned Corgi asset for host `{host}`"),
     };

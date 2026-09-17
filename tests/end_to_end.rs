@@ -1313,8 +1313,14 @@ fn main() {
         .into_owned();
     dispose(version);
 
+    // Any real Clang the provisioning yields is fine; the point is that a
+    // working libclang loaded, not a specific version (which tracks Zig).
     assert!(
-        text.contains("clang version 20."),
+        text.starts_with("clang version ")
+            && text["clang version ".len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit()),
         "unexpected libclang version: {text}"
     );
     println!("cargo::warning=loaded {text}");
