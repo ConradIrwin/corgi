@@ -18,12 +18,13 @@
 //! determines one Clang, so the Zig pin already fixes which libclang is
 //! correct. There is therefore no second version to pin here.
 //!
-//! Integrity depends on the build channel. Release builds embed the artifact's
+//! Integrity depends on the build channel. A release build embeds the artifact's
 //! sha at compile time from `CORGI_LLVM_TOOLS_SHA256` (see [`expected_sha256`])
-//! and hard-pin the download against it — a compile error if the var is unset.
-//! Dev builds skip the check and download the artifact directly. Either way this
-//! trusts whoever can publish to the Corgi release repo, the same trust root as
-//! Corgi itself, since Corgi ships from there.
+//! and hard-pins the download against it; CI sets the var, so the published
+//! binary is always pinned. A build without the var set — a from-source
+//! `cargo install`, or a dev build — downloads the artifact without verifying.
+//! Either way this trusts whoever can publish to the Corgi release repo, the
+//! same trust root as Corgi itself, since Corgi ships from there.
 
 use anyhow::{bail, Context, Result};
 
@@ -79,19 +80,18 @@ pub fn url(host: &str) -> Result<String> {
 
 /// The expected sha256 of the llvm-tools artifact, or `None` when unverified.
 ///
-/// Release builds embed it from `CORGI_LLVM_TOOLS_SHA256` (a compile error if
-/// unset), hard-pinning the download. Dev builds return `None` and download
-/// unverified.
+/// A release build embeds `CORGI_LLVM_TOOLS_SHA256` when it is set, hard-pinning
+/// the download; CI sets it, so the published binary is always pinned. When it
+/// is unset (a from-source `cargo install`, or a dev build) the download is not
+/// verified. `option_env!` rather than `env!` keeps `cargo install` compiling.
 #[cfg(not(debug_assertions))]
 pub fn expected_sha256() -> Option<&'static str> {
-    Some(env!("CORGI_LLVM_TOOLS_SHA256"))
+    option_env!("CORGI_LLVM_TOOLS_SHA256")
 }
 
 /// The expected sha256 of the llvm-tools artifact, or `None` when unverified.
 ///
-/// Release builds embed it from `CORGI_LLVM_TOOLS_SHA256` (a compile error if
-/// unset), hard-pinning the download. Dev builds return `None` and download
-/// unverified.
+/// Dev builds never verify: the pin is embedded only in release builds.
 #[cfg(debug_assertions)]
 pub fn expected_sha256() -> Option<&'static str> {
     None

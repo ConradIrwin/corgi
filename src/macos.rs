@@ -40,17 +40,18 @@ pub fn metal_url() -> String {
 
 /// The expected sha256 of the Metal artifact, or `None` when unverified.
 ///
-/// Release builds embed it from `CORGI_METAL_SHA256` (a compile error if unset),
-/// hard-pinning the download. Dev builds return `None` and download unverified.
+/// A release build embeds `CORGI_METAL_SHA256` when it is set, hard-pinning the
+/// download; CI sets it, so the published binary is always pinned. When it is
+/// unset (a from-source `cargo install`, or a dev build) the download is not
+/// verified. `option_env!` rather than `env!` keeps `cargo install` compiling.
 #[cfg(not(debug_assertions))]
 pub fn metal_expected_sha256() -> Option<&'static str> {
-    Some(env!("CORGI_METAL_SHA256"))
+    option_env!("CORGI_METAL_SHA256")
 }
 
 /// The expected sha256 of the Metal artifact, or `None` when unverified.
 ///
-/// Release builds embed it from `CORGI_METAL_SHA256` (a compile error if unset),
-/// hard-pinning the download. Dev builds return `None` and download unverified.
+/// Dev builds never verify: the pin is embedded only in release builds.
 #[cfg(debug_assertions)]
 pub fn metal_expected_sha256() -> Option<&'static str> {
     None
