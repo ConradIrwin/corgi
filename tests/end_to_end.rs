@@ -1118,38 +1118,31 @@ fn apple_compiler_cold_lookup_executes_only_required_tools() {
     .unwrap();
     fs::write(
         workspace.join("build.rs"),
-        r#"use std::path::Path;
-use std::process::Command;
+        r#"use std::process::Command;
 
 fn main() {
-    match Command::new("/usr/bin/true").status() {
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
-        result => panic!("unrelated executable was not denied: {result:?}"),
+    for tool in ["/usr/bin/true", "/usr/bin/clang", "/usr/bin/xcrun", "/usr/bin/xcode-select"] {
+        match Command::new(tool).arg("--version").status() {
+            Err(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            ) => {}
+            result => panic!("ambient executable {tool} was not denied: {result:?}"),
+        }
     }
 
-    let developer_directory = Command::new("/usr/bin/xcode-select")
-        .arg("-p")
+    let lookup = Command::new("xcrun")
+        .args(["-sdk", "macosx", "--find", "clang"])
         .output()
-        .expect("failed to query the selected developer directory");
-    assert!(developer_directory.status.success());
-    let developer_directory =
-        String::from_utf8(developer_directory.stdout).expect("developer directory is not UTF-8");
-    let xcodebuild = Path::new(developer_directory.trim()).join("usr/bin/xcodebuild");
-    let sdkroot = std::env::var_os("SDKROOT").expect("SDKROOT is not set");
-    let lookup_command = if xcodebuild.is_file() {
-        "\"$1\" -sdk \"$2\" -find clang++ >/dev/null"
-    } else {
-        ":"
-    };
-    let lookup = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(lookup_command)
-        .arg("sh")
-        .arg(xcodebuild)
-        .arg(sdkroot)
+        .expect("failed to start pinned compiler lookup");
+    assert!(lookup.status.success(), "compiler lookup failed: {lookup:?}");
+    let compiler = String::from_utf8(lookup.stdout).unwrap();
+    assert_ne!(compiler.trim(), "/usr/bin/clang");
+    let compiler = Command::new(compiler.trim())
+        .arg("--version")
         .status()
-        .expect("failed to start the Apple compiler lookup");
-    assert!(lookup.success(), "Apple compiler lookup failed: {lookup}");
+        .expect("failed to launch the resolved compiler");
+    assert!(compiler.success());
 }
 "#,
     )
@@ -1166,74 +1159,366 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn downloaded_metal_toolchain_executes_inside_the_sandbox() {
-    let component = Command::new("/usr/bin/xcodebuild")
-        .args(["-showComponent", "MetalToolchain", "-json"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
-    let Some((build_version, identifier)) = component.as_ref().and_then(|component| {
-        Some((
-            component.get("buildVersion")?.as_str()?,
-            component.get("toolchainIdentifier")?.as_str()?,
-        ))
-    }) else {
-        return;
-    };
-
-    let directory = TestDirectory::new("downloaded-metal-toolchain");
-    let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+fn pinned_apple_toolchain_builds_native_and_metal_and_restores_a_relocated_checkout() {
+    let directory = TestDirectory::new("pinned-apple-toolchain");
+    let workspace = directory.path.join("workspace with spaces");
+    let store = directory.path.join("store with spaces");
     fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("host-macro/src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\nhost-macro = {{ path = \"host-macro\" }}\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-macro/Cargo.toml"),
+        "[package]\nname = \"host-macro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\nproc-macro = true\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("host-macro/src/lib.rs"),
+        "#[proc_macro]\npub fn expected(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"42\".parse().unwrap() }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        r#"fn main() {
+    assert_eq!(unsafe { native_value() }, host_macro::expected!());
+    assert!(!include_bytes!(concat!(env!("OUT_DIR"), "/shader.metallib")).is_empty());
+    println!("native and Metal");
+}
+unsafe extern "C" { fn native_value() -> i32; }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("native.c"),
+        "#include <Availability.h>\n#include <stdlib.h>\n\
+         _Static_assert(__MAC_OS_X_VERSION_MAX_ALLOWED == 150000, \"expected SDK 15.0\");\n\
+         _Static_assert(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ == 130000, \"expected deployment 13.0\");\n\
+         int native_value(void) { return abs(-42); }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("shader.metal"),
+        "#include <metal_stdlib>\nusing namespace metal;\n\
+         kernel void answer(device uint *output [[buffer(0)]], uint index [[thread_position_in_grid]]) { output[index] = 42; }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n\"{}\" = [\"native.c\", \"shader.metal\"]\n",
             directory.package_name
         ),
     )
     .unwrap();
     fs::write(
         workspace.join("build.rs"),
-        r#"use std::process::Command;
+        r#"use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    if let Ok(expected) = std::env::var("ASSERT_TOOLCHAINS") {
-        assert_eq!(std::env::var("TOOLCHAINS").as_deref(), Ok(expected.as_str()));
+    assert_eq!(env::var("MACOSX_DEPLOYMENT_TARGET").unwrap(), "13.0");
+    let sdk = Command::new("xcrun")
+        .args(["-sdk", "macosx", "--show-sdk-version"])
+        .output().unwrap();
+    assert!(sdk.status.success(), "{sdk:?}");
+    assert_eq!(String::from_utf8(sdk.stdout).unwrap().trim(), "15.0");
+
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let object = output.join("native.o");
+    let mut compiler = Command::new(env::var_os("CC").expect("CC"));
+    if env::var("DEBUG").map(|value| value != "false").unwrap_or(false) {
+        compiler.arg("-g");
     }
-    for tool in ["metal", "metallib"] {
-        let status = Command::new("/usr/bin/xcrun")
-            .args(["-sdk", "macosx", tool, "--version"])
-            .status()
-            .unwrap_or_else(|error| panic!("failed to launch {tool}: {error}"));
-        assert!(status.success(), "{tool} failed with {status}");
-    }
+    run(compiler
+        .args(["-Werror", "-c", "native.c", "-isysroot"])
+        .arg(env::var_os("SDKROOT").expect("SDKROOT"))
+        .arg("-o").arg(&object));
+    run(Command::new(env::var_os("AR").expect("AR"))
+        .arg("crs").arg(output.join("libnative.a")).arg(&object));
+    // Metal's AIR source_file_name ignores prefix maps; follow GPUI's OUT_DIR staging.
+    std::fs::copy("shader.metal", output.join("shader.metal")).unwrap();
+    run(Command::new("xcrun")
+        .current_dir(&output)
+        .args(["-sdk", "macosx", "metal", "-c"])
+        .arg(output.join("shader.metal"))
+        .arg("-o")
+        .arg(output.join("shader.air")));
+    run(Command::new("xcrun")
+        .args(["-sdk", "macosx", "metallib"])
+        .arg(output.join("shader.air"))
+        .arg("-o").arg(output.join("shader.metallib")));
+    println!("cargo:rustc-link-search=native={}", output.display());
+    println!("cargo:rustc-link-lib=static=native");
+    println!("cargo:rerun-if-changed=native.c");
+    println!("cargo:rerun-if-changed=shader.metal");
+}
+
+fn run(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{command:?}: {output:?}");
 }
 "#,
     )
     .unwrap();
+
+    let build = |workspace: &Path, developer_directory: &str| {
+        corgi_command()
+            .arg("build")
+            .arg("-C")
+            .arg(workspace)
+            .env("CORGI_STORE", &store)
+            .env("CORGI_ALIAS", store.join("alias"))
+            .env("DEVELOPER_DIR", developer_directory)
+            .env_remove("MACOSX_DEPLOYMENT_TARGET")
+            .output()
+            .unwrap()
+    };
+    assert_success(
+        &build(&workspace, "/nonexistent/first-xcode"),
+        "build native, Metal, and host proc macro with the pinned toolchain",
+    );
+    let binary_name = executable_name(&directory.package_name);
+    let original = fs::read(workspace.join("target/debug").join(&binary_name)).unwrap();
+    assert_success(
+        &build(&workspace, "/nonexistent/second-xcode"),
+        "reuse the pinned build after changing ambient DEVELOPER_DIR",
+    );
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(
+        &report,
+        &directory.package_name,
+        "compile",
+        &directory.package_name,
+        "hit",
+    );
+    for (package, action, target) in [
+        (
+            directory.package_name.as_str(),
+            "compile",
+            directory.package_name.as_str(),
+        ),
+        (
+            directory.package_name.as_str(),
+            "run_build_script",
+            "build-script-build",
+        ),
+        ("host-macro", "compile", "host_macro"),
+    ] {
+        assert_unit_not_executed(&report, package, action, target);
+    }
+
+    // Remove all exported outputs before moving, so neither an old debug object
+    // nor an artifact left in the original checkout can satisfy the assertions.
+    fs::remove_dir_all(workspace.join("target")).unwrap();
+    let relocated = directory.path.join("relocated workspace with spaces");
+    fs::rename(&workspace, &relocated).unwrap();
+    assert_success(
+        &build(&relocated, "/nonexistent/third-xcode"),
+        "restore the pinned native and Metal build in a relocated checkout",
+    );
+    let report = report_for_workspace(&store, &relocated);
+    assert_unit_cache(
+        &report,
+        &directory.package_name,
+        "compile",
+        &directory.package_name,
+        "hit",
+    );
+    assert_unit_not_executed(
+        &report,
+        &directory.package_name,
+        "run_build_script",
+        "build-script-build",
+    );
+    let binary = relocated.join("target/debug").join(&binary_name);
+    assert_eq!(fs::read(&binary).unwrap(), original);
+    let application = Command::new(&binary).output().unwrap();
+    assert_success(
+        &application,
+        "run the relocated native and Metal executable",
+    );
+    assert_eq!(
+        String::from_utf8(application.stdout).unwrap(),
+        "native and Metal\n"
+    );
+    let objects = debug_map_objects(&binary, &relocated);
+    assert!(
+        !objects.is_empty(),
+        "the binary has no relative debug objects"
+    );
+    for object in objects {
+        assert!(
+            object.is_file(),
+            "debug object was not restored: {}",
+            object.display()
+        );
+    }
+    let debugger = Command::new("lldb")
+        .current_dir(&relocated)
+        .args([
+            "--batch",
+            "-o",
+            "breakpoint set --file main.rs --line 2",
+            "-o",
+            "breakpoint set --file native.c --line 5",
+            "-o",
+            "breakpoint list --verbose",
+        ])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert_success(&debugger, "read relocated debug information in LLDB");
+    let debugger_output = String::from_utf8_lossy(&debugger.stdout);
+    assert!(!debugger_output.contains("pending"), "{debugger_output}");
+    assert!(debugger_output.contains("main.rs:2"), "{debugger_output}");
+    assert!(debugger_output.contains("native.c:5"), "{debugger_output}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pinned_host_tools_preserve_cross_target_compilation() {
+    let directory = TestDirectory::new("pinned-cross-tools");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
-        workspace.join("src/lib.rs"),
-        "pub fn value() -> u32 { 1 }\n",
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"pinned-cross-tools\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("corgi.toml"),
+        "[extra-inputs]\npinned-cross-tools = [\"native.c\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("native.c"),
+        "int native_value(void) { return 42; }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"),
+        "extern \"C\" { fn native_value() -> i32; }\nfn main() { assert_eq!(unsafe { native_value() }, 42); }\n").unwrap();
+    fs::write(workspace.join("build.rs"), r#"use std::{env, path::PathBuf, process::Command};
+fn main() {
+    let target = env::var("TARGET").unwrap();
+    if target.contains("linux") {
+        assert!(env::var("BINDGEN_EXTRA_CLANG_ARGS").is_err());
+        assert!(env::var("SDKROOT").is_err());
+    }
+    let suffix = target.replace('-', "_");
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    assert!(Command::new(env::var_os(format!("CC_{suffix}")).unwrap())
+        .args(["-c", "native.c", "-o"]).arg(out.join("native.o")).status().unwrap().success());
+    assert!(Command::new(env::var_os(format!("AR_{suffix}")).unwrap())
+        .arg("crs").arg(out.join("libnative.a")).arg(out.join("native.o")).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native");
+}
+"#).unwrap();
+    for target in ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+        let output = invoke_corgi_with_store(
+            &workspace,
+            "build",
+            ["--target", target],
+            &directory.path.join("store"),
+        );
+        assert_success(
+            &output,
+            &format!("link native code for {target} with a pinned host build script"),
+        );
+        let binary = fs::read(
+            workspace
+                .join("target")
+                .join(target)
+                .join("debug/pinned-cross-tools"),
+        )
+        .unwrap();
+        let expected_magic: &[u8] = if target.contains("linux") {
+            b"\x7fELF"
+        } else {
+            b"\xcf\xfa\xed\xfe"
+        };
+        assert!(binary.starts_with(expected_magic));
+    }
+}
+
+/// The pinned Clang driver injects link defaults (`-fuse-ld`, `--ld-path`, and a
+/// `-L` for Zig-less compiler-rt) on every compiler invocation. Two contracts
+/// follow: a compile-only build under `-Werror` must not fail on those unused
+/// link flags, and a crate linking `-lclang_rt.osx` — which Zig does not ship —
+/// must resolve it from the pinned llvm-tools artifact rather than Xcode.
+#[cfg(target_os = "macos")]
+#[test]
+fn pinned_toolchain_supplies_compiler_rt_and_keeps_compile_only_warnings_clean() {
+    let directory = TestDirectory::new("pinned-compiler-rt");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"pinned-compiler-rt\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("corgi.toml"),
+        "[extra-inputs]\npinned-compiler-rt = [\"native.c\"]\n",
+    )
+    .unwrap();
+    // A translation unit that compiles cleanly, so a -Werror failure can only
+    // come from an injected flag the compile step does not use.
+    fs::write(
+        workspace.join("native.c"),
+        "int native_value(void) { return 42; }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "extern \"C\" { fn native_value() -> i32; }\n\
+         fn main() { assert_eq!(unsafe { native_value() }, 42); }\n",
+    )
+    .unwrap();
+    // -Werror makes any -Wunused-command-line-argument fatal, so a compile-only
+    // invocation that saw a stray -L or --ld-path would fail here. Linking
+    // -lclang_rt.osx then proves the pinned compiler-rt search path resolves.
+    fs::write(
+        workspace.join("build.rs"),
+        r#"use std::{env, path::PathBuf, process::Command};
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let object = out.join("native.o");
+    let compile = Command::new(env::var_os("CC").expect("CC"))
+        .args(["-Werror", "-Wall", "-Wextra", "-c", "native.c", "-o"])
+        .arg(&object)
+        .status()
+        .unwrap();
+    assert!(compile.success(), "compile-only -Werror build failed");
+    let archive = Command::new(env::var_os("AR").expect("AR"))
+        .arg("crs")
+        .arg(out.join("libnative.a"))
+        .arg(&object)
+        .status()
+        .unwrap();
+    assert!(archive.success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native");
+    // Zig ships no libclang_rt.osx.a; the pinned llvm-tools artifact supplies it.
+    println!("cargo:rustc-link-lib=clang_rt.osx");
+}
+"#,
     )
     .unwrap();
 
-    let ambient = invoke_corgi_with_store(&workspace, "build", [], &store);
-    assert_success(&ambient, "build using the ambient Metal toolchain");
-    fs::write(
-        workspace.join("corgi.toml"),
-        format!("[apple.toolchains.metal]\nbuild-version = \"{build_version}\"\n"),
-    )
-    .unwrap();
-    fs::create_dir_all(workspace.join(".cargo")).unwrap();
-    fs::write(
-        workspace.join(".cargo/config.toml"),
-        format!("[env]\nASSERT_TOOLCHAINS = \"{identifier}\"\n"),
-    )
-    .unwrap();
     let output = invoke_corgi_with_store(&workspace, "build", [], &store);
-    assert_success(&output, "build using a configured Metal toolchain");
+    assert_success(
+        &output,
+        "link clang_rt.osx and keep compile-only -Werror clean with the pinned toolchain",
+    );
 }
 
 /// A bindgen consumer's build script loads Corgi's pinned libclang from the
@@ -1341,14 +1626,18 @@ fn main() {
     );
 
     // The provisioned artifact is keyed on the pinned Zig version and cached in
-    // the store, so it is reused rather than refetched on a second build.
+    // the store, so it is reused rather than refetched on a second build. It now
+    // carries dsymutil alongside libclang, so both land under the one tools dir.
+    let llvm_tools = store
+        .join("tools")
+        .join(format!("llvm-tools-{}", corgi_zig_version()));
     assert!(
-        store
-            .join("tools")
-            .join(format!("libclang-{}", corgi_zig_version()))
-            .join("lib/libclang.dylib")
-            .exists(),
+        llvm_tools.join("lib/libclang.dylib").exists(),
         "provisioned libclang was not cached under the store"
+    );
+    assert!(
+        llvm_tools.join("bin/dsymutil").exists(),
+        "provisioned dsymutil was not cached under the store"
     );
 
     // Precedence: a project that sets its own LIBCLANG_PATH keeps it — Corgi does

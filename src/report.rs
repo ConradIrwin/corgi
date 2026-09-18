@@ -331,7 +331,6 @@ pub struct ToolchainInput {
     pub cc: String,
     pub ld: String,
     pub sdk: String,
-    pub xcode: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -662,7 +661,6 @@ mod tests {
                     cc: "clang".into(),
                     ld: "ld".into(),
                     sdk: "15.5".into(),
-                    xcode: "16.4".into(),
                 },
                 declared_environment: vec![],
                 host_rustflags: vec![],

@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# Prove a sliced libclang actually parses a header before it is published.
+# Prove the sliced llvm-tools artifact works before it is published.
 #
-# A libclang whose resource headers don't match the library fails in exactly
-# two ways: a hard "'stddef.h' file not found", or — worse — silently wrong
-# bindings. This runs a real translation unit through the sliced library's C
-# API and checks it finds its own builtin headers, catching both.
+# It checks two things:
+#
+#   * libclang actually parses a header. A libclang whose resource headers don't
+#     match the library fails in exactly two ways: a hard "'stddef.h' file not
+#     found", or — worse — silently wrong bindings. This runs a real translation
+#     unit through the sliced library's C API and checks it finds its own
+#     builtin headers, catching both.
+#   * bin/dsymutil exists and runs: `dsymutil --version` succeeds and prints a
+#     version string.
 #
 # Env:
-#   LIBCLANG_STAGE   staged tree containing lib/libclang.dylib (required)
+#   LIBCLANG_STAGE   staged tree containing lib/libclang.dylib and
+#                    bin/dsymutil (required)
 #   LLVM_MAJOR       Clang major version, for the resource dir (required)
 
 set -euo pipefail
@@ -16,11 +22,13 @@ set -euo pipefail
 stage="${LIBCLANG_STAGE:?LIBCLANG_STAGE must point at the staged libclang tree}"
 major="${LLVM_MAJOR:?LLVM_MAJOR must be set}"
 dylib="${stage}/lib/libclang.dylib"
+dsymutil="${stage}/bin/dsymutil"
 # Clang appends /include to -resource-dir itself, so the resource dir is
 # .../clang/<major> and its builtin headers live under .../clang/<major>/include.
 resource_dir="${stage}/lib/clang/${major}"
 
 [ -f "$dylib" ] || { echo "verify: missing ${dylib}" >&2; exit 1; }
+[ -x "$dsymutil" ] || { echo "verify: missing or non-executable ${dsymutil}" >&2; exit 1; }
 [ -f "${resource_dir}/include/stddef.h" ] || {
   echo "verify: missing builtin header ${resource_dir}/include/stddef.h" >&2
   exit 1
@@ -97,3 +105,10 @@ cc -o "${work}/probe" "${work}/probe.c" \
 
 "${work}/probe" "${resource_dir}" "${work}/probe.h"
 echo "verify: libclang parsed a builtin-header translation unit cleanly" >&2
+
+# dsymutil ships in the same artifact; prove it runs and reports a version.
+dsymutil_version="$("$dsymutil" --version)" \
+  || { echo "verify: dsymutil --version failed" >&2; exit 1; }
+printf '%s\n' "$dsymutil_version" | grep -qE '[0-9]+\.[0-9]+' \
+  || { echo "verify: dsymutil --version printed no version: ${dsymutil_version}" >&2; exit 1; }
+echo "verify: dsymutil ran ($(printf '%s' "$dsymutil_version" | head -n1))" >&2

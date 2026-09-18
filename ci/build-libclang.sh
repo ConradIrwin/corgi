@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# Ensure the libclang release artifact for Corgi's pinned Zig version exists.
+# Ensure the llvm-tools release artifact for Corgi's pinned Zig version exists.
+#
+# The artifact carries the LLVM tools Corgi needs beyond Zig: libclang (which
+# bindgen dlopens) plus dsymutil, both sliced from the one upstream LLVM macOS
+# ARM64 tarball so they match each other and the pinned Zig's Clang.
 #
 # This is an idempotent "reconcile" job, not a one-shot build:
 #
@@ -9,8 +13,9 @@
 #   3. check  whether the release asset already exists
 #   4a. if it exists: do nothing
 #   4b. if not: download upstream LLVM, slice libclang + its resource and
-#       libc++ headers, repackage, verify with the bindgen fixture, and
-#       publish the archive together with its .sha256 sidecar.
+#       libc++ headers and dsymutil, repackage, verify with the bindgen fixture
+#       and a dsymutil probe, and publish the archive together with its .sha256
+#       sidecar.
 #
 # The release tag and asset are keyed on the Zig version, because one Zig
 # release determines one Clang. Run it as often as you like; it only does work
@@ -29,7 +34,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_REPO="${RELEASE_REPO:-ConradIrwin/corgi}"
 PLATFORM="macos-arm64"
-ASSET="libclang-${PLATFORM}.tar.zst"
+ASSET="llvm-tools-${PLATFORM}.tar.zst"
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
@@ -40,8 +45,18 @@ zig_version="$(
   sed -n 's/^pub const VERSION: &str = "\([^"]*\)";/\1/p' "${repo_root}/src/zig.rs" | head -n1
 )"
 [ -n "$zig_version" ] || die "could not read pinned Zig version from src/zig.rs"
-tag="libclang-${zig_version}"
+tag="llvm-tools-${zig_version}"
 log "pinned Zig version: ${zig_version} (release tag ${tag})"
+
+# Release builds of Corgi embed this to hard-pin the llvm-tools download.
+# Exported on every path (fresh build and no-op), since the release build runs
+# after this step and embeds the digest whether or not it was rebuilt.
+export_release_sha256() {
+  local digest="$1"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    printf 'CORGI_LLVM_TOOLS_SHA256=%s\n' "$digest" >> "$GITHUB_ENV"
+  fi
+}
 
 # --- 3. check whether the artifact already exists ---------------------------
 
@@ -49,6 +64,13 @@ if [ "${DRY_RUN:-0}" != "1" ]; then
   if gh release view "$tag" -R "$RELEASE_REPO" --json assets \
        --jq '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
     log "release ${tag} already has ${ASSET}; nothing to do"
+    # Read the published sidecar so the pin is available without rebuilding.
+    sidecar="$(gh release view "$tag" -R "$RELEASE_REPO" \
+      --json assets --jq ".assets[] | select(.name == \"${ASSET}.sha256\") | .url")"
+    [ -n "$sidecar" ] || die "release ${tag} is missing ${ASSET}.sha256"
+    digest="$(gh api "$sidecar" -H 'Accept: application/octet-stream' | cut -d' ' -f1)"
+    [ "${#digest}" -eq 64 ] || die "published ${ASSET}.sha256 is malformed"
+    export_release_sha256 "$digest"
     exit 0
   fi
   log "release ${tag} is missing ${ASSET}; building it"
@@ -64,7 +86,7 @@ if ! command -v zstd >/dev/null 2>&1; then
     log "zstd not found; installing via Homebrew"
     brew install zstd || die "failed to install zstd"
   else
-    die "zstd is required to build the libclang artifact but is not installed"
+    die "zstd is required to build the llvm-tools artifact but is not installed"
   fi
 fi
 
@@ -162,6 +184,13 @@ mkdir -p "${stage}/lib"
 # The loadable library bindgen dlopens.
 cp -a "${src}/lib/libclang.dylib" "${stage}/lib/libclang.dylib"
 
+# dsymutil, the other LLVM tool Corgi needs beyond Zig. Sliced from the same
+# upstream tarball so it matches the pinned Zig's Clang. `cp -a` preserves its
+# executable bit; fail hard if upstream ever drops it.
+[ -f "${src}/bin/dsymutil" ] || die "upstream LLVM ${llvm_version} lacks bin/dsymutil"
+mkdir -p "${stage}/bin"
+cp -a "${src}/bin/dsymutil" "${stage}/bin/dsymutil"
+
 # Clang's builtin/resource headers (stddef.h, stdarg.h, ...), named by major.
 # libclang finds these relative to itself; they MUST match the library.
 mkdir -p "${stage}/lib/clang"
@@ -191,10 +220,11 @@ for license in include/llvm/Support/LICENSE.TXT LICENSE.TXT LICENSE; do
 done
 
 # Record provenance for humans; not a trust anchor.
-cat > "${stage}/CORGI_LIBCLANG.txt" <<EOF
+cat > "${stage}/CORGI_LLVM_TOOLS.txt" <<EOF
 zig_version: ${zig_version}
 llvm_version: ${llvm_version}
 upstream: ${upstream_url}
+tools: lib/libclang.dylib, bin/dsymutil
 EOF
 
 log "repackaging ${ASSET}"
@@ -212,6 +242,8 @@ tar --no-mac-metadata -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -o "$asset_p
 log "built dist/${ASSET}"
 log "sidecar: $(cat "${repo_root}/dist/${ASSET}.sha256")"
 
+export_release_sha256 "$(cut -d' ' -f1 < "${repo_root}/dist/${ASSET}.sha256")"
+
 # --- verify before publishing ----------------------------------------------
 #
 # A slice that loads but whose resource headers are wrong produces silently bad
@@ -219,7 +251,7 @@ log "sidecar: $(cat "${repo_root}/dist/${ASSET}.sha256")"
 if [ -x "${repo_root}/ci/verify-libclang.sh" ]; then
   LIBCLANG_STAGE="$stage" LLVM_MAJOR="$llvm_major" \
     "${repo_root}/ci/verify-libclang.sh" \
-    || die "libclang verification failed; not publishing"
+    || die "llvm-tools verification failed; not publishing"
 fi
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -238,7 +270,7 @@ else
   gh release create "$tag" \
     "${repo_root}/dist/${ASSET}" "${repo_root}/dist/${ASSET}.sha256" \
     -R "$RELEASE_REPO" \
-    --title "libclang for Zig ${zig_version} (LLVM ${llvm_version})" \
-    --notes "libclang sliced from upstream LLVM ${llvm_version} for use with Corgi's pinned Zig ${zig_version}. Built by ci/build-libclang.sh."
+    --title "llvm-tools for Zig ${zig_version} (LLVM ${llvm_version})" \
+    --notes "libclang and dsymutil sliced from upstream LLVM ${llvm_version} for use with Corgi's pinned Zig ${zig_version}. Built by ci/build-libclang.sh."
 fi
 log "done"

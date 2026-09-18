@@ -460,11 +460,8 @@ pub struct Ctx {
     target_dir: PathBuf,
     sysroot: String,
     rustup_home: String,
-    devdir: String,
-    metal_toolchain_roots: Vec<PathBuf>,
     sandbox: bool,
     darwin_dirs: Vec<String>,
-    sdkroot: String,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
     src_hash_nanos: std::sync::atomic::AtomicU64,
@@ -482,6 +479,7 @@ pub struct Ctx {
     /// Build standard-library units from this toolchain's pinned rust-src.
     build_std: bool,
     zig: Option<ZigRuntime>,
+    macos: Vec<MacosRuntime>,
     /// Logical `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
     /// so bindgen loads Corgi's pinned libclang. None when unsupported or when
     /// the project set its own `LIBCLANG_PATH`.
@@ -546,6 +544,43 @@ struct ZigRuntime {
     cmake_toolchain: PathBuf,
     use_zig_as_rust_linker: bool,
     identity: String,
+}
+
+struct MacosRuntime {
+    platform: String,
+    directory: PathBuf,
+    config: crate::macos::DriverConfig,
+    bindgen_args: String,
+    identity: String,
+}
+
+impl MacosRuntime {
+    fn environment(&self) -> Vec<(String, String)> {
+        let mut environment = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", self.directory.display()),
+            ),
+            ("SDKROOT".into(), self.config.sdk.display().to_string()),
+            (
+                "MACOSX_DEPLOYMENT_TARGET".into(),
+                self.config.deployment_target.clone(),
+            ),
+            ("BINDGEN_EXTRA_CLANG_ARGS".into(), self.bindgen_args.clone()),
+        ];
+        for (variable, tool) in [
+            ("CC", "cc"),
+            ("CXX", "c++"),
+            ("AR", "ar"),
+            ("RANLIB", "ranlib"),
+        ] {
+            environment.push((
+                variable.into(),
+                self.directory.join(tool).display().to_string(),
+            ));
+        }
+        environment
+    }
 }
 
 struct PackageReadInputs {
@@ -1373,6 +1408,20 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         } else {
             let mut environment = ctx.pkg_env(package);
             environment.extend(ctx.config_env.iter().cloned());
+            // Plan-time env probes reach compiles too, not only build scripts,
+            // so a declared [env] var is visible to env!() at compile time.
+            let mut declared_environment = ctx.config_env.clone();
+            for (name, value, packages, profiles) in &ctx.env_probes {
+                if packages
+                    .iter()
+                    .any(|probe_package| probe_package == &package.name)
+                    && (profiles.is_empty()
+                        || profiles.iter().any(|profile| profile == &unit.profile.name))
+                {
+                    environment.push((name.clone(), value.clone()));
+                    declared_environment.push((name.clone(), value.clone()));
+                }
+            }
             let is_binary = unit.target.kind.iter().any(|kind| kind == "bin");
             let is_executable_example = unit.target.kind.iter().any(|kind| kind == "example")
                 && unit
@@ -1484,7 +1533,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 toolchain: is_linking(ctx, index).then(|| ctx.toolchain.clone()),
                 debug_binary: None,
             }));
-            (spec, ctx.config_env.clone())
+            (spec, declared_environment)
         };
         let outputs = match &spec {
             ActionSpec::Compile(spec) => {
@@ -1706,26 +1755,6 @@ struct ToolSpec {
     auth: String,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MetalToolchainSpec {
-    #[serde(rename = "build-version")]
-    build_version: String,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct AppleToolchains {
-    metal: Option<MetalToolchainSpec>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct AppleSpec {
-    #[serde(default)]
-    toolchains: AppleToolchains,
-}
-
 #[derive(serde::Deserialize, Default)]
 struct EnvProbe {
     #[serde(skip)]
@@ -1755,8 +1784,6 @@ struct RootDef {
 struct CorgiToml {
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
-    #[serde(default)]
-    apple: AppleSpec,
     #[serde(default)]
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
@@ -2296,11 +2323,19 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
         touch_tool_marker(&dest);
         return Ok(dest.join(exported));
     }
+    // Only claim a pin when the bytes are actually verified. The pinned macOS
+    // artifacts pass an empty sha256 in dev builds (the pin is embedded only in
+    // release builds), so their dev download is unverified.
     status!(
         "Installing",
-        "tool {} {} (sha256-pinned)",
+        "tool {} {}{}",
         t.name,
-        t.version
+        t.version,
+        if t.sha256.is_empty() {
+            ""
+        } else {
+            " (sha256-pinned)"
+        }
     );
     let work = store.tmp_path("tool");
     let unpack = work.join("unpack");
@@ -2356,13 +2391,19 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
             t.name
         ),
     }
-    let actual = crate::store::sha256_file(&archive)?;
-    if actual != t.sha256 {
-        bail!(
-            "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
-            t.name,
-            t.sha256
-        );
+    // An empty pin means "download without verifying": the pinned Metal path
+    // supplies one only in release builds, where the sha is embedded at compile
+    // time. Every corgi.toml [tools.*] entry sets a non-empty sha256, so their
+    // hard-pin behavior is unchanged.
+    if !t.sha256.is_empty() {
+        let actual = crate::store::sha256_file(&archive)?;
+        if actual != t.sha256 {
+            bail!(
+                "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
+                t.name,
+                t.sha256
+            );
+        }
     }
     let st = Command::new("tar")
         .arg("-xf")
@@ -2387,9 +2428,139 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     Ok(dest.join(exported))
 }
 
-fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
-    let target = crate::zig::target(target)?
-        .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
+/// Provision a pinned macOS artifact, keying its store directory on the source
+/// pin (`{name}-{version}`) alone.
+///
+/// A `None` checksum downloads without verifying; `Some` hard-pins the bytes.
+/// The sha is deliberately kept out of the directory name so a dev build (no
+/// verification) and a release build (verified) that fetch identical bytes share
+/// one store directory.
+fn pinned_macos_tool(
+    store: &Store,
+    name: &str,
+    version: &str,
+    url: String,
+    checksum: Option<&str>,
+    exported: &str,
+) -> Result<PathBuf> {
+    ensure_tool(
+        store,
+        &ToolSpec {
+            name: name.into(),
+            version: version.into(),
+            url,
+            sha256: checksum.unwrap_or("").into(),
+            bin: String::new(),
+            path: exported.into(),
+            env: String::new(),
+            packages: Vec::new(),
+            targets: Vec::new(),
+            auth: String::new(),
+        },
+    )?;
+    Ok(store
+        .logical_root()
+        .join("tools")
+        .join(format!("{name}-{version}"))
+        .join(exported))
+}
+
+fn ensure_macos(
+    store: &Store,
+    host: &str,
+    platform: &str,
+    sysroot: &Path,
+    dsymutil: &Path,
+    compiler_rt: &Path,
+    deployment_target: &str,
+) -> Result<MacosRuntime> {
+    let asset = crate::zig::asset(host)?;
+    let zig = ensure_zig_executable(store, host)?;
+    let sdk = pinned_macos_tool(
+        store,
+        "macos-sdk",
+        crate::macos::SDK_VERSION,
+        crate::macos::SDK_URL.into(),
+        Some(crate::macos::SDK_SHA256),
+        crate::macos::SDK_ARCHIVE_ROOT,
+    )?;
+    crate::macos::validate_sdk(&sdk)?;
+    let metal = pinned_macos_tool(
+        store,
+        "metal",
+        crate::METAL_XCODE_BUILD,
+        crate::macos::metal_url(),
+        crate::macos::metal_expected_sha256(),
+        ".",
+    )?;
+    crate::macos::validate_metal(&metal)?;
+    let linker = sysroot.join(format!("lib/rustlib/{host}/bin/gcc-ld/ld64.lld"));
+    anyhow::ensure!(
+        linker.is_file(),
+        "pinned Rust distribution has no Mach-O LLD: {}",
+        linker.display()
+    );
+    let arch = match platform {
+        "aarch64-apple-darwin" => "arm64",
+        "x86_64-apple-darwin" => "x86_64",
+        _ => bail!("unsupported pinned macOS target {platform}"),
+    };
+    let config = crate::macos::DriverConfig {
+        zig,
+        sdk,
+        metal,
+        linker,
+        dsymutil: dsymutil.to_path_buf(),
+        compiler_rt: compiler_rt.to_path_buf(),
+        arch: arch.into(),
+        deployment_target: deployment_target.into(),
+    };
+    let bindgen_args = config
+        .clang_args()?
+        .iter()
+        .map(|arg| format!("'{}'", arg.to_string_lossy().replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let contents = serde_json::to_vec(&config)?;
+    let driver = std::env::current_exe()?.canonicalize()?;
+    let identity = sha256_hex(&serde_json::to_vec(&(
+        &contents,
+        crate::macos::DRIVER_VERSION,
+        asset.sha256,
+        crate::macos::SDK_SHA256,
+        crate::METAL_XCODE_BUILD,
+        crate::store::sha256_file(&config.linker)?,
+        crate::store::sha256_file(&driver)?,
+    ))?);
+    let name = format!("macos-wrappers-{}", &identity[..16]);
+    let directory = store.root.join("tools").join(&name);
+    if !directory.join(crate::macos::CONFIG_FILE).exists() {
+        let staging = store.tmp_path("macos-wrappers");
+        fs::create_dir_all(&staging)?;
+        fs::copy(driver, staging.join("driver"))?;
+        for tool in crate::macos::WRAPPERS {
+            std::os::unix::fs::symlink("driver", staging.join(tool))?;
+        }
+        fs::write(staging.join(crate::macos::CONFIG_FILE), contents)?;
+        match fs::rename(&staging, &directory) {
+            Ok(()) => {}
+            Err(_) if directory.join(crate::macos::CONFIG_FILE).is_file() => {
+                fs::remove_dir_all(staging)?;
+            }
+            Err(error) => return Err(error).context("publishing macOS wrappers"),
+        }
+    }
+    touch_tool_marker(&directory);
+    Ok(MacosRuntime {
+        platform: platform.into(),
+        directory: store.logical_root().join("tools").join(name),
+        config,
+        bindgen_args,
+        identity,
+    })
+}
+
+fn ensure_zig_executable(store: &Store, host: &str) -> Result<PathBuf> {
     let asset = crate::zig::asset(host)?;
     let archive_root = crate::zig::archive_root(&asset);
     let spec = ToolSpec {
@@ -2404,12 +2575,19 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         targets: Vec::new(),
         auth: String::new(),
     };
-    let installed = ensure_tool(store, &spec)?;
-    let logical_executable = store
+    ensure_tool(store, &spec)?;
+    Ok(store
         .logical_root()
         .join("tools")
         .join(format!("zig-{}", crate::zig::VERSION))
-        .join(&spec.bin);
+        .join(&spec.bin))
+}
+
+fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
+    let target = crate::zig::target(target)?
+        .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
+    let asset = crate::zig::asset(host)?;
+    let logical_executable = ensure_zig_executable(store, host)?;
     let driver_source = std::env::current_exe()?.canonicalize()?;
     let driver_hash = crate::store::sha256_file(&driver_source)?;
     let wrapper_identity = sha256_hex(
@@ -2476,12 +2654,6 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         }
     }
     touch_tool_marker(&wrapper_dir);
-    Store::touch_used(
-        installed
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or(installed.as_path()),
-    );
     Ok(ZigRuntime {
         cc: logical_wrapper_dir.join("cc"),
         cxx: logical_wrapper_dir.join("c++"),
@@ -2493,47 +2665,33 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
     })
 }
 
-/// Fetch, verify, and unpack the pinned libclang artifact for `host`, and
-/// return the directory to expose as `LIBCLANG_PATH` (the one containing
-/// `libclang.dylib`).
+/// Fetch and unpack the pinned llvm-tools artifact for `host`, and return the
+/// logical root of its unpacked tree (containing `lib/libclang.dylib` and
+/// `bin/dsymutil`).
 ///
 /// The artifact is keyed on the pinned Zig version and downloaded from Corgi's
-/// own release repo (see [`crate::libclang`]). Integrity comes from the
-/// `.sha256` sidecar published beside the archive, not a committed hash: we
-/// fetch the sidecar, then verify the archive bytes against it. The unpacked
-/// tree is stored under `tools/libclang-{zig_version}`, so the sidecar hash
-/// also participates as that tool's on-disk identity.
-fn ensure_libclang(store: &Store, host: &str) -> Result<PathBuf> {
+/// own release repo (see [`crate::libclang`]). Release builds embed the expected
+/// sha at compile time via [`crate::libclang::expected_sha256`] and hard-pin the
+/// download against it; dev builds download without checking.
+fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     let dest = store
         .root
         .join("tools")
-        .join(format!("libclang-{}", crate::zig::VERSION));
+        .join(format!("llvm-tools-{}", crate::zig::VERSION));
     let dylib = dest.join(crate::libclang::DYLIB_RELATIVE);
-    if dylib.exists() {
+    let dsymutil = dest.join(crate::libclang::DSYMUTIL_RELATIVE);
+    if dylib.exists() && dsymutil.exists() {
         touch_tool_marker(&dest);
-        return Ok(logical_libclang_dir(store));
+        return Ok(logical_llvm_tools_dir(store));
     }
     status!(
         "Installing",
-        "libclang for Zig {} (sha256 sidecar-pinned)",
+        "llvm-tools (libclang, dsymutil) for Zig {}",
         crate::zig::VERSION
     );
-    let work = store.tmp_path("libclang");
+    let work = store.tmp_path("llvm-tools");
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
-
-    // The sidecar is the pin: fetch it first, then hold the archive to it.
-    let sidecar_path = work.join("sha256");
-    let sidecar_url = crate::libclang::sha256_url(host)?;
-    let st = crate::curl()
-        .args(["-sSfL", "-o"])
-        .arg(&sidecar_path)
-        .arg(&sidecar_url)
-        .status()?;
-    if !st.success() {
-        bail!("downloading libclang sha256 sidecar failed: {sidecar_url}");
-    }
-    let expected = crate::libclang::parse_sha256_sidecar(&fs::read_to_string(&sidecar_path)?)?;
 
     let archive = work.join("archive");
     let archive_url = crate::libclang::url(host)?;
@@ -2543,14 +2701,16 @@ fn ensure_libclang(store: &Store, host: &str) -> Result<PathBuf> {
         .arg(&archive_url)
         .status()?;
     if !st.success() {
-        bail!("downloading libclang archive failed: {archive_url}");
+        bail!("downloading llvm-tools archive failed: {archive_url}");
     }
-    let actual = crate::store::sha256_file(&archive)?;
-    if actual != expected {
-        bail!(
-            "sha256 mismatch for libclang: sidecar pins {expected}, archive is {actual} \
-             (from {archive_url})"
-        );
+    if let Some(expected) = crate::libclang::expected_sha256() {
+        let actual = crate::store::sha256_file(&archive)?;
+        if actual != expected {
+            bail!(
+                "sha256 mismatch for llvm-tools: pin is {expected}, archive is {actual} \
+                 (from {archive_url})"
+            );
+        }
     }
 
     let st = Command::new("tar")
@@ -2560,32 +2720,33 @@ fn ensure_libclang(store: &Store, host: &str) -> Result<PathBuf> {
         .arg(&unpack)
         .status()?;
     if !st.success() {
-        bail!("unpack failed for libclang archive {archive_url}");
+        bail!("unpack failed for llvm-tools archive {archive_url}");
     }
-    if !unpack.join(crate::libclang::DYLIB_RELATIVE).exists() {
-        bail!(
-            "libclang archive is missing `{}` (from {archive_url})",
-            crate::libclang::DYLIB_RELATIVE
-        );
+    for relative in [
+        crate::libclang::DYLIB_RELATIVE,
+        crate::libclang::DSYMUTIL_RELATIVE,
+    ] {
+        if !unpack.join(relative).exists() {
+            bail!("llvm-tools archive is missing `{relative}` (from {archive_url})");
+        }
     }
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&unpack, &dest) {
         Ok(()) => {}
-        Err(_) if dylib.exists() => {}
-        Err(e) => return Err(e).context("publishing libclang"),
+        Err(_) if dylib.exists() && dsymutil.exists() => {}
+        Err(e) => return Err(e).context("publishing llvm-tools"),
     }
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
-    Ok(logical_libclang_dir(store))
+    Ok(logical_llvm_tools_dir(store))
 }
 
-/// Location-independent directory to hand bindgen as `LIBCLANG_PATH`.
-fn logical_libclang_dir(store: &Store) -> PathBuf {
+/// Location-independent root of the unpacked llvm-tools tree.
+fn logical_llvm_tools_dir(store: &Store) -> PathBuf {
     store
         .logical_root()
         .join("tools")
-        .join(format!("libclang-{}", crate::zig::VERSION))
-        .join("lib")
+        .join(format!("llvm-tools-{}", crate::zig::VERSION))
 }
 
 /// Split a GitHub release-asset url into (owner/repo, tag, asset name):
@@ -3731,7 +3892,6 @@ fn report_run(
                 cc: String::new(),
                 ld: String::new(),
                 sdk: String::new(),
-                xcode: String::new(),
             },
             declared_environment: Vec::new(),
             host_rustflags: Vec::new(),
@@ -4074,15 +4234,6 @@ fn build_inner(
         base_env.push(("HOME".to_string(), value));
     }
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
-    if host.contains("apple") {
-        if let Some(specification) = &corgi_toml.apple.toolchains.metal {
-            if config_env.iter().any(|(name, _)| name == "TOOLCHAINS") {
-                bail!("apple.toolchains.metal conflicts with TOOLCHAINS in .cargo/config.toml");
-            }
-            let toolchain = ensure_metal_component(specification, &base_env, &config_env)?;
-            base_env.push(("TOOLCHAINS".to_string(), toolchain));
-        }
-    }
     // Provision Corgi's pinned libclang on supported Apple hosts and hand its
     // directory to build scripts as LIBCLANG_PATH (injected in
     // build_script_environment). Keyed on the pinned Zig version, so any bindgen
@@ -4092,15 +4243,22 @@ fn build_inner(
     // once per store), so detecting bindgen consumers would add more complexity
     // than it saves. A project that sets its own LIBCLANG_PATH keeps it.
     let project_set_libclang = config_env.iter().any(|(name, _)| name == "LIBCLANG_PATH");
-    let libclang_logical = if crate::libclang::is_supported(&host) && !project_set_libclang {
-        Some(
-            ensure_libclang(&store, &host)?
+    // The pinned llvm-tools artifact carries both libclang (for bindgen) and
+    // dsymutil (which Clang runs on a compile-to-image with debug info). Provision
+    // it once; hand its `lib/` to bindgen and its root to the macOS driver.
+    let llvm_tools_logical = if crate::libclang::is_supported(&host) {
+        Some(ensure_llvm_tools(&store, &host)?)
+    } else {
+        None
+    };
+    let libclang_logical = match (&llvm_tools_logical, project_set_libclang) {
+        (Some(root), false) => Some(
+            root.join("lib")
                 .to_str()
                 .context("libclang path is not UTF-8")?
                 .to_string(),
-        )
-    } else {
-        None
+        ),
+        _ => None,
     };
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
@@ -4639,53 +4797,54 @@ fn build_inner(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let mut xcode_select = hermetic_apple_command("/usr/bin/xcode-select", &base_env, &config_env);
-    xcode_select.arg("-p");
-    let devdir = capture(&mut xcode_select, "xcode-select -p")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "/Library/Developer/CommandLineTools".to_string());
+    let mut macos = Vec::new();
+    if host.ends_with("-apple-darwin") {
+        // The pinned path always provisions llvm-tools on a supported host, so
+        // its presence is what raises the build-host floor to macOS 14.
+        crate::macos::check_host()?;
+        crate::zig::raise_file_descriptor_limit()?;
+        let llvm_tools = llvm_tools_logical
+            .as_ref()
+            .context("pinned macOS builds require the llvm-tools artifact")?;
+        let dsymutil = llvm_tools.join(crate::libclang::DSYMUTIL_RELATIVE);
+        let compiler_rt = crate::libclang::compiler_rt_dir(llvm_tools)?;
+        let deployment = config_env
+            .iter()
+            .find(|(name, _)| name == "MACOSX_DEPLOYMENT_TARGET")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or(crate::macos::DEFAULT_DEPLOYMENT_TARGET);
+        macos.push(ensure_macos(
+            &store,
+            &host,
+            &host,
+            &toolchain_logical,
+            &dsymutil,
+            &compiler_rt,
+            deployment,
+        )?);
+        if let Some(target) = target
+            .as_deref()
+            .filter(|target| target.ends_with("-apple-darwin") && *target != host)
+        {
+            macos.push(ensure_macos(
+                &store,
+                &host,
+                target,
+                &toolchain_logical,
+                &dsymutil,
+                &compiler_rt,
+                deployment,
+            )?);
+        }
+        base_env.push((
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", macos[0].directory.display()),
+        ));
+    }
     // toolchain identity beyond rustc: the linker chain shapes final bits
-    let cc_v = capture(Command::new("cc").arg("--version"), "cc --version")
-        .ok()
-        .and_then(|o| o.lines().next().map(str::to_string))
-        .unwrap_or_default();
-    let ld_v = Command::new("ld")
-        .arg("-v")
-        .output()
-        .map(|o| {
-            let all = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            all.lines().next().unwrap_or("").to_string()
-        })
-        .unwrap_or_default();
-    let sdk_v = if host.contains("apple") {
-        let mut command = hermetic_apple_command("/usr/bin/xcrun", &base_env, &config_env);
-        command.arg("--show-sdk-version");
-        capture(&mut command, "xcrun --show-sdk-version")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    // Metal can be installed independently of Xcode through DVTDownloads,
-    // so its identity and sandbox roots are discovered separately.
-    let xcode_v = if host.contains("apple") {
-        let mut command = hermetic_apple_command("/usr/bin/xcodebuild", &base_env, &config_env);
-        command.arg("-version");
-        capture(&mut command, "xcodebuild -version")
-            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let (metal_toolchain_roots, metal_identity) = if host.contains("apple") {
-        discover_metal_toolchains(&devdir, &base_env, &config_env)?
-    } else {
-        (Vec::new(), String::new())
-    };
+    let cc_v = format!("zig clang {}", crate::zig::VERSION);
+    let ld_v = format!("Rust {channel} Mach-O LLD");
+    let sdk_v = format!("{} {}", crate::macos::SDK_VERSION, crate::macos::SDK_BUILD);
     let zig_runtime = zig_target
         .as_deref()
         .map(|target| ensure_zig(&store, &host_guess, target))
@@ -4694,14 +4853,23 @@ fn build_inner(
         .as_ref()
         .map(|runtime| runtime.identity.as_str())
         .unwrap_or("");
+    let macos_identity = macos
+        .iter()
+        .map(|runtime| runtime.identity.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let libclang_identity = libclang_logical
+        .as_ref()
+        .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
+        .transpose()?
+        .unwrap_or_default();
     let toolchain = format!(
-        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nxcode: {xcode_v}\nmetal: {metal_identity}\nzig: {zig_identity}"
+        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nzig: {zig_identity}\nmacos: {macos_identity}\nlibclang: {libclang_identity}"
     );
     let report_toolchain = crate::report::ToolchainInput {
         cc: cc_v,
         ld: ld_v,
         sdk: sdk_v,
-        xcode: xcode_v,
     };
     recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
     // Unconditional where the platform supports it: there is exactly one
@@ -4728,17 +4896,6 @@ fn build_inner(
             }
         }
     }
-    // resolve the SDK once, outside the sandbox, instead of letting every
-    // rustc link shell out to xcrun (slow and an untracked probe)
-    let sdkroot = if host.contains("apple") {
-        let mut command = hermetic_apple_command("/usr/bin/xcrun", &base_env, &config_env);
-        command.arg("--show-sdk-path");
-        capture(&mut command, "xcrun --show-sdk-path")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
     let cargo = cargo_bin.display().to_string();
     // Lints are plan-time-resolved inputs (see resolve_lints).
     let lints = resolve_lints(&meta)?;
@@ -4938,11 +5095,8 @@ fn build_inner(
         target_dir,
         sysroot,
         rustup_home,
-        devdir,
-        metal_toolchain_roots,
         sandbox,
         darwin_dirs,
-        sdkroot,
         src_hash_memo: Mutex::new(HashMap::new()),
         source_files_memo: Mutex::new(HashMap::new()),
         src_hash_nanos: std::sync::atomic::AtomicU64::new(0),
@@ -4954,6 +5108,7 @@ fn build_inner(
         target,
         build_std,
         zig: zig_runtime,
+        macos,
         libclang_path: libclang_logical,
         timings,
         incremental: !no_incremental,
@@ -6261,351 +6416,6 @@ fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
     sha256_hex(normalized_paths.join("\0").as_bytes())
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct XcodeComponentInfo {
-    build_version: String,
-    status: String,
-    toolchain_identifier: String,
-}
-
-fn installed_metal_component(
-    base_env: &[(String, String)],
-    config_env: &[(String, String)],
-) -> Result<Option<XcodeComponentInfo>> {
-    let mut command = hermetic_apple_command("/usr/bin/xcodebuild", base_env, config_env);
-    command.args(["-showComponent", "MetalToolchain", "-json"]);
-    let output = command
-        .output()
-        .context("querying the installed Metal toolchain")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    serde_json::from_slice(&output.stdout)
-        .context("parsing xcodebuild Metal toolchain information")
-        .map(Some)
-}
-
-fn ensure_metal_component(
-    specification: &MetalToolchainSpec,
-    base_env: &[(String, String)],
-    config_env: &[(String, String)],
-) -> Result<String> {
-    if specification.build_version.is_empty() {
-        bail!("apple.toolchains.metal.build-version cannot be empty");
-    }
-    let installed = installed_metal_component(base_env, config_env)?;
-    let has_requested_build = installed.as_ref().is_some_and(|component| {
-        component.status == "installed" && component.build_version == specification.build_version
-    });
-    if !has_requested_build {
-        status!(
-            "Installing",
-            "Metal toolchain build {}",
-            specification.build_version
-        );
-        let mut command = hermetic_apple_command("/usr/bin/xcodebuild", base_env, config_env);
-        command.args([
-            "-downloadComponent",
-            "MetalToolchain",
-            "-buildVersion",
-            &specification.build_version,
-        ]);
-        let status = command
-            .status()
-            .context("starting the Metal toolchain download")?;
-        if !status.success() {
-            bail!(
-                "downloading Metal toolchain build {} failed with {status}",
-                specification.build_version
-            );
-        }
-    }
-
-    let component = installed_metal_component(base_env, config_env)?
-        .context("Metal toolchain is still unavailable after downloading it")?;
-    if component.status != "installed" || component.build_version != specification.build_version {
-        bail!(
-            "requested Metal toolchain build {}, but xcodebuild reports status `{}` and build `{}`",
-            specification.build_version,
-            component.status,
-            component.build_version
-        );
-    }
-    if component.toolchain_identifier.is_empty() {
-        bail!(
-            "Metal toolchain build {} has no toolchain identifier",
-            component.build_version
-        );
-    }
-    Ok(component.toolchain_identifier)
-}
-
-/// Finds Metal toolchains installed outside the selected Xcode bundle.
-fn discover_metal_toolchains(
-    developer_directory: &str,
-    base_env: &[(String, String)],
-    config_env: &[(String, String)],
-) -> Result<(Vec<PathBuf>, String)> {
-    let xcode_toolchains = selected_xcode_toolchains(developer_directory);
-    let mut discovered = Vec::new();
-    for tool in ["metal", "metallib"] {
-        let mut command = hermetic_apple_command("/usr/bin/xcrun", base_env, config_env);
-        command.args(["-sdk", "macosx", "--find", tool]);
-        let Ok(path) = capture(&mut command, &format!("locating {tool}")) else {
-            continue;
-        };
-        let executable = fs::canonicalize(path.trim())
-            .with_context(|| format!("resolving {tool} executable at {}", path.trim()))?;
-        let root = xcode_toolchain_root(&executable)
-            .with_context(|| format!("no .xctoolchain root for {}", executable.display()))?;
-        if xcode_toolchains
-            .as_ref()
-            .is_none_or(|xcode_toolchains| !root.starts_with(xcode_toolchains))
-        {
-            discovered.push((tool, root.to_path_buf()));
-        }
-    }
-
-    let mut root_identities = BTreeMap::new();
-    let mut identity = String::new();
-    for (tool, root) in &discovered {
-        let root_identity = match root_identities.get(root) {
-            Some(identity) => identity,
-            None => {
-                let root_identity = sealed_apfs_volume_identity(root, base_env, config_env)?
-                    .with_context(|| {
-                        format!(
-                            "Metal toolchain {} is outside Xcode but is not on a sealed, read-only APFS volume",
-                            root.display()
-                        )
-                    })?;
-                root_identities.insert(root.clone(), root_identity);
-                root_identities.get(root).unwrap()
-            }
-        };
-        identity.push_str(&format!("{tool}: {root_identity}\n"));
-    }
-    Ok((root_identities.into_keys().collect(), identity))
-}
-
-fn selected_xcode_toolchains(developer_directory: &str) -> Option<PathBuf> {
-    fs::canonicalize(Path::new(developer_directory).join("Toolchains")).ok()
-}
-
-fn sealed_apfs_volume_identity(
-    root: &Path,
-    base_env: &[(String, String)],
-    config_env: &[(String, String)],
-) -> Result<Option<String>> {
-    let device = filesystem_device(root)?;
-    let mut diskutil = hermetic_apple_command("/usr/sbin/diskutil", base_env, config_env);
-    diskutil.args(["info", "-plist", &device]);
-    let Ok(plist) = capture(&mut diskutil, "reading Metal toolchain volume identity") else {
-        return Ok(None);
-    };
-    let Some(uuid) = sealed_apfs_volume_uuid(&plist) else {
-        return Ok(None);
-    };
-    let manifest = root.join("ToolchainInfo.plist");
-    let manifest_hash = crate::store::sha256_file(&manifest)
-        .with_context(|| format!("hashing {}", manifest.display()))?;
-    Ok(Some(format!("sealed-apfs:{uuid}:{manifest_hash}")))
-}
-
-#[cfg(target_os = "macos")]
-fn filesystem_device(path: &Path) -> Result<String> {
-    use std::ffi::{CStr, CString};
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).context("filesystem path contains NUL")?;
-    let mut filesystem = MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `path` is NUL-terminated, and statfs initializes `filesystem`
-    // before returning success.
-    if unsafe { libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("reading filesystem identity");
-    }
-    // SAFETY: the successful statfs call initialized the structure and its
-    // fixed-size mount-from field is NUL-terminated by macOS.
-    let filesystem = unsafe { filesystem.assume_init() };
-    let device = unsafe { CStr::from_ptr(filesystem.f_mntfromname.as_ptr()) };
-    Ok(device.to_string_lossy().into_owned())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn filesystem_device(_path: &Path) -> Result<String> {
-    anyhow::bail!("Apple filesystem identity is only available on macOS")
-}
-
-fn sealed_apfs_volume_uuid(plist: &str) -> Option<&str> {
-    let filesystem = plist_string(plist, "FilesystemType")?;
-    let sealed = plist_string(plist, "Sealed")?;
-    let writable = plist_bool(plist, "Writable")?;
-    if filesystem == "apfs" && sealed == "Yes" && !writable {
-        plist_string(plist, "VolumeUUID")
-    } else {
-        None
-    }
-}
-
-fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
-    let value = plist.split_once(&format!("<key>{key}</key>"))?.1;
-    value
-        .split_once("<string>")?
-        .1
-        .split_once("</string>")
-        .map(|(value, _)| value)
-}
-
-fn plist_bool(plist: &str, key: &str) -> Option<bool> {
-    let value = plist
-        .split_once(&format!("<key>{key}</key>"))?
-        .1
-        .trim_start();
-    if value.starts_with("<true/>") {
-        Some(true)
-    } else if value.starts_with("<false/>") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn hermetic_apple_command(
-    program: &str,
-    base_env: &[(String, String)],
-    config_env: &[(String, String)],
-) -> Command {
-    let mut command = Command::new(program);
-    command.env_clear();
-    command.envs(base_env.iter().map(|(name, value)| (name, value)));
-    command.envs(config_env.iter().map(|(name, value)| (name, value)));
-    command
-}
-
-fn xcode_toolchain_root(executable: &Path) -> Option<&Path> {
-    executable.ancestors().find(|path| {
-        path.extension()
-            .is_some_and(|extension| extension == "xctoolchain")
-    })
-}
-
-#[cfg(test)]
-mod metal_toolchain_tests {
-    use super::{
-        filesystem_device, hermetic_apple_command, plist_bool, plist_string,
-        sealed_apfs_volume_uuid, selected_xcode_toolchains, xcode_toolchain_root,
-    };
-    use std::collections::BTreeMap;
-    use std::path::Path;
-
-    #[test]
-    fn confines_downloaded_tool_access_to_its_toolchain() {
-        let root = Path::new(
-            "/Users/example/Library/Developer/DVTDownloads/MetalToolchain/mounts/version/Metal.xctoolchain",
-        );
-        let executable = root.join("usr/metal/current/bin/metal");
-        assert_eq!(xcode_toolchain_root(&executable), Some(root));
-    }
-
-    #[test]
-    fn supports_xcode_bundled_tools() {
-        let root = Path::new(
-            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain",
-        );
-        let executable = root.join("usr/bin/metallib");
-        assert_eq!(xcode_toolchain_root(&executable), Some(root));
-    }
-
-    #[test]
-    fn refuses_to_grant_an_unrelated_parent_directory() {
-        assert_eq!(
-            xcode_toolchain_root(Path::new("/Users/example/bin/metal")),
-            None
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn filesystem_identity_follows_the_users_firmlink() {
-        assert_ne!(
-            filesystem_device(Path::new("/")).unwrap(),
-            filesystem_device(Path::new("/Users")).unwrap(),
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn selected_xcode_toolchains_resolves_a_developer_directory_alias() {
-        use std::os::unix::fs::symlink;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
-        let temp = std::env::temp_dir().join(format!(
-            "corgi-xcode-alias-{}-{}",
-            std::process::id(),
-            NEXT_TEST.fetch_add(1, Ordering::Relaxed),
-        ));
-        let developer = temp.join("Xcode.app/Contents/Developer");
-        let toolchains = developer.join("Toolchains");
-        std::fs::create_dir_all(&toolchains).unwrap();
-        let alias = temp.join("SelectedDeveloper");
-        symlink(&developer, &alias).unwrap();
-
-        assert_eq!(
-            selected_xcode_toolchains(alias.to_str().unwrap()),
-            Some(std::fs::canonicalize(toolchains).unwrap())
-        );
-        std::fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[test]
-    fn reads_sealed_volume_identity_fields() {
-        let plist = r#"<?xml version="1.0"?>
-<plist><dict>
-<key>FilesystemType</key><string>apfs</string>
-<key>Sealed</key><string>Yes</string>
-<key>Writable</key><false/>
-<key>VolumeUUID</key><string>E9FD717E</string>
-</dict></plist>"#;
-        assert_eq!(plist_string(plist, "FilesystemType"), Some("apfs"));
-        assert_eq!(plist_string(plist, "Sealed"), Some("Yes"));
-        assert_eq!(plist_bool(plist, "Writable"), Some(false));
-        assert_eq!(plist_string(plist, "VolumeUUID"), Some("E9FD717E"));
-        assert_eq!(sealed_apfs_volume_uuid(plist), Some("E9FD717E"));
-        assert_eq!(
-            sealed_apfs_volume_uuid(&plist.replace("<false/>", "<true/>")),
-            None,
-        );
-    }
-
-    #[test]
-    fn discovery_uses_only_the_environment_actions_receive() {
-        let command = hermetic_apple_command(
-            "/usr/bin/env",
-            &[("PATH".into(), "/usr/bin:/bin".into())],
-            &[("TOOLCHAINS".into(), "selected".into())],
-        );
-        let environment = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().into_owned(),
-                    value.unwrap().to_string_lossy().into_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            environment,
-            BTreeMap::from([
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                ("TOOLCHAINS".into(), "selected".into()),
-            ]),
-        );
-    }
-}
-
 /// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
 /// system dirs, the toolchain, the store, and keyed inputs; writes limited
 /// to the action's output and scratch dirs; no network. Children inherit it.
@@ -6624,16 +6434,13 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         "(allow mach-lookup)\n",
         "(allow file-read-metadata)\n",
     ));
-    // exec allowlist: the *only* runnable binaries are dispatchers
-    // (/usr/bin/cc, the rustup shim) and tools whose identity is part of
-    // the action key (rustc, clang/ld via the toolchain hash, build
-    // scripts via their content hash)
+    // exec allowlist: the *only* runnable binaries are the rustup shim and
+    // tools whose identity is part of the action key (rustc, clang/ld via the
+    // toolchain hash, build scripts via their content hash)
     prof.push_str("(allow process-exec*\n");
-    prof.push_str("  (literal \"/usr/bin/cc\")\n");
     let mut exec_lits = vec![
         format!("{}/bin/rustc", ctx.cargo_home),
         format!("{}/bin/rustc", ctx.sysroot),
-        format!("{}/usr/bin/xcodebuild", ctx.devdir),
     ];
     if let Some(r) = find_in_path(&ctx.rustc) {
         exec_lits.push(r.display().to_string());
@@ -6657,30 +6464,10 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
             .unwrap_or(p);
         prof.push_str(&format!("  (literal \"{canon}\")\n"));
     }
-    prof.push_str(&format!("  (subpath \"{}/Toolchains\")\n", ctx.devdir));
-    for root in &ctx.metal_toolchain_roots {
-        let root = serde_json::to_string(&root.to_string_lossy()).unwrap();
-        prof.push_str(&format!("  (subpath {root})\n"));
-    }
-    // Apple tools bundled with Xcode are keyed collectively through its identity.
-    // Independently installed Metal tools were keyed and granted above.
     // /bin/sh dispatches to the variant selected in /private/var/select/sh,
     // so each system-provided implementation must retain the dispatcher's
     // process-exec capability.
-    for p in [
-        "/usr/bin/ar",
-        "/usr/bin/ranlib",
-        "/usr/bin/clang",
-        "/usr/bin/clang++",
-        "/usr/bin/c++",
-        "/usr/bin/xcrun",
-        "/usr/bin/xcodebuild",
-        "/usr/bin/xcode-select",
-        "/bin/sh",
-        "/bin/bash",
-        "/bin/dash",
-        "/bin/zsh",
-    ] {
+    for p in ["/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh"] {
         prof.push_str(&format!("  (literal \"{p}\")\n"));
     }
     prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
@@ -6721,13 +6508,8 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         ctx.sysroot.clone(),
         ctx.cargo_home.clone(),
         ctx.rustup_home.clone(),
-        ctx.devdir.clone(),
         ctx.store.root.display().to_string(),
     ];
-    for root in &ctx.metal_toolchain_roots {
-        let root = serde_json::to_string(&root.to_string_lossy()).unwrap();
-        prof.push_str(&format!("  (subpath {root})\n"));
-    }
     // A workspace may itself live under the per-user temp directory. In that
     // case a broad cache grant would make every workspace file readable.
     for d in &ctx.darwin_dirs {
@@ -6738,7 +6520,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         }
     }
     for r in reads {
-        prof.push_str(&format!("  (subpath \"{r}\")\n"));
+        if !r.is_empty() {
+            prof.push_str(&format!("  (subpath \"{r}\")\n"));
+        }
     }
     let mut input_directories = std::collections::BTreeSet::new();
     for path in extra_reads {
@@ -6756,6 +6540,12 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
         prof.push_str(&format!("  ({operation} \"{}\")\n", path.display()));
     }
     prof.push_str(")\n");
+    if !ctx.macos.is_empty() {
+        prof.push_str(concat!(
+            "(deny file-read* (subpath \"/Library/Developer\") ",
+            "(regex #\"/[^/]+[.]app/Contents/Developer(/|$)\"))\n",
+        ));
+    }
     // Align the readable set with the hashed set: the source hash deliberately
     // excludes .git, build output dirs, and Cargo.lock, so reading them must
     // be denied or they become unhashed inputs. Later SBPL rules win.
@@ -9238,9 +9028,6 @@ fn compile(
         cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
         cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
     }
-    if !ctx.sdkroot.is_empty() {
-        cmd.env("SDKROOT", &ctx.sdkroot);
-    }
     for (k, v) in &ctx.base_env {
         cmd.env(k, v);
     }
@@ -9300,6 +9087,17 @@ fn compile(
                 cmd.arg("-L").arg(libdir);
             }
         }
+    }
+    if let Some(runtime) = ctx
+        .macos
+        .iter()
+        .find(|runtime| runtime.platform == unit_platform)
+    {
+        cmd.arg("-C").arg(format!(
+            "linker={}",
+            runtime.directory.join("rust-linker").display()
+        ));
+        cmd.envs(runtime.environment());
     }
     for f in pflags {
         cmd.arg(f);
@@ -9582,13 +9380,35 @@ fn build_script_environment<'a>(
             unit.profile.opt_level.clone()
         },
     ));
-    // Deliberately not the profile's value: C compiled with -g embeds its
-    // machine-local build dir. C debug info needs its own treatment later.
-    env.push(("DEBUG".into(), "false".into()));
+    // Pinned macOS compilers remap native debug paths into the stable cache.
+    // Other compilers still suppress debug info to avoid machine-local paths.
+    let native_debug = ctx.macos.iter().any(|runtime| runtime.platform == platform)
+        && unit.profile.debuginfo_flag() != "0";
+    env.push(("DEBUG".into(), native_debug.to_string()));
     env.push(("NUM_JOBS".into(), "4".into()));
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
+    for runtime in &ctx.macos {
+        if runtime.platform == platform {
+            env.extend(runtime.environment());
+        }
+        for (variable, tool) in [
+            ("CC", "cc"),
+            ("CXX", "c++"),
+            ("AR", "ar"),
+            ("RANLIB", "ranlib"),
+        ] {
+            let path = runtime.directory.join(tool).display().to_string();
+            env.push((
+                format!("{variable}_{}", runtime.platform.replace('-', "_")),
+                path.clone(),
+            ));
+            if runtime.platform == ctx.host {
+                env.push((format!("HOST_{variable}"), path));
+            }
+        }
+    }
     if platform != ctx.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
             let target_environment = target.replace('-', "_");
@@ -9776,17 +9596,21 @@ fn run_build_script(
         cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
         cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
     }
-    if !ctx.sdkroot.is_empty() {
-        cmd.env("SDKROOT", &ctx.sdkroot);
-    }
     for (k, v) in &ctx.base_env {
         cmd.env(k, v);
     }
-    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
-        cmd.env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
-    }
     for (k, v) in &spec.environment {
         cmd.env(k, v);
+    }
+    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
+        let path = spec
+            .environment
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("/usr/bin:/bin");
+        cmd.env("PATH", format!("{}:{path}", shims.display()));
     }
     for (k, v) in &dep_env {
         cmd.env(k, v);

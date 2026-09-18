@@ -169,8 +169,16 @@ def existing_release(repository, tag, asset):
                         or any(c not in "0123456789abcdef" for c in checksum[0])
                         or assets[asset].get("digest") != f"sha256:{checksum[0]}"):
                     raise ValueError("Metal release checksum does not match its asset digest")
-                return True
-    return False
+                return checksum[0]
+    return None
+
+
+def export_release_sha256(digest):
+    """Hand the pinned digest to release builds of Corgi, which embed it."""
+    github_env = os.environ.get("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a") as env_file:
+            env_file.write(f"CORGI_METAL_SHA256={digest}\n")
 
 
 def main():
@@ -181,8 +189,12 @@ def main():
     if publish:
         if not repository:
             raise ValueError("publishing requires RELEASE_REPO and authenticated gh")
-        if existing_release(repository, tag, asset):
+        published = existing_release(repository, tag, asset)
+        if published is not None:
             print(f"{repository}: {tag}/{asset} already exists")
+            # Export the pin even on the no-op path: release builds run after
+            # this step and embed the digest whether or not it was rebuilt.
+            export_release_sha256(published)
             return
 
     if sys.platform != "darwin":
@@ -234,6 +246,8 @@ def main():
         verify(unpacked, xcode, provenance, work)
         with archive.open("rb") as source:
             digest = hashlib.file_digest(source, "sha256").hexdigest()
+        # Release builds of Corgi embed this to hard-pin the Metal download.
+        export_release_sha256(digest)
         output = work / "output"
         output.mkdir()
         shutil.move(archive, output / asset)

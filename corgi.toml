@@ -1,3 +1,15 @@
 [extra-inputs]
 # Integration tests execute these files; edits must invalidate cached test passes.
 corgi-build = ["tests/support/*.py"]
+
+# Release builds embed the pinned Metal and llvm-tools sha256 digests at compile
+# time (CI sets these), hard-pinning the downloads. inherit forwards each var
+# only when present, so dev builds (where they are unset) contribute nothing and
+# the env!() pin, gated on debug_assertions, is never reached.
+[env.CORGI_METAL_SHA256]
+inherit = true
+packages = ["corgi-build"]
+
+[env.CORGI_LLVM_TOOLS_SHA256]
+inherit = true
+packages = ["corgi-build"]
