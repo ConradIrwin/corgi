@@ -1103,7 +1103,7 @@ fn build_script_runtime_reads_require_extra_inputs() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn apple_compiler_cold_lookup_executes_only_required_tools() {
+fn apple_builds_deny_ambient_tools_and_reads() {
     let directory = TestDirectory::new("apple-compiler-cold-lookup");
     let workspace = directory.path.join("workspace");
     let store = directory.path.join("store");
@@ -1121,6 +1121,28 @@ fn apple_compiler_cold_lookup_executes_only_required_tools() {
         r#"use std::process::Command;
 
 fn main() {
+    for path in [
+        "/usr", "/bin", "/sbin", "/System", "/Library", "/Applications", "/opt",
+        "/private/etc", "/private/var/db", "/private/preboot",
+    ] {
+        match std::fs::read_dir(path) {
+            Err(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            ) => {}
+            result => panic!("ambient directory {path} was readable: {result:?}"),
+        }
+    }
+    for path in [
+        "/usr/bin/true",
+        "/bin/sh",
+        "/System/Library/CoreServices/SystemVersion.plist",
+        "/private/etc/hosts",
+    ] {
+        let error = std::fs::read(path).expect_err("ambient file was readable");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{path}: {error}");
+    }
+
     for tool in ["/usr/bin/true", "/usr/bin/clang", "/usr/bin/xcrun", "/usr/bin/xcode-select"] {
         match Command::new(tool).arg("--version").status() {
             Err(error) if matches!(

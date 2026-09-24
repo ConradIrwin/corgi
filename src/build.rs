@@ -6417,7 +6417,7 @@ fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
 }
 
 /// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
-/// system dirs, the toolchain, the store, and keyed inputs; writes limited
+/// runtime paths, the toolchain, the store, and keyed inputs; writes limited
 /// to the action's output and scratch dirs; no network. Children inherit it.
 fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
     if !ctx.sandbox {
@@ -6488,21 +6488,9 @@ fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[
     // needs the directory node itself, but nothing under it beyond the
     // explicitly granted package/extra-input subpaths.
     prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
-    for p in [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/System",
-        "/Library",
-        "/Applications",
-        "/opt",
-        "/private/etc",
-        "/private/var/db",
-        "/private/preboot",
-        "/private/var/run/com.apple.security.cryptexd",
-    ] {
-        prof.push_str(&format!("  (subpath \"{p}\")\n"));
-    }
+    // Host-installed tools and libraries are not keyed inputs, so their
+    // directories must not be readable even when an action can execute a shell.
+    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
     let workspace_root = Path::new(&ctx.workspace_root);
     let mut reads: Vec<String> = vec![
         ctx.sysroot.clone(),
