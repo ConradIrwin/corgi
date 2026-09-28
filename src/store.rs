@@ -22,8 +22,9 @@ pub fn default_root() -> Result<PathBuf> {
     if cfg!(target_os = "macos") {
         Ok(PathBuf::from("/Users/Shared/corgi"))
     } else {
-        let home = std::env::var_os("HOME").context("HOME not set")?;
-        Ok(PathBuf::from(home).join(".cache/corgi"))
+        Ok(dirs::data_local_dir()
+            .context("could not determine the user data directory; set CORGI_STORE")?
+            .join("corgi"))
     }
 }
 

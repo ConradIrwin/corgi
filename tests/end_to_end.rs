@@ -6,6 +6,440 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
+    let directory = TestDirectory::new("linux-hello");
+    let workspace = directory.path.join("workspace with spaces");
+    write_linux_package(&workspace, &directory.package_name);
+    let data = directory.path.join("xdg data");
+    let store = data.join("corgi");
+    let binary = workspace.join("target/debug").join(&directory.package_name);
+    for (message, expected_cache) in [("hello", "miss"), ("hello", "hit"), ("changed", "miss")] {
+        fs::write(
+            workspace.join("src/main.rs"),
+            format!("fn main() {{ println!({message:?}); }}\n"),
+        )
+        .unwrap();
+        let output = corgi_command()
+            .current_dir(&workspace)
+            .arg("build")
+            .env_remove("CORGI_STORE")
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        assert_success(&output, "build in the default Linux data directory");
+        assert_unit_cache(
+            &report_for_workspace(&store, &workspace),
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            expected_cache,
+        );
+        let output = Command::new(&binary).env_clear().output().unwrap();
+        assert_success(&output, "run the exported binary without a dev shell");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{message}\n")
+        );
+    }
+    assert!(
+        !store.join("tools").exists(),
+        "supplied tools must not be downloaded"
+    );
+    assert!(!store.join("alias").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_build_scripts_use_clang_and_key_wrapper_flags_with_sandboxed_children() {
+    use std::os::unix::process::CommandExt;
+
+    let directory = TestDirectory::new("linux-native");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    write_linux_package(&workspace, &directory.package_name);
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n{} = [\"answer.c\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("answer.c"),
+        "int answer(void) { return CORGI_VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("private"), "not declared").unwrap();
+    fs::write(directory.path.join("sibling"), "not declared").unwrap();
+    fs::create_dir_all(workspace.join(".git")).unwrap();
+    fs::write(workspace.join(".git/config"), "not hashed").unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        r#"use std::{env, fs, net::TcpListener, os::unix::net::UnixListener, path::PathBuf, process::Command};
+fn main() {
+    if env::args().any(|arg| arg == "probe-child") {
+        assert!(fs::read("private").is_err());
+        assert!(TcpListener::bind("127.0.0.1:0").is_err());
+        return;
+    }
+    let limits = Command::new("sh").args(["-c", "ulimit -S -n; ulimit -H -n"]).output().unwrap();
+    assert!(limits.status.success());
+    let limits = String::from_utf8(limits.stdout).unwrap();
+    let mut limits = limits.lines().map(|limit| limit.parse::<u64>().unwrap_or(u64::MAX));
+    let soft = limits.next().unwrap();
+    let hard = limits.next().unwrap();
+    assert!(soft >= hard.min(4096), "parallel builds must raise low descriptor limits");
+    for path in ["private", "../sibling", ".git/config", "Cargo.lock", "/etc/passwd"] {
+        assert!(fs::read(path).is_err(), "undeclared read: {path}");
+    }
+    for path in ["answer.c", "Cargo.toml", "/forbidden"] {
+        assert!(fs::write(path, "forbidden").is_err(), "undeclared write: {path}");
+    }
+    // This fixture lives under /tmp. New files there may exist in the private
+    // tmpfs, but must never reach the host workspace or its siblings.
+    let _ = fs::write("forbidden", "private scratch");
+    let _ = fs::write("../forbidden", "private scratch");
+    assert!(TcpListener::bind("127.0.0.1:0").is_err());
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    assert!(UnixListener::bind(output.join("socket")).is_err());
+    fs::write(output.join("generated.rs"), "pub const GENERATED: u32 = 1;\n").unwrap();
+    // A child must inherit the same policy, including network restrictions.
+    assert!(Command::new(env::current_exe().unwrap()).arg("probe-child").status().unwrap().success());
+    let object = output.join("answer.o");
+    assert!(Command::new(env::var_os("CC").unwrap())
+        .args(["-c", "answer.c", "-o"]).arg(&object).status().unwrap().success());
+    println!("cargo::rustc-link-arg={}", object.display());
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\
+         unsafe extern \"C\" { fn answer() -> i32; }\n\
+         fn main() { println!(\"{} {}\", unsafe { answer() }, GENERATED); }\n",
+    )
+    .unwrap();
+    for (value, expected_cache) in [(42, "miss"), (42, "hit"), (84, "miss")] {
+        let mut command = corgi_command();
+        command
+            .current_dir(&workspace)
+            .arg("run")
+            .env("CORGI_STORE", &store)
+            .env("NIX_CFLAGS_COMPILE", format!("-DCORGI_VALUE={value}"));
+        // Change only the child: parallel tests must retain their own limits.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(256);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert_success(&output, "run Rust linked to sandbox-built C");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{value} 1\n")
+        );
+        assert_unit_cache(
+            &report_for_workspace(&store, &workspace),
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            expected_cache,
+        );
+    }
+    assert!(!workspace.join("forbidden").exists());
+    assert!(!directory.path.join("forbidden").exists());
+    assert!(!store.join("tools").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_local_toolchains_hash_declared_runtime_dependencies() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let directory = TestDirectory::new("local-toolchain");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    write_linux_package(&workspace, &directory.package_name);
+    let rust = directory.path.join("local rust");
+    fs::create_dir_all(rust.join("bin")).unwrap();
+    let supplied_rust = PathBuf::from(std::env::var_os("CORGI_RUST_TOOLCHAIN").unwrap());
+    for name in ["rustc", "cargo"] {
+        symlink(
+            supplied_rust.join("bin").join(name),
+            rust.join("bin").join(name),
+        )
+        .unwrap();
+    }
+    let driver = PathBuf::from(std::env::var_os("CORGI_CC").unwrap());
+    let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("sh"))
+        .find(|path| path.is_file())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let compiler = directory.path.join("local clang");
+    let includes = directory.path.join("local includes");
+    let headers = directory.path.join("headers");
+    fs::create_dir_all(&includes).unwrap();
+    fs::create_dir_all(&headers).unwrap();
+    let header = headers.join("answer.h");
+    let secret = headers.join("undeclared");
+    fs::write(&secret, "not a declared dependency").unwrap();
+    symlink(&header, includes.join("answer.h")).unwrap();
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!(
+            "[extra-inputs]\n{} = [\"answer.c\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("answer.c"),
+        "int answer(void) { return HEADER_VALUE + WRAPPER_VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        format!(
+            r#"use std::{{env, fs, path::PathBuf, process::Command}};
+fn main() {{
+    assert!(fs::read({secret:?}).is_err());
+    assert!(fs::write({header:?}, "not writable").is_err());
+    let object = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("answer.o");
+    assert!(Command::new(env::var_os("CC").unwrap())
+        .args(["-c", "answer.c", "-o"]).arg(&object).status().unwrap().success());
+    println!("cargo::rustc-link-arg={{}}", object.display());
+}}
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "unsafe extern \"C\" { fn answer() -> i32; }\n\
+         fn main() { println!(\"{}\", unsafe { answer() }); }\n",
+    )
+    .unwrap();
+    let roots = std::env::join_paths([&driver, &includes, &header]).unwrap();
+    let mut command = corgi_command();
+    command
+        .current_dir(&workspace)
+        .arg("run")
+        .env("CORGI_STORE", &store)
+        .env("CORGI_RUST_TOOLCHAIN", &rust)
+        .env("CORGI_CC", &compiler)
+        .env("CORGI_NATIVE_RUNTIME_ROOTS", &roots);
+    for (header_value, wrapper_value, cache) in [
+        (41, 1, "miss"),
+        (41, 1, "hit"),
+        (42, 1, "miss"),
+        (42, 2, "miss"),
+    ] {
+        fs::write(&header, format!("#define HEADER_VALUE {header_value}\n")).unwrap();
+        fs::write(
+            &compiler,
+            format!(
+                "#!{}\nexec {:?} -DWRAPPER_VALUE={wrapper_value} -include {:?} \"$@\"\n",
+                shell.display(),
+                driver,
+                includes.join("answer.h"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = command.output().unwrap();
+        assert_success(
+            &output,
+            "run with a local compiler wrapper and declared headers",
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", header_value + wrapper_value)
+        );
+        assert_unit_cache(
+            &report_for_workspace(&store, &workspace),
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            cache,
+        );
+    }
+    // Even a warm store must validate the closure rather than reuse old actions.
+    command.env(
+        "CORGI_NATIVE_RUNTIME_ROOTS",
+        std::env::join_paths([&driver, &includes]).unwrap(),
+    );
+    let output = command.output().unwrap();
+    assert_failure(&output, "reject an undeclared symlink target");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CORGI_NATIVE_RUNTIME_ROOTS"));
+    command.env("CORGI_NATIVE_RUNTIME_ROOTS", directory.path.join("missing"));
+    let output = command.output().unwrap();
+    assert_failure(&output, "reject a missing declared runtime dependency");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
+    command.env("CORGI_NATIVE_RUNTIME_ROOTS", "relative");
+    let output = command.output().unwrap();
+    assert_failure(
+        &output,
+        "identify the source of an invalid runtime path list",
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("parsing CORGI_NATIVE_RUNTIME_ROOTS"),
+        "{error}"
+    );
+    assert!(
+        error.contains("runtime path-list entries must be nonempty absolute paths"),
+        "{error}"
+    );
+    assert!(!store.join("tools").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_invalid_explicit_tools_fail_without_provisioning_a_replacement() {
+    let directory = TestDirectory::new("linux-invalid-toolchain");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    write_linux_package(&workspace, &directory.package_name);
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+    for variable in ["CORGI_RUST_TOOLCHAIN", "CORGI_CC"] {
+        let output = corgi_command()
+            .current_dir(&workspace)
+            .arg("build")
+            .env("CORGI_STORE", &store)
+            .env(variable, directory.path.join("missing"))
+            .output()
+            .unwrap();
+        assert_failure(&output, "reject a missing explicitly supplied tool");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(variable));
+        assert!(!store.join("tools").exists());
+    }
+    fs::write(
+        workspace.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    assert_failure(&output, "reject an incompatible supplied Rust release");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match project pin 1.0.0"));
+    assert!(!store.join("tools").exists());
+}
+
+#[test]
+fn supplied_build_toolchains_are_selected_by_overrides_on_every_host() {
+    let directory = TestDirectory::new("supplied-toolchain-selection");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"supplied-selection\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let pin = workspace.join("rust-toolchain.toml");
+    for pinned in [true, false] {
+        if pinned {
+            fs::write(&pin, "[toolchain]\nchannel = \"1.97.1\"\n").unwrap();
+        } else {
+            fs::remove_file(&pin).unwrap();
+        }
+        for (rust, compiler, expected_error) in [
+            (Some("missing"), None, "resolving CORGI_RUST_TOOLCHAIN"),
+            (None, Some("missing"), "set CORGI_RUST_TOOLCHAIN"),
+            (Some("workspace"), None, "set CORGI_CC"),
+            (Some("workspace"), Some("missing"), "resolving CORGI_CC"),
+        ] {
+            let mut command = corgi_command();
+            command
+                .current_dir(&workspace)
+                .arg("build")
+                .env("CORGI_STORE", directory.path.join("store"))
+                .env("CORGI_CURL", "false")
+                .env_remove("CORGI_RUST_TOOLCHAIN")
+                .env_remove("CORGI_NATIVE_RUNTIME_ROOTS")
+                .env_remove("CORGI_CC");
+            if let Some(rust) = rust {
+                command.env("CORGI_RUST_TOOLCHAIN", directory.path.join(rust));
+            }
+            if let Some(compiler) = compiler {
+                command.env("CORGI_CC", directory.path.join(compiler));
+            }
+            let output = command.output().unwrap();
+            assert_failure(
+                &output,
+                "reject an invalid selected toolchain without provisioning",
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains(expected_error), "{error}");
+            assert!(!error.contains("Installing"), "{error}");
+            assert_eq!(
+                pin.exists(),
+                pinned,
+                "invalid overrides must not create a pin"
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_build_toolchains_are_selected_explicitly_for_the_host() {
+    let directory = TestDirectory::new("managed-toolchain-selection");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"managed-selection\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.97.1\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let store = directory.path.join("store");
+    let output = corgi_command()
+        .current_dir(&workspace)
+        .arg("build")
+        .env("CORGI_STORE", &store)
+        .env("CORGI_CURL", "false")
+        .env_remove("CORGI_RUST_TOOLCHAIN")
+        .env_remove("CORGI_NATIVE_RUNTIME_ROOTS")
+        .env_remove("CORGI_CC")
+        .output()
+        .unwrap();
+    assert_failure(&output, "exercise managed setup without downloading tools");
+    let error = String::from_utf8_lossy(&output.stderr);
+    if cfg!(target_os = "linux") {
+        assert!(
+            error.contains("managed Linux toolchains are not implemented"),
+            "{error}"
+        );
+        assert!(!store.join("tools").exists());
+    } else {
+        assert!(
+            error.contains("download failed: https://static.rust-lang.org/"),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
     let directory = TestDirectory::new("target-dir");
@@ -3060,6 +3494,57 @@ fn bench_no_run_exports_built_in_and_custom_executables_without_running_them() {
 }
 
 #[test]
+fn fmt_uses_managed_tools_only_when_no_toolchain_is_supplied() {
+    let directory = TestDirectory::new("fmt-toolchain-selection");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    let supplied = directory.path.join("incomplete-toolchain");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(&supplied).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"fmt-selection\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.97.1\"\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    for supplied in [Some(&supplied), None] {
+        let mut command = corgi_command();
+        command
+            .current_dir(&workspace)
+            .arg("fmt")
+            .env("CORGI_STORE", &store)
+            // Fail downloads without network access, so this works on hosts
+            // that cannot run an upstream toolchain (including NixOS).
+            .env("CORGI_CURL", "false")
+            .env_remove("CORGI_RUST_TOOLCHAIN");
+        if let Some(supplied) = supplied {
+            command.env("CORGI_RUST_TOOLCHAIN", supplied);
+        }
+        let output = command.output().unwrap();
+        assert_failure(&output, "format with unavailable tools");
+        let error = String::from_utf8_lossy(&output.stderr);
+        if supplied.is_some() {
+            assert!(
+                error.contains("supplied Rust installation is missing"),
+                "{error}"
+            );
+            assert!(!error.contains("Installing"), "{error}");
+        } else {
+            assert!(
+                error.contains("download failed: https://static.rust-lang.org/"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fmt_discovers_targets_in_a_virtual_workspace() {
     let fixture = fixture_path("fmt-virtual-workspace");
 
@@ -4708,6 +5193,34 @@ fn copy_directory(source: &Path, destination: &Path) {
             fs::copy(entry.path(), destination).unwrap();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_package(workspace: &Path, name: &str) {
+    let toolchain = std::env::var_os("CORGI_RUST_TOOLCHAIN")
+        .expect("Linux integration tests require CORGI_RUST_TOOLCHAIN and CORGI_CC");
+    assert!(std::env::var_os("CORGI_CC").is_some());
+    let version = Command::new(Path::new(&toolchain).join("bin/rustc"))
+        .arg("-vV")
+        .output()
+        .unwrap();
+    assert_success(&version, "probe the supplied test compiler");
+    let version = String::from_utf8(version.stdout).unwrap();
+    let release = version
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("rust-toolchain.toml"),
+        format!("[toolchain]\nchannel = {release:?}\n"),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!("[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+    )
+    .unwrap();
 }
 
 struct TestDirectory {
