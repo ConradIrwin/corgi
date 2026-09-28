@@ -4402,23 +4402,12 @@ fn invoke_corgi_offline<const ARGUMENT_COUNT: usize>(
     arguments: [&str; ARGUMENT_COUNT],
     store: &Path,
 ) -> Output {
-    block_network(&mut corgi_store_command(fixture, command, arguments, store))
+    // Corgi's own downloads fail, and Cargo errors on any network access.
+    corgi_store_command(fixture, command, arguments, store)
+        .env("CORGI_CURL", "/usr/bin/false")
+        .env("CARGO_NET_OFFLINE", "true")
         .output()
         .expect("failed to invoke corgi")
-}
-
-/// Closes every network path: Corgi's own downloads fail, and Cargo can only
-/// reach an unused local port.
-fn block_network(command: &mut Command) -> &mut Command {
-    let unreachable = "http://127.0.0.1:9";
-    command
-        .env("CORGI_CURL", "/usr/bin/false")
-        .env("CARGO_HTTP_PROXY", unreachable)
-        .env("HTTPS_PROXY", unreachable)
-        .env("https_proxy", unreachable)
-        .env("HTTP_PROXY", unreachable)
-        .env("http_proxy", unreachable)
-        .env("CARGO_NET_RETRY", "0")
 }
 
 fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
