@@ -253,28 +253,10 @@ fn file_hashes_hinted(
 /// Central machine-wide store. All mutations are write-to-temp + atomic
 /// rename, so any number of concurrent builds can share it without locks.
 pub struct Store {
+    /// Canonical store path. Actions see and embed this exact spelling, so
+    /// stores at the same path produce identical artifacts on every machine.
     pub root: PathBuf,
-    /// Canonical machine-independent spelling of the store root, routed
-    /// through a symlink at a path that exists on every machine
-    /// (default /Users/Shared/corgi). A poor man's bind mount.
-    pub alias: Option<PathBuf>,
     counter: AtomicU64,
-}
-
-fn setup_alias(alias: &Path, root: &Path) -> Result<()> {
-    if let Ok(t) = fs::read_link(alias) {
-        if t == *root {
-            return Ok(());
-        }
-    }
-    if alias.exists() && !fs::symlink_metadata(alias)?.file_type().is_symlink() {
-        return Err(anyhow!("{} exists and is not a symlink", alias.display()));
-    }
-    let tmp = alias.with_file_name(format!(".corgi-alias-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(root, &tmp)?;
-    fs::rename(&tmp, alias)?; // atomic swap, lock-free like everything else
-    Ok(())
 }
 
 impl Store {
@@ -293,32 +275,8 @@ impl Store {
         // canonicalize so sandbox path rules match kernel-resolved paths
         // (e.g. /tmp/store -> /private/tmp/store)
         let root = root.canonicalize()?;
-        let alias = if std::env::var_os("CORGI_NO_ALIAS").is_some() {
-            None
-        } else {
-            let alias_path = std::env::var_os("CORGI_ALIAS")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/Users/Shared/corgi"));
-            if root == alias_path {
-                // the store already lives at the canonical path: no alias,
-                // no symlink, nothing for realpath() to see through
-                return Ok(Store {
-                    root,
-                    alias: None,
-                    counter: AtomicU64::new(0),
-                });
-            }
-            match setup_alias(&alias_path, &root) {
-                Ok(()) => Some(alias_path),
-                Err(e) => {
-                    eprintln!("corgi warning: no canonical store alias ({e}); embedded OUT_DIR paths will be machine-specific");
-                    None
-                }
-            }
-        };
         Ok(Store {
             root,
-            alias,
             counter: AtomicU64::new(0),
         })
     }
@@ -344,10 +302,6 @@ impl Store {
         if let Ok(f) = opened {
             let _ = f.set_modified(std::time::SystemTime::now());
         }
-    }
-
-    pub fn logical_root(&self) -> &Path {
-        self.alias.as_deref().unwrap_or(&self.root)
     }
 
     pub fn tmp_path(&self, tag: &str) -> PathBuf {
@@ -1239,7 +1193,6 @@ mod manifest_publication_tests {
             Self {
                 store: Store {
                     root,
-                    alias: None,
                     counter: AtomicU64::new(0),
                 },
             }
@@ -1384,7 +1337,6 @@ mod debug_export_tests {
         let destination = root.join("bin/program");
         let second_store = Store {
             root: store.root.clone(),
-            alias: None,
             counter: AtomicU64::new(0),
         };
 
@@ -1538,7 +1490,6 @@ mod debug_export_tests {
         (
             Store {
                 root: root.clone(),
-                alias: None,
                 counter: AtomicU64::new(0),
             },
             root,

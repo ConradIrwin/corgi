@@ -99,10 +99,9 @@ fn real_main() -> Result<()> {
         cli::Cli::command().print_help()?;
         return Ok(());
     };
-    // Default: the store lives *directly at* the canonical machine-wide
-    // path, so embedded OUT_DIR paths are canonical with no indirection.
-    // CORGI_STORE relocates it (a symlink alias then preserves the
-    // canonical spelling).
+    // Default: the store lives at the machine-wide path, so embedded
+    // OUT_DIR paths match on every machine. CORGI_STORE relocates it; a
+    // relocated store embeds its own path instead.
     let store_root = store::default_root()?;
 
     match command {

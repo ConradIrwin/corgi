@@ -106,7 +106,7 @@ fn artifacts(store: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 /// Double-build determinism audit: run the same build into two different
-/// stores (different physical paths, same canonical alias), then demand
+/// stores (each moved to the same canonical path while it builds), then demand
 /// bit-identical artifacts under identical action keys. Every leak this
 /// project has found would have been caught by this check.
 pub fn audit(
@@ -122,8 +122,8 @@ pub fn audit(
     let base = PathBuf::from("/tmp/corgi-audit");
     fs::create_dir_all(&base)?;
     // Each build's store physically occupies the SAME canonical path -- a
-    // real directory, no symlink alias -- exactly like production stores on
-    // two different machines. An alias would be dishonest here: tools that
+    // real directory, not a symlink -- exactly like production stores on
+    // two different machines. A symlink would be dishonest here: tools that
     // realpath() their inputs (the Metal compiler resolves the include path
     // it embeds in line tables) would record per-store physical paths and
     // report nondeterminism that production never exhibits. Stores are
@@ -175,7 +175,6 @@ pub fn audit(
             c.args(["--root", r]);
         }
         c.env("CORGI_STORE", &canonical);
-        c.env_remove("CORGI_ALIAS");
         let st = c.status().context("spawning audit build")?;
         // park even on failure so the state stays inspectable
         fs::rename(&canonical, s).context("parking audit store")?;

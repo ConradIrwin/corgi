@@ -47,7 +47,6 @@ fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
             .arg(workspace.join("Cargo.toml"))
             .args(["--target-dir", output, "--timings"])
             .env("CORGI_STORE", &store)
-            .env("CORGI_ALIAS", store.join("alias"))
             .output()
             .unwrap();
         assert_success(&result, "run with a custom target directory");
@@ -221,24 +220,14 @@ fn fetch_prepares_standard_library_sources_for_an_offline_build_std_check() {
     )
     .unwrap();
 
-    // Build-std planning currently fails when the store is reached through its
-    // alias symlink, so address this store directly.
-    let fetch = corgi_store_command(&workspace, "fetch", [], &store)
-        .env("CORGI_ALIAS", &store)
-        .output()
-        .unwrap();
+    let fetch = invoke_corgi_with_store(&workspace, "fetch", [], &store);
     assert_success(&fetch, "corgi fetch");
-    let check = block_network(
-        corgi_store_command(
-            &workspace,
-            "check",
-            ["--target", "wasm32-unknown-unknown"],
-            &store,
-        )
-        .env("CORGI_ALIAS", &store),
-    )
-    .output()
-    .unwrap();
+    let check = invoke_corgi_offline(
+        &workspace,
+        "check",
+        ["--target", "wasm32-unknown-unknown"],
+        &store,
+    );
 
     assert_success(&check, "offline build-std corgi check");
 }
@@ -553,7 +542,6 @@ fn no_default_features_preserves_other_workspace_defaults() {
             .arg("run")
             .args(&arguments)
             .env("CORGI_STORE", &store)
-            .env("CORGI_ALIAS", store.join("alias"))
             .output()
             .unwrap();
         assert_success(&output, &format!("corgi run {}", arguments.join(" ")));
@@ -574,7 +562,6 @@ fn no_default_features_preserves_other_workspace_defaults() {
         .args(["test", "-p", "app", "--no-default-features", "--force"])
         .env("EXPECTED_FEATURES", scoped)
         .env("CORGI_STORE", &store)
-        .env("CORGI_ALIAS", store.join("alias"))
         .output()
         .unwrap();
     assert_success(&tested, "test without the selected package's defaults");
@@ -614,7 +601,6 @@ fn no_default_features_separates_package_plans_with_configured_roots() {
             .arg("check")
             .args(arguments)
             .env("CORGI_STORE", &store)
-            .env("CORGI_ALIAS", store.join("alias"))
             .output()
             .unwrap();
         assert_success(&output, &format!("corgi check {}", arguments.join(" ")));
@@ -1439,7 +1425,6 @@ fn run(command: &mut Command) {
             .arg("-C")
             .arg(workspace)
             .env("CORGI_STORE", &store)
-            .env("CORGI_ALIAS", store.join("alias"))
             .env("DEVELOPER_DIR", developer_directory)
             .env_remove("MACOSX_DEPLOYMENT_TARGET")
             .output()
@@ -1891,7 +1876,6 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     let output = corgi_command()
         .arg("clean")
         .env("CORGI_STORE", &store)
-        .env("CORGI_NO_ALIAS", "1")
         .output()
         .expect("failed to invoke corgi clean");
     assert_success(&output, "corgi clean");
@@ -1942,7 +1926,6 @@ fn clean_pool_retires_metadata_with_its_library_without_removing_shared_metadata
         let output = corgi_command()
             .args(&arguments)
             .env("CORGI_STORE", &store)
-            .env("CORGI_NO_ALIAS", "1")
             .output()
             .expect("failed to invoke corgi clean");
         assert_success(&output, "corgi clean with shared pool metadata");
@@ -1983,7 +1966,6 @@ fn clean_pool_preserves_the_library_when_paired_metadata_cannot_be_removed() {
     let output = corgi_command()
         .arg("clean")
         .env("CORGI_STORE", &store)
-        .env("CORGI_NO_ALIAS", "1")
         .output()
         .expect("failed to invoke corgi clean");
 
@@ -2044,7 +2026,6 @@ fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
         let output = corgi_command()
             .args(["clean", "--older-than", duration])
             .env("CORGI_STORE", &store)
-            .env("CORGI_NO_ALIAS", "1")
             .output()
             .expect("failed to invoke corgi clean");
         assert_success(&output, "corgi clean --older-than");
@@ -2090,7 +2071,6 @@ fn clean_invalid_age_leaves_store_untouched() {
         let output = corgi_command()
             .args(["clean", "--older-than", duration])
             .env("CORGI_STORE", &store)
-            .env("CORGI_NO_ALIAS", "1")
             .output()
             .expect("failed to invoke corgi clean");
         assert!(!output.status.success(), "accepted {duration}");
@@ -2657,7 +2637,6 @@ fn main() {
                 .current_dir(&workspace)
                 .args(&arguments)
                 .env("CORGI_STORE", &store)
-                .env("CORGI_ALIAS", store.join("alias"))
                 .env("RUNTIME_MARKER", &marker)
                 .env(
                     "EXPECTED_RUNTIME_VALUE",
@@ -2999,7 +2978,6 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
         .arg(&directory.path)
         .args(["--bench", "custom", "--test", "integration", "--no-run"])
         .env("CORGI_STORE", store)
-        .env("CORGI_ALIAS", store.join("alias"))
         .env("CORGI_TEST_BENCH_MARKER", &marker)
         .env("CORGI_INTEGRATION_MARKER", &integration_marker)
         .output()
@@ -3031,7 +3009,6 @@ fn test_no_run_exports_the_executable_without_running_or_caching_a_pass() {
         .arg(&directory.path)
         .args(["--bench", "custom", "--test", "integration"])
         .env("CORGI_STORE", store)
-        .env("CORGI_ALIAS", store.join("alias"))
         .env("CORGI_TEST_BENCH_MARKER", &marker)
         .env("CORGI_INTEGRATION_MARKER", &integration_marker)
         .output()
@@ -4415,8 +4392,7 @@ fn corgi_store_command<const ARGUMENT_COUNT: usize>(
         .arg("-C")
         .arg(fixture)
         .args(arguments)
-        .env("CORGI_STORE", store)
-        .env("CORGI_ALIAS", store.join("alias"));
+        .env("CORGI_STORE", store);
     corgi
 }
 

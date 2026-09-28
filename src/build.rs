@@ -449,10 +449,6 @@ pub struct Ctx {
     meta: Metadata,
     units: Vec<Unit>,
     pool: PathBuf,
-    /// Pool as spelled on rustc command lines: the *logical* store path.
-    /// Physical per-store paths leak into linked artifacts (debug-info OSO
-    /// references to C objects inside dep rlibs record the archive path).
-    pool_logical: PathBuf,
     cargo: String,
     cargo_home: String,
     base_env: Vec<(String, String)>,
@@ -470,7 +466,7 @@ pub struct Ctx {
     /// (cargo maps dev/test to "debug").
     profile_name: String,
     toolchain: String,
-    /// Pinned tools resolved for injection: env var, logical path,
+    /// Pinned tools resolved for injection: env var, store path,
     /// identity hash, shim name/bin, and package scope (empty = all).
     tools: Vec<ToolRt>,
     /// Plan-time probe results: (name, value, packages, profiles).
@@ -480,7 +476,7 @@ pub struct Ctx {
     build_std: bool,
     zig: Option<ZigRuntime>,
     macos: Vec<MacosRuntime>,
-    /// Logical `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
+    /// `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
     /// so bindgen loads Corgi's pinned libclang. None when unsupported or when
     /// the project set its own `LIBCLANG_PATH`.
     libclang_path: Option<String>,
@@ -513,13 +509,13 @@ pub struct Ctx {
     lints: Vec<LintFlags>,
     /// Clippy mode: member checked units run clippy-driver.
     clippy: bool,
-    /// clippy-driver path (logical), identity (version + conf hash), and
+    /// clippy-driver path, identity (version + conf hash), and
     /// the workspace clippy.toml when present.
     clippy_driver: String,
     clippy_id: String,
     clippy_args: Vec<String>,
     clippy_conf: Option<PathBuf>,
-    /// Logical path of the cross target's std lib dir (immutable tools/
+    /// Path of the cross target's std lib dir (immutable tools/
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
     cfg_env_target: Vec<(String, String)>,
@@ -1219,7 +1215,7 @@ fn action_spec_with_producer_keys(
             let output = output.context("binary dependency artifact missing")?;
             spec.environment.push((
                 format!("CARGO_BIN_EXE_{}", ctx.units[dependency.unit].target.name),
-                ctx.pool_logical
+                ctx.pool
                     .join(Store::pool_file_name(&output, &key))
                     .display()
                     .to_string(),
@@ -2506,7 +2502,7 @@ fn pinned_macos_tool(
         },
     )?;
     Ok(store
-        .logical_root()
+        .root
         .join("tools")
         .join(format!("{name}-{version}"))
         .join(exported))
@@ -2640,7 +2636,7 @@ fn ensure_macos(
     touch_tool_marker(&directory);
     Ok(MacosRuntime {
         platform: platform.into(),
-        directory: store.logical_root().join("tools").join(name),
+        directory: store.root.join("tools").join(name),
         config,
         bindgen_args,
         identity,
@@ -2664,7 +2660,7 @@ fn ensure_zig_executable(store: &Store, host: &str) -> Result<PathBuf> {
     };
     ensure_tool(store, &spec)?;
     Ok(store
-        .logical_root()
+        .root
         .join("tools")
         .join(format!("zig-{}", crate::zig::VERSION))
         .join(&spec.bin))
@@ -2674,7 +2670,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
     let target = crate::zig::target(target)?
         .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
     let asset = crate::zig::asset(host)?;
-    let logical_executable = ensure_zig_executable(store, host)?;
+    let zig_executable = ensure_zig_executable(store, host)?;
     let driver_source = std::env::current_exe()?.canonicalize()?;
     let driver_hash = crate::store::sha256_file(&driver_source)?;
     let wrapper_identity = sha256_hex(
@@ -2693,17 +2689,13 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         .root
         .join("tools")
         .join(format!("zig-wrappers-{}", &wrapper_identity[..16]));
-    let logical_wrapper_dir = store
-        .logical_root()
-        .join("tools")
-        .join(format!("zig-wrappers-{}", &wrapper_identity[..16]));
     let cmake_contents = format!(
         "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR {})\nset(CMAKE_C_COMPILER \"{}\")\nset(CMAKE_CXX_COMPILER \"{}\")\nset(CMAKE_AR \"{}\")\nset(CMAKE_RANLIB \"{}\")\n",
         target.cmake_processor,
-        logical_wrapper_dir.join("cc").display(),
-        logical_wrapper_dir.join("c++").display(),
-        logical_wrapper_dir.join("ar").display(),
-        logical_wrapper_dir.join("ranlib").display(),
+        wrapper_dir.join("cc").display(),
+        wrapper_dir.join("c++").display(),
+        wrapper_dir.join("ar").display(),
+        wrapper_dir.join("ranlib").display(),
     );
     let wrapper_is_complete = |directory: &Path| {
         [
@@ -2729,7 +2721,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         fs::write(staging_dir.join("target"), &target.zig)?;
         fs::write(
             staging_dir.join("zig-path"),
-            logical_executable.as_os_str().as_encoded_bytes(),
+            zig_executable.as_os_str().as_encoded_bytes(),
         )?;
         fs::write(staging_dir.join("toolchain.cmake"), &cmake_contents)?;
         match fs::rename(&staging_dir, &wrapper_dir) {
@@ -2742,18 +2734,18 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
     }
     touch_tool_marker(&wrapper_dir);
     Ok(ZigRuntime {
-        cc: logical_wrapper_dir.join("cc"),
-        cxx: logical_wrapper_dir.join("c++"),
-        ar: logical_wrapper_dir.join("ar"),
-        ranlib: logical_wrapper_dir.join("ranlib"),
-        cmake_toolchain: logical_wrapper_dir.join("toolchain.cmake"),
+        cc: wrapper_dir.join("cc"),
+        cxx: wrapper_dir.join("c++"),
+        ar: wrapper_dir.join("ar"),
+        ranlib: wrapper_dir.join("ranlib"),
+        cmake_toolchain: wrapper_dir.join("toolchain.cmake"),
         use_zig_as_rust_linker: target.use_zig_as_rust_linker,
         identity: wrapper_identity,
     })
 }
 
 /// Fetch and unpack the pinned llvm-tools artifact for `host`, and return the
-/// logical root of its unpacked tree (containing `lib/libclang.dylib` and
+/// root of its unpacked tree (containing `lib/libclang.dylib` and
 /// `bin/dsymutil`).
 ///
 /// The artifact is keyed on the pinned Zig version and downloaded from Corgi's
@@ -2769,7 +2761,7 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     let dsymutil = dest.join(crate::libclang::DSYMUTIL_RELATIVE);
     if dylib.exists() && dsymutil.exists() {
         touch_tool_marker(&dest);
-        return Ok(logical_llvm_tools_dir(store));
+        return Ok(llvm_tools_dir(store));
     }
     status!(
         "Installing",
@@ -2825,13 +2817,13 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     }
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
-    Ok(logical_llvm_tools_dir(store))
+    Ok(llvm_tools_dir(store))
 }
 
 /// Location-independent root of the unpacked llvm-tools tree.
-fn logical_llvm_tools_dir(store: &Store) -> PathBuf {
+fn llvm_tools_dir(store: &Store) -> PathBuf {
     store
-        .logical_root()
+        .root
         .join("tools")
         .join(format!("llvm-tools-{}", crate::zig::VERSION))
 }
@@ -3301,10 +3293,10 @@ fn touch_tool_marker(dir: &Path) {
     Store::touch_used(&marker);
 }
 
-/// Install the pinned Rust toolchain and return its *logical* path (via the
-/// store alias). Actions only ever see the logical path: physical per-store
-/// paths leak into ld's UUID (it hashes the link command line, including
-/// libstd rlib paths) and into build-script keys.
+/// Install the pinned Rust toolchain and return its path in the store. That
+/// path leaks into ld's UUID (it hashes the link command line, including
+/// libstd rlib paths) and into build-script keys, so artifacts are only
+/// identical across stores at the same path.
 fn provision_rust_toolchain(
     store: &Store,
     channel: &str,
@@ -3322,7 +3314,7 @@ fn provision_rust_toolchain(
             );
         }
     }
-    Ok(store.logical_root().join("tools").join(format!(
+    Ok(store.root.join("tools").join(format!(
         "rust-{channel}-{host}{}",
         if build_std { "-build-std" } else { "" }
     )))
@@ -4178,13 +4170,13 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
 }
 
 /// Dependency sources live in the store: cargo (fetch/metadata/unit-graph)
-/// runs with CARGO_HOME at the canonical store path, so registry and git
-/// checkouts land at machine-independent locations that exist wherever a
-/// corgi store does. Debug info referencing dep sources therefore needs no
-/// remapping and no debugger fixups. Side effect (deliberate): the user's
+/// runs with CARGO_HOME inside the store, so registry and git checkouts land
+/// at the same locations on every machine whose store is at the default
+/// path. Debug info referencing dep sources therefore needs no remapping and
+/// no debugger fixups. Side effect (deliberate): the user's
 /// ~/.cargo/config.toml no longer silently shapes hermetic builds.
 fn store_cargo_home(store: &Store) -> PathBuf {
-    store.logical_root().join("cargo-home")
+    store.root.join("cargo-home")
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
@@ -4355,9 +4347,9 @@ fn build_inner(
         Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
         None => requested_target,
     };
-    let toolchain_logical = provision_rust_toolchain(&store, &channel, &host_guess, build_std)?;
-    let rustc = toolchain_logical.join("bin/rustc").display().to_string();
-    let cargo_bin = toolchain_logical.join("bin/cargo");
+    let rust_toolchain = provision_rust_toolchain(&store, &channel, &host_guess, build_std)?;
+    let rustc = rust_toolchain.join("bin/rustc").display().to_string();
+    let cargo_bin = rust_toolchain.join("bin/cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
     let host = rustc_version
         .lines()
@@ -4401,8 +4393,8 @@ fn build_inner(
     let project_set_libclang = config_env.iter().any(|(name, _)| name == "LIBCLANG_PATH");
     // Provision llvm-tools once; hand its `lib/` to bindgen and its root to the
     // macOS driver.
-    let llvm_tools_logical = provision_llvm_tools(&store, &host)?;
-    let libclang_logical = match (&llvm_tools_logical, project_set_libclang) {
+    let llvm_tools = provision_llvm_tools(&store, &host)?;
+    let libclang = match (&llvm_tools, project_set_libclang) {
         (Some(root), false) => Some(
             root.join("lib")
                 .to_str()
@@ -4428,9 +4420,8 @@ fn build_inner(
     cfg_probe.args(["--print", "cfg"]);
     cfg_probe.args(&host_rustflags);
     let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
-    // the toolchain dir *is* the sysroot; use the logical spelling so
-    // linker inputs are spelled identically regardless of store location
-    let sysroot = toolchain_logical.display().to_string();
+    // the toolchain dir *is* the sysroot
+    let sysroot = rust_toolchain.display().to_string();
     // Sysroot *content* changes emitted bits even at identical rustc
     // versions: an installed rust-src component devirtualizes std paths in
     // panic locations (observed: 13/14 artifacts differ). Fold it into the
@@ -4444,7 +4435,7 @@ fn build_inner(
             ensure_target_std(&store, &channel, t)?;
             target_std_libdir = Some(
                 store
-                    .logical_root()
+                    .root
                     .join("tools")
                     .join(format!("rust-std-{channel}-{t}"))
                     .join("lib/rustlib")
@@ -4568,7 +4559,7 @@ fn build_inner(
                 command
             };
             fetch_dependencies(
-                &toolchain_logical,
+                &rust_toolchain,
                 Path::new(&cargo_home),
                 &cargo_config_paths,
                 &manifest,
@@ -4589,7 +4580,7 @@ fn build_inner(
                 standard_library_metadata
                     .args(["metadata", "--format-version", "1", "--locked"])
                     .arg("--manifest-path")
-                    .arg(standard_library_manifest(&toolchain_logical))
+                    .arg(standard_library_manifest(&rust_toolchain))
                     .env("RUSTC_BOOTSTRAP", "1");
                 let standard_library_json = capture_with_live_stderr(
                     &mut standard_library_metadata,
@@ -4929,8 +4920,8 @@ fn build_inner(
             &store,
             &host,
             target.as_deref(),
-            &toolchain_logical,
-            llvm_tools_logical.as_deref(),
+            &rust_toolchain,
+            llvm_tools.as_deref(),
             &config_env,
         )?;
         base_env.push((
@@ -4955,7 +4946,7 @@ fn build_inner(
         .map(|runtime| runtime.identity.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let libclang_identity = libclang_logical
+    let libclang_identity = libclang
         .as_ref()
         .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
         .transpose()?
@@ -5001,7 +4992,7 @@ fn build_inner(
     let mut clippy_conf: Option<PathBuf> = None;
     if matches!(mode, Mode::Clippy) {
         ensure_clippy(&store, &channel, &host_guess, build_std)?;
-        clippy_driver = format!("{}/bin/clippy-driver", toolchain_logical.display());
+        clippy_driver = format!("{}/bin/clippy-driver", rust_toolchain.display());
         let version = capture(Command::new(&clippy_driver).arg("-V"), "clippy-driver -V")?;
         let mut conf_hash = String::new();
         for name in ["clippy.toml", ".clippy.toml"] {
@@ -5034,8 +5025,8 @@ fn build_inner(
         }
         ensure_tool(&store, t)?;
         let exported = if !t.bin.is_empty() { &t.bin } else { &t.path };
-        let logical = store
-            .logical_root()
+        let tool_path = store
+            .root
             .join("tools")
             .join(format!("{}-{}", t.name, t.version))
             .join(exported);
@@ -5064,7 +5055,7 @@ fn build_inner(
             name: t.name.clone(),
             version: t.version.clone(),
             env: t.env.clone(),
-            value: logical.display().to_string(),
+            value: tool_path.display().to_string(),
             id,
             bin: t.bin.clone(),
             packages: t.packages.clone(),
@@ -5163,7 +5154,6 @@ fn build_inner(
     }
 
     let pool = store.root.join("pool");
-    let pool_logical = store.logical_root().join("pool");
     let file_names_memo = Mutex::new(HashMap::new());
     let workspace_root = meta.workspace_root.clone();
     let report_unit_keys = report_unit_keys(&meta, &units, &logical_pkg_ids);
@@ -5184,7 +5174,6 @@ fn build_inner(
         meta,
         units,
         pool,
-        pool_logical,
         cargo,
         cargo_home,
         base_env,
@@ -5206,7 +5195,7 @@ fn build_inner(
         build_std,
         zig: zig_runtime,
         macos,
-        libclang_path: libclang_logical,
+        libclang_path: libclang,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -6277,15 +6266,10 @@ fn translate_unit_graph(
 }
 
 impl Ctx {
-    /// Machine-independent spelling of the same path (via the store alias).
-    /// This is what actions see, so any OUT_DIR string they embed in
-    /// artifacts is identical on every machine.
-    fn out_dir_logical(&self, key: &str) -> PathBuf {
-        self.store
-            .logical_root()
-            .join("outdirs")
-            .join(key)
-            .join("out")
+    /// The OUT_DIR actions see. Any OUT_DIR string they embed in artifacts is
+    /// identical on every machine whose store is at the same path.
+    fn out_dir(&self, key: &str) -> PathBuf {
+        self.store.root.join("outdirs").join(key).join("out")
     }
 
     /// Loose debug objects are exported with their binary, never into the
@@ -9119,11 +9103,8 @@ fn compile(
     };
     fs::create_dir_all(&scratch)?;
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
-    let mut allowed_inputs: Vec<PathBuf> = vec![
-        ctx.store.root.clone(),
-        ctx.store.logical_root().to_path_buf(),
-        PathBuf::from(&ctx.sysroot),
-    ];
+    let mut allowed_inputs: Vec<PathBuf> =
+        vec![ctx.store.root.clone(), PathBuf::from(&ctx.sysroot)];
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             allowed_inputs.push(conf.clone());
@@ -9183,7 +9164,7 @@ fn compile(
         cmd.env(k, v);
     }
     if !out_key.is_empty() {
-        cmd.env("OUT_DIR", ctx.out_dir_logical(&out_key));
+        cmd.env("OUT_DIR", ctx.out_dir(&out_key));
     }
 
     let target_sysroot = (!unit.host && !ctx.build_std)
@@ -9271,10 +9252,10 @@ fn compile(
     cmd.arg(format!("-Cextra-filename=-{ef16}"));
     cmd.arg("--out-dir").arg(&outdir);
     cmd.arg("-L")
-        .arg(format!("dependency={}", ctx.pool_logical.display()));
+        .arg(format!("dependency={}", ctx.pool.display()));
     for (name, file) in &externs {
         cmd.arg("--extern")
-            .arg(format!("{name}={}", ctx.pool_logical.join(file).display()));
+            .arg(format!("{name}={}", ctx.pool.join(file).display()));
     }
     // A proc-macro target gets the compiler's own `proc_macro` crate in
     // every mode — including its --test harness, which compiles as a plain
@@ -9704,7 +9685,7 @@ fn run_build_script(
     }
     let stage_out = final_parent.join("out");
     fs::create_dir_all(&stage_out)?;
-    let stage_logical = ctx.out_dir_logical(&key);
+    let stage_out_dir = ctx.out_dir(&key);
     let script_path = ctx
         .pool
         .join(Store::pool_file_name(&script.name, &script_key));
@@ -9751,7 +9732,7 @@ fn run_build_script(
     for (k, v) in &dep_env {
         cmd.env(k, v);
     }
-    cmd.env("OUT_DIR", &stage_logical);
+    cmd.env("OUT_DIR", &stage_out_dir);
     // Cargo-identical manifest env; unkeyed for the same reason as in
     // compiles. Generated code that embeds it is rejected at the
     // consuming compile's ingest; data files are covered by the OUT_DIR
