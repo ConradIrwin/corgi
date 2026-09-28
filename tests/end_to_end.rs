@@ -101,6 +101,55 @@ fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
 }
 
 #[test]
+fn fetch_populates_the_shared_cargo_home_without_building() {
+    let directory = TestDirectory::new("fetch");
+    let workspace = directory.path.join("workspace");
+    let dependency = directory.path.join("dependency");
+    let store = directory.path.join("store");
+    copy_directory(&fixture_path("benchmark-targets"), &workspace);
+    fs::create_dir_all(dependency.join("src")).unwrap();
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"fetched-dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("src/lib.rs"),
+        "pub const FETCHED: bool = true;\n",
+    )
+    .unwrap();
+    initialize_git_repository(&dependency, "https://example.invalid/fetched-dependency");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "{}\n[dependencies]\nfetched-dependency = {{ git = \"file://{}\" }}\n",
+            fs::read_to_string(workspace.join("Cargo.toml")).unwrap(),
+            dependency.display()
+        ),
+    )
+    .unwrap();
+
+    let output = invoke_corgi_with_store(&workspace, "fetch", [], &store);
+
+    assert_success(&output, "corgi fetch");
+    let checkout_roots = fs::read_dir(store.join("cargo-home/git/checkouts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(checkout_roots.len(), 1);
+    let checkouts = fs::read_dir(&checkout_roots[0])
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(
+        fs::read_to_string(checkouts[0].join("src/lib.rs")).unwrap(),
+        "pub const FETCHED: bool = true;\n"
+    );
+    assert!(!workspace.join("target").exists());
+}
+
+#[test]
 fn manifest_path_selects_a_nested_workspace_without_parent_config() {
     let directory = TestDirectory::new("manifest-path");
     let nested = directory.path.join("scripts/helper");

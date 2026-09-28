@@ -142,6 +142,9 @@ pub enum Command {
     /// Format sources with the pinned toolchain
     Fmt(FmtArgs),
 
+    /// Fetch dependencies into the shared cache
+    Fetch,
+
     /// Build twice and compare artifacts for determinism
     Audit(AuditArgs),
 
@@ -409,6 +412,7 @@ mod tests {
             "corgi run:",
             "corgi test:",
             "corgi fmt:",
+            "corgi fetch:",
             "corgi audit:",
             "corgi clean:",
             "corgi pin:",
