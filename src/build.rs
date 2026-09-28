@@ -1755,6 +1755,12 @@ struct ToolSpec {
     auth: String,
 }
 
+impl ToolSpec {
+    fn serves_platform(&self, platform: &str) -> bool {
+        self.targets.is_empty() || self.targets.iter().any(|target| target == platform)
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct EnvProbe {
     #[serde(skip)]
@@ -1977,6 +1983,47 @@ fn cargo_config_root(dir: &Path, manifest: &Path, corgi_toml: Option<&Path>) -> 
         .and_then(Path::parent)
         .unwrap_or(dir)
         .to_path_buf())
+}
+
+/// The Cargo inputs Corgi derives from a project directory. Planning and
+/// `corgi fetch` share this so they always hand Cargo the same configuration.
+struct CargoProject {
+    manifest: PathBuf,
+    corgi_toml_path: Option<PathBuf>,
+    config_root: PathBuf,
+    cargo_config: crate::config::CargoConfig,
+    /// Project configs Cargo receives explicitly, least specific first.
+    cargo_config_paths: Vec<PathBuf>,
+}
+
+impl CargoProject {
+    /// Reads the project at `dir`, which must already be canonical.
+    fn discover(dir: &Path) -> Result<Self> {
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.exists() {
+            bail!("no Cargo.toml in {}", dir.display());
+        }
+        let corgi_toml_path = find_corgi_toml(dir);
+        let config_root = cargo_config_root(dir, &manifest, corgi_toml_path.as_deref())?;
+        let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
+        let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
+        if config_root != dir {
+            let (selected_config, selected_config_path) = crate::config::discover(dir)?;
+            cargo_config.merge(selected_config);
+            cargo_config_paths.extend(selected_config_path);
+        }
+        Ok(Self {
+            manifest,
+            corgi_toml_path,
+            config_root,
+            cargo_config,
+            cargo_config_paths,
+        })
+    }
+
+    fn build_std(&self) -> bool {
+        !self.cargo_config.build_std.is_empty()
+    }
 }
 
 fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
@@ -2463,6 +2510,46 @@ fn pinned_macos_tool(
         .join("tools")
         .join(format!("{name}-{version}"))
         .join(exported))
+}
+
+/// Provision the pinned macOS runtime for an Apple host and, when
+/// cross-compiling to the other Apple architecture, for the target too.
+fn ensure_macos_runtimes(
+    store: &Store,
+    host: &str,
+    target: Option<&str>,
+    toolchain: &Path,
+    llvm_tools: Option<&Path>,
+    config_env: &[(String, String)],
+) -> Result<Vec<MacosRuntime>> {
+    // The pinned path always provisions llvm-tools on a supported host, so
+    // its presence is what raises the build-host floor to macOS 14.
+    crate::macos::check_host()?;
+    crate::zig::raise_file_descriptor_limit()?;
+    let llvm_tools = llvm_tools.context("pinned macOS builds require the llvm-tools artifact")?;
+    let dsymutil = llvm_tools.join(crate::libclang::DSYMUTIL_RELATIVE);
+    let compiler_rt = crate::libclang::compiler_rt_dir(llvm_tools)?;
+    let deployment = config_env
+        .iter()
+        .find(|(name, _)| name == "MACOSX_DEPLOYMENT_TARGET")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or(crate::macos::DEFAULT_DEPLOYMENT_TARGET);
+    let other_apple_target =
+        target.filter(|target| target.ends_with("-apple-darwin") && *target != host);
+    std::iter::once(host)
+        .chain(other_apple_target)
+        .map(|platform| {
+            ensure_macos(
+                store,
+                host,
+                platform,
+                toolchain,
+                &dsymutil,
+                &compiler_rt,
+                deployment,
+            )
+        })
+        .collect()
 }
 
 fn ensure_macos(
@@ -3212,6 +3299,44 @@ fn touch_tool_marker(dir: &Path) {
         return;
     }
     Store::touch_used(&marker);
+}
+
+/// Install the pinned Rust toolchain and return its *logical* path (via the
+/// store alias). Actions only ever see the logical path: physical per-store
+/// paths leak into ld's UUID (it hashes the link command line, including
+/// libstd rlib paths) and into build-script keys.
+fn provision_rust_toolchain(
+    store: &Store,
+    channel: &str,
+    host: &str,
+    build_std: bool,
+) -> Result<PathBuf> {
+    ensure_toolchain(store, channel, host, build_std)?;
+    if !build_std {
+        // Debugger convenience, deliberately outside the sysroot (see
+        // ensure_rust_src). Failure is non-fatal: builds don't need sources.
+        if let Err(e) = ensure_rust_src(store, channel) {
+            eprintln!(
+                "corgi warning: rust-src install failed ({e}); \
+                 std source display in debuggers unavailable"
+            );
+        }
+    }
+    Ok(store.logical_root().join("tools").join(format!(
+        "rust-{channel}-{host}{}",
+        if build_std { "-build-std" } else { "" }
+    )))
+}
+
+/// The pinned llvm-tools artifact carries both libclang (for bindgen) and
+/// dsymutil (which Clang runs on a compile-to-image with debug info), on hosts
+/// that support it.
+fn provision_llvm_tools(store: &Store, host: &str) -> Result<Option<PathBuf>> {
+    if crate::libclang::is_supported(host) {
+        ensure_llvm_tools(store, host).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
@@ -4009,44 +4134,57 @@ pub fn fmt(
     Ok(())
 }
 
+/// Download everything a host build of the project needs, so the build itself
+/// can run without network access: the pinned toolchains, the project's
+/// declared tools, and every Cargo dependency (including the standard
+/// library's under build-std). Nothing is planned or compiled.
 pub fn fetch(store: Store, dir: &Path) -> Result<()> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("bad directory {}", dir.display()))?;
-    let manifest = dir.join("Cargo.toml");
-    if !manifest.exists() {
-        bail!("no Cargo.toml in {}", dir.display());
-    }
-
-    let corgi_toml_path = find_corgi_toml(&dir);
-    let config_root = cargo_config_root(&dir, &manifest, corgi_toml_path.as_deref())?;
-    let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
-    let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
-    if config_root != dir {
-        let (selected_config, selected_config_path) = crate::config::discover(&dir)?;
-        cargo_config.merge(selected_config);
-        cargo_config_paths.extend(selected_config_path);
-    }
-
+    let project = CargoProject::discover(&dir)?;
     let channel = read_toolchain_pin(&dir)?;
     let host = host_triple()?;
-    let build_std = !cargo_config.build_std.is_empty();
-    ensure_toolchain(&store, &channel, &host, build_std)?;
-    let toolchain = store.logical_root().join("tools").join(format!(
-        "rust-{channel}-{host}{}",
-        if build_std { "-build-std" } else { "" }
-    ));
-    let cargo_home = store.logical_root().join("cargo-home");
+    let build_std = project.build_std();
+    let toolchain = provision_rust_toolchain(&store, &channel, &host, build_std)?;
+    let llvm_tools = provision_llvm_tools(&store, &host)?;
+    if host.ends_with("-apple-darwin") {
+        ensure_macos_runtimes(
+            &store,
+            &host,
+            None,
+            &toolchain,
+            llvm_tools.as_deref(),
+            &project.cargo_config.env,
+        )?;
+    }
+    // A build only provisions the tools its graph activates. Without a plan,
+    // fetch takes every tool that could be active on this host.
+    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
+    for tool in corgi_toml.tools.values() {
+        if tool.serves_platform(&host) {
+            ensure_tool(&store, tool)?;
+        }
+    }
 
     status!("Fetching", "dependencies via Cargo");
     fetch_dependencies(
-        &toolchain.join("bin/cargo"),
-        &toolchain.join("bin/rustc"),
-        &cargo_home,
-        &cargo_config_paths,
-        &manifest,
+        &toolchain,
+        &store_cargo_home(&store),
+        &project.cargo_config_paths,
+        &project.manifest,
         build_std,
     )
+}
+
+/// Dependency sources live in the store: cargo (fetch/metadata/unit-graph)
+/// runs with CARGO_HOME at the canonical store path, so registry and git
+/// checkouts land at machine-independent locations that exist wherever a
+/// corgi store does. Debug info referencing dep sources therefore needs no
+/// remapping and no debugger fixups. Side effect (deliberate): the user's
+/// ~/.cargo/config.toml no longer silently shapes hermetic builds.
+fn store_cargo_home(store: &Store) -> PathBuf {
+    store.logical_root().join("cargo-home")
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
@@ -4178,10 +4316,15 @@ fn build_inner(
     recorder.update(|report| {
         report.run.workspace.root = dir.display().to_string();
     });
-    let manifest = dir.join("Cargo.toml");
-    if !manifest.exists() {
-        bail!("no Cargo.toml in {}", dir.display());
-    }
+    let project = CargoProject::discover(&dir)?;
+    let build_std = project.build_std();
+    let CargoProject {
+        manifest,
+        corgi_toml_path,
+        config_root,
+        cargo_config,
+        cargo_config_paths,
+    } = project;
 
     // Env-injected compiler flags are invisible inputs; the config file
     // is the one honored channel.
@@ -4193,15 +4336,6 @@ fn build_inner(
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
             bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
-    }
-    let corgi_toml_path = find_corgi_toml(&dir);
-    let config_root = cargo_config_root(&dir, &manifest, corgi_toml_path.as_deref())?;
-    let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
-    let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
-    if config_root != dir {
-        let (selected_config, selected_config_path) = crate::config::discover(&dir)?;
-        cargo_config.merge(selected_config);
-        cargo_config_paths.extend(selected_config_path);
     }
 
     let channel = read_toolchain_pin(&dir)?;
@@ -4221,25 +4355,7 @@ fn build_inner(
         Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
         None => requested_target,
     };
-    let build_std = !cargo_config.build_std.is_empty();
-    ensure_toolchain(&store, &channel, &host_guess, build_std)?;
-    if !build_std {
-        // Debugger convenience, deliberately outside the sysroot (see
-        // ensure_rust_src). Failure is non-fatal: builds don't need sources.
-        if let Err(e) = ensure_rust_src(&store, &channel) {
-            eprintln!(
-                "corgi warning: rust-src install failed ({e}); \
-                 std source display in debuggers unavailable"
-            );
-        }
-    }
-    // Hand actions only the *logical* toolchain path (via the store alias):
-    // physical per-store paths leak into ld's UUID (it hashes the link
-    // command line, including libstd rlib paths) and into build-script keys.
-    let toolchain_logical = store.logical_root().join("tools").join(format!(
-        "rust-{channel}-{host_guess}{}",
-        if build_std { "-build-std" } else { "" }
-    ));
+    let toolchain_logical = provision_rust_toolchain(&store, &channel, &host_guess, build_std)?;
     let rustc = toolchain_logical.join("bin/rustc").display().to_string();
     let cargo_bin = toolchain_logical.join("bin/cargo");
     let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
@@ -4283,14 +4399,9 @@ fn build_inner(
     // once per store), so detecting bindgen consumers would add more complexity
     // than it saves. A project that sets its own LIBCLANG_PATH keeps it.
     let project_set_libclang = config_env.iter().any(|(name, _)| name == "LIBCLANG_PATH");
-    // The pinned llvm-tools artifact carries both libclang (for bindgen) and
-    // dsymutil (which Clang runs on a compile-to-image with debug info). Provision
-    // it once; hand its `lib/` to bindgen and its root to the macOS driver.
-    let llvm_tools_logical = if crate::libclang::is_supported(&host) {
-        Some(ensure_llvm_tools(&store, &host)?)
-    } else {
-        None
-    };
+    // Provision llvm-tools once; hand its `lib/` to bindgen and its root to the
+    // macOS driver.
+    let llvm_tools_logical = provision_llvm_tools(&store, &host)?;
     let libclang_logical = match (&llvm_tools_logical, project_set_libclang) {
         (Some(root), false) => Some(
             root.join("lib")
@@ -4354,18 +4465,7 @@ fn build_inner(
         cfg_env.clone()
     };
 
-    // Dependency sources live in the store: cargo (fetch/metadata/
-    // unit-graph) runs with CARGO_HOME at the canonical store path, so
-    // registry and git checkouts land at machine-independent locations
-    // that exist wherever a corgi store does. Debug info referencing dep
-    // sources therefore needs no remapping and no debugger fixups. Side
-    // effect (deliberate): the user's ~/.cargo/config.toml no longer
-    // silently shapes hermetic builds.
-    let cargo_home = store
-        .logical_root()
-        .join("cargo-home")
-        .display()
-        .to_string();
+    let cargo_home = store_cargo_home(&store).display().to_string();
 
     finish_report_stage(&recorder, "setup", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "plan");
@@ -4468,8 +4568,7 @@ fn build_inner(
                 command
             };
             fetch_dependencies(
-                &cargo_bin,
-                Path::new(&rustc),
+                &toolchain_logical,
                 Path::new(&cargo_home),
                 &cargo_config_paths,
                 &manifest,
@@ -4486,13 +4585,11 @@ fn build_inner(
             }
             let mut meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
             if build_std {
-                let rust_library_manifest =
-                    toolchain_logical.join("lib/rustlib/src/rust/library/Cargo.toml");
                 let mut standard_library_metadata = cargo_command();
                 standard_library_metadata
                     .args(["metadata", "--format-version", "1", "--locked"])
                     .arg("--manifest-path")
-                    .arg(&rust_library_manifest)
+                    .arg(standard_library_manifest(&toolchain_logical))
                     .env("RUSTC_BOOTSTRAP", "1");
                 let standard_library_json = capture_with_live_stderr(
                     &mut standard_library_metadata,
@@ -4828,43 +4925,14 @@ fn build_inner(
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
     let mut macos = Vec::new();
     if host.ends_with("-apple-darwin") {
-        // The pinned path always provisions llvm-tools on a supported host, so
-        // its presence is what raises the build-host floor to macOS 14.
-        crate::macos::check_host()?;
-        crate::zig::raise_file_descriptor_limit()?;
-        let llvm_tools = llvm_tools_logical
-            .as_ref()
-            .context("pinned macOS builds require the llvm-tools artifact")?;
-        let dsymutil = llvm_tools.join(crate::libclang::DSYMUTIL_RELATIVE);
-        let compiler_rt = crate::libclang::compiler_rt_dir(llvm_tools)?;
-        let deployment = config_env
-            .iter()
-            .find(|(name, _)| name == "MACOSX_DEPLOYMENT_TARGET")
-            .map(|(_, value)| value.as_str())
-            .unwrap_or(crate::macos::DEFAULT_DEPLOYMENT_TARGET);
-        macos.push(ensure_macos(
+        macos = ensure_macos_runtimes(
             &store,
             &host,
-            &host,
+            target.as_deref(),
             &toolchain_logical,
-            &dsymutil,
-            &compiler_rt,
-            deployment,
-        )?);
-        if let Some(target) = target
-            .as_deref()
-            .filter(|target| target.ends_with("-apple-darwin") && *target != host)
-        {
-            macos.push(ensure_macos(
-                &store,
-                &host,
-                target,
-                &toolchain_logical,
-                &dsymutil,
-                &compiler_rt,
-                deployment,
-            )?);
-        }
+            llvm_tools_logical.as_deref(),
+            &config_env,
+        )?;
         base_env.push((
             "PATH".into(),
             format!("{}:/usr/bin:/bin", macos[0].directory.display()),
@@ -4959,7 +5027,7 @@ fn build_inner(
             matches!(unit.kind, Kind::Bsr)
                 && (t.packages.is_empty()
                     || t.packages.iter().any(|package| package == package_name))
-                && (t.targets.is_empty() || t.targets.iter().any(|target| target == platform))
+                && t.serves_platform(platform)
         });
         if !active {
             continue;
@@ -5813,21 +5881,28 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The standard library workspace shipped with a build-std toolchain.
+fn standard_library_manifest(toolchain: &Path) -> PathBuf {
+    toolchain.join("lib/rustlib/src/rust/library/Cargo.toml")
+}
+
+/// Download every source planning needs into `cargo_home`: the project's
+/// dependencies and, under build-std, the standard library's.
 fn fetch_dependencies(
-    cargo: &Path,
-    rustc: &Path,
+    toolchain: &Path,
     cargo_home: &Path,
     cargo_config_paths: &[PathBuf],
     manifest: &Path,
     build_std: bool,
 ) -> Result<()> {
-    // Try --locked first because it never writes. If the lockfile is stale,
-    // let Cargo update it, as a normal `cargo fetch` invocation does.
     let cargo_command = || {
-        let mut command = isolated_cargo_command(cargo, cargo_home, cargo_config_paths);
-        command.env("RUSTC", rustc);
+        let mut command =
+            isolated_cargo_command(&toolchain.join("bin/cargo"), cargo_home, cargo_config_paths);
+        command.env("RUSTC", toolchain.join("bin/rustc"));
         command
     };
+    // Try --locked first because it never writes. If the lockfile is stale,
+    // let Cargo update it, as a normal `cargo fetch` invocation does.
     let mut fetch_locked = cargo_command();
     fetch_locked
         .args(["fetch", "--locked", "--manifest-path"])
@@ -5843,6 +5918,16 @@ fn fetch_dependencies(
             fetch.env("RUSTC_BOOTSTRAP", "1");
         }
         capture_with_live_stderr(&mut fetch, "cargo fetch")?;
+    }
+    if build_std {
+        // Cargo resolves -Zbuild-std against the toolchain's own lockfile,
+        // which is part of the pinned toolchain and must never be rewritten.
+        let mut standard_library = cargo_command();
+        standard_library
+            .args(["fetch", "--locked", "--manifest-path"])
+            .arg(standard_library_manifest(toolchain))
+            .env("RUSTC_BOOTSTRAP", "1");
+        capture_with_live_stderr(&mut standard_library, "cargo fetch for build-std")?;
     }
     Ok(())
 }

@@ -150,6 +150,100 @@ fn fetch_populates_the_shared_cargo_home_without_building() {
 }
 
 #[test]
+fn fetch_prepares_a_cold_store_for_an_offline_build() {
+    let directory = TestDirectory::new("offline-build");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\nmemchr = \"=2.8.3\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"{:?}\", memchr::memchr(b'f', b\"offline\")); }\n",
+    )
+    .unwrap();
+
+    // The harness must actually block the network, or the build below proves
+    // nothing about what fetch provisioned.
+    let cold = invoke_corgi_offline(&workspace, "build", [], &store);
+    assert_failure(&cold, "offline corgi build before fetch");
+    let fetch = invoke_corgi_with_store(&workspace, "fetch", [], &store);
+    assert_success(&fetch, "corgi fetch");
+    let build = invoke_corgi_offline(&workspace, "build", [], &store);
+
+    assert_success(&build, "offline corgi build");
+    let run = Command::new(
+        workspace
+            .join("target/debug")
+            .join(executable_name(&directory.package_name)),
+    )
+    .output()
+    .unwrap();
+    assert_success(&run, "offline application");
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "Some(1)\n");
+}
+
+#[test]
+fn fetch_prepares_standard_library_sources_for_an_offline_build_std_check() {
+    let directory = TestDirectory::new("offline-build-std");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[env]\nRUSTC_BOOTSTRAP = \"1\"\n[unstable]\nbuild-std = [\"std\", \"panic_abort\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    // Build-std planning currently fails when the store is reached through its
+    // alias symlink, so address this store directly.
+    let fetch = corgi_store_command(&workspace, "fetch", [], &store)
+        .env("CORGI_ALIAS", &store)
+        .output()
+        .unwrap();
+    assert_success(&fetch, "corgi fetch");
+    let check = block_network(
+        corgi_store_command(
+            &workspace,
+            "check",
+            ["--target", "wasm32-unknown-unknown"],
+            &store,
+        )
+        .env("CORGI_ALIAS", &store),
+    )
+    .output()
+    .unwrap();
+
+    assert_success(&check, "offline build-std corgi check");
+}
+
+#[test]
 fn manifest_path_selects_a_nested_workspace_without_parent_config() {
     let directory = TestDirectory::new("manifest-path");
     let nested = directory.path.join("scripts/helper");
@@ -4304,15 +4398,51 @@ fn invoke_corgi_with_store<const ARGUMENT_COUNT: usize>(
     arguments: [&str; ARGUMENT_COUNT],
     store: &Path,
 ) -> Output {
-    corgi_command()
+    corgi_store_command(fixture, command, arguments, store)
+        .output()
+        .expect("failed to invoke corgi")
+}
+
+fn corgi_store_command<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+    store: &Path,
+) -> Command {
+    let mut corgi = corgi_command();
+    corgi
         .arg(command)
         .arg("-C")
         .arg(fixture)
         .args(arguments)
         .env("CORGI_STORE", store)
-        .env("CORGI_ALIAS", store.join("alias"))
+        .env("CORGI_ALIAS", store.join("alias"));
+    corgi
+}
+
+fn invoke_corgi_offline<const ARGUMENT_COUNT: usize>(
+    fixture: &Path,
+    command: &str,
+    arguments: [&str; ARGUMENT_COUNT],
+    store: &Path,
+) -> Output {
+    block_network(&mut corgi_store_command(fixture, command, arguments, store))
         .output()
         .expect("failed to invoke corgi")
+}
+
+/// Closes every network path: Corgi's own downloads fail, and Cargo can only
+/// reach an unused local port.
+fn block_network(command: &mut Command) -> &mut Command {
+    let unreachable = "http://127.0.0.1:9";
+    command
+        .env("CORGI_CURL", "/usr/bin/false")
+        .env("CARGO_HTTP_PROXY", unreachable)
+        .env("HTTPS_PROXY", unreachable)
+        .env("https_proxy", unreachable)
+        .env("HTTP_PROXY", unreachable)
+        .env("http_proxy", unreachable)
+        .env("CARGO_NET_RETRY", "0")
 }
 
 fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
