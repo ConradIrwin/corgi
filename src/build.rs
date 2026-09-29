@@ -477,8 +477,7 @@ pub struct Ctx {
     zig: Option<ZigRuntime>,
     macos: Vec<MacosRuntime>,
     /// `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
-    /// so bindgen loads Corgi's pinned libclang. None when unsupported or when
-    /// the project set its own `LIBCLANG_PATH`.
+    /// so bindgen loads Corgi's pinned libclang. None when unsupported.
     libclang_path: Option<String>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
@@ -4389,20 +4388,19 @@ fn build_inner(
     // ships rather than an ambient Xcode/CLT one. Unconditional rather than
     // graph-gated: libclang is the smallest toolchain Corgi fetches (~35 MB,
     // once per store), so detecting bindgen consumers would add more complexity
-    // than it saves. A project that sets its own LIBCLANG_PATH keeps it.
-    let project_set_libclang = config_env.iter().any(|(name, _)| name == "LIBCLANG_PATH");
+    // than it saves.
     // Provision llvm-tools once; hand its `lib/` to bindgen and its root to the
     // macOS driver.
     let llvm_tools = provision_llvm_tools(&store, &host)?;
-    let libclang = match (&llvm_tools, project_set_libclang) {
-        (Some(root), false) => Some(
+    let libclang = llvm_tools
+        .as_ref()
+        .map(|root| {
             root.join("lib")
                 .to_str()
-                .context("libclang path is not UTF-8")?
-                .to_string(),
-        ),
-        _ => None,
-    };
+                .context("libclang path is not UTF-8")
+                .map(str::to_owned)
+        })
+        .transpose()?;
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()

@@ -1677,7 +1677,7 @@ fn main() {
 /// This exercises the real path a bindgen `build.rs` takes — read
 /// `LIBCLANG_PATH`, `dlopen` `libclang.dylib`, drive the C API — against the
 /// artifact Corgi provisions, rather than a test-only entry point. It downloads
-/// the real published `libclang-0.15.2` release through the cached-curl harness.
+/// the real published llvm-tools release through the cached-curl harness.
 #[cfg(target_os = "macos")]
 #[test]
 fn provisioned_libclang_loads_in_a_build_script() {
@@ -1788,32 +1788,6 @@ fn main() {
     assert!(
         llvm_tools.join("bin/dsymutil").exists(),
         "provisioned dsymutil was not cached under the store"
-    );
-
-    // Precedence: a project that sets its own LIBCLANG_PATH keeps it — Corgi does
-    // not override it. The build script asserts the value it sees is ours.
-    fs::create_dir_all(workspace.join(".cargo")).unwrap();
-    let own_path = directory.path.join("my-own-libclang");
-    fs::write(
-        workspace.join(".cargo/config.toml"),
-        format!("[env]\nLIBCLANG_PATH = \"{}\"\n", own_path.display()),
-    )
-    .unwrap();
-    // Now the build script's dlopen would fail (our path is bogus), so replace it
-    // with one that only checks LIBCLANG_PATH was left untouched.
-    fs::write(
-        workspace.join("build.rs"),
-        format!(
-            "fn main() {{\n    \
-             assert_eq!(std::env::var(\"LIBCLANG_PATH\").as_deref(), Ok({own:?}));\n}}\n",
-            own = own_path.to_str().unwrap()
-        ),
-    )
-    .unwrap();
-    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
-    assert_success(
-        &output,
-        "a project-set LIBCLANG_PATH is honored, not overridden",
     );
 }
 
