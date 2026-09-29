@@ -1,5 +1,9 @@
 use crate::meta::{self, Metadata, Package, Target};
+use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
 use crate::report::UnitKeyResolution as KeyResolution;
+use crate::sandbox::linux::setup_linux_sandbox;
+use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
+use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
 use regex::RegexSet;
@@ -256,7 +260,11 @@ fn macos_linked_image(ctx: &Ctx, index: usize) -> bool {
     } else {
         ctx.target.as_deref().unwrap_or(&ctx.host)
     };
-    is_linking(ctx, index) && platform.contains("apple")
+    is_linking(ctx, index) && is_apple_target(platform)
+}
+
+fn is_apple_target(platform: &str) -> bool {
+    platform.contains("apple")
 }
 
 /// Both staging and export use this path: changing the recorded debug-map
@@ -455,9 +463,7 @@ pub struct Ctx {
     workspace_root: String,
     target_dir: PathBuf,
     sysroot: String,
-    rustup_home: String,
-    sandbox: bool,
-    darwin_dirs: Vec<String>,
+    sandbox: Sandbox,
     src_hash_memo: Mutex<HashMap<usize, String>>,
     source_files_memo: Mutex<HashMap<usize, Vec<PathBuf>>>,
     src_hash_nanos: std::sync::atomic::AtomicU64,
@@ -465,7 +471,8 @@ pub struct Ctx {
     /// target/<dir> layout name from the root units' resolved profile
     /// (cargo maps dev/test to "debug").
     profile_name: String,
-    toolchain: String,
+    toolchain: ResolvedToolchain,
+    toolchain_identity: String,
     /// Pinned tools resolved for injection: env var, store path,
     /// identity hash, shim name/bin, and package scope (empty = all).
     tools: Vec<ToolRt>,
@@ -475,10 +482,6 @@ pub struct Ctx {
     /// Build standard-library units from this toolchain's pinned rust-src.
     build_std: bool,
     zig: Option<ZigRuntime>,
-    macos: Vec<MacosRuntime>,
-    /// `LIBCLANG_PATH` handed to build scripts on supported Apple hosts,
-    /// so bindgen loads Corgi's pinned libclang. None when unsupported.
-    libclang_path: Option<String>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
@@ -530,6 +533,109 @@ pub struct Ctx {
     report: Arc<crate::report::Recorder>,
 }
 
+enum ResolvedToolchain {
+    Supplied(NativeToolchain),
+    ManagedDarwin(ManagedDarwinToolchain),
+}
+
+impl ResolvedToolchain {
+    fn supplied(&self) -> Option<&NativeToolchain> {
+        match self {
+            Self::Supplied(native) => Some(native),
+            Self::ManagedDarwin(_) => None,
+        }
+    }
+
+    fn darwin_runtime(&self, platform: &str) -> Option<&MacosRuntime> {
+        match self {
+            Self::Supplied(_) => None,
+            Self::ManagedDarwin(managed) => managed
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.platform == platform),
+        }
+    }
+
+    fn identity(
+        &self,
+        channel: &str,
+        zig_identity: &str,
+    ) -> Result<(String, crate::report::ToolchainInput)> {
+        let ((cc, ld, sdk), macos_identity, libclang_identity) = match self {
+            Self::Supplied(native) => (
+                (
+                    native.compiler_version.trim().to_string(),
+                    format!("{} (native Clang link driver)", native.compiler.display()),
+                    format!("supplied toolchain inputs {}", native.identity),
+                ),
+                String::new(),
+                String::new(),
+            ),
+            Self::ManagedDarwin(managed) => {
+                let macos_identity = managed
+                    .runtimes
+                    .iter()
+                    .map(|runtime| runtime.identity.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let libclang_identity = managed
+                    .libclang_path
+                    .as_ref()
+                    .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
+                    .transpose()?
+                    .unwrap_or_default();
+                (
+                    darwin_toolchain_identity(channel),
+                    macos_identity,
+                    libclang_identity,
+                )
+            }
+        };
+        let identity = format!(
+            "cc: {cc}\nld: {ld}\nsdk: {sdk}\nzig: {zig_identity}\nmacos: {macos_identity}\nlibclang: {libclang_identity}"
+        );
+        Ok((identity, crate::report::ToolchainInput { cc, ld, sdk }))
+    }
+}
+
+struct ManagedDarwinToolchain {
+    runtimes: Vec<MacosRuntime>,
+    /// `LIBCLANG_PATH` for Corgi's pinned header parser.
+    /// None when unsupported.
+    libclang_path: Option<String>,
+}
+
+impl ManagedDarwinToolchain {
+    fn build_script_environment(&self, platform: &str, host: &str) -> Vec<(String, String)> {
+        let mut environment = Vec::new();
+        for runtime in &self.runtimes {
+            if runtime.platform == platform {
+                environment.extend(runtime.environment());
+            }
+            for (variable, tool) in [
+                ("CC", "cc"),
+                ("CXX", "c++"),
+                ("AR", "ar"),
+                ("RANLIB", "ranlib"),
+            ] {
+                let path = runtime.directory.join(tool).display().to_string();
+                environment.push((
+                    format!("{variable}_{}", runtime.platform.replace('-', "_")),
+                    path.clone(),
+                ));
+                if runtime.platform == host {
+                    environment.push((format!("HOST_{variable}"), path));
+                }
+            }
+        }
+        // Match bindgen's header parser to the managed Clang, not ambient Xcode/CLT.
+        if let Some(path) = &self.libclang_path {
+            environment.push(("LIBCLANG_PATH".into(), path.clone()));
+        }
+        environment
+    }
+}
+
 #[derive(Clone)]
 struct ZigRuntime {
     cc: PathBuf,
@@ -575,6 +681,128 @@ impl MacosRuntime {
             ));
         }
         environment
+    }
+}
+
+fn setup_darwin_llvm_tools(store: &Store, host: &str) -> Result<(Option<PathBuf>, Option<String>)> {
+    // One pinned artifact supplies both bindgen's libclang and the dsymutil
+    // used by Clang when linking a debug image. Provisioning it unconditionally
+    // is cheaper than detecting bindgen consumers in the package graph.
+    let llvm_tools = if crate::libclang::is_supported(host) {
+        Some(ensure_llvm_tools(store, host)?)
+    } else {
+        None
+    };
+    let libclang = llvm_tools
+        .as_ref()
+        .map(|root| {
+            root.join("lib")
+                .to_str()
+                .context("libclang path is not UTF-8")
+                .map(str::to_owned)
+        })
+        .transpose()?;
+    Ok((llvm_tools, libclang))
+}
+
+/// Provision the pinned macOS runtime for the host and, when cross-compiling
+/// to the other Apple architecture, for the target too. The host runtime
+/// comes first.
+fn setup_darwin_runtimes(
+    store: &Store,
+    host: &str,
+    target: Option<&str>,
+    rust_toolchain: &Path,
+    llvm_tools: Option<&Path>,
+    config_env: &[(String, String)],
+) -> Result<Vec<MacosRuntime>> {
+    // The macOS version floor comes from the managed LLVM binaries, not
+    // from Corgi or externally supplied compilers.
+    crate::macos::check_host()?;
+    let llvm_tools = llvm_tools.context("pinned macOS builds require the llvm-tools artifact")?;
+    let dsymutil = llvm_tools.join(crate::libclang::DSYMUTIL_RELATIVE);
+    let compiler_rt = crate::libclang::compiler_rt_dir(llvm_tools)?;
+    let deployment = config_env
+        .iter()
+        .find(|(name, _)| name == "MACOSX_DEPLOYMENT_TARGET")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or(crate::macos::DEFAULT_DEPLOYMENT_TARGET);
+    let host_runtime = ensure_macos(
+        store,
+        host,
+        host,
+        rust_toolchain,
+        &dsymutil,
+        &compiler_rt,
+        deployment,
+    )?;
+    let mut runtimes = vec![host_runtime];
+    if let Some(target) =
+        target.filter(|target| target.ends_with("-apple-darwin") && *target != host)
+    {
+        runtimes.push(ensure_macos(
+            store,
+            host,
+            target,
+            rust_toolchain,
+            &dsymutil,
+            &compiler_rt,
+            deployment,
+        )?);
+    }
+    Ok(runtimes)
+}
+
+fn darwin_toolchain_identity(channel: &str) -> (String, String, String) {
+    (
+        format!("zig clang {}", crate::zig::VERSION),
+        format!("Rust {channel} Mach-O LLD"),
+        format!("{} {}", crate::macos::SDK_VERSION, crate::macos::SDK_BUILD),
+    )
+}
+
+fn warn_darwin_debug_settings(units: &[Unit], host: &str, target: Option<&str>) {
+    if units.iter().any(|unit| {
+        let platform = if unit.host {
+            host
+        } else {
+            target.unwrap_or(host)
+        };
+        platform.ends_with("-apple-darwin")
+            && unit.profile.debuginfo_flag() != "0"
+            && matches!(
+                unit.profile.split_debuginfo.as_deref(),
+                Some("packed") | Some("off")
+            )
+    }) {
+        eprintln!(
+            "corgi warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (their debug objects live in the cache)"
+        );
+    }
+}
+
+fn configure_darwin_link_output(
+    command: &mut Command,
+    stage_root: &Path,
+    debug_output: bool,
+    crate_type: &str,
+    crate_name: &str,
+    artifact_suffix: &str,
+) {
+    if debug_output {
+        command.arg("-Csplit-debuginfo=unpacked");
+        command.args([
+            "-Clink-arg=-Xlinker",
+            "-Clink-arg=-oso_prefix",
+            "-Clink-arg=-Xlinker",
+        ]);
+        command.arg(format!("-Clink-arg={}/", stage_root.display()));
+    }
+    if crate_type == "proc-macro" {
+        // ld64 defaults the dylib install name to the temporary output path.
+        command.arg(format!(
+            "-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{artifact_suffix}.dylib"
+        ));
     }
 }
 
@@ -1397,7 +1625,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 dependencies,
                 environment,
                 tools,
-                toolchain: ctx.toolchain.clone(),
+                toolchain: ctx.toolchain_identity.clone(),
             }));
             (spec, declared_environment)
         } else {
@@ -1525,7 +1753,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                     Vec::new()
                 },
                 cap_lints: package.source.is_some(),
-                toolchain: is_linking(ctx, index).then(|| ctx.toolchain.clone()),
+                toolchain: is_linking(ctx, index).then(|| ctx.toolchain_identity.clone()),
                 debug_binary: None,
             }));
             (spec, declared_environment)
@@ -2507,46 +2735,6 @@ fn pinned_macos_tool(
         .join(exported))
 }
 
-/// Provision the pinned macOS runtime for an Apple host and, when
-/// cross-compiling to the other Apple architecture, for the target too.
-fn ensure_macos_runtimes(
-    store: &Store,
-    host: &str,
-    target: Option<&str>,
-    toolchain: &Path,
-    llvm_tools: Option<&Path>,
-    config_env: &[(String, String)],
-) -> Result<Vec<MacosRuntime>> {
-    // The pinned path always provisions llvm-tools on a supported host, so
-    // its presence is what raises the build-host floor to macOS 14.
-    crate::macos::check_host()?;
-    crate::zig::raise_file_descriptor_limit()?;
-    let llvm_tools = llvm_tools.context("pinned macOS builds require the llvm-tools artifact")?;
-    let dsymutil = llvm_tools.join(crate::libclang::DSYMUTIL_RELATIVE);
-    let compiler_rt = crate::libclang::compiler_rt_dir(llvm_tools)?;
-    let deployment = config_env
-        .iter()
-        .find(|(name, _)| name == "MACOSX_DEPLOYMENT_TARGET")
-        .map(|(_, value)| value.as_str())
-        .unwrap_or(crate::macos::DEFAULT_DEPLOYMENT_TARGET);
-    let other_apple_target =
-        target.filter(|target| target.ends_with("-apple-darwin") && *target != host);
-    std::iter::once(host)
-        .chain(other_apple_target)
-        .map(|platform| {
-            ensure_macos(
-                store,
-                host,
-                platform,
-                toolchain,
-                &dsymutil,
-                &compiler_rt,
-                deployment,
-            )
-        })
-        .collect()
-}
-
 fn ensure_macos(
     store: &Store,
     host: &str,
@@ -2848,17 +3036,43 @@ fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
     }
 }
 
-/// Resolve the host triple *without* a rustc: corgi's own build constants.
-/// Cross-checked later against the pinned rustc's self-reported host.
-/// (Known gap: under Rosetta an x86_64 corgi resolves x86_64-apple-darwin.)
-fn host_triple() -> Result<String> {
-    let arch = std::env::consts::ARCH;
-    let os = match std::env::consts::OS {
-        "macos" => "apple-darwin",
-        "linux" => "unknown-linux-gnu", // TODO: musl detection
-        o => bail!("unsupported host OS {o}"),
-    };
-    Ok(format!("{arch}-{os}"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPlatform {
+    Linux,
+    Darwin,
+}
+
+impl HostPlatform {
+    fn current() -> Result<Self> {
+        Self::from_os(std::env::consts::OS)
+    }
+
+    fn from_os(os: &str) -> Result<Self> {
+        match os {
+            "linux" => Ok(Self::Linux),
+            "macos" => Ok(Self::Darwin),
+            _ => bail!("unsupported host OS {os}; corgi builds require macOS or Linux"),
+        }
+    }
+
+    /// Cross-checked against rustc; under Rosetta this describes the translated Corgi binary.
+    fn triple(self) -> String {
+        let arch = std::env::consts::ARCH;
+        let os = match self {
+            Self::Linux => "unknown-linux-gnu", // TODO: musl detection
+            Self::Darwin => "apple-darwin",
+        };
+        format!("{arch}-{os}")
+    }
+
+    fn validate_toolchain_source(self, source: ToolchainSource) -> Result<()> {
+        match (self, source) {
+            (_, ToolchainSource::Supplied) | (Self::Darwin, ToolchainSource::Managed) => Ok(()),
+            (Self::Linux, ToolchainSource::Managed) => {
+                bail!("managed Linux toolchains are not implemented; set CORGI_RUST_TOOLCHAIN and CORGI_CC")
+            }
+        }
+    }
 }
 
 fn read_toolchain_pin(dir: &Path) -> Result<String> {
@@ -2910,10 +3124,14 @@ fn read_toolchain_pin_with(
 }
 
 fn current_toolchain_channel(dir: &Path) -> Result<String> {
-    let output = capture(
-        Command::new("rustc").arg("-vV").current_dir(dir),
-        "rustc -vV",
-    )?;
+    let mut command = if let Some(directory) = std::env::var_os("CORGI_RUST_TOOLCHAIN") {
+        let rustc = crate::native_toolchain::required_component(Path::new(&directory), "rustc")?;
+        let environment = crate::native_toolchain::wrapper_environment(&[])?;
+        crate::native_toolchain::controlled_command(&rustc, &environment)
+    } else {
+        Command::new("rustc")
+    };
+    let output = capture(command.arg("-vV").current_dir(dir), "rustc -vV")?;
     toolchain_channel_from_rustc_version(&output)
 }
 
@@ -3292,6 +3510,64 @@ fn touch_tool_marker(dir: &Path) {
     Store::touch_used(&marker);
 }
 
+/// The Rust toolchain a build uses: a supplied native one, selected by the
+/// `CORGI_*` toolchain variables, or Corgi's pinned download.
+struct SelectedToolchain {
+    source: ToolchainSource,
+    /// The project's pinned Rust channel.
+    channel: String,
+    /// Wrapper environment captured for a supplied toolchain; empty when managed.
+    native_environment: Vec<(String, String)>,
+    supplied_rust: Option<SuppliedRust>,
+    /// The toolchain's root, with `bin/rustc` and `bin/cargo`.
+    rust_toolchain: PathBuf,
+}
+
+/// Select the build's toolchain, installing the pinned one when Corgi
+/// manages it. `corgi fetch` and builds share this so they agree on what a
+/// build needs.
+fn select_toolchain(
+    store: &Store,
+    host_platform: HostPlatform,
+    dir: &Path,
+    host: &str,
+    target: Option<&str>,
+    build_std: bool,
+    config_env: &[(String, String)],
+) -> Result<SelectedToolchain> {
+    // Reject invalid toolchain variables before reading the pin: an unpinned
+    // project asks the selected toolchain for its channel.
+    let source = ToolchainSource::for_build()?;
+    host_platform.validate_toolchain_source(source)?;
+    let channel = read_toolchain_pin(dir)?;
+    if source == ToolchainSource::Managed {
+        return Ok(SelectedToolchain {
+            source,
+            rust_toolchain: provision_rust_toolchain(store, &channel, host, build_std)?,
+            channel,
+            native_environment: Vec::new(),
+            supplied_rust: None,
+        });
+    }
+    if let Some(target) = target {
+        if target != host {
+            bail!("supplied native toolchains currently support native builds only (requested {target}, host {host})");
+        }
+    }
+    if build_std {
+        bail!("supplied native toolchains currently require a prebuilt standard library; build-std is not supported");
+    }
+    let native_environment = crate::native_toolchain::wrapper_environment(config_env)?;
+    let supplied_rust = SuppliedRust::resolve(&channel, host, &native_environment)?;
+    Ok(SelectedToolchain {
+        source,
+        channel,
+        rust_toolchain: supplied_rust.directory.clone(),
+        native_environment,
+        supplied_rust: Some(supplied_rust),
+    })
+}
+
 /// Install the pinned Rust toolchain and return its path in the store. That
 /// path leaks into ld's UUID (it hashes the link command line, including
 /// libstd rlib paths) and into build-script keys, so artifacts are only
@@ -3317,17 +3593,6 @@ fn provision_rust_toolchain(
         "rust-{channel}-{host}{}",
         if build_std { "-build-std" } else { "" }
     )))
-}
-
-/// The pinned llvm-tools artifact carries both libclang (for bindgen) and
-/// dsymutil (which Clang runs on a compile-to-image with debug info), on hosts
-/// that support it.
-fn provision_llvm_tools(store: &Store, host: &str) -> Result<Option<PathBuf>> {
-    if crate::libclang::is_supported(host) {
-        ensure_llvm_tools(store, host).map(Some)
-    } else {
-        Ok(None)
-    }
 }
 
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
@@ -4083,9 +4348,21 @@ pub fn fmt(
     }
 
     let channel = read_toolchain_pin(&dir)?;
-    let host = host_triple()?;
-    let toolchain_bin = ensure_toolchain(&store, &channel, &host, false)?;
-    let rustfmt_bin = ensure_rustfmt(&store, &channel, &host)?;
+    let host = HostPlatform::current()?.triple();
+    let (toolchain_bin, rustfmt_bin) =
+        if ToolchainSource::for_formatting() == ToolchainSource::Supplied {
+            let environment = crate::native_toolchain::wrapper_environment(&[])?;
+            let rust = SuppliedRust::resolve(&channel, &host, &environment)?;
+            crate::native_toolchain::required_component(&rust.directory, "rustfmt")?;
+            crate::native_toolchain::required_component(&rust.directory, "cargo-fmt")?;
+            let bin = rust.directory.join("bin");
+            (bin.clone(), bin)
+        } else {
+            (
+                ensure_toolchain(&store, &channel, &host, false)?,
+                ensure_rustfmt(&store, &channel, &host)?,
+            )
+        };
     let cargo = toolchain_bin.join("cargo");
     let rustc = toolchain_bin.join("rustc");
     let rustfmt = rustfmt_bin.join("rustfmt");
@@ -4134,17 +4411,25 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("bad directory {}", dir.display()))?;
     let project = CargoProject::discover(&dir)?;
-    let channel = read_toolchain_pin(&dir)?;
-    let host = host_triple()?;
+    let host_platform = HostPlatform::current()?;
+    let host = host_platform.triple();
     let build_std = project.build_std();
-    let toolchain = provision_rust_toolchain(&store, &channel, &host, build_std)?;
-    let llvm_tools = provision_llvm_tools(&store, &host)?;
-    if host.ends_with("-apple-darwin") {
-        ensure_macos_runtimes(
+    let toolchain = select_toolchain(
+        &store,
+        host_platform,
+        &dir,
+        &host,
+        None,
+        build_std,
+        &project.cargo_config.env,
+    )?;
+    if (toolchain.source, host_platform) == (ToolchainSource::Managed, HostPlatform::Darwin) {
+        let (llvm_tools, _) = setup_darwin_llvm_tools(&store, &host)?;
+        setup_darwin_runtimes(
             &store,
             &host,
             None,
-            &toolchain,
+            &toolchain.rust_toolchain,
             llvm_tools.as_deref(),
             &project.cargo_config.env,
         )?;
@@ -4160,7 +4445,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
 
     status!("Fetching", "dependencies via Cargo");
     fetch_dependencies(
-        &toolchain,
+        &toolchain.rust_toolchain,
         &store_cargo_home(&store),
         &project.cargo_config_paths,
         &project.manifest,
@@ -4179,10 +4464,10 @@ fn store_cargo_home(store: &Store) -> PathBuf {
 }
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
-    ensure_supported_build_platform(
-        std::env::consts::OS,
-        Path::new("/usr/bin/sandbox-exec").is_file(),
-    )?;
+    let host_platform = HostPlatform::current()?;
+    if host_platform == HostPlatform::Darwin {
+        check_macos_sandbox()?;
+    }
     opts.packages.sort();
     opts.packages.dedup();
     if let Some(target_dir) = &mut opts.target_dir {
@@ -4197,7 +4482,7 @@ pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
     let path = store_root.join("reports").join(format!("{}.json", run.id));
     let recorder = Arc::new(crate::report::Recorder::new_at(run, monotonic_started_at));
     recorder.update(|report| report.run.outcome.stage = Some("setup".to_string()));
-    let result = build_inner(store, dir, opts, Arc::clone(&recorder));
+    let result = build_inner(store, dir, opts, host_platform, Arc::clone(&recorder));
     if result.is_err() {
         let end_ns = recorder.elapsed_ns();
         recorder.update(|report| {
@@ -4270,8 +4555,10 @@ fn build_inner(
     store: Store,
     dir: &Path,
     opts: BuildOpts,
+    host_platform: HostPlatform,
     recorder: Arc<crate::report::Recorder>,
 ) -> Result<()> {
+    raise_file_descriptor_limit()?;
     let BuildOpts {
         verbose,
         release,
@@ -4329,8 +4616,26 @@ fn build_inner(
         }
     }
 
-    let channel = read_toolchain_pin(&dir)?;
-    let host_guess = host_triple()?;
+    let host_guess = host_platform.triple();
+    let SelectedToolchain {
+        source: toolchain_source,
+        channel,
+        native_environment,
+        supplied_rust,
+        rust_toolchain,
+    } = select_toolchain(
+        &store,
+        host_platform,
+        &dir,
+        &host_guess,
+        requested_target.as_deref(),
+        build_std,
+        &cargo_config.env,
+    )?;
+    let native_toolchain = supplied_rust
+        .as_ref()
+        .map(|rust| NativeToolchain::resolve(rust, native_environment.clone()))
+        .transpose()?;
     let zig_target = requested_target
         .as_deref()
         .map(|target| {
@@ -4339,17 +4644,17 @@ fn build_inner(
         })
         .transpose()?
         .flatten();
-    if zig_target.is_some() {
-        crate::zig::raise_file_descriptor_limit()?;
-    }
     let target = match zig_target.as_deref() {
         Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
         None => requested_target,
     };
-    let rust_toolchain = provision_rust_toolchain(&store, &channel, &host_guess, build_std)?;
     let rustc = rust_toolchain.join("bin/rustc").display().to_string();
     let cargo_bin = rust_toolchain.join("bin/cargo");
-    let rustc_version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
+    let rustc_version = if let Some(rust) = &supplied_rust {
+        rust.version.clone()
+    } else {
+        capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?
+    };
     let host = rustc_version
         .lines()
         .find_map(|l| l.strip_prefix("host: "))
@@ -4373,34 +4678,30 @@ fn build_inner(
     } else {
         target_rustflags.clone()
     };
-    let config_env = cargo_config.env;
+    let mut config_env = cargo_config.env;
+    if let Some(native) = &native_toolchain {
+        for (name, value) in &native.environment {
+            config_env.retain(|(existing, _)| existing != name);
+            config_env.push((name.clone(), value.clone()));
+        }
+        config_env.sort();
+    }
     // Actions never see the ambient environment. Tool discovery must use this
     // same base plus configured environment so xcrun selects the same tools.
-    let mut base_env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
-    if let Ok(value) = std::env::var("HOME") {
-        base_env.push(("HOME".to_string(), value));
-    }
+    let mut base_env = if let Some(native) = &native_toolchain {
+        native.environment.clone()
+    } else {
+        let mut environment = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+        if let Ok(value) = std::env::var("HOME") {
+            environment.push(("HOME".to_string(), value));
+        }
+        environment
+    };
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
-    // Provision Corgi's pinned libclang on supported Apple hosts and hand its
-    // directory to build scripts as LIBCLANG_PATH (injected in
-    // build_script_environment). Keyed on the pinned Zig version, so any bindgen
-    // consumer parses headers with the Clang that matches the compiler Corgi
-    // ships rather than an ambient Xcode/CLT one. Unconditional rather than
-    // graph-gated: libclang is the smallest toolchain Corgi fetches (~35 MB,
-    // once per store), so detecting bindgen consumers would add more complexity
-    // than it saves.
-    // Provision llvm-tools once; hand its `lib/` to bindgen and its root to the
-    // macOS driver.
-    let llvm_tools = provision_llvm_tools(&store, &host)?;
-    let libclang = llvm_tools
-        .as_ref()
-        .map(|root| {
-            root.join("lib")
-                .to_str()
-                .context("libclang path is not UTF-8")
-                .map(str::to_owned)
-        })
-        .transpose()?;
+    let (llvm_tools, libclang) = match (toolchain_source, host_platform) {
+        (ToolchainSource::Managed, HostPlatform::Darwin) => setup_darwin_llvm_tools(&store, &host)?,
+        _ => (None, None),
+    };
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()
@@ -4414,18 +4715,29 @@ fn build_inner(
     });
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
-    let mut cfg_probe = Command::new(&rustc);
+    let mut cfg_probe = if let Some(native) = &native_toolchain {
+        crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
+    } else {
+        Command::new(&rustc)
+    };
     cfg_probe.args(["--print", "cfg"]);
     cfg_probe.args(&host_rustflags);
     let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
-    // the toolchain dir *is* the sysroot
-    let sysroot = rust_toolchain.display().to_string();
+    // A managed toolchain dir *is* the sysroot.
+    let sysroot = supplied_rust
+        .as_ref()
+        .map_or(&rust_toolchain, |rust| &rust.sysroot)
+        .display()
+        .to_string();
     // Sysroot *content* changes emitted bits even at identical rustc
     // versions: an installed rust-src component devirtualizes std paths in
     // panic locations (observed: 13/14 artifacts differ). Fold it into the
     // version string so it reaches every action key.
     let rust_src = Path::new(&sysroot).join("lib/rustlib/src/rust").exists();
-    let rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
+    let mut rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
+    if let Some(native) = &native_toolchain {
+        rustc_version.push_str(&format!("native-toolchain: {}\n", native.identity));
+    }
     let cfg_env = cargo_cfg_env(&cfg_out);
     let mut target_std_libdir: Option<String> = None;
     if let Some(t) = &target {
@@ -4445,7 +4757,11 @@ fn build_inner(
         }
     }
     let cfg_env_target = if let Some(t) = &target {
-        let mut probe = Command::new(&rustc);
+        let mut probe = if let Some(native) = &native_toolchain {
+            crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
+        } else {
+            Command::new(&rustc)
+        };
         probe.args(["--print", "cfg", "--target", t]);
         probe.args(&target_rustflags);
         let o = capture(&mut probe, "rustc --print cfg --target")?;
@@ -4455,6 +4771,23 @@ fn build_inner(
     };
 
     let cargo_home = store_cargo_home(&store).display().to_string();
+    let runtime_paths = native_toolchain
+        .as_ref()
+        .map(|native| native.runtime_paths.clone())
+        .unwrap_or_default();
+    let sandbox = match host_platform {
+        HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(&store, runtime_paths)?),
+        HostPlatform::Darwin => Sandbox::Darwin(setup_macos_sandbox(
+            &store,
+            Path::new(&rustc),
+            Path::new(&sysroot),
+            Path::new(&cargo_home),
+            runtime_paths,
+        )?),
+    };
+    if verbose {
+        status!("Sandbox", "hermetic mode enabled ({})", sandbox.name());
+    }
 
     finish_report_stage(&recorder, "setup", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "plan");
@@ -4504,7 +4837,7 @@ fn build_inner(
     };
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{rustc_version}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
@@ -4554,6 +4887,11 @@ fn build_inner(
                 let mut command =
                     isolated_cargo_command(&cargo_bin, Path::new(&cargo_home), &cargo_config_paths);
                 command.env("RUSTC", &rustc);
+                if native_toolchain.is_some() {
+                    for (name, value) in &native_environment {
+                        command.env(name, value);
+                    }
+                }
                 command
             };
             fetch_dependencies(
@@ -4872,17 +5210,7 @@ fn build_inner(
     if units.iter().any(|u| u.profile.rpath) {
         eprintln!("corgi warning: profile requests rpath; ignored");
     }
-    if units.iter().any(|u| {
-        u.profile.debuginfo_flag() != "0"
-            && matches!(
-                u.profile.split_debuginfo.as_deref(),
-                Some("packed") | Some("off")
-            )
-    }) {
-        eprintln!(
-            "corgi warning: split-debuginfo=packed/off requested; darwin linking units use unpacked (their debug objects live in the cache)"
-        );
-    }
+    warn_darwin_debug_settings(&units, &host, target.as_deref());
     // Under check, everything needed for *execution* (build scripts, their
     // runs, proc-macros) and their transitive closures still fully
     // compiles; the rest emits metadata only.
@@ -4910,27 +5238,30 @@ fn build_inner(
     finish_report_stage(&recorder, "plan", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{home}/.rustup"));
-    let mut macos = Vec::new();
-    if host.ends_with("-apple-darwin") {
-        macos = ensure_macos_runtimes(
-            &store,
-            &host,
-            target.as_deref(),
-            &rust_toolchain,
-            llvm_tools.as_deref(),
-            &config_env,
-        )?;
-        base_env.push((
-            "PATH".into(),
-            format!("{}:/usr/bin:/bin", macos[0].directory.display()),
-        ));
-    }
-    // toolchain identity beyond rustc: the linker chain shapes final bits
-    let cc_v = format!("zig clang {}", crate::zig::VERSION);
-    let ld_v = format!("Rust {channel} Mach-O LLD");
-    let sdk_v = format!("{} {}", crate::macos::SDK_VERSION, crate::macos::SDK_BUILD);
+    let toolchain = match native_toolchain {
+        Some(native) => ResolvedToolchain::Supplied(native),
+        None => match host_platform {
+            HostPlatform::Darwin => {
+                let runtimes = setup_darwin_runtimes(
+                    &store,
+                    &host,
+                    target.as_deref(),
+                    &rust_toolchain,
+                    llvm_tools.as_deref(),
+                    &config_env,
+                )?;
+                base_env.push((
+                    "PATH".into(),
+                    format!("{}:/usr/bin:/bin", runtimes[0].directory.display()),
+                ));
+                ResolvedToolchain::ManagedDarwin(ManagedDarwinToolchain {
+                    runtimes,
+                    libclang_path: libclang,
+                })
+            }
+            HostPlatform::Linux => bail!("managed Linux toolchains are not implemented"),
+        },
+    };
     let zig_runtime = zig_target
         .as_deref()
         .map(|target| ensure_zig(&store, &host_guess, target))
@@ -4939,49 +5270,8 @@ fn build_inner(
         .as_ref()
         .map(|runtime| runtime.identity.as_str())
         .unwrap_or("");
-    let macos_identity = macos
-        .iter()
-        .map(|runtime| runtime.identity.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let libclang_identity = libclang
-        .as_ref()
-        .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
-        .transpose()?
-        .unwrap_or_default();
-    let toolchain = format!(
-        "cc: {cc_v}\nld: {ld_v}\nsdk: {sdk_v}\nzig: {zig_identity}\nmacos: {macos_identity}\nlibclang: {libclang_identity}"
-    );
-    let report_toolchain = crate::report::ToolchainInput {
-        cc: cc_v,
-        ld: ld_v,
-        sdk: sdk_v,
-    };
+    let (toolchain_identity, report_toolchain) = toolchain.identity(&channel, zig_identity)?;
     recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
-    // Unconditional where the platform supports it: there is exactly one
-    // mode, and it fails hard. Errors name the missing input (denied exec,
-    // undeclared read), and the fix is a pinned tool or extra-inputs
-    // stanza — loop until green.
-    let sandbox = true;
-    if verbose {
-        status!("Sandbox", "hermetic mode enabled (seatbelt)");
-    }
-    // canonical darwin per-user temp/cache dirs: xcrun/clang/ld use these
-    // regardless of $TMPDIR; without them every link takes a ~1.5s slow path
-    let mut darwin_dirs = Vec::new();
-    for key in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
-        if let Ok(d) = capture(Command::new("/usr/bin/getconf").arg(key), "getconf") {
-            let d = d.trim().trim_end_matches('/').to_string();
-            if !d.is_empty() {
-                let canon = if d.starts_with("/var/") {
-                    format!("/private{d}")
-                } else {
-                    d
-                };
-                darwin_dirs.push(canon);
-            }
-        }
-    }
     let cargo = cargo_bin.display().to_string();
     // Lints are plan-time-resolved inputs (see resolve_lints).
     let lints = resolve_lints(&meta)?;
@@ -4989,9 +5279,21 @@ fn build_inner(
     let mut clippy_id = String::new();
     let mut clippy_conf: Option<PathBuf> = None;
     if matches!(mode, Mode::Clippy) {
-        ensure_clippy(&store, &channel, &host_guess, build_std)?;
+        if supplied_rust.is_some() {
+            crate::native_toolchain::required_component(&rust_toolchain, "clippy-driver")?;
+        } else {
+            ensure_clippy(&store, &channel, &host_guess, build_std)?;
+        }
         clippy_driver = format!("{}/bin/clippy-driver", rust_toolchain.display());
-        let version = capture(Command::new(&clippy_driver).arg("-V"), "clippy-driver -V")?;
+        let mut probe = if let Some(native) = toolchain.supplied() {
+            crate::native_toolchain::controlled_command(
+                Path::new(&clippy_driver),
+                &native.environment,
+            )
+        } else {
+            Command::new(&clippy_driver)
+        };
+        let version = capture(probe.arg("-V"), "clippy-driver -V")?;
         let mut conf_hash = String::new();
         for name in ["clippy.toml", ".clippy.toml"] {
             let candidate = Path::new(&meta.workspace_root).join(name);
@@ -5178,22 +5480,19 @@ fn build_inner(
         workspace_root,
         target_dir,
         sysroot,
-        rustup_home,
         sandbox,
-        darwin_dirs,
         src_hash_memo: Mutex::new(HashMap::new()),
         source_files_memo: Mutex::new(HashMap::new()),
         src_hash_nanos: std::sync::atomic::AtomicU64::new(0),
         file_names_memo,
         profile_name,
         toolchain,
+        toolchain_identity,
         tools: tools_rt,
         env_probes,
         target,
         build_std,
         zig: zig_runtime,
-        macos,
-        libclang_path: libclang,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -5930,17 +6229,6 @@ fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for d in std::env::split_paths(&path) {
-        let c = d.join(name);
-        if c.is_file() {
-            return Some(c);
-        }
-    }
-    None
-}
-
 /// `rustc --print cfg` -> CARGO_CFG_* env for build scripts.
 fn cargo_cfg_env(cfg_out: &str) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -6546,153 +6834,14 @@ fn rust_source_layout_hash(paths: &[PathBuf]) -> String {
     sha256_hex(normalized_paths.join("\0").as_bytes())
 }
 
-/// Wrap a command in a deny-by-default seatbelt sandbox: reads limited to
-/// runtime paths, the toolchain, the store, and keyed inputs; writes limited
-/// to the action's output and scratch dirs; no network. Children inherit it.
-fn sandboxed_command(ctx: &Ctx, program: &str, extra_reads: &[&Path], writes: &[&Path]) -> Command {
-    if !ctx.sandbox {
-        return Command::new(program);
-    }
-    let mut prof = String::from(concat!(
-        "(version 1)\n",
-        "(deny default)\n",
-        "(allow process-fork)\n",
-        "(allow process-info*)\n",
-        "(allow file-map-executable)\n",
-        "(allow signal (target same-sandbox))\n",
-        "(allow sysctl-read)\n",
-        "(allow mach-lookup)\n",
-        "(allow file-read-metadata)\n",
-    ));
-    // exec allowlist: the *only* runnable binaries are the rustup shim and
-    // tools whose identity is part of the action key (rustc, clang/ld via the
-    // toolchain hash, build scripts via their content hash)
-    prof.push_str("(allow process-exec*\n");
-    let mut exec_lits = vec![
-        format!("{}/bin/rustc", ctx.cargo_home),
-        format!("{}/bin/rustc", ctx.sysroot),
-    ];
-    if let Some(r) = find_in_path(&ctx.rustc) {
-        exec_lits.push(r.display().to_string());
-    }
-    // the whole pinned-toolchain bin dir is keyed content (e.g.
-    // proc-macro-crate spawns `cargo locate-project` at macro expansion)
-    let toolchain_bin = Path::new(&ctx.sysroot).join("bin");
-    if let Ok(canon) = fs::canonicalize(&toolchain_bin) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    // rust-lld & friends live under lib/rustlib/<triple>/bin — also keyed
-    let rustlib = Path::new(&ctx.sysroot).join("lib/rustlib");
-    if let Ok(canon) = fs::canonicalize(&rustlib) {
-        prof.push_str(&format!("  (subpath \"{}\")\n", canon.display()));
-    }
-    for p in exec_lits {
-        // seatbelt matches canonical paths: ~/.cargo/bin/rustc is a symlink
-        // to rustup, so resolve before emitting the rule
-        let canon = fs::canonicalize(&p)
-            .map(|c| c.display().to_string())
-            .unwrap_or(p);
-        prof.push_str(&format!("  (literal \"{canon}\")\n"));
-    }
-    // /bin/sh dispatches to the variant selected in /private/var/select/sh,
-    // so each system-provided implementation must retain the dispatcher's
-    // process-exec capability.
-    for p in ["/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh"] {
-        prof.push_str(&format!("  (literal \"{p}\")\n"));
-    }
-    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
-    prof.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        ctx.store.root.join("tools").display()
-    ));
-    // actions may execute binaries they just built in their own writable
-    // dirs (autoconf/aws-lc style compile-and-run probes): those binaries
-    // are products of keyed inputs, so this stays hermetic
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(&format!("  (subpath \"{}\")\n", ctx.pool.display()));
-    prof.push_str(")\n");
-    prof.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
-    // Compiles run with cwd = the workspace root (cargo's shape); getcwd
-    // needs the directory node itself, but nothing under it beyond the
-    // explicitly granted package/extra-input subpaths.
-    prof.push_str(&format!("  (literal \"{}\")\n", ctx.workspace_root));
-    // Host-installed tools and libraries are not keyed inputs, so their
-    // directories must not be readable even when an action can execute a shell.
-    prof.push_str("  (subpath \"/private/var/run/com.apple.security.cryptexd\")\n");
-    let workspace_root = Path::new(&ctx.workspace_root);
-    let mut reads: Vec<String> = vec![
-        ctx.sysroot.clone(),
-        ctx.cargo_home.clone(),
-        ctx.rustup_home.clone(),
-        ctx.store.root.display().to_string(),
-    ];
-    // A workspace may itself live under the per-user temp directory. In that
-    // case a broad cache grant would make every workspace file readable.
-    for d in &ctx.darwin_dirs {
-        if !workspace_root.starts_with(d) {
-            reads.push(d.clone());
-        } else {
-            reads.push(Path::new(d).join("xcrun_db").display().to_string());
-        }
-    }
-    for r in reads {
-        if !r.is_empty() {
-            prof.push_str(&format!("  (subpath \"{r}\")\n"));
-        }
-    }
-    let mut input_directories = std::collections::BTreeSet::new();
-    for path in extra_reads {
-        let mut ancestor = path.parent();
-        while let Some(directory) = ancestor {
-            input_directories.insert(directory);
-            ancestor = directory.parent();
-        }
-    }
-    for directory in input_directories {
-        prof.push_str(&format!("  (literal \"{}\")\n", directory.display()));
-    }
-    for path in extra_reads {
-        let operation = if path.is_dir() { "subpath" } else { "literal" };
-        prof.push_str(&format!("  ({operation} \"{}\")\n", path.display()));
-    }
-    prof.push_str(")\n");
-    if !ctx.macos.is_empty() {
-        prof.push_str(concat!(
-            "(deny file-read* (subpath \"/Library/Developer\") ",
-            "(regex #\"/[^/]+[.]app/Contents/Developer(/|$)\"))\n",
-        ));
-    }
-    // Align the readable set with the hashed set: the source hash deliberately
-    // excludes .git, build output dirs, and Cargo.lock, so reading them must
-    // be denied or they become unhashed inputs. Later SBPL rules win.
-    prof.push_str("(deny file-read* file-read-metadata\n");
-    let mut deny_roots: Vec<String> = vec![ctx.workspace_root.clone()];
-    for path in extra_reads {
-        if path.is_dir() {
-            deny_roots.push(path.display().to_string());
-        }
-    }
-    deny_roots.sort();
-    deny_roots.dedup();
-    for r in &deny_roots {
-        for d in [".git", "target"] {
-            prof.push_str(&format!("  (subpath \"{r}/{d}\")\n"));
-        }
-        prof.push_str(&format!("  (literal \"{r}/Cargo.lock\")\n"));
-    }
-    prof.push_str(")\n(allow file-write*\n  (literal \"/dev/null\")\n");
-    for d in &ctx.darwin_dirs {
-        prof.push_str(&format!("  (subpath \"{d}\")\n"));
-    }
-    for w in writes {
-        prof.push_str(&format!("  (subpath \"{}\")\n", w.display()));
-    }
-    prof.push_str(")\n");
-    let mut c = Command::new("/usr/bin/sandbox-exec");
-    c.arg("-p").arg(prof).arg(program);
-    c
+fn sandboxed_command(
+    ctx: &Ctx,
+    program: &str,
+    extra_reads: &[&Path],
+    writes: &[&Path],
+) -> Result<Command> {
+    ctx.sandbox
+        .command(program, Path::new(&ctx.workspace_root), extra_reads, writes)
 }
 
 fn test_pass_key(harness_action: &str) -> Result<String> {
@@ -8348,7 +8497,14 @@ fn expected_outputs(
             let p = match from_store {
                 Some(p) => p,
                 None => {
-                    let mut cmd = Command::new(&ctx.rustc);
+                    let mut cmd = if let Some(native) = ctx.toolchain.supplied() {
+                        crate::native_toolchain::controlled_command(
+                            Path::new(&ctx.rustc),
+                            &native.environment,
+                        )
+                    } else {
+                        Command::new(&ctx.rustc)
+                    };
                     cmd.args([
                         "--print",
                         "file-names",
@@ -9103,6 +9259,9 @@ fn compile(
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
     let mut allowed_inputs: Vec<PathBuf> =
         vec![ctx.store.root.clone(), PathBuf::from(&ctx.sysroot)];
+    if let Some(native) = ctx.toolchain.supplied() {
+        allowed_inputs.extend(native.runtime_paths.iter().cloned());
+    }
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             allowed_inputs.push(conf.clone());
@@ -9124,7 +9283,7 @@ fn compile(
     if let Some(d) = &incr_dir {
         writes.push(d.as_path());
     }
-    let mut cmd = sandboxed_command(ctx, executor, &reads, &writes);
+    let mut cmd = sandboxed_command(ctx, executor, &reads, &writes)?;
     cmd.current_dir(compile_dir);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
@@ -9203,11 +9362,7 @@ fn compile(
             }
         }
     }
-    if let Some(runtime) = ctx
-        .macos
-        .iter()
-        .find(|runtime| runtime.platform == unit_platform)
-    {
+    if let Some(runtime) = ctx.toolchain.darwin_runtime(unit_platform) {
         cmd.arg("-C").arg(format!(
             "linker={}",
             runtime.directory.join("rust-linker").display()
@@ -9216,6 +9371,10 @@ fn compile(
     }
     for f in pflags {
         cmd.arg(f);
+    }
+    if let Some(native) = ctx.toolchain.supplied() {
+        cmd.arg("-C")
+            .arg(format!("linker={}", native.compiler.display()));
     }
     for f in lint_flags {
         cmd.arg(f);
@@ -9237,14 +9396,15 @@ fn compile(
             cmd.env("RUSTC_BOOTSTRAP", "1");
         }
     }
-    if debug_directory.is_some() {
-        cmd.arg("-Csplit-debuginfo=unpacked");
-        cmd.args([
-            "-Clink-arg=-Xlinker",
-            "-Clink-arg=-oso_prefix",
-            "-Clink-arg=-Xlinker",
-        ]);
-        cmd.arg(format!("-Clink-arg={}/", stage_root.display()));
+    if is_apple_target(unit_platform) {
+        configure_darwin_link_output(
+            &mut cmd,
+            &stage_root,
+            debug_directory.is_some(),
+            crate_type,
+            crate_name,
+            ef16,
+        );
     }
     cmd.arg(format!("-Cmetadata={}", ctx.idents[uidx]));
     cmd.arg(format!("-Cextra-filename=-{ef16}"));
@@ -9261,13 +9421,6 @@ fn compile(
     // --extern proc_macro whenever the unit's target is a proc-macro.
     if crate_type == "proc-macro" || target.kind.iter().any(|k| k == "proc-macro") {
         cmd.arg("--extern").arg("proc_macro");
-    }
-    if crate_type == "proc-macro" && ctx.host.contains("apple") {
-        // ld64 defaults the dylib install name to the (temporary) output
-        // path; pin it to a deterministic value instead.
-        cmd.arg(format!(
-            "-Clink-arg=-Wl,-install_name,/dc/lib{crate_name}-{ef16}.dylib"
-        ));
     }
     for f in &spec.features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
@@ -9497,32 +9650,15 @@ fn build_script_environment<'a>(
     ));
     // Pinned macOS compilers remap native debug paths into the stable cache.
     // Other compilers still suppress debug info to avoid machine-local paths.
-    let native_debug = ctx.macos.iter().any(|runtime| runtime.platform == platform)
-        && unit.profile.debuginfo_flag() != "0";
+    let native_debug =
+        ctx.toolchain.darwin_runtime(&platform).is_some() && unit.profile.debuginfo_flag() != "0";
     env.push(("DEBUG".into(), native_debug.to_string()));
     env.push(("NUM_JOBS".into(), "4".into()));
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    for runtime in &ctx.macos {
-        if runtime.platform == platform {
-            env.extend(runtime.environment());
-        }
-        for (variable, tool) in [
-            ("CC", "cc"),
-            ("CXX", "c++"),
-            ("AR", "ar"),
-            ("RANLIB", "ranlib"),
-        ] {
-            let path = runtime.directory.join(tool).display().to_string();
-            env.push((
-                format!("{variable}_{}", runtime.platform.replace('-', "_")),
-                path.clone(),
-            ));
-            if runtime.platform == ctx.host {
-                env.push((format!("HOST_{variable}"), path));
-            }
-        }
+    if let ResolvedToolchain::ManagedDarwin(managed) = &ctx.toolchain {
+        env.extend(managed.build_script_environment(&platform, &ctx.host));
     }
     if platform != ctx.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
@@ -9543,11 +9679,6 @@ fn build_script_environment<'a>(
                 env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
             }
         }
-    }
-    // bindgen consumers load Corgi's pinned libclang from here rather than an
-    // ambient Xcode/CLT one, keeping the header parser matched to Corgi's Clang.
-    if let Some(path) = &ctx.libclang_path {
-        env.push(("LIBCLANG_PATH".into(), path.clone()));
     }
     // Cargo hands build scripts the rustflags of the unit they configure,
     // joined with the 0x1f separator.
@@ -9692,7 +9823,7 @@ fn run_build_script(
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::BuildScriptRun)?;
     let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
-    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes);
+    let mut cmd = sandboxed_command(ctx, &script_path.to_string_lossy(), &reads, &writes)?;
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
@@ -9996,38 +10127,212 @@ mod dep_info_tests {
     }
 }
 
-fn ensure_supported_build_platform(host_os: &str, sandbox_available: bool) -> Result<()> {
-    if host_os != "macos" {
-        bail!("corgi builds require macOS");
-    }
-    if !sandbox_available {
-        bail!("corgi builds require /usr/bin/sandbox-exec");
+/// Parallel compiler processes need more descriptors than some shells allow by default.
+fn raise_file_descriptor_limit() -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: Both calls receive a valid pointer to an initialized rlimit.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return Err(std::io::Error::last_os_error()).context("reading file descriptor limit");
+        }
+        let desired = limit.rlim_max.min(4096);
+        if limit.rlim_cur < desired {
+            limit.rlim_cur = desired;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("raising file descriptor limit");
+            }
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod build_platform_tests {
-    use super::ensure_supported_build_platform;
+    use super::{
+        configure_darwin_link_output, is_apple_target, HostPlatform, MacosRuntime,
+        ManagedDarwinToolchain, NativeToolchain, ResolvedToolchain, ToolchainSource,
+    };
+    use std::{path::Path, process::Command};
 
     #[test]
-    fn builds_reject_non_macos_hosts() {
+    fn apple_output_classification_includes_non_darwin_targets() {
+        for target in [
+            "aarch64-apple-darwin",
+            "aarch64-apple-ios",
+            "arm64_32-apple-watchos",
+        ] {
+            assert!(is_apple_target(target));
+        }
+        for target in ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"] {
+            assert!(!is_apple_target(target));
+        }
+    }
+
+    #[test]
+    fn darwin_link_output_keeps_debug_and_install_names_relocatable() {
+        let mut command = Command::new("rustc");
+        configure_darwin_link_output(
+            &mut command,
+            Path::new("/stage"),
+            true,
+            "bin",
+            "app",
+            "hash",
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
         assert_eq!(
-            ensure_supported_build_platform("linux", true)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require macOS"
+            arguments,
+            [
+                "-Csplit-debuginfo=unpacked",
+                "-Clink-arg=-Xlinker",
+                "-Clink-arg=-oso_prefix",
+                "-Clink-arg=-Xlinker",
+                "-Clink-arg=/stage/",
+            ]
+        );
+
+        let mut command = Command::new("rustc");
+        configure_darwin_link_output(
+            &mut command,
+            Path::new("/stage"),
+            false,
+            "proc-macro",
+            "derive",
+            "hash",
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-Clink-arg=-Wl,-install_name,/dc/libderive-hash.dylib"]
         );
     }
 
     #[test]
-    fn builds_require_the_macos_sandbox() {
+    fn host_detection_does_not_depend_on_toolchain_selection() {
+        assert_eq!(HostPlatform::from_os("linux").unwrap(), HostPlatform::Linux);
         assert_eq!(
-            ensure_supported_build_platform("macos", false)
-                .unwrap_err()
-                .to_string(),
-            "corgi builds require /usr/bin/sandbox-exec"
+            HostPlatform::from_os("macos").unwrap(),
+            HostPlatform::Darwin
         );
+        assert!(HostPlatform::from_os("windows").is_err());
+    }
+
+    #[test]
+    fn supplied_toolchains_are_supported_on_every_host() {
+        for host in [HostPlatform::Linux, HostPlatform::Darwin] {
+            assert!(host
+                .validate_toolchain_source(ToolchainSource::Supplied)
+                .is_ok());
+        }
+        assert!(HostPlatform::Darwin
+            .validate_toolchain_source(ToolchainSource::Managed)
+            .is_ok());
+        let error = HostPlatform::Linux
+            .validate_toolchain_source(ToolchainSource::Managed)
+            .unwrap_err();
+        assert!(error.to_string().contains("managed Linux toolchains"));
+    }
+
+    #[test]
+    fn managed_darwin_environment_scopes_host_and_target_tools() {
+        let host = "aarch64-apple-darwin";
+        let target = "x86_64-apple-darwin";
+        let managed = ManagedDarwinToolchain {
+            runtimes: vec![
+                darwin_runtime(host, "/host"),
+                darwin_runtime(target, "/target"),
+            ],
+            libclang_path: Some("/llvm/lib".into()),
+        };
+        for (platform, directory) in [(host, "/host"), (target, "/target")] {
+            let environment = managed
+                .build_script_environment(platform, host)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(environment["CC"], format!("{directory}/cc"));
+            assert_eq!(environment["SDKROOT"], format!("{directory}/sdk"));
+            assert_eq!(environment["HOST_CC"], "/host/cc");
+            assert_eq!(environment["CC_aarch64_apple_darwin"], "/host/cc");
+            assert_eq!(environment["CC_x86_64_apple_darwin"], "/target/cc");
+            assert_eq!(environment["LIBCLANG_PATH"], "/llvm/lib");
+        }
+        let environment = managed.build_script_environment("x86_64-unknown-linux-gnu", host);
+        assert!(!environment
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "CC" | "SDKROOT" | "PATH")));
+        let toolchain = ResolvedToolchain::ManagedDarwin(managed);
+        assert!(toolchain.supplied().is_none());
+        assert_eq!(
+            toolchain.darwin_runtime(target).unwrap().directory,
+            Path::new("/target")
+        );
+        assert!(toolchain
+            .darwin_runtime("x86_64-unknown-linux-gnu")
+            .is_none());
+    }
+
+    #[test]
+    fn managed_darwin_identity_preserves_the_cache_format() {
+        let toolchain = ResolvedToolchain::ManagedDarwin(ManagedDarwinToolchain {
+            runtimes: vec![
+                darwin_runtime("aarch64-apple-darwin", "/host"),
+                darwin_runtime("x86_64-apple-darwin", "/target"),
+            ],
+            libclang_path: None,
+        });
+        let (identity, report) = toolchain.identity("1.97.1", "cross-tools").unwrap();
+        assert_eq!(
+            identity,
+            format!(
+                "cc: zig clang {}\nld: Rust 1.97.1 Mach-O LLD\nsdk: {} {}\nzig: cross-tools\nmacos: /host,/target\nlibclang: ",
+                crate::zig::VERSION,
+                crate::macos::SDK_VERSION,
+                crate::macos::SDK_BUILD,
+            )
+        );
+        assert_eq!(report.ld, "Rust 1.97.1 Mach-O LLD");
+    }
+
+    #[test]
+    fn supplied_toolchains_have_no_managed_darwin_inputs() {
+        let toolchain = ResolvedToolchain::Supplied(NativeToolchain {
+            compiler: "/nix/store/clang/bin/clang".into(),
+            compiler_version: "clang version 21\n".into(),
+            environment: Vec::new(),
+            identity: "closure-hash".into(),
+            runtime_paths: Vec::new(),
+        });
+        assert!(toolchain.supplied().is_some());
+        assert!(toolchain.darwin_runtime("aarch64-apple-darwin").is_none());
+        let (identity, report) = toolchain.identity("1.97.1", "").unwrap();
+        assert_eq!(
+            identity,
+            "cc: clang version 21\nld: /nix/store/clang/bin/clang (native Clang link driver)\nsdk: supplied toolchain inputs closure-hash\nzig: \nmacos: \nlibclang: "
+        );
+        assert_eq!(report.sdk, "supplied toolchain inputs closure-hash");
+    }
+
+    fn darwin_runtime(platform: &str, directory: &str) -> MacosRuntime {
+        let directory = Path::new(directory);
+        MacosRuntime {
+            platform: platform.into(),
+            directory: directory.into(),
+            config: crate::macos::DriverConfig {
+                zig: "/zig".into(),
+                sdk: directory.join("sdk"),
+                metal: "/metal".into(),
+                linker: "/linker".into(),
+                dsymutil: "/dsymutil".into(),
+                compiler_rt: "/compiler-rt".into(),
+                arch: platform.split('-').next().unwrap().into(),
+                deployment_target: "14.0".into(),
+            },
+            bindgen_args: "-isysroot /sdk".into(),
+            identity: directory.display().to_string(),
+        }
     }
 }
 

@@ -247,6 +247,7 @@ dependencies = [
  "anyhow",
  "cargo-zigbuild",
  "clap",
+ "dirs",
  "glob",
  "jobserver",
  "libc",

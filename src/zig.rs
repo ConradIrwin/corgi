@@ -116,24 +116,6 @@ pub fn target_requires_zig(host: &str, target_name: &str) -> Result<bool> {
     Ok(target.rust != host || target_name != target.rust)
 }
 
-pub fn raise_file_descriptor_limit() -> Result<()> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: Both calls receive a valid pointer to an initialized rlimit.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return Err(std::io::Error::last_os_error()).context("reading file descriptor limit");
-        }
-        limit.rlim_cur = limit.rlim_max.min(4096);
-        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-            return Err(std::io::Error::last_os_error()).context("raising file descriptor limit");
-        }
-    }
-    Ok(())
-}
-
 pub fn is_linker_invocation(arguments: &[std::ffi::OsString]) -> bool {
     let executable_path = arguments.first().map(PathBuf::from);
     let executable = executable_path
