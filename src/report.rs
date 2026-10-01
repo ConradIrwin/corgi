@@ -304,6 +304,7 @@ pub struct CompileKeyInputs {
     pub cap_lints: bool,
     pub uses_toolchain: bool,
     pub compiler_identity: String,
+    pub profile_flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_binary: Option<String>,
 }
@@ -725,6 +726,7 @@ mod tests {
                     cap_lints: false,
                     uses_toolchain: true,
                     compiler_identity: "compiler".into(),
+                    profile_flags: vec!["-Cdebuginfo=0".into()],
                     debug_binary: None,
                 }))),
             },

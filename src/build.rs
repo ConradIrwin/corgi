@@ -240,7 +240,7 @@ fn is_debug_object(name: &str) -> bool {
 /// Under `check`, units outside every execution closure (build scripts,
 /// proc-macros) emit metadata only: they neither link nor produce rlibs.
 fn is_checked(ctx: &Ctx, idx: usize) -> bool {
-    ctx.check_mode.get(idx).copied().unwrap_or(false)
+    ctx.check_mode[idx]
 }
 
 fn is_pipelined(ctx: &Ctx, idx: usize) -> bool {
@@ -493,7 +493,7 @@ pub struct Ctx {
     /// it, N concurrent rustcs each assume they own every core.
     jobserver: jobserver::Client,
     /// Per-unit identity (16 hex chars): pkg, crate, kind, platform,
-    /// profile, features, dep identities — deliberately source-free, so
+    /// effective profile flags, features, dep identities — source-free, so
     /// -Cmetadata (symbol hashes) and -Cextra-filename are stable across
     /// edits and rustc's incremental state stays valid.
     idents: Vec<String>,
@@ -507,6 +507,9 @@ pub struct Ctx {
     report_unit_keys: Vec<String>,
     /// Under check: true for units that emit metadata only.
     check_mode: Vec<bool>,
+    /// Per-unit resolved rustc profile flags, shared by compiler identities,
+    /// action keys, and execution. Build-script runs have no compiler flags.
+    profile_flags: Vec<Vec<String>>,
     /// Per-package resolved lint flags (empty for non-members).
     lints: Vec<LintFlags>,
     /// Clippy mode: member checked units run clippy-driver.
@@ -1204,10 +1207,12 @@ fn compile_identity(ctx: &Ctx, uidx: usize) -> (String, String, String) {
     (crate_name, crate_type, source)
 }
 
-fn effective_profile_flags(ctx: &Ctx, uidx: usize) -> Vec<String> {
-    let unit = &ctx.units[uidx];
+fn effective_profile_flags(unit: &Unit, checked: bool) -> Vec<String> {
+    if matches!(unit.kind, Kind::Bsr) {
+        return Vec::new();
+    }
     let profile = &unit.profile;
-    let debuginfo = if is_checked(ctx, uidx) {
+    let debuginfo = if checked {
         "0".to_string()
     } else {
         profile.debuginfo_flag()
@@ -1318,8 +1323,9 @@ struct CompileActionSpec {
     platform: String,
     features: Vec<String>,
     dependencies: Vec<PlannedActionDependency>,
+    // Resolved compiler flags, not the name: dev/test and inherited profiles
+    // can compile the same unit identically.
     profile: Vec<String>,
-    profile_name: String,
     compiler_identity: String,
     environment: Vec<(String, String)>,
     rustflags: Vec<String>,
@@ -1740,8 +1746,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 platform,
                 features,
                 dependencies,
-                profile: effective_profile_flags(ctx, index),
-                profile_name: unit.profile.name.clone(),
+                profile: ctx.profile_flags[index].clone(),
                 compiler_identity: ctx.idents[index].clone(),
                 environment,
                 rustflags,
@@ -5152,69 +5157,10 @@ fn build_inner(
                 "debug".into()
             }
         });
-    let logical_pkg_ids = logical_package_ids(&meta)?;
-    // Source-free unit identities (memoized DFS over dep edges).
-    let idents: Vec<String> = {
-        let mut memo: Vec<Option<String>> = vec![None; units.len()];
-        fn ident_of(
-            i: usize,
-            units: &[Unit],
-            logical_pkg_ids: &[String],
-            memo: &mut Vec<Option<String>>,
-        ) -> String {
-            if let Some(v) = &memo[i] {
-                return v.clone();
-            }
-            let u = &units[i];
-            let mut dep_ids: Vec<String> = u
-                .deps
-                .iter()
-                .map(|d| ident_of(d.unit, units, logical_pkg_ids, memo))
-                .collect();
-            dep_ids.sort();
-            let mut features = u.features.clone();
-            features.sort();
-            let prof = &u.profile;
-            let mut ident_input = format!(
-                "ident\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{:?}\0{:?}",
-                TOOL_VERSION,
-                logical_pkg_ids[u.pkg],
-                u.target.name,
-                u.target.kind,
-                u.host,
-                prof.name,
-                prof.opt_level,
-                prof.debuginfo_flag(),
-                prof.codegen_units,
-                prof.panic,
-                prof.debug_assertions,
-                prof.overflow_checks,
-                features,
-                dep_ids
-            );
-            if matches!(u.kind, Kind::Test) && !u.test_harness {
-                ident_input.push_str("\0harness=false");
-            }
-            let ident = sha256_hex(ident_input.as_bytes())[..16].to_string();
-            memo[i] = Some(ident.clone());
-            ident
-        }
-        (0..units.len())
-            .map(|i| ident_of(i, &units, &logical_pkg_ids, &mut memo))
-            .collect()
-    };
-    // One-shot warnings for profile settings we deliberately don't honor.
-    if units.iter().any(|u| u.profile.lto_enabled()) {
-        eprintln!("corgi warning: profile requests lto; not supported yet, building without");
-    }
-    if units.iter().any(|u| u.profile.rpath) {
-        eprintln!("corgi warning: profile requests rpath; ignored");
-    }
-    warn_darwin_debug_settings(&units, &host, target.as_deref());
     // Under check, everything needed for *execution* (build scripts, their
     // runs, proc-macros) and their transitive closures still fully
     // compiles; the rest emits metadata only.
-    let mut check_mode: Vec<bool> = Vec::new();
+    let mut check_mode = vec![false; units.len()];
     if matches!(mode, Mode::Check | Mode::Clippy) {
         let mut codegen = vec![false; units.len()];
         let mut stack: Vec<usize> = (0..units.len())
@@ -5235,6 +5181,67 @@ fn build_inner(
         }
         check_mode = (0..units.len()).map(|i| !codegen[i]).collect();
     }
+    let logical_pkg_ids = logical_package_ids(&meta)?;
+    let profile_flags = units
+        .iter()
+        .enumerate()
+        .map(|(i, unit)| effective_profile_flags(unit, check_mode[i]))
+        .collect::<Vec<_>>();
+    // Source-free unit identities (memoized DFS over dep edges).
+    // Use the same resolved profile flags as the action key and rustc, so
+    // settings overridden for metadata-only compiles or tests do not split
+    // otherwise identical compiler identities.
+    let idents: Vec<String> = {
+        let mut memo: Vec<Option<String>> = vec![None; units.len()];
+        fn ident_of(
+            i: usize,
+            units: &[Unit],
+            logical_pkg_ids: &[String],
+            profile_flags: &[Vec<String>],
+            memo: &mut Vec<Option<String>>,
+        ) -> String {
+            if let Some(v) = &memo[i] {
+                return v.clone();
+            }
+            let u = &units[i];
+            let mut dep_ids: Vec<String> = u
+                .deps
+                .iter()
+                .map(|d| ident_of(d.unit, units, logical_pkg_ids, profile_flags, memo))
+                .collect();
+            dep_ids.sort();
+            let mut features = u.features.clone();
+            features.sort();
+            let mut ident_input = format!(
+                "ident\0{}\0{}\0{}\0{:?}\0{}\0{:?}\0{:?}\0{:?}",
+                TOOL_VERSION,
+                logical_pkg_ids[u.pkg],
+                u.target.name,
+                u.target.kind,
+                u.host,
+                profile_flags[i],
+                features,
+                dep_ids
+            );
+            if matches!(u.kind, Kind::Test) && !u.test_harness {
+                ident_input.push_str("\0harness=false");
+            }
+            let ident = sha256_hex(ident_input.as_bytes())[..16].to_string();
+            memo[i] = Some(ident.clone());
+            ident
+        }
+        (0..units.len())
+            .map(|i| ident_of(i, &units, &logical_pkg_ids, &profile_flags, &mut memo))
+            .collect()
+    };
+    // One-shot warnings for profile settings we deliberately don't honor.
+    if units.iter().any(|u| u.profile.lto_enabled()) {
+        eprintln!("corgi warning: profile requests lto; not supported yet, building without");
+    }
+    if units.iter().any(|u| u.profile.rpath) {
+        eprintln!("corgi warning: profile requests rpath; ignored");
+    }
+    warn_darwin_debug_settings(&units, &host, target.as_deref());
     finish_report_stage(&recorder, "plan", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
@@ -5506,6 +5513,7 @@ fn build_inner(
         logical_pkg_ids,
         report_unit_keys,
         check_mode,
+        profile_flags,
         lints,
         clippy: matches!(mode, Mode::Clippy),
         clippy_driver,
@@ -7610,6 +7618,7 @@ fn planned_report_key_inputs(
                     cap_lints: spec.cap_lints,
                     uses_toolchain: spec.toolchain.is_some(),
                     compiler_identity: spec.compiler_identity.clone(),
+                    profile_flags: spec.profile.clone(),
                     debug_binary: spec
                         .debug_binary
                         .as_ref()

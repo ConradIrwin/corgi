@@ -1247,6 +1247,132 @@ fn non_incremental_results_satisfy_incremental_actions() {
 }
 
 #[test]
+fn run_and_test_reuse_equivalent_compilation_units() {
+    let directory = TestDirectory::new("run-test-action-identity");
+    let workspace = directory.path.join("workspace");
+    write_read_set_workspace(&workspace);
+
+    for commands in [["run", "test"], ["test", "run"]] {
+        let store = directory.path.join(commands.join("-"));
+        let mut reports = Vec::new();
+        for command in commands {
+            let output = invoke_corgi_with_store(&workspace, command, ["--package", "app"], &store);
+            assert_success(&output, &format!("corgi {command}"));
+            reports.push(report_for_workspace(&store, &workspace));
+        }
+
+        for (package, action, target) in [
+            ("lib_a", "compile_build_script", "build-script-build"),
+            ("lib_a", "run_build_script", "build-script-build"),
+            ("lib_a", "compile", "lib_a"),
+            ("lib_b", "compile", "lib_b"),
+            ("app", "compile", "app"),
+        ] {
+            assert_unit_cache(&reports[0], package, action, target, "miss");
+            assert_unit_cache(&reports[1], package, action, target, "hit");
+            let first = report_unit(&reports[0], package, action);
+            let second = report_unit(&reports[1], package, action);
+            assert_ne!(first["profile"]["name"], second["profile"]["name"]);
+            assert_eq!(first["key"]["hash"], second["key"]["hash"]);
+        }
+    }
+}
+
+#[test]
+fn named_profiles_key_compilation_settings_not_names() {
+    let directory = TestDirectory::new("named-profile-action-identity");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [profile.dev]\ndebug = 2\n\
+             [profile.dev-copy]\ninherits = \"dev\"\n\
+             [profile.no-debug]\ninherits = \"dev\"\ndebug = 0\n\
+             [profile.optimized]\ninherits = \"dev\"\nopt-level = 1\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let package = directory.package_name.as_str();
+    let target = package.replace('-', "_");
+
+    let initial = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
+    assert_success(&initial, "corgi build with dev profile");
+    let initial_report = report_for_workspace(&store, &workspace);
+    let initial_unit = report_unit(&initial_report, package, "compile");
+
+    let equivalent = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        ["--workspace", "--profile", "dev-copy"],
+        &store,
+    );
+    assert_success(&equivalent, "corgi build with equivalent named profile");
+    let equivalent_report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(&equivalent_report, package, "compile", &target, "hit");
+    let equivalent_unit = report_unit(&equivalent_report, package, "compile");
+    assert_eq!(initial_unit["key"]["hash"], equivalent_unit["key"]["hash"]);
+    assert_eq!(equivalent_unit["profile"]["name"], "dev-copy");
+
+    let optimized = invoke_corgi_with_store(
+        &workspace,
+        "build",
+        ["--workspace", "--profile", "optimized"],
+        &store,
+    );
+    assert_success(
+        &optimized,
+        "corgi build with different optimization settings",
+    );
+    let optimized_report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(&optimized_report, package, "compile", &target, "miss");
+    let optimized_unit = report_unit(&optimized_report, package, "compile");
+    assert_ne!(initial_unit["key"]["hash"], optimized_unit["key"]["hash"]);
+    assert_ne!(
+        initial_unit["profile"]["opt_level"],
+        optimized_unit["profile"]["opt_level"]
+    );
+
+    // Debug settings are overridden by check, but still affect full compiles.
+    for (command, action, expected_cache) in
+        [("check", "check", "hit"), ("build", "compile", "miss")]
+    {
+        let initial = invoke_corgi_with_store(&workspace, command, ["--workspace"], &store);
+        assert_success(&initial, &format!("corgi {command} with debug info"));
+        let initial_report = report_for_workspace(&store, &workspace);
+
+        let no_debug = invoke_corgi_with_store(
+            &workspace,
+            command,
+            ["--workspace", "--profile", "no-debug"],
+            &store,
+        );
+        assert_success(&no_debug, &format!("corgi {command} without debug info"));
+        let no_debug_report = report_for_workspace(&store, &workspace);
+        assert_unit_cache(&no_debug_report, package, action, &target, expected_cache);
+        let initial_unit = report_unit(&initial_report, package, action);
+        let no_debug_unit = report_unit(&no_debug_report, package, action);
+        assert_eq!(initial_unit["profile"]["debuginfo"], 2);
+        assert_eq!(no_debug_unit["profile"]["debuginfo"], 0);
+        for field in ["compiler_identity", "profile_flags"] {
+            assert_eq!(
+                initial_unit["key"]["inputs"][field] == no_debug_unit["key"]["inputs"][field],
+                command == "check",
+                "{command}: unexpected equality for {field}"
+            );
+        }
+    }
+}
+
+#[test]
 fn local_compile_read_sets_isolate_package_targets() {
     let directory = TestDirectory::new("local-read-sets");
     let workspace = directory.path.join("workspace");
@@ -1321,6 +1447,65 @@ fn local_compile_read_sets_isolate_package_targets() {
         "hit",
     );
     assert_unit_cache(&report, "lib_a", "compile", "lib_a", "miss");
+    let script_identity = report_unit(&report, "lib_a", "compile_build_script")["key"]["inputs"]
+        ["compiler_identity"]
+        .clone();
+
+    let manifest = workspace.join("Cargo.toml");
+    let mut contents = fs::read_to_string(&manifest).unwrap();
+    // dev/test share the debug-map destination and build-script environment.
+    // Only the parent units' raw debug settings differ.
+    contents.push_str(
+        "\n[profile.dev]\ndebug = 2\n\
+         [profile.dev.build-override]\ndebug = 0\n\
+         [profile.test]\ndebug = 1\n\
+         [profile.test.build-override]\ndebug = 0\n\
+         [profile.codegen-debug]\ninherits = \"dev\"\n\
+         [profile.codegen-debug.build-override]\ndebug = 1\n",
+    );
+    fs::write(manifest, contents).unwrap();
+    let mut reports = Vec::new();
+    for profile in ["dev", "test"] {
+        let output = invoke_corgi_with_store(
+            &workspace,
+            "check",
+            ["--workspace", "--profile", profile],
+            &store,
+        );
+        assert_success(&output, &format!("corgi check with {profile} profile"));
+        reports.push(report_for_workspace(&store, &workspace));
+    }
+    for package in ["lib_a", "lib_b", "app"] {
+        assert_unit_cache(&reports[1], package, "check", package, "hit");
+        assert_eq!(
+            report_unit(&reports[0], package, "check")["key"]["hash"],
+            report_unit(&reports[1], package, "check")["key"]["hash"]
+        );
+    }
+    for action in ["compile_build_script", "run_build_script"] {
+        assert_unit_not_executed(&reports[1], "lib_a", action, "build-script-build");
+    }
+
+    // Execution dependencies still compile with their actual debug flags.
+    let codegen = invoke_corgi_with_store(
+        &workspace,
+        "check",
+        ["--workspace", "--profile", "codegen-debug"],
+        &store,
+    );
+    assert_success(&codegen, "corgi check with different codegen debug info");
+    let report = report_for_workspace(&store, &workspace);
+    assert_unit_cache(
+        &report,
+        "lib_a",
+        "compile_build_script",
+        "build-script-build",
+        "miss",
+    );
+    assert_ne!(
+        report_unit(&report, "lib_a", "compile_build_script")["key"]["inputs"]["compiler_identity"],
+        script_identity
+    );
 }
 
 #[test]
