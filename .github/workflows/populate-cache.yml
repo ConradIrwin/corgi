@@ -1,9 +1,6 @@
 name: Populate Corgi build cache
 
 on:
-  push:
-    branches:
-      - r2-cache-e2e
   workflow_dispatch:
     inputs:
       store-path:
@@ -24,7 +21,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     env:
-      CORGI_STORE: ${{ inputs.store-path || '/private/tmp/corgi-r2-e2e-45bf0e2' }}
+      CORGI_STORE: ${{ inputs.store-path }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -41,7 +38,7 @@ jobs:
           test "$(uname -m)" = arm64
           cargo build --locked --target-dir "$RUNNER_TEMP/corgi-bootstrap"
 
-      - name: Populate build and successful test results
+      - name: Populate build results
         env:
           CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
           CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
@@ -51,6 +48,14 @@ jobs:
           : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
           "$corgi" cache build --no-incremental
+
+      - name: Populate successful test results
+        env:
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
           "$corgi" cache test --no-incremental
 
       - name: Retain build reports
