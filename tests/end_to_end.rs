@@ -6,6 +6,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[path = "end_to_end/remote_cache.rs"]
+mod remote_cache;
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {

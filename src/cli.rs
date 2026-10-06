@@ -117,6 +117,12 @@ pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run normally, then publish successful results (including local hits)
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+
     /// Build the selected package
     #[command(visible_alias = "b")]
     Build(WorkspaceBuildArgs),
@@ -153,6 +159,23 @@ pub enum Command {
 
     /// Record this corgi version in corgi.toml
     Pin,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// Build and publish artifacts
+    Build(WorkspaceBuildArgs),
+    /// Build, run tests, and publish artifacts and successful test results
+    Test(TestArgs),
+}
+
+impl From<CacheCommand> for Command {
+    fn from(command: CacheCommand) -> Self {
+        match command {
+            CacheCommand::Build(args) => Self::Build(args),
+            CacheCommand::Test(args) => Self::Test(args),
+        }
+    }
 }
 
 #[derive(Debug, Args, Default)]
@@ -446,6 +469,43 @@ mod tests {
             panic!("test command not parsed");
         };
         assert_eq!(args.timeout, Some(15));
+    }
+
+    #[test]
+    fn cache_wraps_build_and_test_without_changing_their_arguments() {
+        let cli =
+            Cli::try_parse_from(["corgi", "cache", "build", "--release", "-p", "example"]).unwrap();
+        let Some(Command::Cache {
+            command: super::CacheCommand::Build(args),
+        }) = cli.command
+        else {
+            panic!("cache build not parsed");
+        };
+        assert!(args.build.release);
+        assert_eq!(args.build.packages, ["example"]);
+        let cli = Cli::try_parse_from([
+            "corgi",
+            "cache",
+            "test",
+            "--force",
+            "--timeout",
+            "5",
+            "parser",
+            "--",
+            "--ignored",
+        ])
+        .unwrap();
+        let Some(Command::Cache {
+            command: super::CacheCommand::Test(args),
+        }) = cli.command
+        else {
+            panic!("cache test not parsed");
+        };
+        assert!(args.force);
+        assert_eq!(args.timeout, Some(5));
+        assert_eq!(args.filters, ["parser"]);
+        assert_eq!(args.exec_args, ["--ignored"]);
+        assert!(Cli::try_parse_from(["corgi", "cache", "run"]).is_err());
     }
 
     #[test]

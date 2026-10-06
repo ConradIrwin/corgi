@@ -7,6 +7,7 @@ mod macos;
 mod meta;
 mod native_toolchain;
 mod out_dir_archive;
+mod remote;
 mod report;
 mod sandbox;
 mod self_update;
@@ -101,6 +102,10 @@ fn real_main() -> Result<()> {
         cli::Cli::command().print_help()?;
         return Ok(());
     };
+    let (command, publish_cache) = match command {
+        cli::Command::Cache { command } => (command.into(), true),
+        command => (command, false),
+    };
     // Default: the store lives at the machine-wide path, so embedded
     // OUT_DIR paths match on every machine. CORGI_STORE relocates it; a
     // relocated store embeds its own path instead.
@@ -147,6 +152,7 @@ fn real_main() -> Result<()> {
                     &dir,
                     build::BuildOpts {
                         verbose,
+                        publish_cache,
                         release: args.release,
                         profile: args.profile,
                         workspace,
@@ -275,7 +281,9 @@ fn real_main() -> Result<()> {
                 }
                 cli::Command::Fetch => build::fetch(store, &dir),
                 cli::Command::Clean(args) => build::clean(&store, args.cache, args.older_than),
-                cli::Command::Audit(_) | cli::Command::Pin => unreachable!(),
+                cli::Command::Audit(_) | cli::Command::Pin | cli::Command::Cache { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
