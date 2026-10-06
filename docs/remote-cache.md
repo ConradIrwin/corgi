@@ -62,6 +62,8 @@ non-destructive cold-cache check, dispatch it with a fresh absolute path and use
 that same canonical path as `CORGI_STORE` locally. This avoids moving or
 deleting the ordinary local cache. Both checkouts must use the same revision
 and equivalent Git origin URLs: origin contributes to local package identity.
+Independently built Corgi executables can share results when their cache-format
+and compiler-driver versions agree; executable bytes are not cache inputs.
 
 ## Identity and storage
 

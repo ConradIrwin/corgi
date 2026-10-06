@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Cache compatibility version, including the Corgi executable copied into tool wrappers.
+/// Bump when build or wrapper behavior changes invalidate cached outputs; executable
+/// bytes and installation paths deliberately do not participate in cache identity.
 const TOOL_VERSION: &str = "corgi/0.31";
 static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -2748,6 +2751,62 @@ fn pinned_macos_tool(
         .join(exported))
 }
 
+fn wrapper_identity(tool_version: &str, settings: impl Serialize) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&(tool_version, settings))?))
+}
+
+#[cfg(test)]
+mod wrapper_identity_tests {
+    use super::{wrapper_identity, TOOL_VERSION};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn cache_version_changes_wrapper_identity() {
+        for settings in tool_settings() {
+            assert_ne!(
+                wrapper_identity(TOOL_VERSION, &settings).unwrap(),
+                wrapper_identity("corgi/next-cache-version", &settings).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_setting_changes_wrapper_identity() {
+        for settings in tool_settings() {
+            let identity = wrapper_identity(TOOL_VERSION, &settings).unwrap();
+            for index in 0..settings.as_array().unwrap().len() {
+                let mut changed = settings.clone();
+                changed[index] = json!("changed");
+                assert_ne!(
+                    identity,
+                    wrapper_identity(TOOL_VERSION, changed).unwrap(),
+                    "setting {index} must participate in {settings}",
+                );
+            }
+        }
+    }
+
+    fn tool_settings() -> [Value; 2] {
+        [
+            json!([
+                b"serialized macOS driver configuration".as_slice(),
+                crate::macos::DRIVER_VERSION,
+                "zig-asset-sha256",
+                crate::macos::SDK_SHA256,
+                crate::METAL_XCODE_BUILD,
+                "linker-file-sha256",
+            ]),
+            json!([
+                crate::zig::VERSION,
+                crate::zig::DRIVER_VERSION,
+                "aarch64-macos",
+                "zig-asset-sha256",
+                "aarch64-linux-gnu",
+            ]),
+        ]
+    }
+}
+
 fn ensure_macos(
     store: &Store,
     host: &str,
@@ -2805,21 +2864,23 @@ fn ensure_macos(
         .collect::<Vec<_>>()
         .join(" ");
     let contents = serde_json::to_vec(&config)?;
-    let driver = std::env::current_exe()?.canonicalize()?;
-    let identity = sha256_hex(&serde_json::to_vec(&(
-        &contents,
-        crate::macos::DRIVER_VERSION,
-        asset.sha256,
-        crate::macos::SDK_SHA256,
-        crate::METAL_XCODE_BUILD,
-        crate::store::sha256_file(&config.linker)?,
-        crate::store::sha256_file(&driver)?,
-    ))?);
+    let identity = wrapper_identity(
+        TOOL_VERSION,
+        (
+            &contents,
+            crate::macos::DRIVER_VERSION,
+            asset.sha256,
+            crate::macos::SDK_SHA256,
+            crate::METAL_XCODE_BUILD,
+            crate::store::sha256_file(&config.linker)?,
+        ),
+    )?;
     let name = format!("macos-wrappers-{}", &identity[..16]);
     let directory = store.root.join("tools").join(&name);
     if !directory.join(crate::macos::CONFIG_FILE).exists() {
         let staging = store.tmp_path("macos-wrappers");
         fs::create_dir_all(&staging)?;
+        let driver = std::env::current_exe()?.canonicalize()?;
         fs::copy(driver, staging.join("driver"))?;
         for tool in crate::macos::WRAPPERS {
             std::os::unix::fs::symlink("driver", staging.join(tool))?;
@@ -2871,20 +2932,16 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
     let asset = crate::zig::asset(host)?;
     let zig_executable = ensure_zig_executable(store, host)?;
-    let driver_source = std::env::current_exe()?.canonicalize()?;
-    let driver_hash = crate::store::sha256_file(&driver_source)?;
-    let wrapper_identity = sha256_hex(
-        format!(
-            "{}\0{}\0{}\0{}\0{}\0{}",
+    let wrapper_identity = wrapper_identity(
+        TOOL_VERSION,
+        (
             crate::zig::VERSION,
             crate::zig::DRIVER_VERSION,
             asset.platform,
             asset.sha256,
-            target.zig,
-            driver_hash,
-        )
-        .as_bytes(),
-    );
+            &target.zig,
+        ),
+    )?;
     let wrapper_dir = store
         .root
         .join("tools")
@@ -2914,6 +2971,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
     if !wrapper_is_complete(&wrapper_dir) {
         let staging_dir = store.tmp_path("zig-wrappers");
         fs::create_dir_all(&staging_dir)?;
+        let driver_source = std::env::current_exe()?.canonicalize()?;
         fs::copy(&driver_source, staging_dir.join("driver"))?;
         for name in ["cc", "c++", "ar", "ranlib"] {
             std::os::unix::fs::symlink("driver", staging_dir.join(name))?;
