@@ -1,13 +1,13 @@
 # R2 action cache
 
-Pin the public read location in the project's `corgi.toml`. Readers need no
-credentials. These are example values; use your own bucket and public domain:
+The project's `corgi.toml` pins the public read location in Zed Industries.
+Readers need no credentials:
 
 ```toml
 [cache]
-read-url = "https://corgi-cache.example.com"
-endpoint = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
-bucket = "corgi-cache"
+read-url = "https://pub-cf9929c86d0144829e53d5e9f66d3060.r2.dev"
+endpoint = "https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com"
+bucket = "corgi-build-cache"
 ```
 
 `read-url` is the public bucket root, without the versioned prefix.
@@ -51,6 +51,18 @@ Supply write credentials through the publisher's secret environment:
 The transport uses curl's AWS SigV4 support (`aws:amz:auto:s3`). Credentials are
 sent to curl on stdin, not command-line arguments or committed configuration.
 
+The **Populate Corgi build cache** GitHub Actions workflow runs only on manual
+dispatch. Configure the two variables above as repository Actions secrets using
+an R2 **Object Read & Write** token scoped only to `corgi-build-cache`. The job
+bootstraps Corgi from its checkout, then runs `cache build` and `cache test`
+without changing the package version or publishing a release.
+
+The workflow's `store-path` input defaults to `/Users/Shared/corgi`. For a
+non-destructive cold-cache check, dispatch it with a fresh absolute path and use
+that same canonical path as `CORGI_STORE` locally. This avoids moving or
+deleting the ordinary local cache. Both checkouts must use the same revision
+and equivalent Git origin URLs: origin contributes to local package identity.
+
 ## Identity and storage
 
 Remote keys conservatively hash complete package source trees (relative paths
@@ -89,3 +101,8 @@ this policy, touch remote objects to extend their lifetime, or run a remote
 garbage-collection service. A record can outlive one of its blobs; readers
 treat that as a miss and publishers repair the missing blob without rewriting
 the record.
+
+The `corgi-build-cache` bucket has the `expire-after-30-days` lifecycle rule,
+enabled for every object prefix. The bucket's default incomplete multipart
+upload cleanup rule is separate and does not refresh or expire completed
+cache objects.

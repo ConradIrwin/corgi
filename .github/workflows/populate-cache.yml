@@ -1,0 +1,59 @@
+name: Populate Corgi build cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      store-path:
+        description: "Canonical store path (override for an isolated CI/local verification)"
+        required: true
+        default: /Users/Shared/corgi
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corgi-build-cache
+  cancel-in-progress: false
+
+jobs:
+  populate:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CORGI_STORE: ${{ inputs.store-path }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Build the cache publisher with the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cargo build --locked --target-dir "$RUNNER_TEMP/corgi-bootstrap"
+
+      - name: Populate build and successful test results
+        env:
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CORGI_R2_ACCESS_KEY_ID:?Configure the bucket-scoped R2 access key}"
+          : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
+          corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
+          "$corgi" cache build --no-incremental
+          "$corgi" cache test --no-incremental
+
+      - name: Retain build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corgi-cache-reports
+          path: ${{ inputs.store-path }}/reports/*.json
+          if-no-files-found: ignore
