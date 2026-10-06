@@ -1,6 +1,9 @@
 name: Populate Corgi build cache
 
 on:
+  push:
+    branches:
+      - r2-cache-e2e
   workflow_dispatch:
     inputs:
       store-path:
@@ -21,7 +24,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     env:
-      CORGI_STORE: ${{ inputs.store-path }}
+      CORGI_STORE: ${{ inputs.store-path || '/private/tmp/corgi-r2-e2e-45bf0e2' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -55,5 +58,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: corgi-cache-reports
-          path: ${{ inputs.store-path }}/reports/*.json
+          path: ${{ env.CORGI_STORE }}/reports/*.json
           if-no-files-found: ignore
