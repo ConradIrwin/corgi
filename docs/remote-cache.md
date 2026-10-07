@@ -67,9 +67,22 @@ and compiler-driver versions agree; executable bytes are not cache inputs.
 
 ## Identity and storage
 
-Remote keys conservatively hash complete package source trees (relative paths
-and contents), declared inputs, action configuration, and dependency remote
-keys. They are computed before compiling dependencies. Result records retain
+For local packages, remote keys hash the entire Rust source set enumerated for
+the compiler sandbox (relative paths and contents), rather than the whole
+package directory. They also include manifests, declared inputs, action
+configuration, and dependency remote keys. Unrelated non-Rust files, such as
+documentation or generated fixture executables, do not affect these keys unless
+declared as inputs. Registry/Git packages retain whole-package hashing because
+their actions may read their entire package.
+
+Source enumeration is unchanged: it recursively includes `.rs` files beneath
+the package root, excluding `.git` and the root's `target` directory. There is no
+new nested-package boundary or Git-ignore filtering. A permitted but unread
+Rust file still affects the remote key; its contents need not affect the precise
+local key. Local keys retain their source-layout guard for additions/removals,
+verified read sets, and precise dependency identities.
+
+Remote keys are computed before compiling dependencies. Result records retain
 the producer's precise local action key, read set, and dependency identities.
 Imports install local action records and manifests plus a local association
 with the remote key, so subsequent builds do not need remote discovery.

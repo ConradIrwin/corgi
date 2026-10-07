@@ -65,8 +65,9 @@ fn make_record(ctx: &Ctx, index: usize, action: &ResolvedAction, result: ActionR
 }
 
 pub(super) fn compute_keys(ctx: &Ctx) -> Result<Vec<String>> {
-    // Hash the full source tree, not a previously discovered read set.
-    // External declared inputs are already hashed in the action template.
+    // Local compiles can read the enumerated Rust sources, not arbitrary files
+    // in the package directory. Hash that entire set, not a learned read set.
+    // Manifests and declared inputs are already hashed in the action template.
     let mut sources = HashMap::new();
     for unit in &ctx.units {
         if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(unit.pkg) {
@@ -74,13 +75,10 @@ pub(super) fn compute_keys(ctx: &Ctx) -> Result<Vec<String>> {
             let hash = if package.source.is_some() {
                 ctx.immutable_source_hash(unit.pkg)?
             } else {
-                // Tree hashing records symlink targets. Also hash the bytes of
-                // permitted Rust inputs, including files reached through links.
-                sha256_hex(&serde_json::to_vec(&(
-                    ctx.store.hash_dir_cached(&package.root(), None)?,
-                    ctx.store
-                        .hash_file_set_cached(&package.root(), &ctx.source_files_for(unit.pkg)?)?,
-                ))?)
+                sha256_hex(&serde_json::to_vec(&ctx.store.hash_file_set_cached(
+                    &package.root(),
+                    &ctx.source_files_for(unit.pkg)?,
+                )?)?)
             };
             entry.insert(hash);
         }

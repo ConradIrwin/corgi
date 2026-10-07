@@ -417,11 +417,68 @@ fn remote_cache_publishes_local_hits_and_dependency_closure_and_repairs_blobs() 
         );
     }
     assert!(state.requests.contains(&("PUT".into(), blob)));
-    drop(state);
+}
 
-    // This file is outside rustc's precise read set, but inside the package
-    // tree used for conservative remote identities.
-    fs::write(workspace.join("unused.txt"), "not consumed by rustc").unwrap();
+#[test]
+fn remote_cache_keys_follow_permitted_inputs_without_broadening_local_keys() {
+    let directory = TestDirectory::new("remote-inputs");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    fs::write(
+        workspace.join("src/unused.rs"),
+        "pub const UNUSED: u32 = 1;\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("declared.txt"), "initial declared input").unwrap();
+    let config = workspace.join("corgi.toml");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str("[extra-inputs]\nremote_dependency = [\"../declared.txt\"]\n");
+    fs::write(config, contents).unwrap();
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let (_, original) = root_record(&server, &directory.package_name);
+    let original_records = server.records();
+
+    // These files are not compiler inputs, including the nested fixture output
+    // that caused a real CI/local remote-key mismatch.
+    let unrelated = [
+        workspace.join("notes.md"),
+        workspace.join("tests/fixtures/other/target/debug/app"),
+    ];
+    for path in &unrelated {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
+    for content in [Some("new non-input"), Some("changed non-input"), None] {
+        for path in &unrelated {
+            if let Some(content) = content {
+                fs::write(path, content).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        server.reset_requests();
+        remote_run(&workspace, &store, &["cache", "build"]);
+        assert_unit_cache(
+            &report_for_workspace(&store, &workspace),
+            &directory.package_name,
+            "compile",
+            &directory.package_name,
+            "hit",
+        );
+        assert_eq!(server.records(), original_records);
+        assert!(
+            server.requests().iter().all(|(method, _)| method != "PUT"),
+            "non-input changes must not publish new remote results"
+        );
+    }
+
+    // Changing an existing unread Rust file preserves the local read-set key,
+    // but changes the remote key without learning another read set.
+    fs::write(
+        workspace.join("src/unused.rs"),
+        "pub const UNUSED: u32 = 123;\n",
+    )
+    .unwrap();
     server.reset_requests();
     remote_run(&workspace, &store, &["cache", "build"]);
     assert_unit_cache(
@@ -431,13 +488,48 @@ fn remote_cache_publishes_local_hits_and_dependency_closure_and_repairs_blobs() 
         &directory.package_name,
         "hit",
     );
+    let published_root = || {
+        server
+            .records()
+            .into_iter()
+            .find(|(path, record)| {
+                record["spec"]["target"]["name"] == directory.package_name
+                    && server.requests().contains(&("PUT".into(), path.clone()))
+            })
+            .expect("new root record published")
+            .1
+    };
+    let unread_edit = published_root();
+    assert_eq!(unread_edit["action_key"], original["action_key"]);
+    assert_ne!(unread_edit["remote_key"], original["remote_key"]);
+
+    // Declared inputs outside a dependency's directory are still keyed, and
+    // that dependency's remote identity must propagate to its consumer.
+    fs::write(workspace.join("declared.txt"), "changed declared input").unwrap();
+    server.reset_requests();
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let declared_edit = published_root();
+    assert_ne!(declared_edit["action_key"], unread_edit["action_key"]);
+    assert_ne!(declared_edit["remote_key"], unread_edit["remote_key"]);
+
+    // Adding a source path retains the existing local source-layout guard.
+    fs::write(
+        workspace.join("src/another.rs"),
+        "pub const ANOTHER: u32 = 0;\n",
+    )
+    .unwrap();
+    server.reset_requests();
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let added_source = published_root();
+    assert_ne!(added_source["action_key"], declared_edit["action_key"]);
+    assert_ne!(added_source["remote_key"], declared_edit["remote_key"]);
     assert!(
-        server.records().iter().any(|(path, record)| {
-            record["action_key"] == root["action_key"]
-                && record["remote_key"] != root["remote_key"]
-                && server.requests().contains(&("PUT".into(), path.clone()))
-        }),
-        "full-tree changes must publish a new remote key without changing precise local identity"
+        added_source["spec"]["read_set"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| { file[0] != "src/unused.rs" && file[0] != "src/another.rs" }),
+        "precise read sets must not grow to include unread sources"
     );
 }
 
