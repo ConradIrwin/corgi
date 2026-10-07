@@ -43,6 +43,15 @@ exit status. Successful actions from an otherwise failed build/test invocation
 can still be published. Only canonical, unfiltered successful test runs are
 cached, matching the local test cache; `test --force` bypasses cached passes.
 
+For a canonical `corgi test`, pass records are fetched before artifact records,
+while local compilation continues. A valid pass at the requested remote input
+key satisfies that test root immediately: its executable need not be built,
+downloaded, or exported. Queued dependencies and runtime binaries needed only
+by satisfied tests are pruned; running compilers finish normally, and work
+shared with other roots remains required. Imported passes are stored locally
+under their remote keys, not under the records' claimed precise identities.
+`--force`, `--no-run`, filters, and harness arguments bypass this shortcut.
+
 Supply write credentials through the publisher's secret environment:
 
 - `CORGI_R2_ACCESS_KEY_ID`

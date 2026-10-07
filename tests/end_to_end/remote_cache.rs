@@ -318,6 +318,7 @@ os.execvp(tool, [tool, *args])
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     std::fs::write(out.join("remote-test-running"), "started").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(3));
+    std::fs::write(out.join("remote-test-finished"), "finished").unwrap();
     println!("cargo::rustc-env=REMOTE_SCRIPT_FINISHED=yes");
 }
 "#,
@@ -766,8 +767,13 @@ fn remote_cache_upload_failure_is_strict_but_ordinary_read_outage_is_a_miss() {
 fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
     let directory = TestDirectory::new("remote-pass");
     let server = HttpCache::new();
-    let workspace = remote_fixture(&directory, &server, false);
+    let workspace = remote_fixture(&directory, &server, true);
     let store = directory.path.join("store");
+    fs::rename(
+        workspace.join("build.rs"),
+        workspace.join("dependency/build.rs"),
+    )
+    .unwrap();
     let marker = directory.path.join("test-ran");
     fs::write(
         workspace.join("src/main.rs"),
@@ -785,6 +791,11 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
         output
     };
     invoke(&["test"]);
+    let precise_key = report_for_workspace(&store, &workspace)["test_harnesses"][0]["cache"]
+        ["pass_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(marker.exists());
     fs::remove_file(&marker).unwrap();
     invoke(&["cache", "test"]);
@@ -792,34 +803,126 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
         !marker.exists(),
         "cache test must publish an existing local pass"
     );
-    assert!(
-        server.records().iter().any(|(_, record)| {
-            record["harness_action"].is_string()
-                && record["result"]["passed"] == true
-                && record["blobs"].as_array().is_some_and(Vec::is_empty)
-        }),
-        "publish a pass record as well as the harness"
-    );
+    let (pass_path, mut pass) = remote_pass_record(&server);
+    assert_eq!(pass["result"]["passed"], true);
+    assert_eq!(pass["result"]["test_count"], 1);
+    assert_eq!(pass["blobs"], serde_json::json!([]));
+    let (harness_path, harness_record) = server
+        .records()
+        .into_iter()
+        .find(|(_, record)| record["action_key"] == pass["harness_action"])
+        .expect("uploaded harness action");
+    // Producer action metadata is not authority to create a precise local pass.
+    pass["harness_action"] = serde_json::json!("f".repeat(64));
+    retain_remote_pass(&server, &pass_path, &pass);
     clear_local_results(&directory, &store, &workspace);
+    {
+        let mut state = server.objects.lock().unwrap();
+        state.gated.insert(pass_path.clone());
+        state.marker_root = Some(store.join("outdirs"));
+    }
+    server.reset_requests();
     let output = invoke(&["test"]);
     assert!(
         !marker.exists(),
         "a restored test pass must not execute the harness"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("1 tests passed (cached)"));
+    assert_eq!(server.objects.lock().unwrap().gates_released, 1);
+    let report = report_for_workspace(&store, &workspace);
+    assert_eq!(
+        report["test_harnesses"][0]["cache"]["pass_key"],
+        pass["remote_key"]
+    );
+    assert_eq!(report["test_harnesses"][0]["cache"]["result"], "hit");
+    assert_unit_cache(
+        &report,
+        "remote_dependency",
+        "run_build_script",
+        "build-script-build",
+        "miss",
+    );
+    assert_pruned_target(&report, "remote_dependency", "remote_dependency");
+    assert_pruned_target(&report, &directory.package_name, &directory.package_name);
+    assert!(
+        fs::read_dir(store.join("outdirs")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .join("out/remote-test-finished")
+                .is_file()
+        }),
+        "the already running script must finish, not be cancelled"
+    );
+    assert_no_test_artifacts(&workspace);
+    assert!(server
+        .requests()
+        .contains(&("GET".into(), pass_path.clone())));
+    assert!(!server
+        .requests()
+        .contains(&("GET".into(), harness_path.clone())));
+    assert_eq!(server.requests(), vec![("GET".into(), pass_path.clone())]);
+    let alias = local_action_path(&store, pass["remote_key"].as_str().unwrap());
+    let imported: serde_json::Value = serde_json::from_slice(&fs::read(&alias).unwrap()).unwrap();
+    assert_eq!(
+        imported, pass,
+        "persist the validated record at its requested remote key"
+    );
+    assert!(!local_action_path(&store, &precise_key).exists());
+    assert!(
+        local_action_records(&store)
+            .iter()
+            .all(|record| record.get("passed").is_none()),
+        "untrusted harness_action must never manufacture a precise test pass"
+    );
 
-    // Remove only the remote pass, retaining the harness and the imported
-    // local pass. A failed forced rerun must invalidate that historical pass,
-    // not republish it or let the next invocation claim a cached success.
-    let pass_paths: Vec<_> = server
-        .records()
-        .into_iter()
-        .filter(|(_, record)| record["harness_action"].is_string())
-        .map(|(path, _)| path)
-        .collect();
-    for path in &pass_paths {
-        server.objects.lock().unwrap().bytes.remove(path);
+    server.reset_requests();
+    invoke(&["test"]);
+    assert!(
+        server.requests().is_empty(),
+        "warm remote pass alias must need zero GETs"
+    );
+    assert!(!marker.exists());
+    assert_no_test_artifacts(&workspace);
+    let report = report_for_workspace(&store, &workspace);
+    assert_eq!(
+        report["test_harnesses"][0]["cache"]["pass_key"],
+        pass["remote_key"]
+    );
+    assert!(report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|unit| unit["outcome"]["status"] == "skipped"));
+
+    // A pass-only root remains publishable with missing artifact blobs or a
+    // deserializable but invalid alias, without any precise manifest.
+    server.objects.lock().unwrap().gated.clear();
+    clear_local_results(&directory, &store, &workspace);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::write(&alias, serde_json::to_vec(&pass).unwrap()).unwrap();
+    let stale_alias = store
+        .join("remote-actions/corgi/v1")
+        .join(harness_path.rsplit('/').next().unwrap());
+    fs::create_dir_all(stale_alias.parent().unwrap()).unwrap();
+    let mut invalid_record = harness_record.clone();
+    invalid_record["action_key"] = serde_json::json!("0".repeat(64));
+    for record in [harness_record, invalid_record] {
+        fs::write(&stale_alias, serde_json::to_vec(&record).unwrap()).unwrap();
+        server.objects.lock().unwrap().bytes.clear();
+        invoke(&["cache", "test"]);
+        assert!(!marker.exists());
+        assert_no_test_artifacts(&workspace);
+        assert_eq!(
+            remote_pass_record(&server),
+            (pass_path.clone(), pass.clone())
+        );
+        assert_eq!(server.objects.lock().unwrap().bytes.len(), 1);
     }
+
+    // A failed forced rerun must invalidate the imported REMOTE alias, not
+    // republish it or let the next invocation claim a cached success.
+    server.objects.lock().unwrap().bytes.clear();
     for arguments in [&["cache", "test", "--force"][..], &["cache", "test"][..]] {
         let output = remote_command(&workspace, &store, arguments)
             .env("CORGI_TEST_MARKER", &marker)
@@ -832,11 +935,258 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
         );
         assert!(marker.exists(), "the failing test must actually execute");
         fs::remove_file(&marker).unwrap();
-        assert!(pass_paths.iter().all(|path| !server
+        assert!(
+            !alias.exists(),
+            "failed execution must remove the remote pass alias"
+        );
+        assert!(!server
             .objects
             .lock()
             .unwrap()
             .bytes
-            .contains_key(path)));
+            .contains_key(&pass_path));
     }
+}
+
+#[test]
+fn remote_cache_test_pass_shortcut_is_bypassed_by_noncanonical_invocations() {
+    let directory = TestDirectory::new("remote-pass-bypass");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    let marker = directory.path.join("test-ran");
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() {}\n#[test] fn passes() { std::fs::write(std::env::var(\"CORGI_TEST_MARKER\").unwrap(), \"ran\").unwrap(); }\n",
+    ).unwrap();
+    let invoke = |arguments: &[&str]| {
+        let output = remote_command(&workspace, &store, arguments)
+            .env("CORGI_TEST_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert_success(&output, "noncanonical test invocation");
+    };
+    invoke(&["cache", "test"]);
+    let (path, pass) = remote_pass_record(&server);
+    retain_remote_pass(&server, &path, &pass);
+    for arguments in [
+        &["test", "--force"][..],
+        &["test", "^passes$"][..],
+        &["test", "--", "--test-threads=1"][..],
+        &["test", "--no-run"][..],
+    ] {
+        clear_local_results(&directory, &store, &workspace);
+        fs::remove_file(&marker).unwrap();
+        server.reset_requests();
+        invoke(arguments);
+        let no_run = arguments.contains(&"--no-run");
+        assert_eq!(marker.exists(), !no_run, "{arguments:?}");
+        let report = report_for_workspace(&store, &workspace);
+        assert_unit_cache(
+            &report,
+            &directory.package_name,
+            "compile_test",
+            &directory.package_name,
+            "miss",
+        );
+        assert!(
+            !server.requests().contains(&("GET".into(), path.clone())),
+            "must not probe a pass for {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_cache_invalid_test_pass_records_are_misses() {
+    let directory = TestDirectory::new("remote-pass-invalid");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    let marker = directory.path.join("test-ran");
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() {}\n#[test] fn passes() { std::fs::write(std::env::var(\"CORGI_TEST_MARKER\").unwrap(), \"ran\").unwrap(); }\n",
+    ).unwrap();
+    let invoke = |arguments: &[&str]| {
+        let output = remote_command(&workspace, &store, arguments)
+            .env("CORGI_TEST_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert_success(&output, "invalid remote pass falls back to execution");
+    };
+    invoke(&["cache", "test"]);
+    let (path, pass) = remote_pass_record(&server);
+    for (field, value) in [
+        ("remote_key", serde_json::json!("0".repeat(64))),
+        (
+            "result",
+            serde_json::json!({"passed": false, "test_count": 1}),
+        ),
+        ("blobs", serde_json::json!(["a".repeat(64)])),
+    ] {
+        let mut invalid = pass.clone();
+        invalid[field] = value;
+        retain_remote_pass(&server, &path, &invalid);
+        clear_local_results(&directory, &store, &workspace);
+        fs::remove_file(&marker).unwrap();
+        server.reset_requests();
+        invoke(&["test"]);
+        assert!(marker.exists(), "invalid {field} must run tests");
+        assert!(server.requests().contains(&("GET".into(), path.clone())));
+        let report = report_for_workspace(&store, &workspace);
+        assert_eq!(
+            report["test_harnesses"][0]["cache"]["result"], "miss",
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn remote_cache_test_pass_prunes_runtime_binaries_only_when_no_other_root_needs_them() {
+    let directory = TestDirectory::new("remote-pass-shared");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, true);
+    let store = directory.path.join("store");
+    fs::rename(
+        workspace.join("build.rs"),
+        workspace.join("dependency/build.rs"),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = {:?}\nversion = \"0.1.0\"\nedition = \"2024\"\nautotests = false\n\
+         [dependencies]\nremote_dependency = {{ path = \"dependency\" }}\n\
+         [[bin]]\nname = \"app\"\npath = \"src/main.rs\"\ntest = false\n\
+         [[test]]\nname = \"cached\"\npath = \"tests/cached.rs\"\n\
+         [[test]]\nname = \"uncached\"\npath = \"tests/uncached.rs\"\n\
+         [[test]]\nname = \"opaque\"\npath = \"tests/opaque.rs\"\nharness = false\n",
+            directory.package_name,
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("tests")).unwrap();
+    fs::write(workspace.join("tests/cached.rs"),
+        "#[test] fn passes() { assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file()); std::fs::write(\"cached-ran\", \"ran\").unwrap(); }\n",
+    ).unwrap();
+    fs::write(workspace.join("tests/uncached.rs"),
+        "#[test] fn passes() { assert_eq!(remote_dependency::value(), 42); let output = std::process::Command::new(env!(\"CARGO_BIN_EXE_app\")).output().unwrap(); assert!(output.status.success()); assert_eq!(output.stdout, b\"42\\n\"); std::fs::write(\"uncached-ran\", \"ran\").unwrap(); }\n",
+    ).unwrap();
+    fs::write(workspace.join("tests/opaque.rs"),
+        "fn main() { assert_eq!(remote_dependency::value(), 42); assert!(std::process::Command::new(env!(\"CARGO_BIN_EXE_app\")).status().unwrap().success()); std::fs::write(\"opaque-ran\", \"ran\").unwrap(); }\n",
+    ).unwrap();
+    remote_run(&workspace, &store, &["cache", "test", "--test", "cached"]);
+    let (path, pass) = remote_pass_record(&server);
+    retain_remote_pass(&server, &path, &pass);
+    for mixed in [false, true] {
+        clear_local_results(&directory, &store, &workspace);
+        for name in ["cached-ran", "uncached-ran", "opaque-ran"] {
+            let marker = workspace.join(name);
+            if marker.exists() {
+                fs::remove_file(marker).unwrap();
+            }
+        }
+        {
+            let mut state = server.objects.lock().unwrap();
+            state.gated.insert(path.clone());
+            state.marker_root = Some(store.join("outdirs"));
+            state.gates_released = 0;
+        }
+        server.reset_requests();
+        let arguments = if mixed {
+            &["test"][..]
+        } else {
+            &["test", "--test", "cached"][..]
+        };
+        remote_run(&workspace, &store, arguments);
+        assert_eq!(server.objects.lock().unwrap().gates_released, 1);
+        assert!(!workspace.join("cached-ran").exists());
+        assert_eq!(workspace.join("uncached-ran").exists(), mixed);
+        assert_eq!(workspace.join("opaque-ran").exists(), mixed);
+        let report = report_for_workspace(&store, &workspace);
+        assert_pruned_target(&report, &directory.package_name, "cached");
+        if mixed {
+            assert_unit_cache(
+                &report,
+                "remote_dependency",
+                "compile",
+                "remote_dependency",
+                "miss",
+            );
+            assert_unit_cache(&report, &directory.package_name, "compile", "app", "miss");
+            for target in ["uncached", "opaque"] {
+                assert_unit_cache(
+                    &report,
+                    &directory.package_name,
+                    "compile_test",
+                    target,
+                    "miss",
+                );
+            }
+        } else {
+            assert_pruned_target(&report, "remote_dependency", "remote_dependency");
+            assert_pruned_target(&report, &directory.package_name, "app");
+            assert!(!workspace
+                .join("target/debug")
+                .join(executable_name("app"))
+                .exists());
+            assert_no_test_artifacts(&workspace);
+        }
+    }
+}
+
+fn remote_pass_record(server: &HttpCache) -> (String, serde_json::Value) {
+    let mut records = server
+        .records()
+        .into_iter()
+        .filter(|(_, record)| record["harness_action"].is_string());
+    let record = records.next().expect("uploaded test pass record");
+    assert!(
+        records.next().is_none(),
+        "fixture should have one test harness"
+    );
+    record
+}
+
+fn retain_remote_pass(server: &HttpCache, path: &str, record: &serde_json::Value) {
+    let mut state = server.objects.lock().unwrap();
+    state.bytes.clear();
+    state
+        .bytes
+        .insert(path.to_owned(), serde_json::to_vec(record).unwrap());
+}
+
+fn local_action_path(store: &Path, key: &str) -> PathBuf {
+    store
+        .join("cache")
+        .join(&key[..2])
+        .join(format!("{key}.json"))
+}
+
+fn local_action_records(store: &Path) -> Vec<serde_json::Value> {
+    fs::read_dir(store.join("cache"))
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().is_dir())
+        .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
+        .filter_map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).ok())
+        .collect()
+}
+
+fn assert_no_test_artifacts(workspace: &Path) {
+    let deps = workspace.join("target/debug/deps");
+    assert!(
+        !deps.exists() || fs::read_dir(deps).unwrap().next().is_none(),
+        "a pass-only hit must not export its harness or dependencies"
+    );
+}
+
+fn assert_pruned_target(report: &serde_json::Value, package: &str, target: &str) {
+    let unit = report["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["package"]["name"] == package && unit["target"]["name"] == target)
+        .expect("planned target");
+    assert_eq!(unit["outcome"]["status"], "skipped", "{unit:#}");
+    assert_eq!(unit["outputs"], serde_json::json!([]), "{unit:#}");
 }

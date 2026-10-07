@@ -379,7 +379,8 @@ struct UnitResult {
 struct TestHarness {
     unit_id: usize,
     name: String,
-    path: PathBuf,
+    /// A cached test result does not require an executable to be materialized.
+    path: Option<PathBuf>,
     cwd: PathBuf,
     binary_environment: Vec<(String, String)>,
     pass_key: String,
@@ -1958,7 +1959,7 @@ struct TestPassKey<'a> {
     harness_action: &'a str,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TestPass {
     passed: bool,
     test_count: u64,
@@ -5623,8 +5624,10 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "build");
     let results: Vec<OnceLock<UnitResult>> =
         (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
+    let cached_test_passes: Vec<OnceLock<remote_cache::PassRecord>> =
+        (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let build_result = (|| -> Result<()> {
-        let (executed, cached) = schedule(&ctx, &results)?;
+        let (executed, cached) = schedule(&ctx, &results, &cached_test_passes)?;
         recorder.update(|report| {
             report.counters.source_hash_ns = ctx.src_hash_nanos.load(Ordering::Relaxed)
         });
@@ -5653,6 +5656,22 @@ fn build_inner(
             let canonical_run = test_filters.is_empty() && exec_args.is_empty();
             for (i, u) in ctx.units.iter().enumerate() {
                 if !matches!(u.kind, Kind::Test) || !u.is_root {
+                    continue;
+                }
+                if let Some(pass) = cached_test_passes[i].get() {
+                    test_harnesses.push(TestHarness {
+                        unit_id: i,
+                        name: u.target.name.clone(),
+                        path: None,
+                        cwd: ctx.meta.packages[u.pkg].root(),
+                        binary_environment: Vec::new(),
+                        pass_key: pass.key().to_string(),
+                        cached_pass: true,
+                        cached_test_count: pass.test_count(),
+                        cache_bypassed: false,
+                        discovery_ns: 0,
+                        tests: Vec::new(),
+                    });
                     continue;
                 }
                 let r = results[i].get().context("test harness not built")?;
@@ -5687,7 +5706,7 @@ fn build_inner(
                         test_harnesses.push(TestHarness {
                             unit_id: i,
                             name,
-                            path: dest,
+                            path: Some(dest),
                             cwd,
                             binary_environment,
                             pass_key,
@@ -5716,11 +5735,15 @@ fn build_inner(
             }
         }
 
+        let requested_outputs =
+            requested_units(&ctx, |index| cached_test_passes[index].get().is_some());
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
                 break;
             }
-            if matches!(u.kind, Kind::Bin) {
+            if matches!(u.kind, Kind::Bin)
+                && (!matches!(mode, Mode::Test) || requested_outputs.contains(&i))
+            {
                 // Integration tests can demand normal binaries through CARGO_BIN_EXE
                 // even when those binaries were not selected as roots.
                 if let Some(r) = results[i].get() {
@@ -5862,6 +5885,7 @@ fn build_inner(
         let published = remote_cache::publish(
             &ctx,
             &results,
+            &cached_test_passes,
             matches!(mode, Mode::Test)
                 && !no_run
                 && test_filters.is_empty()
@@ -6992,11 +7016,16 @@ fn save_test_pass(store: &Store, key: &str, test_count: u64) -> Result<()> {
     )
 }
 
-fn configure_test_command(harness: &TestHarness) -> Command {
-    let mut command = Command::new(&harness.path);
+fn configure_test_command(harness: &TestHarness) -> Result<Command> {
+    let mut command = Command::new(
+        harness
+            .path
+            .as_ref()
+            .context("test executable not materialized")?,
+    );
     command.current_dir(&harness.cwd);
     command.envs(harness.binary_environment.iter().cloned());
-    command
+    Ok(command)
 }
 
 fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> Result<()> {
@@ -7071,7 +7100,7 @@ fn matches_test_filters(filters: &RegexSet, test_name: &str) -> bool {
 }
 
 fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
-    let mut command = configure_test_command(harness);
+    let mut command = configure_test_command(harness)?;
     command.args(["--list", "--format", "terse"]);
     if ignored {
         command.arg("--ignored");
@@ -7121,7 +7150,7 @@ fn run_test_case(
     capture_directory: &Path,
 ) -> Result<TestOutcome> {
     let started = Instant::now();
-    let mut command = configure_test_command(harness);
+    let mut command = configure_test_command(harness)?;
     command.args(["--exact", name, "--nocapture"]);
     command.args(exec_args);
     let (stdout_capture, stdout_file) = TestCaptureFile::create(capture_directory, "stdout")?;
@@ -7155,10 +7184,16 @@ fn run_tests(
         // A forced rerun supersedes an old pass, even if discovery/execution
         // fails. Otherwise explicit publication could upload that stale success.
         for harness in harnesses.iter().filter(|harness| !harness.cached_pass) {
-            match fs::remove_file(ctx.store.action_path(&harness.pass_key)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("invalidating previous test pass"),
+            let mut keys = vec![harness.pass_key.clone()];
+            if let Some(remote_key) = ctx.remote_keys.get(harness.unit_id) {
+                keys.push(test_pass_key(remote_key)?);
+            }
+            for key in keys {
+                match fs::remove_file(ctx.store.action_path(&key)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("invalidating previous test pass"),
+                }
             }
         }
     }
@@ -7534,7 +7569,7 @@ mod test_runner_tests {
         TestHarness {
             unit_id: 0,
             name: "corgi".to_string(),
-            path: std::env::current_exe().unwrap(),
+            path: Some(std::env::current_exe().unwrap()),
             cwd: std::env::current_dir().unwrap(),
             binary_environment: Vec::new(),
             pass_key: String::new(),
@@ -7994,12 +8029,12 @@ fn lookup_cached_unit(
     }
 }
 
-fn requested_units(ctx: &Ctx) -> Vec<usize> {
+fn requested_units(ctx: &Ctx, test_passed: impl Fn(usize) -> bool) -> Vec<usize> {
     let mut requested = ctx
         .units
         .iter()
         .enumerate()
-        .filter_map(|(index, unit)| unit.is_root.then_some(index))
+        .filter_map(|(index, unit)| (unit.is_root && !test_passed(index)).then_some(index))
         .collect::<Vec<_>>();
     // Integration tests and benchmarks receive CARGO_BIN_EXE_* paths at
     // runtime. A cached harness therefore still needs those binaries even
@@ -8026,7 +8061,11 @@ fn requested_units(ctx: &Ctx) -> Vec<usize> {
 /// through cached intermediate actions: rustc resolves transitive crate
 /// metadata from the shared pool, so their dependency artifacts must also be
 /// materialized even though those actions do not execute.
-fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bool>, usize)> {
+fn prepare_demand(
+    ctx: &Ctx,
+    results: &[OnceLock<UnitResult>],
+    test_passes: &[OnceLock<remote_cache::PassRecord>],
+) -> Result<(Vec<bool>, usize)> {
     fn demand(
         ctx: &Ctx,
         index: usize,
@@ -8081,7 +8120,7 @@ fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bo
     let mut needed = vec![false; ctx.units.len()];
     let mut expanded = vec![false; ctx.units.len()];
     let mut cached = 0;
-    for index in requested_units(ctx) {
+    for index in requested_units(ctx, |index| test_passes[index].get().is_some()) {
         demand(
             ctx,
             index,
@@ -8107,9 +8146,40 @@ struct SchedState {
     cached: usize,
 }
 
-fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize)> {
+/// Only unsatisfied roots demand artifacts; completed tests need no runtime binaries.
+fn refresh_artifact_demand(
+    ctx: &Ctx,
+    state: &mut SchedState,
+    results: &[OnceLock<UnitResult>],
+    test_passes: &[OnceLock<remote_cache::PassRecord>],
+) {
+    state.wanted.fill(false);
+    for root in requested_units(ctx, |index| test_passes[index].get().is_some()) {
+        state.wanted[root] = true;
+        if results[root].get().is_none() {
+            for dependency in dependency_closure(ctx, [root]) {
+                state.wanted[dependency] = true;
+            }
+        }
+    }
+}
+
+fn schedule(
+    ctx: &Ctx,
+    results: &[OnceLock<UnitResult>],
+    test_passes: &[OnceLock<remote_cache::PassRecord>],
+) -> Result<(usize, usize)> {
     let n = ctx.units.len();
-    let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
+    if ctx.remote_test_passes {
+        for (index, unit) in ctx.units.iter().enumerate() {
+            if unit.is_root && matches!(unit.kind, Kind::Test) && unit.test_harness {
+                if let Some(pass) = remote_cache::local_pass(ctx, index) {
+                    let _ = test_passes[index].set(pass);
+                }
+            }
+        }
+    }
+    let (needed, preloaded_cached) = prepare_demand(ctx, results, test_passes)?;
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
@@ -8296,15 +8366,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         if prune {
             // Cut off satisfied roots atomically with their completion,
             // before another worker can claim now-unneeded dependencies.
-            st.wanted.fill(false);
-            for root in requested_units(ctx) {
-                st.wanted[root] = true;
-                if results[root].get().is_none() {
-                    for dependency in dependency_closure(ctx, [root]) {
-                        st.wanted[dependency] = true;
-                    }
-                }
-            }
+            refresh_artifact_demand(ctx, &mut st, results, test_passes);
         }
         drop(st);
         cv.notify_all();
@@ -8314,19 +8376,17 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     // These workers never acquire compiler/jobserver slots.
     let mut requests = VecDeque::new();
     if ctx.remote.is_some() {
-        for index in requested_units(ctx) {
-            if ctx.remote_test_passes && ctx.units[index].test_harness {
-                let local_pass = results[index].get().and_then(|result| {
-                    test_pass_key(&result.action.key)
-                        .ok()
-                        .and_then(|key| load_test_pass(&ctx.store, &key))
-                });
-                if local_pass.is_none() {
-                    requests.push_back((index, true));
-                }
+        for (index, unit) in ctx.units.iter().enumerate() {
+            if ctx.remote_test_passes
+                && unit.is_root
+                && matches!(unit.kind, Kind::Test)
+                && unit.test_harness
+                && test_passes[index].get().is_none()
+            {
+                requests.push_back((index, true));
             }
         }
-        let mut order = requested_units(ctx);
+        let mut order = requested_units(ctx, |index| test_passes[index].get().is_some());
         order.extend(0..n);
         let mut seen = HashSet::new();
         for index in order {
@@ -8335,60 +8395,89 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             }
         }
     }
-    let remote_workers = requests.len().min(4);
-    let requests = Mutex::new(requests);
-    let remote_passes: Vec<OnceLock<(String, u64)>> = (0..n).map(|_| OnceLock::new()).collect();
+    let remote_enabled = !requests.is_empty();
+    let (pass_requests, artifact_requests): (VecDeque<_>, VecDeque<_>) =
+        requests.into_iter().partition(|(_, pass)| *pass);
+    let requests = [Mutex::new(pass_requests), Mutex::new(artifact_requests)];
     std::thread::scope(|scope| {
-        for _ in 0..remote_workers {
+        if remote_enabled {
             scope.spawn(|| {
-                while !cancel.load(Relaxed) {
-                    let Some((index, pass)) = requests.lock().unwrap().pop_front() else {
-                        break;
-                    };
-                    if pass {
-                        if let Ok(Some(pass)) = remote_cache::fetch_pass(ctx, index, &cancel) {
-                            let _ = remote_passes[index].set(pass);
+                // Resolve small final test results before spending bandwidth
+                // on artifacts they may make unnecessary. Only download workers
+                // wait between these phases; local compilers keep running.
+                for requests in &requests {
+                    let remote_workers = requests.lock().unwrap().len().min(4);
+                    std::thread::scope(|downloads| {
+                        for _ in 0..remote_workers {
+                            downloads.spawn(|| {
+                                while !cancel.load(Relaxed) {
+                                    let Some((index, pass)) = requests.lock().unwrap().pop_front()
+                                    else {
+                                        break;
+                                    };
+                                    if pass {
+                                        if let Ok(Some(pass)) =
+                                            remote_cache::fetch_pass(ctx, index, &cancel)
+                                        {
+                                            let mut st = state.lock().unwrap();
+                                            let _ = test_passes[index].set(pass);
+                                            refresh_artifact_demand(
+                                                ctx,
+                                                &mut st,
+                                                results,
+                                                test_passes,
+                                            );
+                                            drop(st);
+                                            cv.notify_all();
+                                        }
+                                        continue;
+                                    }
+                                    {
+                                        let st = state.lock().unwrap();
+                                        if st.started[index]
+                                            || !st.wanted[index]
+                                            || results[index].get().is_some()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    let Ok(Some(record)) = remote_cache::fetch(ctx, index, &cancel)
+                                    else {
+                                        continue;
+                                    };
+                                    // Claim only after every blob has been downloaded and verified.
+                                    {
+                                        let mut st = state.lock().unwrap();
+                                        if cancel.load(Relaxed)
+                                            || st.started[index]
+                                            || !st.wanted[index]
+                                            || results[index].get().is_some()
+                                        {
+                                            continue;
+                                        }
+                                        st.started[index] = true;
+                                        st.in_flight += 1;
+                                    }
+                                    t_start[index]
+                                        .store(t_sched.elapsed().as_nanos() as u64, Relaxed);
+                                    match remote_cache::install(ctx, index, record) {
+                                        Ok(result) => {
+                                            complete(index, Ok(result), true);
+                                        }
+                                        Err(_) => {
+                                            let mut st = state.lock().unwrap();
+                                            st.started[index] = false;
+                                            st.in_flight -= 1;
+                                            if st.indeg[index] == 0 {
+                                                st.ready.push(index);
+                                            }
+                                        }
+                                    }
+                                    cv.notify_all();
+                                }
+                            });
                         }
-                        continue;
-                    }
-                    {
-                        let st = state.lock().unwrap();
-                        if st.started[index] || !st.wanted[index] || results[index].get().is_some()
-                        {
-                            continue;
-                        }
-                    }
-                    let Ok(Some(record)) = remote_cache::fetch(ctx, index, &cancel) else {
-                        continue;
-                    };
-                    // Claim only after every blob has been downloaded and verified.
-                    {
-                        let mut st = state.lock().unwrap();
-                        if cancel.load(Relaxed)
-                            || st.started[index]
-                            || !st.wanted[index]
-                            || results[index].get().is_some()
-                        {
-                            continue;
-                        }
-                        st.started[index] = true;
-                        st.in_flight += 1;
-                    }
-                    t_start[index].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
-                    match remote_cache::install(ctx, index, record) {
-                        Ok(result) => {
-                            complete(index, Ok(result), true);
-                        }
-                        Err(_) => {
-                            let mut st = state.lock().unwrap();
-                            st.started[index] = false;
-                            st.in_flight -= 1;
-                            if st.indeg[index] == 0 {
-                                st.ready.push(index);
-                            }
-                        }
-                    }
-                    cv.notify_all();
+                    });
                 }
             });
         }
@@ -8422,17 +8511,6 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         }
         cancel.store(true, Relaxed);
     });
-    for (index, pass) in remote_passes.iter().enumerate() {
-        if let Some((harness_action, count)) = pass.get() {
-            if results[index]
-                .get()
-                .is_some_and(|result| result.action.key == *harness_action)
-            {
-                let _ = save_test_pass(&ctx.store, &test_pass_key(harness_action)?, *count);
-            }
-        }
-    }
-
     let st = state.into_inner().unwrap();
     ctx.report.update(|report| {
         for index in 0..n {
