@@ -9386,12 +9386,13 @@ fn compile(
         ));
         cmd.envs(runtime.environment());
     }
-    for f in pflags {
-        cmd.arg(f);
-    }
+    // Before the unit's rustflags, so a project's own `-C linker` wins.
     if let Some(native) = ctx.toolchain.supplied() {
         cmd.arg("-C")
             .arg(format!("linker={}", native.compiler.display()));
+    }
+    for f in pflags {
+        cmd.arg(f);
     }
     for f in lint_flags {
         cmd.arg(f);
