@@ -13,6 +13,7 @@ mod report;
 mod sandbox;
 mod self_update;
 mod store;
+mod toolchain;
 mod zig;
 
 use anyhow::Result;
