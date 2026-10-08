@@ -281,7 +281,9 @@ pub fn controlled_command(program: &Path, environment: &[(String, String)]) -> C
 }
 
 pub fn required_component(directory: &Path, name: &str) -> Result<PathBuf> {
-    let path = directory.join("bin").join(name);
+    let path = directory
+        .join("bin")
+        .join(crate::platform::executable_name(name));
     ensure!(
         path.is_file(),
         "supplied Rust installation is missing {}; install that component in CORGI_RUST_TOOLCHAIN (no replacement will be downloaded)",
@@ -400,12 +402,19 @@ fn environment_store_roots(environment: &[(String, String)]) -> Result<BTreeSet<
 }
 
 pub fn find_executable(name: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    let executable = |metadata: fs::Metadata| {
+        #[cfg(unix)]
+        let runnable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let runnable = true;
+        metadata.is_file() && runnable
+    };
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let path = directory.join(name);
-        if fs::metadata(&path)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        {
+        if fs::metadata(&path).is_ok_and(executable) {
             return path
                 .canonicalize()
                 .with_context(|| format!("resolving {name}"));
@@ -458,6 +467,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // Windows path lists use ';' and drive letters.
     #[test]
     fn runtime_roots_use_path_list_syntax_without_implicit_current_directories() {
         assert!(runtime_roots(None).unwrap().is_empty());

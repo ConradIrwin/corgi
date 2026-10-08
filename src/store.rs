@@ -274,8 +274,8 @@ impl Store {
             fs::create_dir_all(root.join(d))?;
         }
         // canonicalize so sandbox path rules match kernel-resolved paths
-        // (e.g. /tmp/store -> /private/tmp/store)
-        let root = root.canonicalize()?;
+        // (e.g. /tmp/store -> /private/tmp/store), in Windows' ordinary C:\ spelling
+        let root = dunce::canonicalize(root)?;
         Ok(Store {
             root,
             counter: AtomicU64::new(0),

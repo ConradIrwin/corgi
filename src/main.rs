@@ -7,6 +7,7 @@ mod macos;
 mod meta;
 mod native_toolchain;
 mod out_dir_archive;
+mod platform;
 mod report;
 mod sandbox;
 mod self_update;
