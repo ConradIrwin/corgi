@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -8152,6 +8152,7 @@ fn refresh_artifact_demand(
     state: &mut SchedState,
     results: &[OnceLock<UnitResult>],
     test_passes: &[OnceLock<remote_cache::PassRecord>],
+    cancel_downloads: &[AtomicBool],
 ) {
     state.wanted.fill(false);
     for root in requested_units(ctx, |index| test_passes[index].get().is_some()) {
@@ -8161,6 +8162,82 @@ fn refresh_artifact_demand(
                 state.wanted[dependency] = true;
             }
         }
+    }
+    for (wanted, cancel) in state.wanted.iter().zip(cancel_downloads) {
+        if !wanted {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Visit every needed consumer before its producers, with final outputs first.
+fn reverse_dependency_order(dependencies: &[Vec<usize>], needed: &[bool]) -> Result<Vec<usize>> {
+    let mut remaining_consumers = vec![0; dependencies.len()];
+    for (index, producers) in dependencies.iter().enumerate() {
+        if needed[index] {
+            for &producer in producers {
+                if needed[producer] {
+                    remaining_consumers[producer] += 1;
+                }
+            }
+        }
+    }
+    let mut ready = (0..dependencies.len())
+        .filter(|&index| needed[index] && remaining_consumers[index] == 0)
+        .collect::<VecDeque<_>>();
+    let mut order = Vec::new();
+    while let Some(index) = ready.pop_front() {
+        order.push(index);
+        for &producer in &dependencies[index] {
+            if needed[producer] {
+                remaining_consumers[producer] -= 1;
+                if remaining_consumers[producer] == 0 {
+                    ready.push_back(producer);
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        order.len() == needed.iter().filter(|&&needed| needed).count(),
+        "cycle in remote download graph"
+    );
+    Ok(order)
+}
+
+#[cfg(test)]
+mod download_order_tests {
+    use super::reverse_dependency_order;
+
+    #[test]
+    fn final_outputs_precede_intermediates_regardless_of_unit_indices() {
+        let dependencies = vec![vec![], vec![0], vec![1], vec![0], vec![3]];
+        assert_eq!(
+            reverse_dependency_order(&dependencies, &[true; 5]).unwrap(),
+            [2, 4, 1, 3, 0],
+        );
+    }
+
+    #[test]
+    fn shared_producer_waits_for_all_consumers() {
+        let dependencies = vec![vec![1, 2], vec![3], vec![3], vec![]];
+        assert_eq!(
+            reverse_dependency_order(&dependencies, &[true; 4]).unwrap(),
+            [0, 1, 2, 3],
+        );
+    }
+
+    #[test]
+    fn unneeded_roots_do_not_hold_up_shared_inputs() {
+        let dependencies = vec![vec![1], vec![2], vec![], vec![2]];
+        assert_eq!(
+            reverse_dependency_order(&dependencies, &[false, false, true, true]).unwrap(),
+            [3, 2],
+        );
+    }
+
+    #[test]
+    fn needed_cycles_are_rejected() {
+        assert!(reverse_dependency_order(&[vec![1], vec![0]], &[true; 2]).is_err());
     }
 }
 
@@ -8245,6 +8322,7 @@ fn schedule(
     let t_end: Vec<TNs> = (0..n).map(|_| TNs::new(0)).collect();
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
+    let cancel_downloads: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let ready: Vec<usize> = (0..n)
         .filter(|&i| needed[i] && results[i].get().is_none() && indeg[i] == 0)
         .collect();
@@ -8366,12 +8444,12 @@ fn schedule(
         if prune {
             // Cut off satisfied roots atomically with their completion,
             // before another worker can claim now-unneeded dependencies.
-            refresh_artifact_demand(ctx, &mut st, results, test_passes);
+            refresh_artifact_demand(ctx, &mut st, results, test_passes, &cancel_downloads);
         }
         drop(st);
         cv.notify_all();
     };
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel = AtomicBool::new(false);
     // Prefer requested results: they can cut off the entire build closure.
     // These workers never acquire compiler/jobserver slots.
     let mut requests = VecDeque::new();
@@ -8386,11 +8464,13 @@ fn schedule(
                 requests.push_back((index, true));
             }
         }
-        let mut order = requested_units(ctx, |index| test_passes[index].get().is_some());
-        order.extend(0..n);
-        let mut seen = HashSet::new();
-        for index in order {
-            if needed[index] && results[index].get().is_none() && seen.insert(index) {
+        let dependencies = ctx
+            .units
+            .iter()
+            .map(|unit| unit.deps.iter().map(|dep| dep.unit).collect())
+            .collect::<Vec<Vec<usize>>>();
+        for index in reverse_dependency_order(&dependencies, &needed)? {
+            if results[index].get().is_none() {
                 requests.push_back((index, false));
             }
         }
@@ -8405,8 +8485,16 @@ fn schedule(
                 // Resolve small final test results before spending bandwidth
                 // on artifacts they may make unnecessary. Only download workers
                 // wait between these phases; local compilers keep running.
-                for requests in &requests {
-                    let remote_workers = requests.lock().unwrap().len().min(4);
+                for (phase, requests) in requests.iter().enumerate() {
+                    // Pass records use independent GETs. Artifact actions are
+                    // visited in graph order, each owning the whole GET budget
+                    // for its connection-reusing, parallel blob batch.
+                    let limit = if phase == 0 {
+                        crate::remote::GET_CONCURRENCY
+                    } else {
+                        1
+                    };
+                    let remote_workers = requests.lock().unwrap().len().min(limit);
                     std::thread::scope(|downloads| {
                         for _ in 0..remote_workers {
                             downloads.spawn(|| {
@@ -8426,6 +8514,7 @@ fn schedule(
                                                 &mut st,
                                                 results,
                                                 test_passes,
+                                                &cancel_downloads,
                                             );
                                             drop(st);
                                             cv.notify_all();
@@ -8441,7 +8530,8 @@ fn schedule(
                                             continue;
                                         }
                                     }
-                                    let Ok(Some(record)) = remote_cache::fetch(ctx, index, &cancel)
+                                    let Ok(Some(record)) =
+                                        remote_cache::fetch(ctx, index, &cancel_downloads[index])
                                     else {
                                         continue;
                                     };
@@ -8492,6 +8582,7 @@ fn schedule(
                                 continue;
                             }
                             st.started[i] = true;
+                            cancel_downloads[i].store(true, Relaxed);
                             st.in_flight += 1;
                             break i;
                         }
@@ -8510,6 +8601,9 @@ fn schedule(
             compiler.join().unwrap();
         }
         cancel.store(true, Relaxed);
+        for cancel in &cancel_downloads {
+            cancel.store(true, Relaxed);
+        }
     });
     let st = state.into_inner().unwrap();
     ctx.report.update(|report| {

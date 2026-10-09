@@ -25,10 +25,18 @@ secrets.
 ## Populate and consume
 
 Ordinary `corgi build` and `corgi test` only read remotely. They remain usable
-offline: missing, invalid, or unavailable remote data is a cache miss. Up to
-four downloads run alongside compilation, never ahead of ready local work.
-A completed download can replace a queued action, but never a running action.
-Outstanding downloads are cancelled when compilation finishes.
+offline: missing, invalid, or unavailable remote data is a cache miss.
+Downloads walk the graph backwards, visiting consumers before their producers
+and starting with final outputs. Each action's missing blobs use one curl
+process with connection reuse and up to four parallel GETs. Artifact actions
+take turns using that budget rather than multiplying it across actions.
+
+Local compilation proceeds independently from inputs toward outputs; ready work
+never waits for the network. A complete remote result can replace a queued
+action and prune work needed only by that output, but cannot replace a running
+compiler. Downloads are cancelled when local execution claims their action,
+when their action is no longer needed, or when compilation finishes. Intermediate
+cache hits retain producer work still needed by other consumers.
 
 ```sh
 corgi build

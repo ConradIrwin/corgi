@@ -310,17 +310,15 @@ pub(super) fn lookup_local(ctx: &Ctx, index: usize) -> Result<Option<UnitResult>
     lookup_cached_unit(ctx, index, action, "imported")
 }
 
-pub(super) fn fetch(ctx: &Ctx, index: usize, cancel: &Arc<AtomicBool>) -> Result<Option<Record>> {
+pub(super) fn fetch(ctx: &Ctx, index: usize, cancel: &AtomicBool) -> Result<Option<Record>> {
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;
     let Some(bytes) = cache.fetch_record(&ctx.remote_keys[index], cancel)? else {
         return Ok(None);
     };
     let mut record: Record = serde_json::from_slice(&bytes)?;
     validate(ctx, index, &mut record)?;
-    for hash in &record.blobs {
-        if cache.fetch_blob(&ctx.store, hash, cancel)?.is_none() {
-            return Ok(None);
-        }
+    if !cache.fetch_blobs(&ctx.store, &record.blobs, cancel)? {
+        return Ok(None);
     }
     if let Some(archive) = &record.result.out_dir {
         // Verify archive structure before accepting the action, too: a valid
@@ -375,7 +373,7 @@ pub(super) fn local_pass(ctx: &Ctx, index: usize) -> Option<PassRecord> {
 pub(super) fn fetch_pass(
     ctx: &Ctx,
     index: usize,
-    cancel: &Arc<AtomicBool>,
+    cancel: &AtomicBool,
 ) -> Result<Option<PassRecord>> {
     let remote_key = test_pass_key(&ctx.remote_keys[index])?;
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;

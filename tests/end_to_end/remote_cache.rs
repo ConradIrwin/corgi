@@ -276,7 +276,7 @@ fn remote_fixture(directory: &TestDirectory, server: &HttpCache, slow: bool) -> 
 import os
 import sys
 args = sys.argv[1:]
-if any(arg.startswith("http://127.0.0.1:") for arg in args):
+if "--config" in args or "-K" in args or any(arg.startswith("http://127.0.0.1:") for arg in args):
     os.execvp("curl", ["curl", "-q", *args])
 tool = os.environ["CORGI_TEST_DOWNLOAD_CURL"]
 os.execvp(tool, [tool, *args])
@@ -561,7 +561,15 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     // may also be embedded in artifacts. Only the checkout location changes.
     remote_run(&other, &store, &["build"]);
     assert!(server.objects.lock().unwrap().gates_released > 0);
-    assert!(server.requests().contains(&("GET".into(), path)));
+    assert_eq!(
+        server
+            .requests()
+            .into_iter()
+            .filter(|(method, path)| method == "GET" && path.contains("/actions/"))
+            .collect::<Vec<_>>(),
+        vec![("GET".into(), path)],
+        "a final-output hit must not fetch pruned producer records"
+    );
     let report = report_for_workspace(&store, &other);
     assert_unit_cache(
         &report,
@@ -622,14 +630,24 @@ fn remote_cache_accepts_a_queued_root_but_never_replaces_a_running_build_script(
         state
             .bytes
             .retain(|path, _| !path.contains("/actions/") || path == &root || path == &script);
-        state.gated.extend([root, script]);
+        state.gated.insert(root.clone());
         state.marker_root = Some(store.join("outdirs"));
     }
+    server.reset_requests();
     remote_run(&workspace, &store, &["build"]);
     assert_eq!(
         server.objects.lock().unwrap().gates_released,
-        2,
-        "both responses arrived after the script started"
+        1,
+        "the root response arrived after the script started"
+    );
+    assert_eq!(
+        server
+            .requests()
+            .into_iter()
+            .filter(|(method, path)| method == "GET" && path.contains("/actions/"))
+            .collect::<Vec<_>>(),
+        vec![("GET".into(), root)],
+        "finish the root before considering its producers, including the running script"
     );
     let report = report_for_workspace(&store, &workspace);
     assert_unit_cache(
@@ -650,6 +668,15 @@ fn remote_cache_accepts_a_queued_root_but_never_replaces_a_running_build_script(
 
 #[test]
 fn remote_cache_intermediate_hit_waits_for_transitive_metadata_needed_by_local_consumer() {
+    check_intermediate_hit_with_local_consumer(false);
+}
+
+#[test]
+fn remote_cache_intermediate_hit_preserves_shared_remote_dependency_for_local_consumer() {
+    check_intermediate_hit_with_local_consumer(true);
+}
+
+fn check_intermediate_hit_with_local_consumer(shared_remote_dependency: bool) {
     let directory = TestDirectory::new("remote-intermediate");
     let server = HttpCache::new();
     let workspace = remote_fixture(&directory, &server, true);
@@ -679,7 +706,29 @@ fn remote_cache_intermediate_hit_waits_for_transitive_metadata_needed_by_local_c
          [dependencies]\nremote_dependency = {{ package = \"remote_intermediate\", path = \"intermediate\" }}\n",
         directory.package_name,
     )).unwrap();
+    if shared_remote_dependency {
+        let mut manifest = fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+        manifest.push_str(
+            "shared_dependency = { package = \"remote_dependency\", path = \"dependency\" }\n",
+        );
+        fs::write(workspace.join("Cargo.toml"), manifest).unwrap();
+        fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { println!(\"{}\", remote_dependency::value() + shared_dependency::value()); }\n",
+        )
+        .unwrap();
+    }
     remote_run(&workspace, &store, &["cache", "build"]);
+    let (root, _) = root_record(&server, &directory.package_name);
+    let dependency = server
+        .records()
+        .into_iter()
+        .find(|(_, record)| {
+            record["spec"]["target"]["name"] == "remote_dependency"
+                && record["spec"]["kind"] == "compile"
+        })
+        .expect("uploaded shared dependency")
+        .0;
     let intermediate = server
         .records()
         .into_iter()
@@ -689,14 +738,32 @@ fn remote_cache_intermediate_hit_waits_for_transitive_metadata_needed_by_local_c
     clear_local_results(&directory, &store, &workspace);
     {
         let mut state = server.objects.lock().unwrap();
-        state
-            .bytes
-            .retain(|path, _| !path.contains("/actions/") || path == &intermediate);
-        state.gated.insert(intermediate);
+        state.bytes.retain(|path, _| {
+            !path.contains("/actions/")
+                || path == &intermediate
+                || (shared_remote_dependency && path == &dependency)
+        });
+        state.gated.insert(intermediate.clone());
         state.marker_root = Some(store.join("outdirs"));
     }
+    server.reset_requests();
     remote_run(&workspace, &store, &["build"]);
     assert_eq!(server.objects.lock().unwrap().gates_released, 1);
+    let artifact_requests: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|(method, path)| {
+            method == "GET"
+                && [root.as_str(), intermediate.as_str(), dependency.as_str()]
+                    .contains(&path.as_str())
+        })
+        .map(|(_, path)| path)
+        .collect();
+    assert_eq!(
+        artifact_requests,
+        vec![root, intermediate, dependency],
+        "after a root miss, visit consumers before shared producers; an intermediate hit cannot prune a producer needed locally"
+    );
     let report = report_for_workspace(&store, &workspace);
     assert_unit_cache(
         &report,
@@ -710,7 +777,11 @@ fn remote_cache_intermediate_hit_waits_for_transitive_metadata_needed_by_local_c
         "remote_dependency",
         "compile",
         "remote_dependency",
-        "miss",
+        if shared_remote_dependency {
+            "hit"
+        } else {
+            "miss"
+        },
     );
     assert_unit_cache(
         &report,
@@ -730,7 +801,14 @@ fn remote_cache_intermediate_hit_waits_for_transitive_metadata_needed_by_local_c
         &output,
         "run binary linked through an imported intermediate",
     );
-    assert_eq!(output.stdout, b"42\n");
+    assert_eq!(
+        output.stdout,
+        if shared_remote_dependency {
+            b"84\n"
+        } else {
+            b"42\n"
+        }
+    );
 }
 
 #[test]
