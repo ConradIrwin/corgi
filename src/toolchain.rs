@@ -15,17 +15,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) struct Toolchain {
-    /// Every action's starting environment.
+    /// Every action's and probe's starting environment. Not keyed: it may hold
+    /// machine-local values such as HOME.
     pub base_environment: Vec<(String, String)>,
-    /// Applied and keyed like the project's `[env]`.
+    /// Environment the user supplied with the toolchain. Applied and keyed
+    /// like the project's `[env]`; a wrapped rustc may read it (NIX_RUSTFLAGS).
     pub configured_environment: Vec<(String, String)>,
-    /// Environment for Corgi's own rustc and clippy probes; `None` uses Corgi's.
-    pub probe_environment: Option<Vec<(String, String)>>,
     /// What compiles may read beyond the store and sysroot.
     pub read_paths: Vec<PathBuf>,
     /// Added to every build script's environment, after the per-platform tools.
     pub extra_build_script_environment: Vec<(String, String)>,
-    /// Folded into rustc's version, so it reaches every action key.
+    /// Folded into rustc's version, so it reaches every action key. A supplied
+    /// toolchain's fingerprint also covers the supplied Rust's files.
     pub rustc_identity: Option<String>,
     /// Actions get scratch cache directories for Zig.
     pub uses_zig: bool,
@@ -76,12 +77,10 @@ impl Toolchain {
             .find(|entry| entry.platform == platform)
     }
 
-    /// A command for Corgi's probes of `program` (rustc, clippy).
+    /// A command for Corgi's probes of `program` (rustc, clippy), which see
+    /// only the base environment, like actions.
     pub fn command(&self, program: &Path) -> Command {
-        match &self.probe_environment {
-            Some(environment) => crate::native_toolchain::controlled_command(program, environment),
-            None => Command::new(program),
-        }
+        crate::native_toolchain::controlled_command(program, &self.base_environment)
     }
 
     /// What a build script for `platform` needs to find C tools.

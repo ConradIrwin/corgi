@@ -800,7 +800,6 @@ fn apple_toolchain(
     Toolchain {
         base_environment,
         configured_environment: Vec::new(),
-        probe_environment: None,
         read_paths: Vec::new(),
         // Match bindgen's header parser to the managed Clang, not ambient Xcode/CLT.
         extra_build_script_environment: libclang

@@ -261,8 +261,7 @@ fn clang_toolchain(
 ) -> Toolchain {
     Toolchain {
         base_environment: environment.clone(),
-        configured_environment: environment.clone(),
-        probe_environment: Some(environment),
+        configured_environment: environment,
         read_paths,
         extra_build_script_environment: Vec::new(),
         identity: Identity {
