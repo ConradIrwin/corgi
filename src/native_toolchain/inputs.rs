@@ -7,7 +7,6 @@ use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -52,8 +51,8 @@ pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
     let mut processed = BTreeSet::new();
     while let Some(path) = state.paths.difference(&processed).next().cloned() {
         let canonical = canonicalize(&path)?;
-        field(&mut state.hash, path.as_os_str().as_bytes());
-        field(&mut state.hash, canonical.as_os_str().as_bytes());
+        field(&mut state.hash, path.as_os_str().as_encoded_bytes());
+        field(&mut state.hash, canonical.as_os_str().as_encoded_bytes());
         state.hash_aliases(&path)?;
         for spelling in [&path, &canonical] {
             if let Some(root) = nix_root(spelling) {
@@ -103,14 +102,14 @@ pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
                 path.display()
             );
             field(&mut state.hash, b"nix");
-            field(&mut state.hash, path.as_os_str().as_bytes());
+            field(&mut state.hash, path.as_os_str().as_encoded_bytes());
         }
         state.paths.extend(closure);
     }
     // Include exactly what is exposed, independently of traversal/discovery order.
     for path in &state.paths {
         field(&mut state.hash, b"grant");
-        field(&mut state.hash, path.as_os_str().as_bytes());
+        field(&mut state.hash, path.as_os_str().as_encoded_bytes());
     }
     Ok(RuntimeInputs {
         paths: state.paths.into_iter().collect(),
@@ -139,7 +138,7 @@ impl Resolver {
             fs::symlink_metadata(&path)
         }
         .with_context(|| format!("reading runtime input {}", path.display()))?;
-        field(&mut self.hash, relative.as_os_str().as_bytes());
+        field(&mut self.hash, relative.as_os_str().as_encoded_bytes());
         field(&mut self.hash, &metadata.permissions().mode().to_le_bytes());
         if metadata.is_dir() {
             field(&mut self.hash, b"directory");
@@ -158,7 +157,7 @@ impl Resolver {
         } else if metadata.file_type().is_symlink() {
             field(&mut self.hash, b"symlink");
             let text = fs::read_link(&path)?;
-            field(&mut self.hash, text.as_os_str().as_bytes());
+            field(&mut self.hash, text.as_os_str().as_encoded_bytes());
             let target =
                 self.normalize_target(&path.parent().context("symlink has no parent")?.join(text))?;
             let canonical = canonicalize(&path)?;
@@ -227,11 +226,11 @@ impl Resolver {
             let metadata = fs::symlink_metadata(&prefix)?;
             if metadata.file_type().is_symlink() {
                 field(&mut self.hash, b"alias");
-                field(&mut self.hash, prefix.as_os_str().as_bytes());
+                field(&mut self.hash, prefix.as_os_str().as_encoded_bytes());
                 field(&mut self.hash, &metadata.permissions().mode().to_le_bytes());
                 field(
                     &mut self.hash,
-                    fs::read_link(&prefix)?.as_os_str().as_bytes(),
+                    fs::read_link(&prefix)?.as_os_str().as_encoded_bytes(),
                 );
             }
         }
@@ -292,7 +291,8 @@ impl PathPolicy {
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).with_context(|| {
+    // dunce keeps Windows paths in their ordinary C:\ spelling.
+    dunce::canonicalize(path).with_context(|| {
         format!(
             "resolving runtime input {} (missing or cyclic dependency); check CORGI_NATIVE_RUNTIME_ROOTS",
             path.display()

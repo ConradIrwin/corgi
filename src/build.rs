@@ -1,11 +1,13 @@
 use crate::meta::{self, Metadata, Package, Target};
 use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
+use crate::platform::executable_name;
 use crate::report::UnitKeyResolution as KeyResolution;
 use crate::sandbox::linux::setup_linux_sandbox;
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
 use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
+use path_slash::PathExt as _;
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -871,16 +873,16 @@ impl Ctx {
     ) -> Result<PackageReadInputs> {
         let pkg = &self.meta.packages[package_index];
         let mut inputs = if pkg.source.is_some() {
-            vec![pkg.root().canonicalize()?]
+            vec![dunce::canonicalize(pkg.root())?]
         } else if matches!(phase, PackageReadPhase::Compile) {
             self.source_files_for(package_index)?
                 .into_iter()
-                .map(|relative_path| pkg.root().join(relative_path).canonicalize())
+                .map(|relative_path| dunce::canonicalize(pkg.root().join(relative_path)))
                 .collect::<std::io::Result<Vec<_>>>()?
         } else {
             Vec::new()
         };
-        inputs.push(PathBuf::from(&pkg.manifest_path).canonicalize()?);
+        inputs.push(dunce::canonicalize(&pkg.manifest_path)?);
         inputs.extend(
             self.extra_inputs
                 .for_package(package_index)
@@ -937,7 +939,7 @@ struct ExtraInput {
 /// directories included, and may be empty.
 fn expand_extra_input(root: &Path, entry: &str) -> Result<Vec<PathBuf>> {
     let root = root
-        .to_str()
+        .to_slash()
         .with_context(|| format!("package root {} is not valid UTF-8", root.display()))?;
     // A trailing `**` is a directory and its subdirectories to the glob
     // crate, which never names a file; `**/*` is what "everything under here"
@@ -964,8 +966,7 @@ fn expand_extra_input(root: &Path, entry: &str) -> Result<Vec<PathBuf>> {
     for matched in matches {
         let matched = matched.with_context(|| format!("expanding extra-input `{entry}`"))?;
         paths.push(
-            matched
-                .canonicalize()
+            dunce::canonicalize(&matched)
                 .with_context(|| format!("resolving {}", matched.display()))?,
         );
     }
@@ -978,6 +979,7 @@ fn expand_extra_input(root: &Path, entry: &str) -> Result<Vec<PathBuf>> {
 mod extra_input_tests {
     use super::{expand_extra_input, ExtraInputDeclarations, ExtraInputs, Package};
     use anyhow::Result;
+    use path_slash::PathExt as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1160,7 +1162,7 @@ mod extra_input_tests {
         for file in files {
             write(&workspace, file);
         }
-        workspace.canonicalize().unwrap()
+        dunce::canonicalize(&workspace).unwrap()
     }
 
     /// Matches as paths relative to `root`, in the order they are returned.
@@ -1169,9 +1171,9 @@ mod extra_input_tests {
             .unwrap()
             .iter()
             .map(|path| {
-                path.strip_prefix(root.canonicalize().unwrap())
+                path.strip_prefix(dunce::canonicalize(root).unwrap())
                     .unwrap()
-                    .to_string_lossy()
+                    .to_slash_lossy()
                     .into_owned()
             })
             .collect()
@@ -2112,7 +2114,7 @@ impl ExtraInputs {
                             pkg.name
                         );
                     };
-                    let label = relative.to_string_lossy().into_owned();
+                    let label = relative.to_slash_lossy().into_owned();
                     resolved.push(ExtraInput { label, path });
                 }
             }
@@ -2202,9 +2204,7 @@ fn cargo_config_root(dir: &Path, manifest: &Path, corgi_toml: Option<&Path>) -> 
         .and_then(|package| package.get("workspace"))
         .and_then(toml::Value::as_str)
     {
-        return dir
-            .join(workspace)
-            .canonicalize()
+        return dunce::canonicalize(dir.join(workspace))
             .with_context(|| format!("resolving package.workspace `{workspace}`"));
     }
     Ok(corgi_toml
@@ -2574,7 +2574,7 @@ fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>
             .join("tools")
             .join(format!("{}-{}", t.name, t.version))
             .join(&t.bin);
-        std::os::unix::fs::symlink(&target, tmp.join(&t.name)).ok();
+        crate::platform::symlink(&target, tmp.join(&t.name)).ok();
     }
     fs::create_dir_all(dir.parent().unwrap())?;
     match fs::rename(&tmp, &dir) {
@@ -2814,7 +2814,7 @@ fn ensure_macos(
         fs::create_dir_all(&staging)?;
         fs::copy(driver, staging.join("driver"))?;
         for tool in crate::macos::WRAPPERS {
-            std::os::unix::fs::symlink("driver", staging.join(tool))?;
+            crate::platform::symlink("driver", staging.join(tool))?;
         }
         fs::write(staging.join(crate::macos::CONFIG_FILE), contents)?;
         match fs::rename(&staging, &directory) {
@@ -2908,7 +2908,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         fs::create_dir_all(&staging_dir)?;
         fs::copy(&driver_source, staging_dir.join("driver"))?;
         for name in ["cc", "c++", "ar", "ranlib"] {
-            std::os::unix::fs::symlink("driver", staging_dir.join(name))?;
+            crate::platform::symlink("driver", staging_dir.join(name))?;
         }
         fs::write(staging_dir.join("target"), &target.zig)?;
         fs::write(
@@ -3614,7 +3614,9 @@ fn ensure_toolchain(
         .join("tools")
         .join(format!("rust-{channel}-{triple}{suffix}"));
     let bin = dest.join("bin");
-    if bin.join("rustc").is_file() && bin.join("cargo").is_file() {
+    let rustc = executable_name("rustc");
+    let cargo = executable_name("cargo");
+    if bin.join(&rustc).is_file() && bin.join(&cargo).is_file() {
         ensure_linker_runtime(&dest, triple)?;
         touch_tool_marker(&dest);
         return Ok(bin);
@@ -3688,30 +3690,24 @@ fn ensure_toolchain(
         if actual != expected {
             bail!("sha256 mismatch for {name}: expected {expected}, got {actual}");
         }
+        // Merge only the component payload (`<name>/<payload>/...`) into the install.
         let st = Command::new("tar")
             .arg("-xf")
             .arg(&tarball)
             .arg("-C")
-            .arg(&work)
+            .arg(&install)
+            .arg("--strip-components=2")
+            .arg(format!("{name}/{payload}"))
             .status()?;
         if !st.success() {
             bail!("unpack failed: {name}");
-        }
-        let payload_dir = work.join(&name).join(&payload);
-        let st = Command::new("cp")
-            .arg("-R")
-            .arg(format!("{}/.", payload_dir.display()))
-            .arg(&install)
-            .status()?;
-        if !st.success() {
-            bail!("copying component {comp} failed");
         }
         status!("Verified", "{comp} {ver} (sha256 {}…)", &expected[..12]);
     }
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&install, &dest) {
         Ok(()) => {}
-        Err(_) if dest.join("bin/rustc").is_file() => {} // concurrent racer won
+        Err(_) if bin.join(&rustc).is_file() => {} // concurrent racer won
         Err(e) => return Err(e).context("publishing toolchain"),
     }
     ensure_linker_runtime(&dest, triple)?;
@@ -3827,7 +3823,8 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str, build_std: bool) ->
         "rust-{channel}-{triple}{}",
         if build_std { "-build-std" } else { "" }
     ));
-    let driver = toolchain.join("bin/clippy-driver");
+    let driver_name = executable_name("clippy-driver");
+    let driver = toolchain.join("bin").join(&driver_name);
     if driver.is_file() {
         return Ok(());
     }
@@ -3879,7 +3876,10 @@ fn ensure_clippy(store: &Store, channel: &str, triple: &str, build_std: bool) ->
     if !st.success() {
         bail!("unpack failed: {name}");
     }
-    let payload = work.join(&name).join("clippy-preview/bin/clippy-driver");
+    let payload = work
+        .join(&name)
+        .join("clippy-preview/bin")
+        .join(&driver_name);
     match fs::rename(&payload, &driver) {
         Ok(()) => {}
         Err(_) if driver.is_file() => {} // concurrent racer won
@@ -3897,8 +3897,8 @@ fn ensure_rustfmt(store: &Store, channel: &str, triple: &str) -> Result<PathBuf>
         .root
         .join("tools")
         .join(format!("rustfmt-{channel}-{triple}"));
-    let cargo_fmt = dest.join("bin/cargo-fmt");
-    let rustfmt = dest.join("bin/rustfmt");
+    let cargo_fmt = dest.join("bin").join(executable_name("cargo-fmt"));
+    let rustfmt = dest.join("bin").join(executable_name("rustfmt"));
     if cargo_fmt.is_file() && rustfmt.is_file() {
         ensure_rustfmt_lib_link(&dest, channel, triple)?;
         touch_tool_marker(&dest);
@@ -3976,7 +3976,7 @@ fn ensure_rustfmt_lib_link(dir: &Path, channel: &str, triple: &str) -> Result<()
     let target = PathBuf::from("..")
         .join(format!("rust-{channel}-{triple}"))
         .join("lib");
-    match std::os::unix::fs::symlink(target, &link) {
+    match crate::platform::symlink(target, &link) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e).context("linking rustfmt to pinned compiler libraries"),
@@ -4324,8 +4324,8 @@ fn isolated_cargo_command(
     command
         .env("CARGO_HOME", cargo_home)
         // Cargo discovers config from cwd rather than --manifest-path. The
-        // filesystem root has no project ancestors to inspect.
-        .current_dir(Path::new("/"));
+        // filesystem root (`/` or `C:\`) has no project ancestors to inspect.
+        .current_dir(cargo.ancestors().last().unwrap_or(cargo));
     for path in cargo_config_paths {
         command.arg("--config").arg(path);
     }
@@ -4344,9 +4344,8 @@ pub fn fmt(
     verbose: bool,
     args: &[String],
 ) -> Result<()> {
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("bad directory {}", dir.display()))?;
+    let dir =
+        dunce::canonicalize(dir).with_context(|| format!("bad directory {}", dir.display()))?;
     let manifest = dir.join("Cargo.toml");
     if !manifest.exists() {
         bail!("no Cargo.toml in {}", dir.display());
@@ -4368,9 +4367,9 @@ pub fn fmt(
                 ensure_rustfmt(&store, &channel, &host)?,
             )
         };
-    let cargo = toolchain_bin.join("cargo");
-    let rustc = toolchain_bin.join("rustc");
-    let rustfmt = rustfmt_bin.join("rustfmt");
+    let cargo = toolchain_bin.join(executable_name("cargo"));
+    let rustc = toolchain_bin.join(executable_name("rustc"));
+    let rustfmt = rustfmt_bin.join(executable_name("rustfmt"));
 
     let mut paths = vec![rustfmt_bin, toolchain_bin];
     if let Some(path) = std::env::var_os("PATH") {
@@ -4412,9 +4411,8 @@ pub fn fmt(
 /// declared tools, and every Cargo dependency (including the standard
 /// library's under build-std). Nothing is planned or compiled.
 pub fn fetch(store: Store, dir: &Path) -> Result<()> {
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("bad directory {}", dir.display()))?;
+    let dir =
+        dunce::canonicalize(dir).with_context(|| format!("bad directory {}", dir.display()))?;
     let project = CargoProject::discover(&dir)?;
     let host_platform = HostPlatform::current()?;
     let host = host_platform.triple();
@@ -4593,9 +4591,8 @@ fn build_inner(
     let all_roots = workspace || (root.is_some() && packages.is_empty());
     let t0 = Instant::now();
     let mut report_stage_start = begin_report_stage(&recorder, "setup");
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("bad directory {}", dir.display()))?;
+    let dir =
+        dunce::canonicalize(dir).with_context(|| format!("bad directory {}", dir.display()))?;
     recorder.update(|report| {
         report.run.workspace.root = dir.display().to_string();
     });
@@ -4653,8 +4650,12 @@ fn build_inner(
         Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
         None => requested_target,
     };
-    let rustc = rust_toolchain.join("bin/rustc").display().to_string();
-    let cargo_bin = rust_toolchain.join("bin/cargo");
+    let rustc = rust_toolchain
+        .join("bin")
+        .join(executable_name("rustc"))
+        .display()
+        .to_string();
+    let cargo_bin = rust_toolchain.join("bin").join(executable_name("cargo"));
     let rustc_version = if let Some(rust) = &supplied_rust {
         rust.version.clone()
     } else {
@@ -4854,7 +4855,7 @@ fn build_inner(
     let mut plan: Option<(String, String)> = None; // (metadata json, unit-graph json)
     if let Some(bytes) = store.load_action(&plan_ptr) {
         if let Ok(entry) = serde_json::from_slice::<PlanEntry>(&bytes) {
-            if let Ok(ws_root) = dir.join(&entry.ws_root_rel).canonicalize() {
+            if let Ok(ws_root) = dunce::canonicalize(dir.join(&entry.ws_root_rel)) {
                 if let Some(source_roots) = resolve_plan_sources(&ws_root, &entry.local_sources) {
                     if plan_fingerprint(
                         &ws_root,
@@ -5291,7 +5292,11 @@ fn build_inner(
         } else {
             ensure_clippy(&store, &channel, &host_guess, build_std)?;
         }
-        clippy_driver = format!("{}/bin/clippy-driver", rust_toolchain.display());
+        clippy_driver = rust_toolchain
+            .join("bin")
+            .join(executable_name("clippy-driver"))
+            .display()
+            .to_string();
         let mut probe = if let Some(native) = toolchain.supplied() {
             crate::native_toolchain::controlled_command(
                 Path::new(&clippy_driver),
@@ -5873,7 +5878,7 @@ fn plan_fingerprint(
 }
 
 fn plan_abs(ws_root: &Path, rel: &str) -> PathBuf {
-    if rel.starts_with('/') {
+    if Path::new(rel).is_absolute() {
         PathBuf::from(rel)
     } else {
         ws_root.join(rel)
@@ -5882,28 +5887,29 @@ fn plan_abs(ws_root: &Path, rel: &str) -> PathBuf {
 
 /// `to` expressed relative to `from` (both absolute).
 fn rel_path(from: &Path, to: &Path) -> String {
-    let from_parts: Vec<_> = from.components().collect();
-    let to_parts: Vec<_> = to.components().collect();
-    let mut common = 0;
-    while common < from_parts.len()
-        && common < to_parts.len()
-        && from_parts[common] == to_parts[common]
-    {
-        common += 1;
-    }
-    let mut parts: Vec<String> = vec!["..".to_string(); from_parts.len() - common];
-    for c in &to_parts[common..] {
-        parts.push(c.as_os_str().to_string_lossy().into_owned());
-    }
-    if parts.is_empty() {
+    let difference = pathdiff::diff_paths(to, from).unwrap_or_else(|| to.to_path_buf());
+    if difference.as_os_str().is_empty() {
         ".".to_string()
     } else {
-        parts.join("/")
+        difference.to_slash_lossy().into_owned()
     }
 }
 
-fn plan_source_token(index: usize) -> String {
-    format!("$CORGI_LOCAL_SOURCE_{index}$")
+/// Each local source root's spellings in Cargo's JSON and their tokens: the
+/// JSON-escaped path, and the `/`-separated form inside `path+file://` package
+/// IDs. On Unix the two spellings are the same, so only the first token appears.
+fn plan_source_replacements(index: usize, root: &Path) -> [(String, String); 2] {
+    let escaped = serde_json::to_string(&root.display().to_string()).expect("strings serialize");
+    [
+        (
+            escaped[1..escaped.len() - 1].to_owned(),
+            format!("$CORGI_LOCAL_SOURCE_{index}$"),
+        ),
+        (
+            root.to_slash_lossy().into_owned(),
+            format!("$CORGI_LOCAL_SOURCE_URL_{index}$"),
+        ),
+    ]
 }
 
 fn plan_local_sources(meta: &Metadata, ws_root: &Path) -> Result<Vec<(PlanLocalSource, PathBuf)>> {
@@ -5913,7 +5919,7 @@ fn plan_local_sources(meta: &Metadata, ws_root: &Path) -> Result<Vec<(PlanLocalS
         if package.source.is_some() {
             continue;
         }
-        let package_root = package.root().canonicalize().with_context(|| {
+        let package_root = dunce::canonicalize(package.root()).with_context(|| {
             format!(
                 "canonicalizing local package root {}",
                 package.root().display()
@@ -5963,7 +5969,7 @@ fn tokenize_plan_sources(
     let mut replacements = sources
         .iter()
         .enumerate()
-        .map(|(index, (_, root))| (root.display().to_string(), plan_source_token(index)))
+        .flat_map(|(index, (_, root))| plan_source_replacements(index, root))
         .collect::<Vec<_>>();
     replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.len()));
     for (root, token) in &replacements {
@@ -5979,7 +5985,7 @@ fn resolve_plan_sources(ws_root: &Path, sources: &[PlanLocalSource]) -> Option<V
     sources
         .iter()
         .map(|source| {
-            let root = ws_root.join(&source.locator).canonicalize().ok()?;
+            let root = dunce::canonicalize(ws_root.join(&source.locator)).ok()?;
             plan_source_identity(&root)
                 .is_some_and(|identity| identity == source.identity)
                 .then_some(root)
@@ -6000,7 +6006,9 @@ fn plan_source_identity(root: &Path) -> Option<String> {
 
 fn expand_plan_sources(mut text: String, sources: &[PathBuf]) -> String {
     for (index, root) in sources.iter().enumerate() {
-        text = text.replace(&plan_source_token(index), &root.display().to_string());
+        for (spelling, token) in plan_source_replacements(index, root) {
+            text = text.replace(&token, &spelling);
+        }
     }
     text
 }
@@ -6015,9 +6023,8 @@ fn save_plan(
     meta_json: &str,
     ug_json: &str,
 ) -> Result<()> {
-    let ws_root = Path::new(&meta.workspace_root)
-        .canonicalize()
-        .context("canonicalizing workspace root")?;
+    let ws_root =
+        dunce::canonicalize(&meta.workspace_root).context("canonicalizing workspace root")?;
     let mut files: BTreeSet<String> = BTreeSet::new();
     files.insert("Cargo.toml".to_string());
     files.insert("Cargo.lock".to_string());
@@ -8662,7 +8669,7 @@ fn git_package_identity(
     let manifest = Path::new(&package.manifest_path)
         .strip_prefix(repository_root)
         .ok()?
-        .to_string_lossy()
+        .to_slash_lossy()
         .into_owned();
     Some((remote.clone(), manifest))
 }
@@ -8684,7 +8691,8 @@ fn git_repository<'a>(
                 "rev-parse",
                 "--show-toplevel",
             ]))?;
-            let repository_root = PathBuf::from(repository_root);
+            // git prints `C:/...` on Windows; use the native, canonical spelling.
+            let repository_root = dunce::canonicalize(repository_root).ok()?;
             let remote = command_stdout(Command::new("git").args([
                 "-C",
                 repository_root.to_str()?,
@@ -9957,9 +9965,18 @@ fn dep_info_package_files(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((_, rest)) = line.split_once(':') else {
+        // Skip drive-letter colons when finding the Make rule separator.
+        let Some(separator) = line.char_indices().find_map(|(index, character)| {
+            (character == ':'
+                && line[index + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace))
+            .then_some(index)
+        }) else {
             continue;
         };
+        let rest = &line[separator + 1..];
         for token in dep_info_prerequisites(rest) {
             let tok = token.as_str();
             let p = Path::new(tok);
@@ -10035,6 +10052,27 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod dep_info_tests {
     use super::dep_info_package_files;
     use std::path::{Path, PathBuf};
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_letter_colons_are_not_rule_separators() {
+        let root = Path::new(r"C:\workspace\app");
+        let files = dep_info_package_files(
+            r"C:\out\app.exe: C:\workspace\app\src\main.rs",
+            root,
+            root,
+            &[root.join("src/main.rs")],
+        )
+        .unwrap();
+        assert_eq!(files, [PathBuf::from("src/main.rs")]);
+        assert!(dep_info_package_files(
+            r"C:\out\app.exe: C:\workspace\secret.txt",
+            root,
+            root,
+            &[root.join("src/main.rs")],
+        )
+        .is_err());
+    }
 
     #[test]
     fn relative_inputs_are_resolved_from_the_compile_directory() {
