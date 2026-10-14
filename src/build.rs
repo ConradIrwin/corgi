@@ -708,6 +708,7 @@ fn provision_toolchains(
         }
         (None, HostPlatform::Linux) => bail!("managed Linux toolchains are not implemented"),
     };
+    c.add_user_directory();
     if let (Some(zig_target), Some(target)) = (&zig_target, &target) {
         add_zig(&mut c, target, ensure_zig(store, host, zig_target)?);
     }
@@ -789,16 +790,11 @@ fn apple_toolchain(
     channel: &str,
 ) -> Toolchain {
     let (cc, ld, sdk) = darwin_toolchain_identity(channel);
-    let mut base_environment = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
-    if let Ok(value) = std::env::var("HOME") {
-        base_environment.push(("HOME".to_string(), value));
-    }
-    base_environment.push((
-        "PATH".into(),
-        format!("{}:/usr/bin:/bin", runtimes[0].directory.display()),
-    ));
     Toolchain {
-        base_environment,
+        base_environment: vec![(
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", runtimes[0].directory.display()),
+        )],
         configured_environment: Vec::new(),
         read_paths: Vec::new(),
         // Match bindgen's header parser to the managed Clang, not ambient Xcode/CLT.
@@ -10223,6 +10219,10 @@ mod build_platform_tests {
             .iter()
             .any(|(name, _)| matches!(name.as_str(), "CC" | "SDKROOT" | "PATH")));
         assert!(toolchain.read_paths.is_empty());
+        assert_eq!(
+            toolchain.base_environment,
+            [("PATH".to_string(), "/host:/usr/bin:/bin".to_string())]
+        );
         assert_eq!(
             toolchain.platform(target).unwrap().linker.as_deref(),
             Some(Path::new("/target/rust-linker"))

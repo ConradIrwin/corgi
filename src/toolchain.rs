@@ -16,7 +16,8 @@ use std::process::Command;
 
 pub(crate) struct Toolchain {
     /// Every action's and probe's starting environment. Not keyed: it may hold
-    /// machine-local values such as HOME.
+    /// machine-local values such as HOME, which [`Toolchain::add_user_directory`]
+    /// adds for every source.
     pub base_environment: Vec<(String, String)>,
     /// Environment the user supplied with the toolchain. Applied and keyed
     /// like the project's `[env]`; a wrapped rustc may read it (NIX_RUSTFLAGS).
@@ -75,6 +76,14 @@ impl Toolchain {
         self.platforms
             .iter()
             .find(|entry| entry.platform == platform)
+    }
+
+    /// Every action sees the user's home directory. It is not keyed, so
+    /// builds from different home directories share cached results.
+    pub fn add_user_directory(&mut self) {
+        if let Ok(value) = std::env::var("HOME") {
+            self.base_environment.push(("HOME".to_string(), value));
+        }
     }
 
     /// A command for Corgi's probes of `program` (rustc, clippy), which see
