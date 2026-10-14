@@ -29,6 +29,7 @@ macro_rules! status {
     };
 }
 
+mod compiler_race;
 mod remote_cache;
 
 // Profiles come per unit from cargo's unit graph — inheritance,
@@ -8323,6 +8324,15 @@ fn schedule(
     let t_cached: Vec<TBool> = (0..n).map(|_| TBool::new(false)).collect();
     let phase_slots: Vec<OnceLock<Phases>> = (0..n).map(|_| OnceLock::new()).collect();
     let cancel_downloads: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let compiler_races: Vec<Option<compiler_race::Race>> = (0..n)
+        .map(|index| {
+            (cfg!(unix)
+                && ctx.remote.is_some()
+                && !matches!(ctx.units[index].kind, Kind::Bsr)
+                && !is_pipelined(ctx, index))
+            .then(compiler_race::Race::default)
+        })
+        .collect();
     let ready: Vec<usize> = (0..n)
         .filter(|&i| needed[i] && results[i].get().is_none() && indeg[i] == 0)
         .collect();
@@ -8374,6 +8384,7 @@ fn schedule(
 
     let complete = |idx: usize, res: Result<UnitResult>, prune: bool| {
         t_end[idx].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
+        cancel_downloads[idx].store(true, Relaxed);
         let mut st = state.lock().unwrap();
         st.in_flight -= 1;
         match res {
@@ -8479,6 +8490,67 @@ fn schedule(
     let (pass_requests, artifact_requests): (VecDeque<_>, VecDeque<_>) =
         requests.into_iter().partition(|(_, pass)| *pass);
     let requests = [Mutex::new(pass_requests), Mutex::new(artifact_requests)];
+    use crate::report::{RemoteDownload, RemoteDownloadKind, RemoteDownloadOutcome};
+    let start_download = |index: usize, pass: bool| -> Result<RemoteDownload> {
+        Ok(RemoteDownload {
+            unit: ctx.report_unit_keys[index].clone(),
+            kind: if pass {
+                RemoteDownloadKind::TestPass
+            } else {
+                RemoteDownloadKind::Artifact
+            },
+            remote_key: if pass {
+                test_pass_key(&ctx.remote_keys[index])?
+            } else {
+                ctx.remote_keys[index].clone()
+            },
+            start_ns: ctx.report.elapsed_ns(),
+            record_ns: None,
+            blobs_start_ns: None,
+            downloaded_ns: None,
+            end_ns: 0,
+            blob_count: 0,
+            superseded_local_ns: None,
+            outcome: RemoteDownloadOutcome::Miss,
+            detail: None,
+        })
+    };
+    let finish_download = |index: usize, mut download: RemoteDownload, result: Result<bool>| {
+        download.end_ns = ctx.report.elapsed_ns();
+        download.outcome = match result {
+            Ok(true) => RemoteDownloadOutcome::Used,
+            Ok(false) => {
+                download.detail = Some("record not found (HTTP 404)".into());
+                RemoteDownloadOutcome::Miss
+            }
+            Err(error) if error.is::<crate::remote::ReadCancelled>() => {
+                let st = state.lock().unwrap();
+                download.detail = Some(
+                    if !st.wanted[index] {
+                        "action no longer needed"
+                    } else if st.started[index]
+                        && matches!(download.kind, RemoteDownloadKind::Artifact)
+                    {
+                        if compiler_races[index].is_some() {
+                            "local result won"
+                        } else {
+                            "local execution claimed action"
+                        }
+                    } else {
+                        "local work finished"
+                    }
+                    .into(),
+                );
+                RemoteDownloadOutcome::Cancelled
+            }
+            Err(error) => {
+                download.detail = Some(format!("{error:#}"));
+                RemoteDownloadOutcome::Failed
+            }
+        };
+        ctx.report
+            .update(|report| report.remote_downloads.push(download));
+    };
     std::thread::scope(|scope| {
         if remote_enabled {
             scope.spawn(|| {
@@ -8504,45 +8576,92 @@ fn schedule(
                                         break;
                                     };
                                     if pass {
-                                        if let Ok(Some(pass)) =
-                                            remote_cache::fetch_pass(ctx, index, &cancel)
-                                        {
-                                            let mut st = state.lock().unwrap();
-                                            let _ = test_passes[index].set(pass);
-                                            refresh_artifact_demand(
-                                                ctx,
-                                                &mut st,
-                                                results,
-                                                test_passes,
-                                                &cancel_downloads,
-                                            );
-                                            drop(st);
-                                            cv.notify_all();
-                                        }
+                                        let mut download = start_download(index, true)
+                                            .expect("test pass key serialization");
+                                        let fetched = remote_cache::fetch_pass(
+                                            ctx,
+                                            index,
+                                            &cancel,
+                                            &mut download,
+                                        );
+                                        let outcome = fetched.map(|pass| {
+                                            if let Some(pass) = pass {
+                                                let mut st = state.lock().unwrap();
+                                                let _ = test_passes[index].set(pass);
+                                                refresh_artifact_demand(
+                                                    ctx,
+                                                    &mut st,
+                                                    results,
+                                                    test_passes,
+                                                    &cancel_downloads,
+                                                );
+                                                drop(st);
+                                                cv.notify_all();
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        finish_download(index, download, outcome);
                                         continue;
                                     }
                                     {
                                         let st = state.lock().unwrap();
-                                        if st.started[index]
+                                        if (st.started[index] && compiler_races[index].is_none())
                                             || !st.wanted[index]
                                             || results[index].get().is_some()
                                         {
                                             continue;
                                         }
                                     }
-                                    let Ok(Some(record)) =
-                                        remote_cache::fetch(ctx, index, &cancel_downloads[index])
-                                    else {
-                                        continue;
+                                    let mut download = start_download(index, false)
+                                        .expect("artifact key is already computed");
+                                    let record = match remote_cache::fetch(
+                                        ctx,
+                                        index,
+                                        &cancel_downloads[index],
+                                        &mut download,
+                                    ) {
+                                        Ok(Some(record)) => record,
+                                        Ok(None) => {
+                                            finish_download(index, download, Ok(false));
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            finish_download(index, download, Err(error));
+                                            continue;
+                                        }
                                     };
                                     // Claim only after every blob has been downloaded and verified.
                                     {
                                         let mut st = state.lock().unwrap();
                                         if cancel.load(Relaxed)
-                                            || st.started[index]
+                                            || (st.started[index]
+                                                && compiler_races[index].is_none())
                                             || !st.wanted[index]
                                             || results[index].get().is_some()
                                         {
+                                            drop(st);
+                                            finish_download(
+                                                index,
+                                                download,
+                                                Err(crate::remote::ReadCancelled.into()),
+                                            );
+                                            continue;
+                                        }
+                                        if st.started[index] {
+                                            let race = compiler_races[index].as_ref().unwrap();
+                                            let offered = race.offer(record, download);
+                                            drop(st);
+                                            if let Err((_, download)) = offered {
+                                                finish_download(
+                                                    index,
+                                                    download,
+                                                    Err(crate::remote::ReadCancelled.into()),
+                                                );
+                                            }
+                                            // The compiler worker reaps its process, installs
+                                            // the winner, and completes this unit exactly once.
                                             continue;
                                         }
                                         st.started[index] = true;
@@ -8553,14 +8672,21 @@ fn schedule(
                                     match remote_cache::install(ctx, index, record) {
                                         Ok(result) => {
                                             complete(index, Ok(result), true);
+                                            finish_download(index, download, Ok(true));
                                         }
-                                        Err(_) => {
+                                        Err(error) => {
                                             let mut st = state.lock().unwrap();
                                             st.started[index] = false;
                                             st.in_flight -= 1;
                                             if st.indeg[index] == 0 {
                                                 st.ready.push(index);
                                             }
+                                            drop(st);
+                                            finish_download(
+                                                index,
+                                                download,
+                                                Err(error.context("installing remote result")),
+                                            );
                                         }
                                     }
                                     cv.notify_all();
@@ -8582,7 +8708,9 @@ fn schedule(
                                 continue;
                             }
                             st.started[i] = true;
-                            cancel_downloads[i].store(true, Relaxed);
+                            if compiler_races[i].is_none() {
+                                cancel_downloads[i].store(true, Relaxed);
+                            }
                             st.in_flight += 1;
                             break i;
                         }
@@ -8594,7 +8722,55 @@ fn schedule(
                     }
                 };
                 t_start[idx].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
-                complete(idx, run_unit(ctx, idx, results, &metas, &fire_meta), false);
+                let race = compiler_races[idx].as_ref();
+                let local_start = Instant::now();
+                let local = run_unit(ctx, idx, results, &metas, &fire_meta, race);
+                if let Some((record, mut download)) = race.and_then(|race| race.finish()) {
+                    download.superseded_local_ns = Some(local_start.elapsed().as_nanos() as u64);
+                    // A teardown error is not permission to install over a
+                    // compiler that might still be writing.
+                    if local
+                        .as_ref()
+                        .is_err_and(|error| error.is::<compiler_race::TeardownFailed>())
+                    {
+                        finish_download(
+                            idx,
+                            download,
+                            Err(anyhow::anyhow!(
+                                "local compiler failed during remote takeover"
+                            )),
+                        );
+                        complete(idx, local, false);
+                        continue;
+                    }
+                    match remote_cache::install(ctx, idx, record) {
+                        Ok(result) => {
+                            status!(
+                                "Downloaded",
+                                "{} — replaced local compilation",
+                                describe(ctx, idx)
+                            );
+                            complete(idx, Ok(result), true);
+                            finish_download(idx, download, Ok(true));
+                        }
+                        Err(error) => {
+                            finish_download(
+                                idx,
+                                download,
+                                Err(error.context("installing remote result")),
+                            );
+                            // The valid-looking remote result failed installation;
+                            // retry locally without racing another download.
+                            complete(
+                                idx,
+                                run_unit(ctx, idx, results, &metas, &fire_meta, None),
+                                false,
+                            );
+                        }
+                    }
+                } else {
+                    complete(idx, local, false);
+                }
             }));
         }
         for compiler in compilers {
@@ -8697,9 +8873,15 @@ fn schedule(
                 phases: phase_slots[i].get().copied().unwrap_or_default(),
             });
         }
-        if let Err(e) =
-            write_timings_report(ctx, &rows, wall, st.executed, st.cached, cached_walk_ns)
-        {
+        if let Err(e) = write_timings_report(
+            ctx,
+            &rows,
+            wall,
+            st.executed,
+            st.cached,
+            cached_walk_ns,
+            report_schedule_start,
+        ) {
             eprintln!("corgi warning: could not write timings report: {e:#}");
         }
     }
@@ -8726,6 +8908,7 @@ fn write_timings_report(
     executed: usize,
     cached: usize,
     cached_walk_ns: u64,
+    report_schedule_start: u64,
 ) -> Result<()> {
     let wall_ns = wall.as_nanos().max(1) as u64;
     let cpu_ns: u64 = rows.iter().map(|r| r.end_ns - r.start_ns).sum();
@@ -8802,6 +8985,7 @@ fn write_timings_report(
     let sum_bytes: u64 = rows.iter().map(|r| r.phases.ingest_bytes).sum();
     let sum_key: u64 = rows.iter().map(|r| r.phases.key_ns).sum();
     let sum_finish: u64 = rows.iter().map(|r| r.phases.finish_ns).sum();
+    let remote_downloads = ctx.report.remote_downloads_html(report_schedule_start);
     let html = format!(
         "<!doctype html><meta charset=utf-8><title>corgi timings</title><style>\
 body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
@@ -8813,7 +8997,9 @@ body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
 table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;padding:2px 8px;text-align:left;font-size:12px}}\
 </style>\n<h1>corgi timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
 <div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>total</th><th>rustc</th><th>front-end</th><th>ingest</th><th>key</th><th>cache</th><th>validate</th><th>finish</th><th>other</th></tr>{table}</table>\n\
-<p>phase totals across executed units: rustc {:.1}s · ingest {:.1}s ({:.2} GB hashed) · key {:.1}s · finish {:.1}s · cache-hit walk {:.1}s</p>\n",
+<p>phase totals across executed units: rustc {:.1}s · ingest {:.1}s ({:.2} GB hashed) · key {:.1}s · finish {:.1}s · cache-hit walk {:.1}s</p>\n\
+<h2>remote cache downloads</h2><p>Times are relative to scheduling start, like the compiler timeline. A received record is not a usable hit until validated, downloaded and installed. Blob counts include already-local blobs. Only attempted reads are listed.</p>\
+<table><tr><th>unit</th><th>kind</th><th>remote key</th><th>lookup start</th><th>record received</th><th>blobs start</th><th>verified</th><th>end</th><th>blobs referenced</th><th>outcome</th><th>local work replaced</th><th>detail</th></tr>{remote_downloads}</table>\n",
         wall.as_secs_f64(),
         executed,
         cached,
@@ -8853,7 +9039,11 @@ fn run_unit(
     results: &[OnceLock<UnitResult>],
     metas: &[OnceLock<MetaOut>],
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+    race: Option<&compiler_race::Race>,
 ) -> Result<UnitResult> {
+    if let Some(race) = race {
+        race.check()?;
+    }
     let plan = &ctx.action_plans[idx];
     let execution_spec = action_spec_with_producer_keys(ctx, idx, &plan.template, |producer| {
         let action = metas[producer]
@@ -8882,7 +9072,7 @@ fn run_unit(
             results,
             candidate.context("build-script action identity missing")?,
         ),
-        _ => compile(ctx, idx, results, metas, fire_meta, execution_spec),
+        _ => compile(ctx, idx, results, metas, fire_meta, execution_spec, race),
     }
 }
 
@@ -9483,6 +9673,7 @@ fn compile(
     metas: &[OnceLock<MetaOut>],
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
     execution_spec: ActionSpec,
+    race: Option<&compiler_race::Race>,
 ) -> Result<UnitResult> {
     let unit = &ctx.units[uidx];
     let pkg = &ctx.meta.packages[unit.pkg];
@@ -9681,6 +9872,7 @@ fn compile(
     };
     fs::create_dir_all(&scratch)?;
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
+    let _staging = compiler_race::Staging(vec![scratch.clone(), stage_root.clone()]);
     let mut allowed_inputs: Vec<PathBuf> =
         vec![ctx.store.root.clone(), PathBuf::from(&ctx.sysroot)];
     if let Some(native) = ctx.toolchain.supplied() {
@@ -9897,14 +10089,19 @@ fn compile(
     if ctx.verbose {
         status!("Exec", "{cmd:?}");
     }
-    ctx.jobserver.configure(&mut cmd);
     // One token per running compiler (its implicit thread); rustc acquires
     // more from the shared pool for extra codegen threads and releases
     // them as codegen units finish.
-    let job_token = ctx
-        .jobserver
-        .acquire()
-        .context("acquiring jobserver token")?;
+    let job_token = if race.is_none() {
+        ctx.jobserver.configure(&mut cmd);
+        Some(
+            ctx.jobserver
+                .acquire()
+                .context("acquiring jobserver token")?,
+        )
+    } else {
+        None
+    };
     let dep_file = outdir.join(format!("{crate_name}-{ef16}.d"));
     let finalize_action = || {
         finalize_compile_action(
@@ -9925,6 +10122,14 @@ fn compile(
     let t_rustc = Instant::now();
     let (success, stderr, streamed_action) = if self_pipelined {
         run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &finalize_action, fire_meta)?
+    } else if let Some(race) = race {
+        let (success, stderr) = compiler_race::run(
+            &mut cmd,
+            &ctx.jobserver,
+            || race.check(),
+            &scratch.join("compiler.stderr"),
+        )?;
+        (success, stderr, None)
     } else {
         let out = cmd
             .output()
@@ -9957,7 +10162,6 @@ fn compile(
         Some(action) => action,
         None => finalize_action()?,
     };
-    record_resolved_action(ctx, uidx, &action)?;
     phases.validate_ns = t_val.elapsed().as_nanos() as u64;
     fs::remove_file(&dep_file).ok(); // references the tmp outdir; never cached
     let key = &action.key;
@@ -10026,6 +10230,10 @@ location-free — resolve paths at runtime instead of baking them in at build ti
             );
         }
     }
+    if let Some(race) = race {
+        race.commit_local()?;
+    }
+    record_resolved_action(ctx, uidx, &action)?;
     ctx.store.save_action(key, &serde_json::to_vec(&res)?)?;
     let mut manifest_spec = action.spec.clone();
     if let Some(read_set) = manifest_spec.local_read_set_mut() {

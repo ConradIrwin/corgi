@@ -310,16 +310,22 @@ pub(super) fn lookup_local(ctx: &Ctx, index: usize) -> Result<Option<UnitResult>
     lookup_cached_unit(ctx, index, action, "imported")
 }
 
-pub(super) fn fetch(ctx: &Ctx, index: usize, cancel: &AtomicBool) -> Result<Option<Record>> {
+pub(super) fn fetch(
+    ctx: &Ctx,
+    index: usize,
+    cancel: &AtomicBool,
+    download: &mut crate::report::RemoteDownload,
+) -> Result<Option<Record>> {
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;
     let Some(bytes) = cache.fetch_record(&ctx.remote_keys[index], cancel)? else {
         return Ok(None);
     };
-    let mut record: Record = serde_json::from_slice(&bytes)?;
-    validate(ctx, index, &mut record)?;
-    if !cache.fetch_blobs(&ctx.store, &record.blobs, cancel)? {
-        return Ok(None);
-    }
+    download.record_ns = Some(ctx.report.elapsed_ns());
+    let mut record: Record = serde_json::from_slice(&bytes).context("decoding action record")?;
+    validate(ctx, index, &mut record).context("validating action record")?;
+    download.blob_count = record.blobs.len();
+    download.blobs_start_ns = Some(ctx.report.elapsed_ns());
+    cache.fetch_blobs(&ctx.store, &record.blobs, cancel)?;
     if let Some(archive) = &record.result.out_dir {
         // Verify archive structure before accepting the action, too: a valid
         // digest alone doesn't make an invalid or unsafe tar installable.
@@ -330,8 +336,9 @@ pub(super) fn fetch(ctx: &Ctx, index: usize, cancel: &AtomicBool) -> Result<Opti
             &stage,
         );
         fs::remove_dir_all(stage).ok();
-        checked?;
+        checked.context("validating remote OUT_DIR archive")?;
     }
+    download.downloaded_ns = Some(ctx.report.elapsed_ns());
     Ok(Some(record))
 }
 
@@ -374,13 +381,16 @@ pub(super) fn fetch_pass(
     ctx: &Ctx,
     index: usize,
     cancel: &AtomicBool,
+    download: &mut crate::report::RemoteDownload,
 ) -> Result<Option<PassRecord>> {
     let remote_key = test_pass_key(&ctx.remote_keys[index])?;
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;
     let Some(bytes) = cache.fetch_record(&remote_key, cancel)? else {
         return Ok(None);
     };
+    download.record_ns = Some(ctx.report.elapsed_ns());
     let record = decode_pass(&remote_key, &bytes)?;
+    download.downloaded_ns = Some(ctx.report.elapsed_ns());
     // The requested input key is the authority. Never install a local precise
     // pass under the record's claimed harness identity, which is metadata only.
     ctx.store

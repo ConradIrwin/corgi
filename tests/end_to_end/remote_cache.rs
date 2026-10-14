@@ -22,6 +22,8 @@ struct Objects {
     gated: BTreeSet<String>,
     marker_root: Option<PathBuf>,
     gates_released: usize,
+    blocked: BTreeSet<String>,
+    compiler_gate: Option<(String, PathBuf)>,
 }
 
 struct HttpCache {
@@ -180,6 +182,31 @@ fn serve(mut stream: TcpStream, objects: Arc<Mutex<Objects>>, stopped: Arc<Atomi
             thread::sleep(Duration::from_millis(5));
         }
         objects.lock().unwrap().gates_released += 1;
+    }
+    let compiler_gate = objects
+        .lock()
+        .unwrap()
+        .compiler_gate
+        .clone()
+        .filter(|(gated_path, _)| method == "GET" && *gated_path == path);
+    if let Some((_, store)) = compiler_gate {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !has_compiler_marker(&store) {
+            if stopped.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 504 Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        objects.lock().unwrap().gates_released += 1;
+    }
+    while objects.lock().unwrap().blocked.contains(&path) {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
     let (status, response) = {
         let mut state = objects.lock().unwrap();
@@ -559,7 +586,7 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     server.reset_requests();
     // The same CORGI_STORE is intentional: store paths are in remote keys and
     // may also be embedded in artifacts. Only the checkout location changes.
-    remote_run(&other, &store, &["build"]);
+    remote_run(&other, &store, &["build", "--timings"]);
     assert!(server.objects.lock().unwrap().gates_released > 0);
     assert_eq!(
         server
@@ -571,6 +598,27 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
         "a final-output hit must not fetch pruned producer records"
     );
     let report = report_for_workspace(&store, &other);
+    let download = &report["remote_downloads"][0];
+    assert_eq!(download["outcome"], "used");
+    assert_eq!(download["remote_key"], record["remote_key"]);
+    assert_eq!(download["kind"], "artifact");
+    assert_eq!(
+        download["blob_count"],
+        record["blobs"].as_array().unwrap().len()
+    );
+    let times = [
+        "start_ns",
+        "record_ns",
+        "blobs_start_ns",
+        "downloaded_ns",
+        "end_ns",
+    ]
+    .map(|field| download[field].as_u64().unwrap());
+    assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+    let html = fs::read_to_string(other.join("target/corgi-timings/corgi-timing.html")).unwrap();
+    assert!(html.contains("remote cache downloads"));
+    assert!(html.contains(record["remote_key"].as_str().unwrap()));
+    assert!(html.contains("<td>used</td>"));
     assert_unit_cache(
         &report,
         &directory.package_name,
@@ -596,6 +644,10 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
         server.requests().is_empty(),
         "an imported local hit must need zero GETs"
     );
+    assert_eq!(
+        report_for_workspace(&store, &other)["remote_downloads"],
+        serde_json::json!([])
+    );
     let local: serde_json::Value = serde_json::from_slice(&fs::read(alias).unwrap()).unwrap();
     assert_eq!(local["spec"], record["spec"]);
     assert_eq!(local["action_key"], record["action_key"]);
@@ -608,6 +660,187 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     .unwrap();
     assert_success(&output, "run remotely restored binary");
     assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn remote_cache_profiles_failed_and_cancelled_downloads() {
+    let directory = TestDirectory::new("remote-profile");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, true);
+    let store = directory.path.join("store");
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let (root_path, record) = root_record(&server, &directory.package_name);
+    let blob_path = format!("{PREFIX}blobs/{}", record["blobs"][0].as_str().unwrap());
+    let original = server.objects.lock().unwrap().bytes.clone();
+    for (scenario, outcome, detail) in [
+        ("missing record", "miss", "HTTP 404"),
+        ("unavailable", "failed", "HTTP 503"),
+        ("missing blob", "failed", "404"),
+        ("corrupt blob", "failed", "SHA-256"),
+        ("cancelled", "cancelled", "local result won"),
+    ] {
+        clear_local_results(&directory, &store, &workspace);
+        {
+            let mut state = server.objects.lock().unwrap();
+            state.bytes = original.clone();
+            state.gated.insert(root_path.clone());
+            state.marker_root = Some(store.join("outdirs"));
+            state.fail_reads = scenario == "unavailable";
+            state.blocked.clear();
+            match scenario {
+                "missing record" => {
+                    state.bytes.remove(&root_path);
+                }
+                "missing blob" => {
+                    state.bytes.remove(&blob_path);
+                }
+                "corrupt blob" => {
+                    state.bytes.insert(blob_path.clone(), b"corrupt".to_vec());
+                }
+                "cancelled" => {
+                    state.blocked.insert(blob_path.clone());
+                }
+                _ => {}
+            }
+        }
+        remote_run(&workspace, &store, &["build", "--timings"]);
+        let report = report_for_workspace(&store, &workspace);
+        let download = report["remote_downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|download| download["remote_key"] == record["remote_key"])
+            .expect("root lookup was attempted");
+        assert_eq!(download["outcome"], outcome, "{scenario}: {download:#}");
+        assert!(
+            download["detail"].as_str().unwrap().contains(detail),
+            "{scenario}: {download:#}"
+        );
+        assert!(download["downloaded_ns"].is_null(), "{scenario}");
+        assert!(download["end_ns"].as_u64().unwrap() >= download["start_ns"].as_u64().unwrap());
+        if scenario.contains("blob") || scenario == "cancelled" {
+            assert!(download["record_ns"].is_u64(), "{scenario}");
+            assert!(download["blobs_start_ns"].is_u64(), "{scenario}");
+        }
+        if scenario == "cancelled" {
+            let unit = report_unit(&report, &directory.package_name, "compile");
+            assert_eq!(unit["cache"]["result"], "miss");
+            assert!(
+                download["end_ns"].as_u64().unwrap() >= unit["timings"]["end_ns"].as_u64().unwrap()
+            );
+        }
+        let html =
+            fs::read_to_string(workspace.join("target/corgi-timings/corgi-timing.html")).unwrap();
+        assert!(html.contains(&format!("<td>{outcome}</td>")), "{scenario}");
+        assert!(html.contains(detail), "{scenario}");
+    }
+}
+
+#[test]
+fn remote_cache_replaces_a_running_compiler_and_reuses_its_result_locally() {
+    let directory = TestDirectory::new("remote-compiler-race");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    fs::create_dir_all(&store).unwrap();
+    let release = store.join("compiler-release");
+    fs::write(&release, "publish normally").unwrap();
+    fs::create_dir_all(workspace.join("gate/src")).unwrap();
+    fs::write(workspace.join("gate/Cargo.toml"),
+        "[package]\nname = \"remote_gate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n").unwrap();
+    fs::write(workspace.join("gate/src/lib.rs"), r#"
+extern crate proc_macro;
+#[proc_macro]
+pub fn wait(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let release = input.to_string();
+    let scratch = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap());
+    std::fs::write(scratch.join("remote-compiler-running"), "running").unwrap();
+    let start = std::time::Instant::now();
+    while !std::path::Path::new(release.trim_matches('"')).exists() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "remote takeover never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    proc_macro::TokenStream::new()
+}
+"#).unwrap();
+    let manifest = workspace.join("Cargo.toml");
+    let original = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        manifest,
+        format!("{original}\nremote_gate = {{ path = \"gate\" }}\n"),
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"), format!(
+        "remote_gate::wait!({:?});\nfn main() {{ println!(\"{{}}\", remote_dependency::value()); }}\n",
+        release.to_str().unwrap(),
+    )).unwrap();
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let (root, record) = root_record(&server, &directory.package_name);
+    clear_local_results(&directory, &store, &workspace);
+    fs::remove_file(&release).unwrap();
+    assert!(!has_compiler_marker(&store));
+    {
+        let mut state = server.objects.lock().unwrap();
+        state.compiler_gate = Some((root.clone(), store.clone()));
+        state
+            .bytes
+            .retain(|path, _| !path.contains("/actions/") || path == &root);
+    }
+    let output = remote_run(&workspace, &store, &["build", "--timings"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("replaced local compilation"));
+    assert_eq!(server.objects.lock().unwrap().gates_released, 1);
+    assert!(
+        !has_compiler_marker(&store),
+        "losing compiler staging must be removed"
+    );
+    let report = report_for_workspace(&store, &workspace);
+    let download = report["remote_downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|download| download["remote_key"] == record["remote_key"])
+        .unwrap();
+    assert_eq!(download["outcome"], "used");
+    assert!(download["superseded_local_ns"].as_u64().unwrap() > 0);
+    let unit = report_unit(&report, &directory.package_name, "compile");
+    assert_eq!(unit["cache"]["probe"], "remote");
+    assert!(
+        unit["timings"]["start_ns"].as_u64().unwrap() < download["record_ns"].as_u64().unwrap()
+    );
+    assert_eq!(unit["key"]["hash"], record["action_key"]);
+    server.reset_requests();
+    remote_run(&workspace, &store, &["build"]);
+    assert!(
+        server.requests().is_empty(),
+        "warm reuse must need no network"
+    );
+    let output = Command::new(
+        workspace
+            .join("target/debug")
+            .join(executable_name(&directory.package_name)),
+    )
+    .output()
+    .unwrap();
+    assert_success(&output, "run replacement binary");
+    assert_eq!(output.stdout, b"42\n");
+}
+
+fn has_compiler_marker(store: &Path) -> bool {
+    fn visit(root: &Path, depth: usize) -> bool {
+        if root.join("remote-compiler-running").is_file() {
+            return true;
+        }
+        depth > 0
+            && fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_dir())
+                        && visit(&entry.path(), depth - 1)
+                })
+    }
+    visit(&store.join("tmp"), 2) || visit(&store.join("incr"), 2)
 }
 
 #[test]
@@ -913,6 +1146,15 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
         pass["remote_key"]
     );
     assert_eq!(report["test_harnesses"][0]["cache"]["result"], "hit");
+    assert_eq!(report["remote_downloads"][0]["kind"], "test_pass");
+    assert_eq!(report["remote_downloads"][0]["outcome"], "used");
+    assert_eq!(
+        report["remote_downloads"][0]["remote_key"],
+        pass["remote_key"]
+    );
+    assert!(report["remote_downloads"][0]["record_ns"].is_u64());
+    assert!(report["remote_downloads"][0]["downloaded_ns"].is_u64());
+    assert!(report["remote_downloads"][0]["blobs_start_ns"].is_null());
     assert_unit_cache(
         &report,
         "remote_dependency",
@@ -1112,6 +1354,11 @@ fn remote_cache_invalid_test_pass_records_are_misses() {
         assert!(marker.exists(), "invalid {field} must run tests");
         assert!(server.requests().contains(&("GET".into(), path.clone())));
         let report = report_for_workspace(&store, &workspace);
+        let download = &report["remote_downloads"][0];
+        assert_eq!(download["kind"], "test_pass");
+        assert_eq!(download["outcome"], "failed");
+        assert_eq!(download["detail"], "invalid test pass");
+        assert!(download["record_ns"].is_u64());
         assert_eq!(
             report["test_harnesses"][0]["cache"]["result"], "miss",
             "{field}"

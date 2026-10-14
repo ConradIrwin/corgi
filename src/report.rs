@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -26,6 +26,7 @@ pub struct Report {
     pub cache: CacheSummary,
     pub counters: Counters,
     pub units: Vec<Unit>,
+    pub remote_downloads: Vec<RemoteDownload>,
     pub test_harnesses: Vec<TestHarness>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<Execution>,
@@ -40,6 +41,7 @@ impl Report {
             cache: CacheSummary::default(),
             counters: Counters::default(),
             units: Vec::new(),
+            remote_downloads: Vec::new(),
             test_harnesses: Vec::new(),
             execution: None,
         }
@@ -125,6 +127,40 @@ pub enum RunStatus {
 pub struct StageTiming {
     pub start_ns: u64,
     pub end_ns: u64,
+}
+
+/// One attempted remote read, independent of the action's eventual local outcome.
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteDownload {
+    pub unit: String,
+    pub kind: RemoteDownloadKind,
+    pub remote_key: String,
+    pub start_ns: u64,
+    pub record_ns: Option<u64>,
+    pub blobs_start_ns: Option<u64>,
+    pub downloaded_ns: Option<u64>,
+    pub end_ns: u64,
+    pub blob_count: usize,
+    /// Time spent in local execution before accepting a remote replacement.
+    pub superseded_local_ns: Option<u64>,
+    pub outcome: RemoteDownloadOutcome,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDownloadKind {
+    Artifact,
+    TestPass,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDownloadOutcome {
+    Used,
+    Miss,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -455,6 +491,28 @@ impl Recorder {
         update(&mut self.report.lock().unwrap());
     }
 
+    pub fn remote_downloads_html(&self, schedule_start_ns: u64) -> String {
+        let report = self.report.lock().unwrap();
+        let mut downloads = report.remote_downloads.iter().collect::<Vec<_>>();
+        downloads.sort_by_key(|download| download.start_ns);
+        let mut html = String::new();
+        for download in downloads {
+            let label = report
+                .units
+                .iter()
+                .find(|unit| unit.id == download.unit)
+                .map(|unit| {
+                    format!(
+                        "{} · {} ({})",
+                        unit.package.name, unit.target.name, unit.action.kind
+                    )
+                })
+                .unwrap_or_else(|| download.unit.clone());
+            html.push_str(&download.html_row(&label, schedule_start_ns));
+        }
+        html
+    }
+
     pub fn finish_to_path(&self, path: &Path) -> Result<Report> {
         let duration_ns = self.elapsed_ns();
         let mut report = self.report.lock().unwrap().clone();
@@ -472,6 +530,47 @@ impl Recorder {
             .with_context(|| format!("publishing timing report {}", path.display()))?;
         Ok(report)
     }
+}
+
+impl RemoteDownload {
+    fn html_row(&self, label: &str, schedule_start_ns: u64) -> String {
+        let time = |ns: Option<u64>| {
+            ns.map(|ns| format!("{:.3}s", ns.saturating_sub(schedule_start_ns) as f64 / 1e9))
+                .unwrap_or_else(|| "—".into())
+        };
+        let kind = match self.kind {
+            RemoteDownloadKind::Artifact => "artifact",
+            RemoteDownloadKind::TestPass => "test pass",
+        };
+        let outcome = match self.outcome {
+            RemoteDownloadOutcome::Used => "used",
+            RemoteDownloadOutcome::Miss => "miss",
+            RemoteDownloadOutcome::Failed => "failed",
+            RemoteDownloadOutcome::Cancelled => "cancelled",
+        };
+        format!(
+            "<tr><td>{}</td><td>{kind}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{outcome}</td><td>{}</td><td>{}</td></tr>\n",
+            escape_html(label),
+            escape_html(&self.remote_key),
+            time(Some(self.start_ns)),
+            time(self.record_ns),
+            time(self.blobs_start_ns),
+            time(self.downloaded_ns),
+            time(Some(self.end_ns)),
+            self.blob_count,
+            self.superseded_local_ns.map(|ns| format!("{:.3}s", ns as f64 / 1e9)).unwrap_or_else(|| "—".into()),
+            escape_html(self.detail.as_deref().unwrap_or("")),
+        )
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 const RUNS_CSV_HEADER: &str = "schema_version,run_id,started_at_unix_ns,workspace_root,command,profile,target,corgi_version,rustc_version,outcome,failure_stage,total_ns,build_ns,execute_ns,test_ns,plan_cache_result,workspace_hits,workspace_misses,dependency_hits,dependency_misses,test_result_hits,test_result_misses";
@@ -571,6 +670,34 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn remote_downloads_render_relative_times_and_escape_diagnostics() {
+        let download = RemoteDownload {
+            unit: "unit".into(),
+            kind: RemoteDownloadKind::Artifact,
+            remote_key: "a".repeat(64),
+            start_ns: 2_000_000_000,
+            record_ns: Some(2_100_000_000),
+            blobs_start_ns: Some(2_200_000_000),
+            downloaded_ns: None,
+            end_ns: 3_000_000_000,
+            blob_count: 17,
+            superseded_local_ns: None,
+            outcome: RemoteDownloadOutcome::Failed,
+            detail: Some("bad <blob> & \"data\"".into()),
+        };
+        let html = download.html_row("<package>", 1_000_000_000);
+        assert!(html.contains("&lt;package&gt;"));
+        assert!(html.contains("bad &lt;blob&gt; &amp; &quot;data&quot;"));
+        assert!(
+            html.contains("<td>1.000s</td><td>1.100s</td><td>1.200s</td><td>—</td><td>2.000s</td>")
+        );
+        assert!(html.contains("<td>17</td><td>failed</td>"));
+        let json = serde_json::to_value(download).unwrap();
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["start_ns"], 2_000_000_000u64);
+    }
+
+    #[test]
     fn recorder_accepts_concurrent_units_and_publishes_atomically() {
         let recorder = Arc::new(Recorder::new_at(run(), Instant::now()));
         recorder.update(|report| report.units.push(unit()));
@@ -587,7 +714,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 5);
+        assert_eq!(persisted["schema_version"], 6);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }

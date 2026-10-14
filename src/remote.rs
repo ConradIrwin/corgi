@@ -38,6 +38,24 @@ pub struct BlobRef<'a> {
     pub path: &'a Path,
 }
 
+#[derive(Debug)]
+pub struct ReadCancelled;
+
+impl std::fmt::Display for ReadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote request cancelled")
+    }
+}
+
+impl std::error::Error for ReadCancelled {}
+
+fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(ReadCancelled.into());
+    }
+    Ok(())
+}
+
 impl Cache {
     pub fn new(config: Config) -> Result<Self> {
         for url in std::iter::once(&config.read_url).chain(config.endpoint.iter()) {
@@ -64,174 +82,176 @@ impl Cache {
         })
     }
 
-    /// Transport errors, cancellation and malformed JSON are cache misses.
-    /// The caller must validate the record's schema and referenced hashes.
+    /// Returns None for HTTP 404; other failures retain their diagnostic cause.
+    /// Callers treat errors as cache misses and validate the record's schema.
     pub fn fetch_record(&self, key: &str, cancel: &AtomicBool) -> Result<Option<Vec<u8>>> {
         validate_hash(key)?;
-        let result: Result<Option<Vec<u8>>> = (|| {
-            let tmp = Temporary::new(&std::env::temp_dir())?;
-            let status = self.request(
-                "GET",
-                &self.read_url(&format!("actions/{key}.json")),
-                &tmp.0,
-                None,
-                None,
-                MAX_RECORD,
-                cancel,
-                self.read_timeout,
-            )?;
-            if status != 200 {
-                return Ok(None);
-            }
-            let bytes = fs::read(&tmp.0)?;
-            if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
-                return Ok(None);
-            }
-            Ok(Some(bytes))
-        })();
-        Ok(result.unwrap_or(None))
+        let tmp = Temporary::new(&std::env::temp_dir())?;
+        let status = self.request(
+            "GET",
+            &self.read_url(&format!("actions/{key}.json")),
+            &tmp.0,
+            None,
+            None,
+            MAX_RECORD,
+            cancel,
+            self.read_timeout,
+        )?;
+        if status == 404 {
+            return Ok(None);
+        }
+        ensure!(status == 200, "R2 record returned HTTP {status}");
+        let bytes = fs::read(&tmp.0)?;
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .context("invalid remote record JSON")?;
+        Ok(Some(bytes))
     }
 
-    /// Returns true only when every requested blob is locally available and verified.
+    /// Succeeds only when every requested blob is locally available and verified.
     ///
-    /// Transport errors and cancellation are misses; invalid hashes are errors.
+    /// Failures retain their diagnostic cause; callers treat them as cache misses.
     /// Only verified bytes are atomically renamed into the local CAS.
     /// Existing local bytes are checked too, so a damaged CAS entry is repaired.
-    pub fn fetch_blobs(
-        &self,
-        store: &Store,
-        hashes: &[String],
-        cancel: &AtomicBool,
-    ) -> Result<bool> {
+    pub fn fetch_blobs(&self, store: &Store, hashes: &[String], cancel: &AtomicBool) -> Result<()> {
         for hash in hashes {
             validate_hash(hash)?;
         }
-        let result = (|| -> Result<bool> {
-            let mut seen = HashSet::new();
-            let mut missing = Vec::new();
-            for hash in hashes {
-                ensure!(!cancel.load(Ordering::Relaxed), "remote request cancelled");
-                if seen.insert(hash)
-                    && sha256_file(&store.cache_path(hash)).ok().as_deref() != Some(hash)
-                {
-                    missing.push((hash, Temporary::new(&store.root.join("tmp"))?));
-                }
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for hash in hashes {
+            check_cancelled(cancel)?;
+            if seen.insert(hash)
+                && sha256_file(&store.cache_path(hash)).ok().as_deref() != Some(hash)
+            {
+                missing.push((hash, Temporary::new(&store.root.join("tmp"))?));
             }
-            if missing.is_empty() {
-                return Ok(!cancel.load(Ordering::Relaxed));
-            }
+        }
+        if missing.is_empty() {
+            check_cancelled(cancel)?;
+            return Ok(());
+        }
 
-            // File-backed metadata cannot fill a pipe while we wait for curl.
-            // Each transfer emits one indexed status, in completion order.
-            let statuses = Temporary::new(&store.root.join("tmp"))?;
-            let status_limit = (missing.len() * (missing.len().to_string().len() + 9)) as u64;
-            // Large incremental actions can exceed ARG_MAX, especially with
-            // long store paths. Keep per-transfer options out of argv.
-            let config = Temporary::new(&store.root.join("tmp"))?;
-            let mut config_file = OpenOptions::new().write(true).open(&config.0)?;
-            let mut command = crate::curl();
-            command.args([
-                "-q",
-                "--parallel",
-                "--parallel-max",
-                &GET_CONCURRENCY.to_string(),
-            ]);
-            command.arg("--config").arg(&config.0);
-            for (index, (hash, temporary)) in missing.iter().enumerate() {
-                if index > 0 {
-                    writeln!(config_file, "next")?;
-                }
-                writeln!(
-                    config_file,
-                    "silent\ngloboff\nproto = \"=http,https\"\nconnect-timeout = 3"
-                )?;
-                for (option, value) in [
-                    ("max-time", self.read_timeout.as_secs_f64().to_string()),
-                    ("max-filesize", MAX_BLOB.to_string()),
-                    (
-                        "write-out",
-                        format!("{index} %{{http_code}} %{{exitcode}}\n"),
-                    ),
-                    ("url", self.read_url(&format!("blobs/{hash}"))),
-                ] {
-                    write!(config_file, "{option} = \"")?;
-                    config_file.write_all(&curl_config_escape(value.as_bytes()))?;
-                    writeln!(config_file, "\"")?;
-                }
-                write!(config_file, "output = \"")?;
-                config_file.write_all(&curl_config_escape(
-                    temporary.0.as_os_str().as_encoded_bytes(),
-                ))?;
+        // File-backed metadata cannot fill a pipe while we wait for curl.
+        // Each transfer emits one indexed status, in completion order.
+        let statuses = Temporary::new(&store.root.join("tmp"))?;
+        let status_limit = (missing.len() * (missing.len().to_string().len() + 9)) as u64;
+        // Large incremental actions can exceed ARG_MAX, especially with
+        // long store paths. Keep per-transfer options out of argv.
+        let config = Temporary::new(&store.root.join("tmp"))?;
+        let mut config_file = OpenOptions::new().write(true).open(&config.0)?;
+        let mut command = crate::curl();
+        command.args([
+            "-q",
+            "--parallel",
+            "--parallel-max",
+            &GET_CONCURRENCY.to_string(),
+        ]);
+        command.arg("--config").arg(&config.0);
+        for (index, (hash, temporary)) in missing.iter().enumerate() {
+            if index > 0 {
+                writeln!(config_file, "next")?;
+            }
+            writeln!(
+                config_file,
+                "silent\ngloboff\nproto = \"=http,https\"\nconnect-timeout = 3"
+            )?;
+            for (option, value) in [
+                ("max-time", self.read_timeout.as_secs_f64().to_string()),
+                ("max-filesize", MAX_BLOB.to_string()),
+                (
+                    "write-out",
+                    format!("{index} %{{http_code}} %{{exitcode}}\n"),
+                ),
+                ("url", self.read_url(&format!("blobs/{hash}"))),
+            ] {
+                write!(config_file, "{option} = \"")?;
+                config_file.write_all(&curl_config_escape(value.as_bytes()))?;
                 writeln!(config_file, "\"")?;
             }
-            drop(config_file);
-            command
-                .stdin(Stdio::null())
-                .stdout(OpenOptions::new().write(true).open(&statuses.0)?)
-                .stderr(Stdio::null());
-            let mut child = command
-                .spawn()
-                .context("starting parallel R2 curl transport")?;
-            let start = Instant::now();
-            // --max-time applies to individual transfers, not time in the queue.
-            let waves = missing.len().div_ceil(GET_CONCURRENCY);
-            let deadline = self
-                .read_timeout
-                .saturating_mul(u32::try_from(waves).unwrap_or(u32::MAX))
-                .saturating_add(Duration::from_secs(1));
-            let wait = (|| -> Result<()> {
-                loop {
+            write!(config_file, "output = \"")?;
+            config_file.write_all(&curl_config_escape(
+                temporary.0.as_os_str().as_encoded_bytes(),
+            ))?;
+            writeln!(config_file, "\"")?;
+        }
+        drop(config_file);
+        command
+            .stdin(Stdio::null())
+            .stdout(OpenOptions::new().write(true).open(&statuses.0)?)
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .context("starting parallel R2 curl transport")?;
+        let start = Instant::now();
+        // --max-time applies to individual transfers, not time in the queue.
+        let waves = missing.len().div_ceil(GET_CONCURRENCY);
+        let deadline = self
+            .read_timeout
+            .saturating_mul(u32::try_from(waves).unwrap_or(u32::MAX))
+            .saturating_add(Duration::from_secs(1));
+        let wait = (|| -> Result<()> {
+            loop {
+                check_cancelled(cancel)?;
+                ensure!(
+                    start.elapsed() <= deadline,
+                    "remote batch deadline exceeded"
+                );
+                ensure!(
+                    fs::metadata(&statuses.0)?.len() <= status_limit
+                        && missing.iter().all(|(_, temporary)| {
+                            fs::metadata(&temporary.0).is_ok_and(|m| m.len() <= MAX_BLOB)
+                        }),
+                    "remote batch exceeded response size limits"
+                );
+                if let Some(status) = child.try_wait()? {
                     ensure!(
-                        !cancel.load(Ordering::Relaxed)
-                            && start.elapsed() <= deadline
-                            && fs::metadata(&statuses.0)?.len() <= status_limit
-                            && missing.iter().all(|(_, temporary)| {
-                                fs::metadata(&temporary.0).is_ok_and(|m| m.len() <= MAX_BLOB)
-                            }),
-                        "remote batch cancelled or exceeded its bounds"
+                        status.success(),
+                        "parallel R2 curl transport failed ({status})"
                     );
-                    if let Some(status) = child.try_wait()? {
-                        ensure!(status.success(), "parallel R2 curl transport failed");
-                        return Ok(());
-                    }
-                    thread::sleep(Duration::from_millis(10));
+                    return Ok(());
                 }
-            })();
-            if let Err(error) = wait {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
+                thread::sleep(Duration::from_millis(10));
             }
-            ensure!(
-                fs::metadata(&statuses.0)?.len() <= status_limit,
-                "oversized curl metadata"
-            );
-            let mut completed = HashSet::new();
-            for line in fs::read_to_string(&statuses.0)?.lines() {
-                let (index, status) = line.split_once(' ').context("invalid curl status")?;
-                let index: usize = index.parse()?;
-                ensure!(
-                    status == "200 0" && index < missing.len() && completed.insert(index),
-                    "incomplete remote batch"
-                );
-            }
-            ensure!(completed.len() == missing.len(), "incomplete remote batch");
-            for (hash, temporary) in &missing {
-                ensure!(
-                    !cancel.load(Ordering::Relaxed)
-                        && fs::metadata(&temporary.0)?.len() <= MAX_BLOB
-                        && sha256_file(&temporary.0)?.as_str() == hash.as_str()
-                        && !cancel.load(Ordering::Relaxed),
-                    "unverified remote blob"
-                );
-                let destination = store.cache_path(hash);
-                fs::create_dir_all(destination.parent().unwrap())?;
-                fs::rename(&temporary.0, destination)
-                    .context("publishing verified remote blob into CAS")?;
-            }
-            Ok(!cancel.load(Ordering::Relaxed))
         })();
-        Ok(result.unwrap_or(false))
+        if let Err(error) = wait {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        ensure!(
+            fs::metadata(&statuses.0)?.len() <= status_limit,
+            "oversized curl metadata"
+        );
+        let mut completed = HashSet::new();
+        for line in fs::read_to_string(&statuses.0)?.lines() {
+            let (index, status) = line.split_once(' ').context("invalid curl status")?;
+            let index: usize = index.parse()?;
+            ensure!(
+                index < missing.len() && completed.insert(index),
+                "incomplete remote batch"
+            );
+            ensure!(
+                status == "200 0",
+                "remote blob {} returned HTTP/curl status {status}",
+                missing[index].0
+            );
+        }
+        ensure!(completed.len() == missing.len(), "incomplete remote batch");
+        for (hash, temporary) in &missing {
+            check_cancelled(cancel)?;
+            ensure!(
+                fs::metadata(&temporary.0)?.len() <= MAX_BLOB
+                    && sha256_file(&temporary.0)?.as_str() == hash.as_str(),
+                "remote blob {hash} failed size or SHA-256 verification"
+            );
+            check_cancelled(cancel)?;
+            let destination = store.cache_path(hash);
+            fs::create_dir_all(destination.parent().unwrap())?;
+            fs::rename(&temporary.0, destination)
+                .context("publishing verified remote blob into CAS")?;
+        }
+        check_cancelled(cancel)?;
+        Ok(())
     }
 
     /// Validate explicit write opt-in before the caller schedules any work.
@@ -473,7 +493,7 @@ impl Cache {
         timeout: Duration,
         condition: Option<&str>,
     ) -> Result<(u16, Option<String>)> {
-        ensure!(!cancel.load(Ordering::Relaxed), "remote request cancelled");
+        check_cancelled(cancel)?;
         let headers = Temporary::new(&std::env::temp_dir())?;
         // -q must be first: never inherit ~/.curlrc credentials or redirects.
         // Do not follow redirects; public reads must stay unauthenticated and
@@ -527,12 +547,15 @@ impl Cache {
             }
             drop(child.stdin.take());
             loop {
-                if cancel.load(Ordering::Relaxed)
-                    || start.elapsed() > timeout
-                    || fs::metadata(output).is_ok_and(|m| m.len() > limit)
+                check_cancelled(cancel)?;
+                ensure!(
+                    start.elapsed() <= timeout,
+                    "remote request deadline exceeded"
+                );
+                if fs::metadata(output).is_ok_and(|m| m.len() > limit)
                     || fs::metadata(&headers.0).is_ok_and(|m| m.len() > 64 * 1024)
                 {
-                    bail!("remote request cancelled or exceeded its bounds");
+                    bail!("remote request exceeded response size limits");
                 }
                 if child.try_wait()?.is_some() {
                     break;
@@ -922,9 +945,13 @@ mod tests {
         let name = format!("actions/{}.json", key());
         assert!(cache.fetch_record(&key(), &cancel()).unwrap().is_none());
         server.set(&name, b"broken");
-        assert!(cache.fetch_record(&key(), &cancel()).unwrap().is_none());
+        assert!(cache
+            .fetch_record(&key(), &cancel())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid remote record JSON"));
         server.set(&name, &vec![b' '; MAX_RECORD as usize + 1]);
-        assert!(cache.fetch_record(&key(), &cancel()).unwrap().is_none());
+        assert!(cache.fetch_record(&key(), &cancel()).is_err());
         server.set(&name, &record(&[]));
         assert_eq!(
             cache.fetch_record(&key(), &cancel()).unwrap().unwrap(),
@@ -938,7 +965,7 @@ mod tests {
             .iter()
             .all(|(_, auth)| !auth));
         drop(server);
-        assert!(cache.fetch_record(&key(), &cancel()).unwrap().is_none());
+        assert!(cache.fetch_record(&key(), &cancel()).is_err());
     }
 
     #[test]
@@ -948,23 +975,27 @@ mod tests {
         let local = Local::new();
         let hash = sha256_hex(b"correct bytes");
         let name = format!("blobs/{hash}");
-        assert!(!cache
+        assert!(cache
             .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap());
+            .unwrap_err()
+            .to_string()
+            .contains("404"));
         server.set(&name, b"wrong bytes");
-        assert!(!cache
+        assert!(cache
             .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap());
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256"));
         assert!(!local.0.cache_path(&hash).exists());
         server.set(&name, b"correct bytes");
-        assert!(cache
+        cache
             .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap());
+            .unwrap();
         let path = local.0.cache_path(&hash);
         fs::write(&path, b"damaged").unwrap();
-        assert!(cache
+        cache
             .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap());
+            .unwrap();
         assert_eq!(fs::read(path).unwrap(), b"correct bytes");
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
     }
@@ -984,7 +1015,7 @@ mod tests {
         }
         let count = hashes.len();
         hashes.extend(hashes.clone());
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
         for hash in &hashes {
             assert_eq!(sha256_file(&local.0.cache_path(hash)).unwrap(), *hash);
         }
@@ -1006,7 +1037,7 @@ mod tests {
                 .iter()
                 .all(|(method, auth)| method == "GET" && !auth));
         }
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
         assert_eq!(
             server.state.lock().unwrap().requests.len(),
             count,
@@ -1042,10 +1073,10 @@ mod tests {
             .collect();
         // Output paths alone would exceed macOS's 256 KiB argv limit.
         assert!(store.root.as_os_str().len() * hashes.len() > 256 * 1024);
-        assert!(server
+        server
             .cache()
             .fetch_blobs(&store, &hashes, &cancel())
-            .unwrap());
+            .unwrap();
         for hash in &hashes {
             assert_eq!(sha256_file(&store.cache_path(hash)).unwrap(), *hash);
         }
@@ -1069,13 +1100,13 @@ mod tests {
             })
             .collect();
         let start = Instant::now();
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
         assert!(start.elapsed() > cache.read_timeout);
 
         let other = Local::new();
         server.state.lock().unwrap().delay = Duration::from_secs(2);
         cache.read_timeout = Duration::from_millis(80);
-        assert!(!cache.fetch_blobs(&other.0, &hashes, &cancel()).unwrap());
+        assert!(cache.fetch_blobs(&other.0, &hashes, &cancel()).is_err());
         assert!(hashes.iter().all(|hash| !other.0.cache_path(hash).exists()));
         assert_eq!(fs::read_dir(other.0.root.join("tmp")).unwrap().count(), 0);
     }
@@ -1089,20 +1120,20 @@ mod tests {
         let bad = sha256_hex(b"bad");
         let hashes = vec![good.clone(), bad.clone()];
         server.set(&format!("blobs/{good}"), b"good");
-        assert!(!cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
         server.set(&format!("blobs/{bad}"), b"corrupt");
-        assert!(!cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
         assert!(!local.0.cache_path(&bad).exists());
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
         assert!(cache
             .fetch_blobs(&local.0, &["../escape".into()], &cancel())
             .is_err());
-        assert!(cache.fetch_blobs(&local.0, &[], &cancel()).unwrap());
+        cache.fetch_blobs(&local.0, &[], &cancel()).unwrap();
 
         server.state.lock().unwrap().delay = Duration::from_secs(2);
         let flag = cancel();
         thread::scope(|scope| {
-            let worker = scope.spawn(|| cache.fetch_blobs(&local.0, &hashes, &flag).unwrap());
+            let worker = scope.spawn(|| cache.fetch_blobs(&local.0, &hashes, &flag));
             let deadline = Instant::now() + Duration::from_secs(2);
             while server.state.lock().unwrap().active_gets == 0 {
                 assert!(Instant::now() < deadline, "curl never started");
@@ -1110,14 +1141,17 @@ mod tests {
             }
             let start = Instant::now();
             flag.store(true, Ordering::Relaxed);
-            assert!(!worker.join().unwrap());
+            assert!(worker.join().unwrap().unwrap_err().is::<ReadCancelled>());
             assert!(start.elapsed() < Duration::from_secs(1));
         });
         assert!(!local.0.cache_path(&bad).exists());
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
-        assert!(!cache.fetch_blobs(&local.0, &[], &flag).unwrap());
+        assert!(cache
+            .fetch_blobs(&local.0, &[], &flag)
+            .unwrap_err()
+            .is::<ReadCancelled>());
         drop(server);
-        assert!(!cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
     }
 
     #[test]
@@ -1131,13 +1165,17 @@ mod tests {
         server.set(&format!("blobs/{hash}"), b"body");
         for status in [206, 302, 503] {
             server.state.lock().unwrap().read_status = Some(status);
-            assert!(!cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+            assert!(cache
+                .fetch_blobs(&local.0, &hashes, &cancel())
+                .unwrap_err()
+                .to_string()
+                .contains(&status.to_string()));
             assert!(!local.0.cache_path(&hash).exists());
         }
         server.state.lock().unwrap().read_status = None;
         for length in [MAX_BLOB + 1, 5] {
             server.state.lock().unwrap().read_length = Some(length);
-            assert!(!cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap());
+            assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
             assert!(!local.0.cache_path(&hash).exists());
             assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
         }
@@ -1150,16 +1188,16 @@ mod tests {
         let mut cache = server.cache();
         cache.read_timeout = Duration::from_millis(80);
         let start = Instant::now();
-        assert!(cache.fetch_record(&key(), &cancel()).unwrap().is_none());
+        assert!(cache.fetch_record(&key(), &cancel()).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
         cache.read_timeout = Duration::from_secs(10);
         let flag = cancel();
         let flag2 = flag.clone();
-        let worker = thread::spawn(move || cache.fetch_record(&key(), &flag2).unwrap());
+        let worker = thread::spawn(move || cache.fetch_record(&key(), &flag2));
         thread::sleep(Duration::from_millis(40));
         let start = Instant::now();
         flag.store(true, Ordering::Relaxed);
-        assert!(worker.join().unwrap().is_none());
+        assert!(worker.join().unwrap().unwrap_err().is::<ReadCancelled>());
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 

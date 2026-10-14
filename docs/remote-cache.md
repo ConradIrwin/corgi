@@ -32,11 +32,32 @@ process with connection reuse and up to four parallel GETs. Artifact actions
 take turns using that budget rather than multiplying it across actions.
 
 Local compilation proceeds independently from inputs toward outputs; ready work
-never waits for the network. A complete remote result can replace a queued
-action and prune work needed only by that output, but cannot replace a running
-compiler. Downloads are cancelled when local execution claims their action,
-when their action is no longer needed, or when compilation finishes. Intermediate
-cache hits retain producer work still needed by other consumers.
+never waits for the network. A complete remote result can replace a queued action
+and prune work needed only by that output. On Unix, non-pipelined compiles
+(including final executable links) also race after compilation starts: the first
+verified result wins. A remote winner stops and reaps the compiler process group,
+removes staging outputs, then installs the result. If installation fails, local
+compilation is retried. Cancellable compilers borrow currently spare jobserver
+capacity into a private pool so termination cannot strand global codegen tokens.
+
+Build-script execution and pipelined producers still cannot be replaced once
+started: they may have side effects or metadata already in use by consumers.
+Their downloads are cancelled at startup. Other downloads are cancelled when
+the local result wins, their action is no longer needed, or local work finishes.
+Intermediate cache hits retain producer work still needed by other consumers.
+
+Performance JSON reports include `remote_downloads`, separately from local
+cache probes. Each attempted artifact or test-pass read records its unit, remote
+key, lookup start, record receipt, blob-phase start, verification completion,
+end time, referenced blob count, outcome, and failure/cancellation detail.
+Times are nanoseconds from invocation start. `used` means the result was
+accepted; `miss` means HTTP 404; `failed` retains the transport, validation, or
+installation error; `cancelled` explains why the scheduler stopped the attempt.
+`superseded_local_ns` records local execution time discarded for a remote winner.
+The terminal also prints `Downloaded … — replaced local compilation` on takeover.
+Errors still fall back to local work. Queued reads that never start are not
+listed. `corgi build --timings` also lists these attempts in the HTML report,
+with times relative to scheduling start so they can be compared with compilers.
 
 ```sh
 corgi build
