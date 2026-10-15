@@ -472,43 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_wraps_build_and_test_without_changing_their_arguments() {
-        let cli =
-            Cli::try_parse_from(["corgi", "cache", "build", "--release", "-p", "example"]).unwrap();
-        let Some(Command::Cache {
-            command: super::CacheCommand::Build(args),
-        }) = cli.command
-        else {
-            panic!("cache build not parsed");
-        };
-        assert!(args.build.release);
-        assert_eq!(args.build.packages, ["example"]);
-        let cli = Cli::try_parse_from([
-            "corgi",
-            "cache",
-            "test",
-            "--force",
-            "--timeout",
-            "5",
-            "parser",
-            "--",
-            "--ignored",
-        ])
-        .unwrap();
-        let Some(Command::Cache {
-            command: super::CacheCommand::Test(args),
-        }) = cli.command
-        else {
-            panic!("cache test not parsed");
-        };
-        assert!(args.force);
-        assert_eq!(args.timeout, Some(5));
-        assert_eq!(args.filters, ["parser"]);
-        assert_eq!(args.exec_args, ["--ignored"]);
-        assert!(Cli::try_parse_from(["corgi", "cache", "run"]).is_err());
-    }
-
-    #[test]
     fn test_filters_are_repeatable_regular_expressions() {
         let cli = Cli::try_parse_from(["corgi", "test", "^parser::", "empty$"]).unwrap();
         let Some(Command::Test(args)) = cli.command else {

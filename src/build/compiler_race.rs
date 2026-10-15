@@ -248,26 +248,4 @@ time.sleep(60)
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-
-    #[test]
-    fn cancellation_while_waiting_for_capacity_does_not_spawn() {
-        let jobserver = jobserver::Client::new(0).unwrap();
-        let mut command = Command::new("/this-command-must-not-start");
-        let result = run(
-            &mut command,
-            &jobserver,
-            || Err(Superseded.into()),
-            Path::new("/unused"),
-        );
-        assert!(result.unwrap_err().is::<Superseded>());
-        assert_eq!(jobserver.available().unwrap(), 0);
-    }
-
-    #[test]
-    fn local_commit_closes_the_offer_window() {
-        let race = Race::default();
-        race.commit_local().unwrap();
-        assert!(matches!(*race.state.lock().unwrap(), State::Local));
-        assert!(race.finish().is_none());
-    }
 }

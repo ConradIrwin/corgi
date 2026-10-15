@@ -13,36 +13,6 @@ pub(super) struct Record {
     pub(super) blobs: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct PassRecord {
-    remote_key: String,
-    harness_action: String,
-    result: TestPass,
-    blobs: Vec<String>,
-}
-
-impl PassRecord {
-    pub(super) fn key(&self) -> &str {
-        &self.remote_key
-    }
-
-    pub(super) fn test_count(&self) -> u64 {
-        self.result.test_count
-    }
-
-    fn new(remote_key: String, harness_action: String, test_count: u64) -> Self {
-        Self {
-            remote_key,
-            harness_action,
-            result: TestPass {
-                passed: true,
-                test_count,
-            },
-            blobs: Vec::new(),
-        }
-    }
-}
-
 fn blobs(result: &ActionResult) -> Vec<String> {
     let mut hashes = result
         .outputs
@@ -145,7 +115,7 @@ pub(super) fn compute_keys(ctx: &Ctx) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-fn alias_path(ctx: &Ctx, index: usize) -> PathBuf {
+pub(super) fn alias_path(ctx: &Ctx, index: usize) -> PathBuf {
     ctx.store
         .root
         .join("remote-actions")
@@ -203,20 +173,10 @@ fn validate(ctx: &Ctx, index: usize, record: &Record) -> Result<()> {
             "invalid output name"
         );
     }
-    if matches!(ctx.units[index].kind, Kind::Bsr) {
-        anyhow::ensure!(
-            record.result.bs.is_some() && record.result.out_dir.is_some(),
-            "incomplete build script"
-        );
-    } else {
-        anyhow::ensure!(
-            ctx.action_plans[index]
-                .outputs
-                .iter()
-                .all(|name| names.contains(name)),
-            "incomplete outputs"
-        );
-    }
+    anyhow::ensure!(
+        ctx.action_plans[index].accepts_result(&record.result),
+        "invalid action result"
+    );
     Ok(())
 }
 
@@ -237,7 +197,7 @@ fn remember(ctx: &Ctx, index: usize, record: &Record) -> Result<()> {
 }
 
 pub(super) fn lookup_local(ctx: &Ctx, index: usize) -> Result<Option<UnitResult>> {
-    if ctx.remote_keys.is_empty() {
+    if ctx.remote_keys.is_empty() || !ctx.action_plans[index].cache_policy.reads() {
         return Ok(None);
     }
     let Some(record) = fs::read(alias_path(ctx, index))
@@ -290,63 +250,19 @@ pub(super) fn install(ctx: &Ctx, index: usize, record: Record) -> Result<UnitRes
         .context("complete remote result could not be installed")
 }
 
-fn decode_pass(remote_key: &str, bytes: &[u8]) -> Result<PassRecord> {
-    let record: PassRecord = serde_json::from_slice(bytes)?;
-    anyhow::ensure!(
-        record.remote_key == remote_key
-            && is_hash(&record.harness_action)
-            && record.blobs.is_empty()
-            && record.result.passed,
-        "invalid test pass"
-    );
-    Ok(record)
-}
-
-pub(super) fn local_pass(ctx: &Ctx, index: usize) -> Option<PassRecord> {
-    let remote_key = test_pass_key(ctx.remote_keys.get(index)?).ok()?;
-    if let Some(record) = ctx
-        .store
-        .load_action(&remote_key)
-        .and_then(|bytes| decode_pass(&remote_key, &bytes).ok())
-    {
-        return Some(record);
-    }
-    // A verified local candidate can also prove a pass without materializing
-    // its executable. This preserves the precise local cache's narrower reuse.
-    let candidate = ctx.action_plans[index].candidate.as_ref()?;
-    let count = load_test_pass(&ctx.store, &test_pass_key(&candidate.key).ok()?)?;
-    Some(PassRecord::new(remote_key, candidate.key.clone(), count))
-}
-
-pub(super) fn remember_downloaded_pass(
-    ctx: &Ctx,
-    index: usize,
-    bytes: &[u8],
-    download: &mut crate::report::RemoteDownload,
-) -> Result<PassRecord> {
-    let remote_key = test_pass_key(&ctx.remote_keys[index])?;
-    download.record_ns = Some(ctx.report.elapsed_ns());
-    let record = decode_pass(&remote_key, bytes)?;
-    download.downloaded_ns = Some(ctx.report.elapsed_ns());
-    // The requested input key is the authority. Never install a local precise
-    // pass under the record's claimed harness identity, which is metadata only.
-    ctx.store
-        .save_action(&remote_key, &serde_json::to_vec(&record)?)?;
-    Ok(record)
-}
-
 /// Publish the relevant graph, not just actions executed in this invocation.
 /// Requested local hits prune execution, but must not hide reusable dependency
 /// results from an explicit cache-population command.
-pub(super) fn publish(
-    ctx: &Ctx,
-    results: &[OnceLock<UnitResult>],
-    cached_passes: &[OnceLock<PassRecord>],
-    test_passes: bool,
-) -> Result<()> {
+pub(super) fn publish(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<()> {
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;
     let mut count = 0;
-    for index in dependency_closure(ctx, requested_units(ctx, |_| false)) {
+    for index in dependency_closure(ctx, requested_units(ctx)) {
+        let plan = &ctx.action_plans[index];
+        if !plan.cache_policy.writes()
+            || (!plan.cache_policy.reads() && results[index].get().is_none())
+        {
+            continue;
+        }
         let publication = (|| -> Result<()> {
             let mut record = if let Some(result) = results[index].get() {
                 Some(make_record(ctx, index, &result.action, result.res.clone()))
@@ -374,7 +290,6 @@ pub(super) fn publish(
                     if results[index].get().is_some() {
                         return Err(error);
                     }
-                    // A pass-only root need not have artifact records or blobs.
                     // Stale aliases for skipped work are not publication inputs.
                     record = None;
                 }
@@ -393,28 +308,6 @@ pub(super) fn publish(
                     .collect::<Vec<_>>();
                 cache.publish(&record.remote_key, &serde_json::to_vec(record)?, &refs)?;
                 count += 1;
-            }
-            if test_passes && ctx.units[index].is_root && ctx.units[index].test_harness {
-                let pass = match cached_passes[index].get() {
-                    Some(pass) => Some(pass.clone()),
-                    None => match &record {
-                        Some(record) => {
-                            match load_test_pass(&ctx.store, &test_pass_key(&record.action_key)?) {
-                                Some(test_count) => Some(PassRecord::new(
-                                    test_pass_key(&record.remote_key)?,
-                                    record.action_key.clone(),
-                                    test_count,
-                                )),
-                                None => None,
-                            }
-                        }
-                        None => None,
-                    },
-                };
-                if let Some(pass) = pass {
-                    cache.publish(pass.key(), &serde_json::to_vec(&pass)?, &[])?;
-                    count += 1;
-                }
             }
             Ok(())
         })();

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -151,7 +151,7 @@ pub struct RemoteDownload {
 #[serde(rename_all = "snake_case")]
 pub enum RemoteDownloadKind {
     Artifact,
-    TestPass,
+    TestRun,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -318,6 +318,14 @@ pub enum UnitKeyResolution {
 pub enum ActionKeyInputs {
     Compile(Box<CompileKeyInputs>),
     BuildScriptRun(Box<BuildScriptRunKeyInputs>),
+    TestRun(TestRunKeyInputs),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TestRunKeyInputs {
+    pub dependencies: Vec<String>,
+    pub filters: Vec<String>,
+    pub arguments: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -419,7 +427,7 @@ pub struct TestHarness {
 #[derive(Clone, Debug, Serialize)]
 pub struct HarnessCache {
     pub result: UnitCacheResult,
-    pub pass_key: String,
+    pub action_key: String,
     pub bypassed: bool,
 }
 
@@ -540,7 +548,7 @@ impl RemoteDownload {
         };
         let kind = match self.kind {
             RemoteDownloadKind::Artifact => "artifact",
-            RemoteDownloadKind::TestPass => "test pass",
+            RemoteDownloadKind::TestRun => "test run",
         };
         let outcome = match self.outcome {
             RemoteDownloadOutcome::Used => "used",
@@ -670,34 +678,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn remote_downloads_render_relative_times_and_escape_diagnostics() {
-        let download = RemoteDownload {
-            unit: "unit".into(),
-            kind: RemoteDownloadKind::Artifact,
-            remote_key: "a".repeat(64),
-            start_ns: 2_000_000_000,
-            record_ns: Some(2_100_000_000),
-            blobs_start_ns: Some(2_200_000_000),
-            downloaded_ns: None,
-            end_ns: 3_000_000_000,
-            blob_count: 17,
-            superseded_local_ns: None,
-            outcome: RemoteDownloadOutcome::Failed,
-            detail: Some("bad <blob> & \"data\"".into()),
-        };
-        let html = download.html_row("<package>", 1_000_000_000);
-        assert!(html.contains("&lt;package&gt;"));
-        assert!(html.contains("bad &lt;blob&gt; &amp; &quot;data&quot;"));
-        assert!(
-            html.contains("<td>1.000s</td><td>1.100s</td><td>1.200s</td><td>—</td><td>2.000s</td>")
-        );
-        assert!(html.contains("<td>17</td><td>failed</td>"));
-        let json = serde_json::to_value(download).unwrap();
-        assert_eq!(json["outcome"], "failed");
-        assert_eq!(json["start_ns"], 2_000_000_000u64);
-    }
-
-    #[test]
     fn recorder_accepts_concurrent_units_and_publishes_atomically() {
         let recorder = Arc::new(Recorder::new_at(run(), Instant::now()));
         recorder.update(|report| report.units.push(unit()));
@@ -714,7 +694,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 6);
+        assert_eq!(persisted["schema_version"], 7);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }

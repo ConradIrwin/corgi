@@ -3,7 +3,7 @@
 //! Only the coordinator owns queue and completion state. Workers perform one
 //! transfer at a time; matching records insert their blobs at the same priority.
 
-use super::{remote_cache, test_pass_key, Ctx};
+use super::{remote_cache, Ctx, Kind};
 use crate::report::{RemoteDownload, RemoteDownloadKind, RemoteDownloadOutcome};
 use anyhow::Result;
 use std::{
@@ -14,11 +14,6 @@ use std::{
     },
 };
 
-pub(super) enum Downloaded {
-    Artifact(remote_cache::Record),
-    Pass(remote_cache::PassRecord),
-}
-
 struct Job {
     priority: usize,
     index: usize,
@@ -26,7 +21,7 @@ struct Job {
 }
 
 enum JobKind {
-    Record { key: String, pass: bool },
+    Record { key: String },
     Blob(String),
 }
 
@@ -38,11 +33,11 @@ struct Pending {
 
 pub(super) fn run(
     ctx: &Ctx,
-    requests: VecDeque<(usize, bool)>,
+    requests: VecDeque<usize>,
     cancel: &AtomicBool,
     cancel_units: &[AtomicBool],
-    wanted: impl Fn(usize, bool) -> bool,
-    completed: impl Fn(usize, Result<Option<Downloaded>>, RemoteDownload),
+    wanted: impl Fn(usize) -> bool,
+    completed: impl Fn(usize, Result<Option<remote_cache::Record>>, RemoteDownload),
 ) {
     if requests.is_empty() {
         return;
@@ -54,16 +49,12 @@ pub(super) fn run(
     let mut queue: VecDeque<_> = requests
         .into_iter()
         .enumerate()
-        .map(|(priority, (index, pass))| {
-            let key = if pass {
-                test_pass_key(&ctx.remote_keys[index]).expect("test pass key serialization")
-            } else {
-                ctx.remote_keys[index].clone()
-            };
+        .map(|(priority, index)| {
+            let key = ctx.remote_keys[index].clone();
             Job {
                 priority,
                 index,
-                kind: JobKind::Record { key, pass },
+                kind: JobKind::Record { key },
             }
         })
         .collect();
@@ -78,14 +69,9 @@ pub(super) fn run(
             scope.spawn(move || {
                 while let Ok((job, started)) = jobs.recv() {
                     let result = match &job.kind {
-                        JobKind::Record { key, pass } => cache.fetch_record(
-                            key,
-                            if *pass {
-                                cancel
-                            } else {
-                                &cancel_units[job.index]
-                            },
-                        ),
+                        JobKind::Record { key } => {
+                            cache.fetch_record(key, &cancel_units[job.index])
+                        }
                         JobKind::Blob(hash) => cache
                             .fetch_blob(&ctx.store, hash, &cancel_units[job.index])
                             .map(|()| None),
@@ -100,11 +86,10 @@ pub(super) fn run(
         loop {
             while !idle.is_empty() && !queue.is_empty() && !cancel.load(Relaxed) {
                 let job = queue.pop_front().unwrap();
-                let pass = matches!(&job.kind, JobKind::Record { pass: true, .. });
                 if matches!(job.kind, JobKind::Blob(_)) && pending[job.index].is_none() {
                     continue;
                 }
-                if !wanted(job.index, pass) {
+                if !wanted(job.index) {
                     finish_artifact(
                         ctx,
                         job.index,
@@ -127,11 +112,11 @@ pub(super) fn run(
             idle.push(worker);
             let index = job.index;
             match job.kind {
-                JobKind::Record { key, pass } => {
+                JobKind::Record { key } => {
                     let mut download = RemoteDownload {
                         unit: ctx.report_unit_keys[index].clone(),
-                        kind: if pass {
-                            RemoteDownloadKind::TestPass
+                        kind: if matches!(ctx.units[index].kind, Kind::TestRun) {
+                            RemoteDownloadKind::TestRun
                         } else {
                             RemoteDownloadKind::Artifact
                         },
@@ -147,7 +132,7 @@ pub(super) fn run(
                         detail: None,
                     };
                     let bytes = match result {
-                        Ok(Some(bytes)) if !cancel.load(Relaxed) && wanted(index, pass) => bytes,
+                        Ok(Some(bytes)) if !cancel.load(Relaxed) && wanted(index) => bytes,
                         Ok(Some(_)) => {
                             completed(index, Err(crate::remote::ReadCancelled.into()), download);
                             continue;
@@ -157,20 +142,6 @@ pub(super) fn run(
                             continue;
                         }
                     };
-                    if pass {
-                        let result = remote_cache::remember_downloaded_pass(
-                            ctx,
-                            index,
-                            &bytes,
-                            &mut download,
-                        );
-                        completed(
-                            index,
-                            result.map(|pass| Some(Downloaded::Pass(pass))),
-                            download,
-                        );
-                        continue;
-                    }
                     let record =
                         match remote_cache::decode_record(ctx, index, &bytes, &mut download) {
                             Ok(record) => record,
@@ -242,7 +213,7 @@ fn finish_artifact(
     pending: &mut [Option<Pending>],
     cancel_units: &[AtomicBool],
     result: Result<()>,
-    completed: &impl Fn(usize, Result<Option<Downloaded>>, RemoteDownload),
+    completed: &impl Fn(usize, Result<Option<remote_cache::Record>>, RemoteDownload),
 ) {
     let Some(mut action) = pending[index].take() else {
         return;
@@ -258,9 +229,5 @@ fn finish_artifact(
     } else {
         cancel_units[index].store(true, Relaxed);
     }
-    completed(
-        index,
-        result.map(|()| Some(Downloaded::Artifact(action.record))),
-        action.download,
-    );
+    completed(index, result.map(|()| Some(action.record)), action.download);
 }

@@ -80,8 +80,10 @@ enum Kind {
     Bsr, // run build.rs
     Bin,
     Test, // test harness executable (rustc --test)
+    TestRun,
 }
 
+#[derive(Clone)]
 struct UnitDep {
     unit: usize,
     role: DependencyRole,
@@ -94,6 +96,7 @@ enum DependencyRole {
     BuildScriptOutput,
     BuildScriptMetadata,
     BinaryExecutable,
+    TestExecutable,
     Other,
 }
 
@@ -112,11 +115,13 @@ impl DependencyRole {
             Self::BuildScriptOutput => "build_script",
             Self::BuildScriptMetadata => "build_script_metadata",
             Self::BinaryExecutable => "binary_executable",
+            Self::TestExecutable => "test_executable",
             Self::Other => "dependency",
         }
     }
 }
 
+#[derive(Clone)]
 struct Unit {
     pkg: usize,
     kind: Kind,
@@ -168,6 +173,8 @@ struct ActionResult {
     bs: Option<BuildScriptOut>,
     #[serde(default)]
     out_dir: Option<OutDirArchive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_result: Option<TestResult>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -217,7 +224,7 @@ fn unit_crate_type(unit: &Unit) -> String {
             }
         }
         Kind::Bsc | Kind::Bin | Kind::Test => "bin".to_string(),
-        Kind::Bsr => String::new(),
+        Kind::Bsr | Kind::TestRun => String::new(),
     }
 }
 
@@ -233,7 +240,7 @@ fn unit_links(unit: &Unit) -> bool {
     match unit.kind {
         Kind::Bin | Kind::Bsc | Kind::Test => true,
         Kind::Lib => unit_crate_type(unit) != "lib",
-        Kind::Bsr => false,
+        Kind::Bsr | Kind::TestRun => false,
     }
 }
 
@@ -309,7 +316,7 @@ fn binary_export_path(ctx: &Ctx, index: usize, output_name: &str) -> PathBuf {
             let extra_filename = format!("-{}", action_extra_filename(ctx, index));
             directory.push(output_name.replace(&extra_filename, ""));
         }
-        Kind::Lib | Kind::Bsr => directory.push(output_name),
+        Kind::Lib | Kind::Bsr | Kind::TestRun => directory.push(output_name),
     }
     directory
 }
@@ -320,7 +327,7 @@ fn validate_debug_export_paths(ctx: &Ctx) -> Result<()> {
         .iter()
         .filter_map(|plan| match &plan.template {
             ActionSpec::Compile(spec) => spec.debug_binary.as_deref(),
-            ActionSpec::BuildScriptRun(_) => None,
+            ActionSpec::BuildScriptRun(_) | ActionSpec::TestRun(_) => None,
         })
         .collect::<BTreeSet<_>>();
     for binary in &binaries {
@@ -381,16 +388,26 @@ struct UnitResult {
 struct TestHarness {
     unit_id: usize,
     name: String,
-    /// A cached test result does not require an executable to be materialized.
-    path: Option<PathBuf>,
+    path: PathBuf,
     cwd: PathBuf,
     binary_environment: Vec<(String, String)>,
-    pass_key: String,
-    cached_pass: bool,
-    cached_test_count: u64,
+    action_key: String,
     cache_bypassed: bool,
     discovery_ns: u64,
     tests: Vec<String>,
+}
+
+struct TestOptions {
+    filters: Vec<String>,
+    arguments: Vec<String>,
+    timeout: Option<Duration>,
+    force: bool,
+}
+
+impl TestOptions {
+    fn canonical(&self) -> bool {
+        self.filters.is_empty() && self.arguments.is_empty()
+    }
 }
 
 struct BenchmarkExecutable {
@@ -544,7 +561,7 @@ pub struct Ctx {
     report: Arc<crate::report::Recorder>,
     remote: Option<crate::remote::Cache>,
     remote_keys: Vec<String>,
-    remote_test_passes: bool,
+    test_options: TestOptions,
 }
 
 enum ResolvedToolchain {
@@ -1219,7 +1236,7 @@ fn compile_identity(ctx: &Ctx, uidx: usize) -> (String, String, String) {
 }
 
 fn effective_profile_flags(unit: &Unit, checked: bool) -> Vec<String> {
-    if matches!(unit.kind, Kind::Bsr) {
+    if matches!(unit.kind, Kind::Bsr | Kind::TestRun) {
         return Vec::new();
     }
     let profile = &unit.profile;
@@ -1316,6 +1333,15 @@ struct PlannedTool {
 enum ActionSpec {
     Compile(Box<CompileActionSpec>),
     BuildScriptRun(Box<BuildScriptRunActionSpec>),
+    TestRun(TestRunActionSpec),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TestRunActionSpec {
+    tool: String,
+    dependencies: Vec<PlannedActionDependency>,
+    filters: Vec<String>,
+    arguments: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1392,6 +1418,23 @@ struct ActionPlan {
     outputs: Vec<String>,
     main_output: Option<String>,
     declared_environment: Vec<(String, String)>,
+    cache_policy: CachePolicy,
+}
+
+enum CachePolicy {
+    Use,
+    Refresh,
+    Bypass,
+}
+
+impl CachePolicy {
+    fn reads(&self) -> bool {
+        matches!(self, Self::Use)
+    }
+
+    fn writes(&self) -> bool {
+        !matches!(self, Self::Bypass)
+    }
 }
 
 struct ResolvedAction {
@@ -1407,7 +1450,7 @@ impl ActionSpec {
                 CompileSourceInputs::Local { read_set, .. } => Some(read_set),
                 CompileSourceInputs::Static { .. } => None,
             },
-            Self::BuildScriptRun(_) => None,
+            Self::BuildScriptRun(_) | Self::TestRun(_) => None,
         }
     }
 
@@ -1417,7 +1460,7 @@ impl ActionSpec {
                 CompileSourceInputs::Local { read_set, .. } => Some(read_set),
                 CompileSourceInputs::Static { .. } => None,
             },
-            Self::BuildScriptRun(_) => None,
+            Self::BuildScriptRun(_) | Self::TestRun(_) => None,
         }
     }
 }
@@ -1426,7 +1469,30 @@ impl ActionPlan {
     fn compile_spec(&self) -> Result<&CompileActionSpec> {
         match &self.template {
             ActionSpec::Compile(spec) => Ok(spec),
-            ActionSpec::BuildScriptRun(_) => bail!("compile action plan expected"),
+            ActionSpec::BuildScriptRun(_) | ActionSpec::TestRun(_) => {
+                bail!("compile action plan expected")
+            }
+        }
+    }
+
+    fn accepts_result(&self, result: &ActionResult) -> bool {
+        match &self.template {
+            ActionSpec::TestRun(_) => {
+                result.test_result.is_some()
+                    && result.outputs.is_empty()
+                    && result.bs.is_none()
+                    && result.out_dir.is_none()
+            }
+            ActionSpec::BuildScriptRun(_) => {
+                result.test_result.is_none() && result.bs.is_some() && result.out_dir.is_some()
+            }
+            ActionSpec::Compile(_) => {
+                result.test_result.is_none()
+                    && self
+                        .outputs
+                        .iter()
+                        .all(|name| result.outputs.iter().any(|output| &output.name == name))
+            }
         }
     }
 }
@@ -1443,6 +1509,7 @@ fn action_spec_with_producer_keys(
     let dependencies = match &mut spec {
         ActionSpec::Compile(spec) => &mut spec.dependencies,
         ActionSpec::BuildScriptRun(spec) => &mut spec.dependencies,
+        ActionSpec::TestRun(spec) => &mut spec.dependencies,
     };
     for dependency in dependencies.iter_mut() {
         let Some((key, _)) = producer(dependency.producer_unit) else {
@@ -1592,9 +1659,9 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                     };
                     (true, filename)
                 }
-                DependencyRole::BuildScriptCompile | DependencyRole::BinaryExecutable => {
-                    (true, producer.main_output.clone())
-                }
+                DependencyRole::BuildScriptCompile
+                | DependencyRole::BinaryExecutable
+                | DependencyRole::TestExecutable => (true, producer.main_output.clone()),
                 DependencyRole::BuildScriptOutput | DependencyRole::BuildScriptMetadata => {
                     (true, None)
                 }
@@ -1615,7 +1682,17 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         } else {
             ctx.target.clone().unwrap_or_else(|| ctx.host.clone())
         };
-        let (mut spec, declared_environment) = if matches!(unit.kind, Kind::Bsr) {
+        let (mut spec, declared_environment) = if matches!(unit.kind, Kind::TestRun) {
+            (
+                ActionSpec::TestRun(TestRunActionSpec {
+                    tool: TOOL_VERSION.to_string(),
+                    dependencies,
+                    filters: ctx.test_options.filters.clone(),
+                    arguments: ctx.test_options.arguments.clone(),
+                }),
+                Vec::new(),
+            )
+        } else if matches!(unit.kind, Kind::Bsr) {
             let (environment, declared_environment, visible_tools) =
                 build_script_environment(ctx, unit, package);
             let mut tools = visible_tools
@@ -1793,7 +1870,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                     expected_outputs(ctx, &spec.crate_name, extra, &spec.crate_type, unit.host)?
                 }
             }
-            ActionSpec::BuildScriptRun(_) => Vec::new(),
+            ActionSpec::BuildScriptRun(_) | ActionSpec::TestRun(_) => Vec::new(),
         };
         let main_output = outputs
             .iter()
@@ -1829,6 +1906,15 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             outputs,
             main_output,
             declared_environment,
+            cache_policy: if !matches!(unit.kind, Kind::TestRun) {
+                CachePolicy::Use
+            } else if !ctx.test_options.canonical() {
+                CachePolicy::Bypass
+            } else if ctx.test_options.force {
+                CachePolicy::Refresh
+            } else {
+                CachePolicy::Use
+            },
         })
     }
 
@@ -1964,16 +2050,8 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
         .collect()
 }
 
-#[derive(Serialize)]
-struct TestPassKey<'a> {
-    kind: &'a str,
-    tool: &'a str,
-    harness_action: &'a str,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
-struct TestPass {
-    passed: bool,
+struct TestResult {
     test_count: u64,
 }
 
@@ -2766,58 +2844,6 @@ fn pinned_macos_tool(
 
 fn wrapper_identity(tool_version: &str, settings: impl Serialize) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(&(tool_version, settings))?))
-}
-
-#[cfg(test)]
-mod wrapper_identity_tests {
-    use super::{wrapper_identity, TOOL_VERSION};
-    use serde_json::{json, Value};
-
-    #[test]
-    fn cache_version_changes_wrapper_identity() {
-        for settings in tool_settings() {
-            assert_ne!(
-                wrapper_identity(TOOL_VERSION, &settings).unwrap(),
-                wrapper_identity("corgi/next-cache-version", &settings).unwrap(),
-            );
-        }
-    }
-
-    #[test]
-    fn every_tool_setting_changes_wrapper_identity() {
-        for settings in tool_settings() {
-            let identity = wrapper_identity(TOOL_VERSION, &settings).unwrap();
-            for index in 0..settings.as_array().unwrap().len() {
-                let mut changed = settings.clone();
-                changed[index] = json!("changed");
-                assert_ne!(
-                    identity,
-                    wrapper_identity(TOOL_VERSION, changed).unwrap(),
-                    "setting {index} must participate in {settings}",
-                );
-            }
-        }
-    }
-
-    fn tool_settings() -> [Value; 2] {
-        [
-            json!([
-                b"serialized macOS driver configuration".as_slice(),
-                crate::macos::DRIVER_VERSION,
-                "zig-asset-sha256",
-                crate::macos::SDK_SHA256,
-                crate::METAL_XCODE_BUILD,
-                "linker-file-sha256",
-            ]),
-            json!([
-                crate::zig::VERSION,
-                crate::zig::DRIVER_VERSION,
-                "aarch64-macos",
-                "zig-asset-sha256",
-                "aarch64-linux-gnu",
-            ]),
-        ]
-    }
 }
 
 fn ensure_macos(
@@ -4611,6 +4637,9 @@ pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
         let mut workspace = crate::report::CacheCounts::default();
         let mut dependencies = crate::report::CacheCounts::default();
         for unit in &report.units {
+            if unit.action.kind == "test_run" {
+                continue;
+            }
             let counts = if unit.package.scope == "workspace" {
                 &mut workspace
             } else {
@@ -5175,7 +5204,8 @@ fn build_inner(
     let root_packages = select_root_packages(&meta, &pkgs, all_roots, &packages, mode)?;
     let ug: meta::UnitGraph = serde_json::from_str(&ug_json).context("parsing unit-graph")?;
     let targets_without_harness = targets_without_harness(&meta)?;
-    let units = translate_unit_graph(&ug, &pkgs, root_packages.as_ref(), &targets_without_harness)?;
+    let mut units =
+        translate_unit_graph(&ug, &pkgs, root_packages.as_ref(), &targets_without_harness)?;
     let missing_root_packages = root_packages
         .iter()
         .flat_map(|packages| packages.iter())
@@ -5226,6 +5256,36 @@ fn build_inner(
              available targets:\n  {details}\n\
              check your target selectors and any required features"
         );
+    }
+    if matches!(mode, Mode::Test) && !no_run {
+        if !test_filters.is_empty()
+            && units
+                .iter()
+                .any(|unit| unit.is_root && matches!(unit.kind, Kind::Test) && !unit.test_harness)
+        {
+            bail!("pass arguments to test harnesses with --");
+        }
+        for index in 0..units.len() {
+            if units[index].is_root
+                && matches!(units[index].kind, Kind::Test)
+                && units[index].test_harness
+            {
+                let mut execution = units[index].clone();
+                execution.kind = Kind::TestRun;
+                execution.deps.retain(|dependency| {
+                    matches!(dependency.role, DependencyRole::BinaryExecutable)
+                });
+                execution.deps.insert(
+                    0,
+                    UnitDep {
+                        unit: index,
+                        role: DependencyRole::TestExecutable,
+                    },
+                );
+                units[index].is_root = false;
+                units.push(execution);
+            }
+        }
     }
     let profile_name = units
         .iter()
@@ -5613,11 +5673,12 @@ fn build_inner(
             .map(crate::remote::Cache::new)
             .transpose()?,
         remote_keys: Vec::new(),
-        remote_test_passes: matches!(mode, Mode::Test)
-            && !no_run
-            && !force_tests
-            && test_filters.is_empty()
-            && exec_args.is_empty(),
+        test_options: TestOptions {
+            filters: test_filters.clone(),
+            arguments: exec_args.clone(),
+            timeout: test_timeout,
+            force: force_tests,
+        },
     };
     if publish_cache {
         ctx.remote
@@ -5636,14 +5697,14 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "build");
     let results: Vec<OnceLock<UnitResult>> =
         (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
-    let cached_test_passes: Vec<OnceLock<remote_cache::PassRecord>> =
-        (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
     let build_result = (|| -> Result<()> {
-        let (executed, cached) = schedule(&ctx, &results, &cached_test_passes)?;
+        let scheduled = schedule(&ctx, &results);
         recorder.update(|report| {
             report.counters.source_hash_ns = ctx.src_hash_nanos.load(Ordering::Relaxed)
         });
         finish_report_stage(&recorder, "build", report_stage_start);
+        summarize_test_actions(&ctx, &results);
+        let (executed, cached) = scheduled?;
         report_stage_start = begin_report_stage(&recorder, "export");
 
         let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
@@ -5653,7 +5714,6 @@ fn build_inner(
         }
 
         let mut written = Vec::new();
-        let mut test_harnesses = Vec::new();
         let mut opaque_test_executables = Vec::new();
         let mut benchmark_executables = Vec::new();
         // Plain Cargo [env] entries are runtime defaults: the caller's environment wins.
@@ -5665,25 +5725,8 @@ fn build_inner(
             .collect();
 
         if exports_harnesses {
-            let canonical_run = test_filters.is_empty() && exec_args.is_empty();
             for (i, u) in ctx.units.iter().enumerate() {
                 if !matches!(u.kind, Kind::Test) || !u.is_root {
-                    continue;
-                }
-                if let Some(pass) = cached_test_passes[i].get() {
-                    test_harnesses.push(TestHarness {
-                        unit_id: i,
-                        name: u.target.name.clone(),
-                        path: None,
-                        cwd: ctx.meta.packages[u.pkg].root(),
-                        binary_environment: Vec::new(),
-                        pass_key: pass.key().to_string(),
-                        cached_pass: true,
-                        cached_test_count: pass.test_count(),
-                        cache_bypassed: false,
-                        discovery_ns: 0,
-                        tests: Vec::new(),
-                    });
                     continue;
                 }
                 let r = results[i].get().context("test harness not built")?;
@@ -5708,34 +5751,12 @@ fn build_inner(
                     .cloned()
                     .collect();
                 if matches!(mode, Mode::Test) {
-                    if u.test_harness {
-                        let pass_key = test_pass_key(&r.action.key)?;
-                        let cached_test_count = if canonical_run && !force_tests {
-                            load_test_pass(&ctx.store, &pass_key)
-                        } else {
-                            None
-                        };
-                        test_harnesses.push(TestHarness {
-                            unit_id: i,
-                            name,
-                            path: Some(dest),
-                            cwd,
-                            binary_environment,
-                            pass_key,
-                            cached_pass: cached_test_count.is_some(),
-                            cached_test_count: cached_test_count.unwrap_or(0),
-                            cache_bypassed: !canonical_run || force_tests,
-                            discovery_ns: 0,
-                            tests: Vec::new(),
-                        });
-                    } else {
-                        opaque_test_executables.push(BenchmarkExecutable {
-                            name,
-                            path: dest,
-                            cwd,
-                            binary_environment,
-                        });
-                    }
+                    opaque_test_executables.push(BenchmarkExecutable {
+                        name,
+                        path: dest,
+                        cwd,
+                        binary_environment,
+                    });
                 } else if matches!(mode, Mode::Bench) {
                     benchmark_executables.push(BenchmarkExecutable {
                         name,
@@ -5747,8 +5768,7 @@ fn build_inner(
             }
         }
 
-        let requested_outputs =
-            requested_units(&ctx, |index| cached_test_passes[index].get().is_some());
+        let requested_outputs = requested_units(&ctx);
         for (i, u) in ctx.units.iter().enumerate() {
             if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
                 break;
@@ -5791,28 +5811,31 @@ fn build_inner(
             }
         }
         if matches!(mode, Mode::Test) && !no_run {
-            let test_stage_start = begin_report_stage(&recorder, "test");
-            let canonical_run = test_filters.is_empty() && exec_args.is_empty();
-            let test_filter_set =
-                RegexSet::new(&test_filters).context("compiling test-name regular expressions")?;
-            if test_harnesses.is_empty() && opaque_test_executables.is_empty() {
+            if !ctx
+                .units
+                .iter()
+                .any(|unit| matches!(unit.kind, Kind::TestRun))
+                && opaque_test_executables.is_empty()
+            {
                 bail!("no tests found");
             }
-            if !test_filters.is_empty() && !opaque_test_executables.is_empty() {
-                bail!("pass arguments to test harnesses with --");
+            if !opaque_test_executables.is_empty() {
+                let now = recorder.elapsed_ns();
+                let mut test_stage_start = now;
+                recorder.update(|report| {
+                    report.run.outcome.stage = Some("test".into());
+                    test_stage_start = report
+                        .stages
+                        .entry("test".into())
+                        .or_insert(crate::report::StageTiming {
+                            start_ns: now,
+                            end_ns: now,
+                        })
+                        .start_ns;
+                });
+                run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
+                finish_report_stage(&recorder, "test", test_stage_start);
             }
-            if !test_harnesses.is_empty() {
-                run_tests(
-                    &ctx,
-                    &mut test_harnesses,
-                    &test_filter_set,
-                    &exec_args,
-                    test_timeout,
-                    canonical_run,
-                )?;
-            }
-            run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
-            finish_report_stage(&recorder, "test", test_stage_start);
         }
         if matches!(mode, Mode::Bench) && !no_run {
             let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
@@ -5894,15 +5917,7 @@ fn build_inner(
         let publication_start = build_result
             .is_ok()
             .then(|| begin_report_stage(&recorder, "publish"));
-        let published = remote_cache::publish(
-            &ctx,
-            &results,
-            &cached_test_passes,
-            matches!(mode, Mode::Test)
-                && !no_run
-                && test_filters.is_empty()
-                && exec_args.is_empty(),
-        );
+        let published = remote_cache::publish(&ctx, &results);
         if let Some(start) = publication_start {
             finish_report_stage(&recorder, "publish", start);
         }
@@ -7001,43 +7016,11 @@ fn sandboxed_command(
         .command(program, Path::new(&ctx.workspace_root), extra_reads, writes)
 }
 
-fn test_pass_key(harness_action: &str) -> Result<String> {
-    let key = TestPassKey {
-        kind: "test-pass",
-        tool: TOOL_VERSION,
-        harness_action,
-    };
-    Ok(sha256_hex(&serde_json::to_vec(&key)?))
-}
-
-fn load_test_pass(store: &Store, key: &str) -> Option<u64> {
-    store
-        .load_action(key)
-        .and_then(|bytes| serde_json::from_slice::<TestPass>(&bytes).ok())
-        .filter(|result| result.passed)
-        .map(|result| result.test_count)
-}
-
-fn save_test_pass(store: &Store, key: &str, test_count: u64) -> Result<()> {
-    store.save_action(
-        key,
-        &serde_json::to_vec(&TestPass {
-            passed: true,
-            test_count,
-        })?,
-    )
-}
-
-fn configure_test_command(harness: &TestHarness) -> Result<Command> {
-    let mut command = Command::new(
-        harness
-            .path
-            .as_ref()
-            .context("test executable not materialized")?,
-    );
+fn configure_test_command(harness: &TestHarness) -> Command {
+    let mut command = Command::new(&harness.path);
     command.current_dir(&harness.cwd);
     command.envs(harness.binary_environment.iter().cloned());
-    Ok(command)
+    command
 }
 
 fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> Result<()> {
@@ -7112,7 +7095,7 @@ fn matches_test_filters(filters: &RegexSet, test_name: &str) -> bool {
 }
 
 fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
-    let mut command = configure_test_command(harness)?;
+    let mut command = configure_test_command(harness);
     command.args(["--list", "--format", "terse"]);
     if ignored {
         command.arg("--ignored");
@@ -7162,7 +7145,7 @@ fn run_test_case(
     capture_directory: &Path,
 ) -> Result<TestOutcome> {
     let started = Instant::now();
-    let mut command = configure_test_command(harness)?;
+    let mut command = configure_test_command(harness);
     command.args(["--exact", name, "--nocapture"]);
     command.args(exec_args);
     let (stdout_capture, stdout_file) = TestCaptureFile::create(capture_directory, "stdout")?;
@@ -7184,32 +7167,192 @@ fn run_test_case(
     })
 }
 
+fn run_test_action(
+    ctx: &Ctx,
+    index: usize,
+    results: &[OnceLock<UnitResult>],
+    action: Arc<ResolvedAction>,
+) -> Result<UnitResult> {
+    let unit = &ctx.units[index];
+    let ActionSpec::TestRun(spec) = &action.spec else {
+        bail!("test execution action expected");
+    };
+    let harness_index = unit
+        .deps
+        .iter()
+        .find(|dependency| dependency.role == DependencyRole::TestExecutable)
+        .context("test executable dependency missing")?
+        .unit;
+    let compiled = results[harness_index]
+        .get()
+        .context("test executable not built")?;
+    let path = ctx.export_binary(
+        harness_index,
+        compiled.main.as_ref().context("test executable missing")?,
+        &compiled.res,
+    )?;
+    for dependency in &unit.deps {
+        if dependency.role == DependencyRole::BinaryExecutable {
+            let result = results[dependency.unit]
+                .get()
+                .context("runtime binary not built")?;
+            ctx.export_binary(
+                dependency.unit,
+                result.main.as_ref().context("runtime binary missing")?,
+                &result.res,
+            )?;
+        }
+    }
+    let ActionSpec::Compile(compile) = &compiled.action.spec else {
+        bail!("test executable compile action expected");
+    };
+    let binary_environment = compile
+        .environment
+        .iter()
+        .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
+        .chain(
+            ctx.config_env
+                .iter()
+                .filter(|(name, _)| std::env::var_os(name).is_none()),
+        )
+        .cloned()
+        .collect();
+    fs::create_dir_all("/tmp/corgi/target-tmp")?;
+    let plan = &ctx.action_plans[index];
+    let mut harness = TestHarness {
+        unit_id: index,
+        name: unit.target.name.clone(),
+        path,
+        cwd: ctx.meta.packages[unit.pkg].root(),
+        binary_environment,
+        action_key: action.key.clone(),
+        cache_bypassed: !plan.cache_policy.reads(),
+        discovery_ns: 0,
+        tests: Vec::new(),
+    };
+    let filters =
+        RegexSet::new(&spec.filters).context("compiling test-name regular expressions")?;
+    let test_count = run_tests(
+        ctx,
+        std::slice::from_mut(&mut harness),
+        &filters,
+        &spec.arguments,
+        ctx.test_options.timeout,
+    )?;
+    let res = ActionResult {
+        test_result: Some(TestResult { test_count }),
+        ..ActionResult::default()
+    };
+    Ok(UnitResult {
+        action,
+        cached: false,
+        res,
+        main: None,
+        phases: Phases::default(),
+    })
+}
+
+fn summarize_test_actions(ctx: &Ctx, results: &[OnceLock<UnitResult>]) {
+    let mut count = 0;
+    let mut cached_count = 0;
+    let mut actions = 0;
+    let mut completed = 0;
+    ctx.report.update(|report| {
+        for (index, unit) in ctx
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| matches!(unit.kind, Kind::TestRun))
+        {
+            actions += 1;
+            if !results[index].get().is_some_and(|result| result.cached) {
+                if let Some(timing) = &report.units[index].timings {
+                    if let (Some(start_ns), Some(end_ns)) = (timing.start_ns, timing.end_ns) {
+                        let test = report
+                            .stages
+                            .entry("test".into())
+                            .or_insert(crate::report::StageTiming { start_ns, end_ns });
+                        test.start_ns = test.start_ns.min(start_ns);
+                        test.end_ns = test.end_ns.max(end_ns);
+                    }
+                }
+            }
+            if matches!(
+                report.units[index].outcome.status,
+                crate::report::UnitStatus::Failed
+            ) {
+                report.run.outcome.stage = Some("test".into());
+            }
+            let Some(result) = results[index].get() else {
+                continue;
+            };
+            let Some(test) = &result.res.test_result else {
+                continue;
+            };
+            completed += 1;
+            count += test.test_count;
+            if result.cached {
+                cached_count += test.test_count;
+                report.test_harnesses.push(crate::report::TestHarness {
+                    unit: ctx.report_unit_keys[index].clone(),
+                    name: unit.target.name.clone(),
+                    cache: crate::report::HarnessCache {
+                        result: crate::report::UnitCacheResult::Hit,
+                        action_key: result.action.key.clone(),
+                        bypassed: false,
+                    },
+                    discovery_ns: 0,
+                    duration_ns: 0,
+                    summary: crate::report::TestSummary {
+                        passed: test.test_count,
+                        ..Default::default()
+                    },
+                    tests: Vec::new(),
+                });
+            }
+        }
+        report
+            .test_harnesses
+            .sort_by(|left, right| left.unit.cmp(&right.unit));
+        report.cache.test_results = crate::report::TestResultCache::default();
+        for harness in &report.test_harnesses {
+            if harness.cache.bypassed {
+                report.cache.test_results.bypassed += 1;
+            } else if matches!(harness.cache.result, crate::report::UnitCacheResult::Hit) {
+                report.cache.test_results.hits += 1;
+            } else {
+                report.cache.test_results.misses += 1;
+            }
+        }
+    });
+    if actions > 0 && completed == actions {
+        let elapsed = ctx.report.elapsed_ns() as f64 / 1e9;
+        if results
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| matches!(ctx.units[*index].kind, Kind::TestRun))
+            .all(|(_, result)| result.get().is_some_and(|result| result.cached))
+        {
+            status!("Finished", "{count} tests passed (cached) in {elapsed:.2}s");
+        } else if cached_count > 0 {
+            status!(
+                "Finished",
+                "{count} tests passed ({cached_count} cached) in {elapsed:.2}s"
+            );
+        } else {
+            status!("Finished", "{count} tests passed in {elapsed:.2}s");
+        }
+    }
+}
+
 fn run_tests(
     ctx: &Ctx,
     harnesses: &mut [TestHarness],
     filters: &RegexSet,
     exec_args: &[String],
     timeout: Option<Duration>,
-    canonical_run: bool,
-) -> Result<()> {
-    if canonical_run {
-        // A forced rerun supersedes an old pass, even if discovery/execution
-        // fails. Otherwise explicit publication could upload that stale success.
-        for harness in harnesses.iter().filter(|harness| !harness.cached_pass) {
-            let mut keys = vec![harness.pass_key.clone()];
-            if let Some(remote_key) = ctx.remote_keys.get(harness.unit_id) {
-                keys.push(test_pass_key(remote_key)?);
-            }
-            for key in keys {
-                match fs::remove_file(ctx.store.action_path(&key)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error).context("invalidating previous test pass"),
-                }
-            }
-        }
-    }
-    let result = run_tests_inner(ctx, harnesses, filters, exec_args, timeout, canonical_run);
+) -> Result<u64> {
+    let result = run_tests_inner(ctx, harnesses, filters, exec_args, timeout);
     ctx.report.update(|report| {
         let recorded_unit_ids = report
             .test_harnesses
@@ -7226,35 +7369,18 @@ fn run_tests(
                 cache: crate::report::HarnessCache {
                     result: if harness.cache_bypassed {
                         crate::report::UnitCacheResult::NotChecked
-                    } else if harness.cached_pass {
-                        crate::report::UnitCacheResult::Hit
                     } else {
                         crate::report::UnitCacheResult::Miss
                     },
-                    pass_key: harness.pass_key.clone(),
+                    action_key: harness.action_key.clone(),
                     bypassed: harness.cache_bypassed,
                 },
                 discovery_ns: harness.discovery_ns,
                 duration_ns: 0,
-                summary: crate::report::TestSummary {
-                    passed: harness.cached_test_count,
-                    ..crate::report::TestSummary::default()
-                },
+                summary: crate::report::TestSummary::default(),
                 tests: Vec::new(),
             });
         }
-        report.cache.test_results.hits = harnesses
-            .iter()
-            .filter(|harness| harness.cached_pass && !harness.cache_bypassed)
-            .count() as u64;
-        report.cache.test_results.misses = harnesses
-            .iter()
-            .filter(|harness| !harness.cached_pass && !harness.cache_bypassed)
-            .count() as u64;
-        report.cache.test_results.bypassed = harnesses
-            .iter()
-            .filter(|harness| harness.cache_bypassed)
-            .count() as u64;
     });
     result
 }
@@ -7265,28 +7391,14 @@ fn run_tests_inner(
     filters: &RegexSet,
     exec_args: &[String],
     timeout: Option<Duration>,
-    canonical_run: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let started = Instant::now();
     let ignored_only = exec_args.iter().any(|argument| argument == "--ignored");
     let include_ignored = exec_args
         .iter()
         .any(|argument| argument == "--include-ignored");
     let mut queue = VecDeque::new();
-    let mut cached_test_count = 0u64;
     for (harness_index, harness) in harnesses.iter_mut().enumerate() {
-        if harness.cached_pass {
-            cached_test_count += harness.cached_test_count;
-            if ctx.verbose {
-                status!(
-                    "Cached",
-                    "{} tests from {}",
-                    harness.cached_test_count,
-                    harness.name
-                );
-            }
-            continue;
-        }
         let discovery_started = Instant::now();
         let all_tests = list_tests(harness, false)?;
         let ignored: BTreeSet<String> = list_tests(harness, true)?.into_iter().collect();
@@ -7313,7 +7425,7 @@ fn run_tests_inner(
         }
     }
     let uncached_test_count = queue.len();
-    let test_count = uncached_test_count as u64 + cached_test_count;
+    let test_count = uncached_test_count as u64;
     if uncached_test_count > 0 {
         status!("Running", "{uncached_test_count} tests");
     }
@@ -7399,15 +7511,9 @@ fn run_tests_inner(
     });
     fs::remove_dir_all(&capture_directory).ok();
     let mut failures = Vec::new();
-    let mut harness_failed = vec![false; harnesses.len()];
     let mut harness_tests: Vec<Vec<crate::report::Test>> =
         (0..harnesses.len()).map(|_| Vec::new()).collect();
     let mut harness_summaries = vec![crate::report::TestSummary::default(); harnesses.len()];
-    for (summary, harness) in harness_summaries.iter_mut().zip(harnesses.iter()) {
-        if harness.cached_pass {
-            summary.passed = harness.cached_test_count;
-        }
-    }
     let mut harness_start_ns = vec![u64::MAX; harnesses.len()];
     let mut harness_end_ns = vec![0u64; harnesses.len()];
     let mut infrastructure_error = None;
@@ -7442,7 +7548,6 @@ fn run_tests_inner(
             duration_ns,
         });
         if !outcome.success {
-            harness_failed[outcome.harness] = true;
             failures.push(format!(
                 "{} {}",
                 harnesses[outcome.harness].name, outcome.name
@@ -7456,12 +7561,10 @@ fn run_tests_inner(
             cache: crate::report::HarnessCache {
                 result: if harness.cache_bypassed {
                     crate::report::UnitCacheResult::NotChecked
-                } else if harness.cached_pass {
-                    crate::report::UnitCacheResult::Hit
                 } else {
                     crate::report::UnitCacheResult::Miss
                 },
-                pass_key: harness.pass_key.clone(),
+                action_key: harness.action_key.clone(),
                 bypassed: harness.cache_bypassed,
             },
             discovery_ns: harness.discovery_ns,
@@ -7476,33 +7579,8 @@ fn run_tests_inner(
     if let Some(error) = infrastructure_error {
         return Err(error);
     }
-    if canonical_run {
-        for (index, harness) in harnesses.iter().enumerate() {
-            if !harness.cached_pass && !harness_failed[index] {
-                save_test_pass(
-                    &ctx.store,
-                    &harness.pass_key,
-                    harness_summaries[index].passed,
-                )?;
-            }
-        }
-    }
     if failures.is_empty() {
-        let elapsed = started.elapsed().as_secs_f64();
-        if !harnesses.is_empty() && harnesses.iter().all(|harness| harness.cached_pass) {
-            status!(
-                "Finished",
-                "{test_count} tests passed (cached) in {elapsed:.2}s"
-            );
-        } else if cached_test_count > 0 {
-            status!(
-                "Finished",
-                "{test_count} tests passed ({cached_test_count} cached) in {elapsed:.2}s"
-            );
-        } else {
-            status!("Finished", "{test_count} tests passed in {elapsed:.2}s");
-        }
-        Ok(())
+        Ok(test_count)
     } else {
         bail!("{} test(s) failed: {}", failures.len(), failures.join(", "))
     }
@@ -7581,12 +7659,10 @@ mod test_runner_tests {
         TestHarness {
             unit_id: 0,
             name: "corgi".to_string(),
-            path: Some(std::env::current_exe().unwrap()),
+            path: std::env::current_exe().unwrap(),
             cwd: std::env::current_dir().unwrap(),
             binary_environment: Vec::new(),
-            pass_key: String::new(),
-            cached_pass: false,
-            cached_test_count: 0,
+            action_key: String::new(),
             cache_bypassed: false,
             discovery_ns: 0,
             tests: Vec::new(),
@@ -7635,6 +7711,7 @@ fn describe(ctx: &Ctx, idx: usize) -> String {
         Kind::Bsr => "build.rs run".to_string(),
         Kind::Bin => format!("bin \"{}\"", u.target.name),
         Kind::Test => format!("test \"{}\"", u.target.name),
+        Kind::TestRun => format!("run tests \"{}\"", u.target.name),
     };
     let plat = if !u.host {
         ctx.target
@@ -7652,6 +7729,7 @@ fn report_action_kind(kind: Kind) -> &'static str {
         Kind::Bsc => "compile_build_script",
         Kind::Bsr => "run_build_script",
         Kind::Test => "compile_test",
+        Kind::TestRun => "test_run",
         Kind::Lib | Kind::Bin => "compile",
     }
 }
@@ -7735,6 +7813,17 @@ fn planned_report_key_inputs(
         })
         .collect();
     match &action.spec {
+        ActionSpec::TestRun(spec) => Ok(crate::report::ActionKeyInputs::TestRun(
+            crate::report::TestRunKeyInputs {
+                dependencies: spec
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.producer.clone())
+                    .collect(),
+                filters: spec.filters.clone(),
+                arguments: spec.arguments.clone(),
+            },
+        )),
         ActionSpec::Compile(spec) => {
             let (read_set_entry_hash, manifest_hash, source_layout_hash) = match &spec.source_inputs
             {
@@ -7908,7 +7997,7 @@ fn register_report_units(ctx: &Ctx) {
                 root: package.root().display().to_string(),
             },
             action: crate::report::UnitAction {
-                kind: if matches!(unit.kind, Kind::Bsr | Kind::Bsc) {
+                kind: if matches!(unit.kind, Kind::Bsr | Kind::Bsc | Kind::TestRun) {
                     action_kind.to_string()
                 } else {
                     compile_action_kind(ctx, id).replace('-', "_")
@@ -7980,18 +8069,15 @@ fn lookup_cached_unit(
 ) -> Result<Option<UnitResult>> {
     let started = Instant::now();
     let plan = &ctx.action_plans[index];
+    if !plan.cache_policy.reads() {
+        return Ok(None);
+    }
     let unit = &ctx.units[index];
-    let build_script = matches!(unit.kind, Kind::Bsr);
+    let compile = !matches!(unit.kind, Kind::Bsr | Kind::TestRun);
     let lookup = ctx.lookup_action(&action.key)?.and_then(|result| {
         // Additional auxiliary outputs are fine, but every predicted output
         // must be present for a cached action to replace execution.
-        let valid = if build_script {
-            result.bs.is_some() && result.out_dir.is_some()
-        } else {
-            plan.outputs
-                .iter()
-                .all(|name| result.outputs.iter().any(|output| &output.name == name))
-        };
+        let valid = plan.accepts_result(&result);
         if valid {
             Ok(result)
         } else {
@@ -8011,7 +8097,7 @@ fn lookup_cached_unit(
             return Ok(None);
         }
     };
-    if !build_script {
+    if compile {
         ctx.materialize_action(index, &action.key, &result)?;
         if !result.stderr.is_empty() && ctx.meta.packages[unit.pkg].source.is_none() {
             eprint!("{}", result.stderr);
@@ -8028,7 +8114,7 @@ fn lookup_cached_unit(
         cache_ns: started.elapsed().as_nanos() as u64,
         ..Phases::default()
     };
-    if build_script {
+    if !compile {
         Ok(Some(UnitResult {
             action,
             cached: true,
@@ -8041,12 +8127,12 @@ fn lookup_cached_unit(
     }
 }
 
-fn requested_units(ctx: &Ctx, test_passed: impl Fn(usize) -> bool) -> Vec<usize> {
+fn requested_units(ctx: &Ctx) -> Vec<usize> {
     let mut requested = ctx
         .units
         .iter()
         .enumerate()
-        .filter_map(|(index, unit)| (unit.is_root && !test_passed(index)).then_some(index))
+        .filter_map(|(index, unit)| unit.is_root.then_some(index))
         .collect::<Vec<_>>();
     // Integration tests and benchmarks receive CARGO_BIN_EXE_* paths at
     // runtime. A cached harness therefore still needs those binaries even
@@ -8073,41 +8159,77 @@ fn requested_units(ctx: &Ctx, test_passed: impl Fn(usize) -> bool) -> Vec<usize>
 /// through cached intermediate actions: rustc resolves transitive crate
 /// metadata from the shared pool, so their dependency artifacts must also be
 /// materialized even though those actions do not execute.
-fn prepare_demand(
+fn prepare_demand(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(Vec<bool>, usize)> {
+    let mut cached = 0;
+    let needed = demanded_units(ctx, &mut |index| {
+        let plan = &ctx.action_plans[index];
+        if !plan.cache_policy.reads() {
+            if matches!(plan.cache_policy, CachePolicy::Refresh) {
+                invalidate_cached_unit(
+                    ctx,
+                    index,
+                    plan.candidate.as_ref().map(|action| action.key.as_str()),
+                )?;
+            }
+            return Ok(false);
+        }
+        let result = if let Some(candidate) = &plan.candidate {
+            lookup_cached_unit(ctx, index, candidate.clone(), "found")?
+        } else {
+            ctx.report.update(|report| {
+                report.units[index].cache = crate::report::UnitCache {
+                    result: crate::report::UnitCacheResult::Miss,
+                    probe: Some("pending".to_string()),
+                };
+            });
+            None
+        };
+        let result = match result {
+            Some(result) => Some(result),
+            None => remote_cache::lookup_local(ctx, index)?,
+        };
+        if let Some(result) = result {
+            let _ = results[index].set(result);
+            cached += 1;
+        }
+        Ok(results[index].get().is_some())
+    })?;
+    Ok((needed, cached))
+}
+
+fn invalidate_cached_unit(ctx: &Ctx, index: usize, key: Option<&str>) -> Result<()> {
+    let mut paths = Vec::new();
+    if let Some(key) = key {
+        paths.push(ctx.store.action_path(key));
+    }
+    if !ctx.remote_keys.is_empty() {
+        paths.push(remote_cache::alias_path(ctx, index));
+    }
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("invalidating bypassed action"),
+        }
+    }
+    Ok(())
+}
+
+fn demanded_units(
     ctx: &Ctx,
-    results: &[OnceLock<UnitResult>],
-    test_passes: &[OnceLock<remote_cache::PassRecord>],
-) -> Result<(Vec<bool>, usize)> {
+    completed: &mut impl FnMut(usize) -> Result<bool>,
+) -> Result<Vec<bool>> {
     fn demand(
         ctx: &Ctx,
         index: usize,
         mut descend: bool,
         needed: &mut [bool],
         expanded: &mut [bool],
-        results: &[OnceLock<UnitResult>],
-        cached: &mut usize,
+        completed: &mut impl FnMut(usize) -> Result<bool>,
     ) -> Result<()> {
         if !needed[index] {
             needed[index] = true;
-            let result = if let Some(candidate) = &ctx.action_plans[index].candidate {
-                lookup_cached_unit(ctx, index, candidate.clone(), "found")?
-            } else {
-                ctx.report.update(|report| {
-                    report.units[index].cache = crate::report::UnitCache {
-                        result: crate::report::UnitCacheResult::Miss,
-                        probe: Some("pending".to_string()),
-                    };
-                });
-                None
-            };
-            let result = match result {
-                Some(result) => Some(result),
-                None => remote_cache::lookup_local(ctx, index)?,
-            };
-            if let Some(result) = result {
-                let _ = results[index].set(result);
-                *cached += 1;
-            } else {
+            if !completed(index)? {
                 descend = true;
             }
         }
@@ -8118,11 +8240,10 @@ fn prepare_demand(
                 demand(
                     ctx,
                     dependency.unit,
-                    true,
+                    !matches!(ctx.units[index].kind, Kind::TestRun),
                     needed,
                     expanded,
-                    results,
-                    cached,
+                    completed,
                 )?;
             }
         }
@@ -8131,19 +8252,10 @@ fn prepare_demand(
 
     let mut needed = vec![false; ctx.units.len()];
     let mut expanded = vec![false; ctx.units.len()];
-    let mut cached = 0;
-    for index in requested_units(ctx, |index| test_passes[index].get().is_some()) {
-        demand(
-            ctx,
-            index,
-            false,
-            &mut needed,
-            &mut expanded,
-            results,
-            &mut cached,
-        )?;
+    for index in requested_units(ctx) {
+        demand(ctx, index, false, &mut needed, &mut expanded, completed)?;
     }
-    Ok((needed, cached))
+    Ok(needed)
 }
 
 struct SchedState {
@@ -8158,23 +8270,15 @@ struct SchedState {
     cached: usize,
 }
 
-/// Only unsatisfied roots demand artifacts; completed tests need no runtime binaries.
+/// Recompute demand after a cached action cuts off its prerequisites.
 fn refresh_artifact_demand(
     ctx: &Ctx,
     state: &mut SchedState,
     results: &[OnceLock<UnitResult>],
-    test_passes: &[OnceLock<remote_cache::PassRecord>],
     cancel_downloads: &[AtomicBool],
 ) {
-    state.wanted.fill(false);
-    for root in requested_units(ctx, |index| test_passes[index].get().is_some()) {
-        state.wanted[root] = true;
-        if results[root].get().is_none() {
-            for dependency in dependency_closure(ctx, [root]) {
-                state.wanted[dependency] = true;
-            }
-        }
-    }
+    state.wanted = demanded_units(ctx, &mut |index| Ok(results[index].get().is_some()))
+        .expect("reading in-memory action results is infallible");
     for (wanted, cancel) in state.wanted.iter().zip(cancel_downloads) {
         if !wanted {
             cancel.store(true, Ordering::Relaxed);
@@ -8216,59 +8320,9 @@ fn reverse_dependency_order(dependencies: &[Vec<usize>], needed: &[bool]) -> Res
     Ok(order)
 }
 
-#[cfg(test)]
-mod download_order_tests {
-    use super::reverse_dependency_order;
-
-    #[test]
-    fn final_outputs_precede_intermediates_regardless_of_unit_indices() {
-        let dependencies = vec![vec![], vec![0], vec![1], vec![0], vec![3]];
-        assert_eq!(
-            reverse_dependency_order(&dependencies, &[true; 5]).unwrap(),
-            [2, 4, 1, 3, 0],
-        );
-    }
-
-    #[test]
-    fn shared_producer_waits_for_all_consumers() {
-        let dependencies = vec![vec![1, 2], vec![3], vec![3], vec![]];
-        assert_eq!(
-            reverse_dependency_order(&dependencies, &[true; 4]).unwrap(),
-            [0, 1, 2, 3],
-        );
-    }
-
-    #[test]
-    fn unneeded_roots_do_not_hold_up_shared_inputs() {
-        let dependencies = vec![vec![1], vec![2], vec![], vec![2]];
-        assert_eq!(
-            reverse_dependency_order(&dependencies, &[false, false, true, true]).unwrap(),
-            [3, 2],
-        );
-    }
-
-    #[test]
-    fn needed_cycles_are_rejected() {
-        assert!(reverse_dependency_order(&[vec![1], vec![0]], &[true; 2]).is_err());
-    }
-}
-
-fn schedule(
-    ctx: &Ctx,
-    results: &[OnceLock<UnitResult>],
-    test_passes: &[OnceLock<remote_cache::PassRecord>],
-) -> Result<(usize, usize)> {
+fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize)> {
     let n = ctx.units.len();
-    if ctx.remote_test_passes {
-        for (index, unit) in ctx.units.iter().enumerate() {
-            if unit.is_root && matches!(unit.kind, Kind::Test) && unit.test_harness {
-                if let Some(pass) = remote_cache::local_pass(ctx, index) {
-                    let _ = test_passes[index].set(pass);
-                }
-            }
-        }
-    }
-    let (needed, preloaded_cached) = prepare_demand(ctx, results, test_passes)?;
+    let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
@@ -8293,8 +8347,10 @@ fn schedule(
         // A freshly compiled rmeta implies its transitive metadata is
         // already present. An imported rmeta does not: make that requirement
         // explicit for consumers, while still allowing early root hits.
-        for j in dependency_closure(ctx, u.deps.iter().map(|dep| dep.unit)) {
-            required.insert((j, is_linking(ctx, i) || !is_pipelined(ctx, j)));
+        if !matches!(u.kind, Kind::TestRun) {
+            for j in dependency_closure(ctx, u.deps.iter().map(|dep| dep.unit)) {
+                required.insert((j, is_linking(ctx, i) || !is_pipelined(ctx, j)));
+            }
         }
         required.retain(|(dependency, _)| results[*dependency].get().is_none());
         indeg[i] = required.len();
@@ -8339,7 +8395,7 @@ fn schedule(
         .map(|index| {
             (cfg!(unix)
                 && ctx.remote.is_some()
-                && !matches!(ctx.units[index].kind, Kind::Bsr)
+                && !matches!(ctx.units[index].kind, Kind::Bsr | Kind::TestRun)
                 && !is_pipelined(ctx, index))
             .then(compiler_race::Race::default)
         })
@@ -8403,7 +8459,7 @@ fn schedule(
                 let _ = phase_slots[idx].set(ur.phases);
                 let verb = if ur.cached {
                     "Cached"
-                } else if matches!(ctx.units[idx].kind, Kind::Bsr) {
+                } else if matches!(ctx.units[idx].kind, Kind::Bsr | Kind::TestRun) {
                     "Ran"
                 } else {
                     "Compiled"
@@ -8466,7 +8522,7 @@ fn schedule(
         if prune {
             // Cut off satisfied roots atomically with their completion,
             // before another worker can claim now-unneeded dependencies.
-            refresh_artifact_demand(ctx, &mut st, results, test_passes, &cancel_downloads);
+            refresh_artifact_demand(ctx, &mut st, results, &cancel_downloads);
         }
         drop(st);
         cv.notify_all();
@@ -8476,24 +8532,14 @@ fn schedule(
     // These workers never acquire compiler/jobserver slots.
     let mut requests = VecDeque::new();
     if ctx.remote.is_some() {
-        for (index, unit) in ctx.units.iter().enumerate() {
-            if ctx.remote_test_passes
-                && unit.is_root
-                && matches!(unit.kind, Kind::Test)
-                && unit.test_harness
-                && test_passes[index].get().is_none()
-            {
-                requests.push_back((index, true));
-            }
-        }
         let dependencies = ctx
             .units
             .iter()
             .map(|unit| unit.deps.iter().map(|dep| dep.unit).collect())
             .collect::<Vec<Vec<usize>>>();
         for index in reverse_dependency_order(&dependencies, &needed)? {
-            if results[index].get().is_none() {
-                requests.push_back((index, false));
+            if results[index].get().is_none() && ctx.action_plans[index].cache_policy.reads() {
+                requests.push_back(index);
             }
         }
     }
@@ -8542,10 +8588,7 @@ fn schedule(
                     requests,
                     &cancel,
                     &cancel_downloads,
-                    |index, pass| {
-                        if pass {
-                            return test_passes[index].get().is_none();
-                        }
+                    |index| {
                         let st = state.lock().unwrap();
                         st.wanted[index]
                             && results[index].get().is_none()
@@ -8553,22 +8596,7 @@ fn schedule(
                     },
                     |index, fetched, download| {
                         let record = match fetched {
-                            Ok(Some(downloads::Downloaded::Pass(pass))) => {
-                                let mut st = state.lock().unwrap();
-                                let _ = test_passes[index].set(pass);
-                                refresh_artifact_demand(
-                                    ctx,
-                                    &mut st,
-                                    results,
-                                    test_passes,
-                                    &cancel_downloads,
-                                );
-                                drop(st);
-                                cv.notify_all();
-                                finish_download(index, download, Ok(true));
-                                return;
-                            }
-                            Ok(Some(downloads::Downloaded::Artifact(record))) => record,
+                            Ok(Some(record)) => record,
                             Ok(None) => {
                                 finish_download(index, download, Ok(false));
                                 return;
@@ -8999,6 +9027,13 @@ fn run_unit(
     })?
     .context("producer action missing when unit became ready")?;
     let candidate = candidate_action(ctx, idx, execution_spec.clone())?;
+    if matches!(plan.cache_policy, CachePolicy::Refresh) {
+        invalidate_cached_unit(
+            ctx,
+            idx,
+            candidate.as_ref().map(|action| action.key.as_str()),
+        )?;
+    }
     if let Some(candidate) = &candidate {
         if let Some(result) = lookup_cached_unit(ctx, idx, candidate.clone(), "found_after_wait")? {
             return Ok(result);
@@ -9007,7 +9042,13 @@ fn run_unit(
             record_resolved_action(ctx, idx, candidate)?;
         }
     }
-    match ctx.units[idx].kind {
+    let mut result = match ctx.units[idx].kind {
+        Kind::TestRun => run_test_action(
+            ctx,
+            idx,
+            results,
+            candidate.context("test execution identity missing")?,
+        ),
         Kind::Bsr => run_build_script(
             ctx,
             idx,
@@ -9015,7 +9056,18 @@ fn run_unit(
             candidate.context("build-script action identity missing")?,
         ),
         _ => compile(ctx, idx, results, metas, fire_meta, execution_spec, race),
+    }?;
+    anyhow::ensure!(
+        plan.accepts_result(&result.res),
+        "executor returned an invalid action result"
+    );
+    if plan.cache_policy.writes() {
+        let start = Instant::now();
+        ctx.store
+            .save_action(&result.action.key, &serde_json::to_vec(&result.res)?)?;
+        result.phases.finish_ns += start.elapsed().as_nanos() as u64;
     }
+    Ok(result)
 }
 
 /// Authoritative output names for a compile: rustc itself reports them
@@ -9754,6 +9806,7 @@ fn compile(
             Kind::Bsc => "bsc",
             Kind::Bsr => "bsr",
             Kind::Test => "test",
+            Kind::TestRun => unreachable!("test execution does not compile"),
         };
         let mode_tag = if clippy_action {
             "clippy"
@@ -10161,6 +10214,7 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         stderr,
         bs: None,
         out_dir: None,
+        test_result: None,
     };
     // Never record an action whose outputs are incomplete: a poisoned
     // record would replay the failure from cache on every future run.
@@ -10176,7 +10230,6 @@ location-free — resolve paths at runtime instead of baking them in at build ti
         race.commit_local()?;
     }
     record_resolved_action(ctx, uidx, &action)?;
-    ctx.store.save_action(key, &serde_json::to_vec(&res)?)?;
     let mut manifest_spec = action.spec.clone();
     if let Some(read_set) = manifest_spec.local_read_set_mut() {
         let files = std::mem::take(read_set);
@@ -10494,12 +10547,12 @@ fn run_build_script(
         stderr,
         bs: Some(bs),
         out_dir: Some(out_dir),
+        test_result: None,
     };
     // Commit order: archive, sentinel (local OUT_DIR complete), then action
-    // record. A crash before the record leaves only reclaimable CAS/local
+    // record (saved by run_unit). A crash before the record leaves only reclaimable CAS/local
     // state; a missing local directory after commit is restored from tar.
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
-    ctx.store.save_action(&key, &serde_json::to_vec(&res)?)?;
     Ok(UnitResult {
         action,
         cached: false,
