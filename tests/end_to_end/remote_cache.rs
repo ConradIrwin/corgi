@@ -24,6 +24,9 @@ struct Objects {
     gates_released: usize,
     blocked: BTreeSet<String>,
     compiler_gate: Option<(String, PathBuf)>,
+    blob_delay: Duration,
+    active_gets: usize,
+    peak_gets: usize,
 }
 
 struct HttpCache {
@@ -74,10 +77,7 @@ impl HttpCache {
     fn configure(&self, workspace: &Path) {
         fs::write(
             workspace.join("corgi.toml"),
-            format!(
-                "[cache]\nread-url = \"http://{0}/bucket\"\nendpoint = \"http://{0}\"\nbucket = \"bucket\"\n",
-                self.address,
-            ),
+            format!("[cache]\nread-url = \"http://{0}/bucket\"\n", self.address,),
         )
         .unwrap();
     }
@@ -129,7 +129,6 @@ fn serve(mut stream: TcpStream, objects: Arc<Mutex<Objects>>, stopped: Arc<Atomi
     let mut length = 0;
     let mut expect_continue = false;
     let mut if_none_match = None;
-    let mut if_match = None;
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -147,9 +146,6 @@ fn serve(mut stream: TcpStream, objects: Arc<Mutex<Objects>>, stopped: Arc<Atomi
             }
             if name.eq_ignore_ascii_case("if-none-match") {
                 if_none_match = Some(value.trim().to_owned());
-            }
-            if name.eq_ignore_ascii_case("if-match") {
-                if_match = Some(value.trim().to_owned());
             }
         }
     }
@@ -208,9 +204,13 @@ fn serve(mut stream: TcpStream, objects: Arc<Mutex<Objects>>, stopped: Arc<Atomi
         }
         thread::sleep(Duration::from_millis(5));
     }
-    let (status, response) = {
+    let (status, response, delay) = {
         let mut state = objects.lock().unwrap();
-        match method.as_str() {
+        if method == "GET" {
+            state.active_gets += 1;
+            state.peak_gets = state.peak_gets.max(state.active_gets);
+        }
+        let (status, response) = match method.as_str() {
             "GET" | "HEAD" if state.fail_reads => (503, Vec::new()),
             "PUT" if state.fail_writes => (503, Vec::new()),
             "GET" | "HEAD" => match state.bytes.get(&path) {
@@ -220,39 +220,43 @@ fn serve(mut stream: TcpStream, objects: Arc<Mutex<Objects>>, stopped: Arc<Atomi
             "PUT" if if_none_match.as_deref() == Some("*") && state.bytes.contains_key(&path) => {
                 (412, Vec::new())
             }
-            "PUT"
-                if if_match.as_ref().is_some_and(|tag| {
-                    state.bytes.get(&path).map(|bytes| etag(bytes)).as_ref() != Some(tag)
-                }) =>
-            {
-                (412, Vec::new())
-            }
             "PUT" => {
                 state.bytes.insert(path.clone(), body);
                 (200, Vec::new())
             }
             _ => (405, Vec::new()),
-        }
+        };
+        (
+            status,
+            response,
+            if path.contains("/blobs/") {
+                state.blob_delay
+            } else {
+                Duration::ZERO
+            },
+        )
     };
+    thread::sleep(delay);
     // Cancellation may close the connection after an action starts locally.
     let _ = write!(
         stream,
-        "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.len(),
-        etag(&response)
     );
     if method != "HEAD" {
         let _ = stream.write_all(&response);
     }
+    if method == "GET" {
+        objects.lock().unwrap().active_gets -= 1;
+    }
 }
 
-fn etag(bytes: &[u8]) -> String {
+fn blob_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let hash: String = Sha256::digest(bytes)
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("\"{hash}\"")
+        .collect()
 }
 
 fn has_running_marker(root: &Path) -> bool {
@@ -265,6 +269,8 @@ fn has_running_marker(root: &Path) -> bool {
 
 fn remote_command(workspace: &Path, store: &Path, arguments: &[&str]) -> Command {
     let mut command = corgi_command();
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(workspace.join("corgi.toml")).unwrap()).unwrap();
     let download_curl = command
         .get_envs()
         .find(|(key, _)| *key == "CORGI_CURL")
@@ -281,6 +287,10 @@ fn remote_command(workspace: &Path, store: &Path, arguments: &[&str]) -> Command
         .env("CORGI_TEST_DOWNLOAD_CURL", download_curl)
         .env("NO_PROXY", "127.0.0.1")
         .env("no_proxy", "127.0.0.1")
+        .env(
+            "CORGI_R2_WRITE_URL",
+            config["cache"]["read-url"].as_str().unwrap(),
+        )
         .env("CORGI_R2_ACCESS_KEY_ID", "test-access-key")
         .env("CORGI_R2_SECRET_ACCESS_KEY", "test-secret-key");
     command
@@ -422,7 +432,7 @@ fn remote_cache_publishes_local_hits_and_dependency_closure_and_repairs_blobs() 
     let original_records = {
         let mut state = server.objects.lock().unwrap();
         let bytes = state.bytes.remove(&blob).expect("uploaded blob");
-        assert_eq!(etag(&bytes), format!("\"{hash}\""));
+        assert_eq!(blob_hash(&bytes), hash);
         state
             .bytes
             .iter()
@@ -570,6 +580,7 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     remote_run(&workspace, &store, &["cache", "build"]);
     let (path, record) = root_record(&server, &directory.package_name);
     assert!(!record["spec"]["read_set"].as_array().unwrap().is_empty());
+    assert!(record.get("producers").is_none());
     let other = directory.path.join("checkout-b");
     copy_directory(&workspace, &other);
     clear_local_results(&directory, &store, &workspace);
@@ -588,17 +599,23 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     // may also be embedded in artifacts. Only the checkout location changes.
     remote_run(&other, &store, &["build", "--timings"]);
     assert!(server.objects.lock().unwrap().gates_released > 0);
-    assert_eq!(
-        server
-            .requests()
-            .into_iter()
-            .filter(|(method, path)| method == "GET" && path.contains("/actions/"))
-            .collect::<Vec<_>>(),
-        vec![("GET".into(), path)],
-        "a final-output hit must not fetch pruned producer records"
-    );
+    assert!(server.requests().contains(&("GET".into(), path.clone())));
     let report = report_for_workspace(&store, &other);
-    let download = &report["remote_downloads"][0];
+    let download = report["remote_downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|download| download["remote_key"] == record["remote_key"])
+        .unwrap();
+    assert!(
+        report["remote_downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["start_ns"].as_u64().unwrap()
+                <= download["end_ns"].as_u64().unwrap()),
+        "a root hit must prevent new attempts for pruned dependencies"
+    );
     assert_eq!(download["outcome"], "used");
     assert_eq!(download["remote_key"], record["remote_key"]);
     assert_eq!(download["kind"], "artifact");
@@ -651,6 +668,14 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     let local: serde_json::Value = serde_json::from_slice(&fs::read(alias).unwrap()).unwrap();
     assert_eq!(local["spec"], record["spec"]);
     assert_eq!(local["action_key"], record["action_key"]);
+    server.objects.lock().unwrap().bytes.remove(&path);
+    server.reset_requests();
+    remote_run(&other, &store, &["cache", "build"]);
+    assert_eq!(
+        root_record(&server, &directory.package_name).1,
+        record,
+        "an imported result must republish without reconstructing dependency graph indices"
+    );
     let output = Command::new(
         other
             .join("target/debug")
@@ -660,6 +685,62 @@ fn remote_cache_reuses_another_checkout_in_the_same_store_then_needs_no_gets() {
     .unwrap();
     assert_success(&output, "run remotely restored binary");
     assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn remote_cache_shares_four_get_slots_between_records_and_blobs() {
+    let directory = TestDirectory::new("remote-get-queue");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, true);
+    let store = directory.path.join("store");
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let (path, mut record) = root_record(&server, &directory.package_name);
+    clear_local_results(&directory, &store, &workspace);
+    {
+        let mut state = server.objects.lock().unwrap();
+        state
+            .bytes
+            .retain(|key, _| !key.contains("/actions/") || key == &path);
+        // More than four outputs forces multiple queue turns even for tiny
+        // fixture compiles. Auxiliary outputs are part of the cache contract.
+        for index in 0..9 {
+            let bytes = format!("queued blob {index}");
+            let hash = blob_hash(bytes.as_bytes());
+            state
+                .bytes
+                .insert(format!("{PREFIX}blobs/{hash}"), bytes.into_bytes());
+            record["result"]["outputs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": format!("queue-{index}.txt"), "hash": hash, "exe": false
+                }));
+            record["blobs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(hash));
+        }
+        record["blobs"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        state
+            .bytes
+            .insert(path.clone(), serde_json::to_vec(&record).unwrap());
+        state.gated.insert(path);
+        state.marker_root = Some(store.join("outdirs"));
+        state.blob_delay = Duration::from_millis(80);
+        state.peak_gets = 0;
+    }
+    remote_run(&workspace, &store, &["build"]);
+    assert_eq!(server.objects.lock().unwrap().peak_gets, 4);
+    let report = report_for_workspace(&store, &workspace);
+    let root = report_unit(&report, &directory.package_name, "compile");
+    assert_eq!(root["cache"]["probe"], "remote", "{report:#}");
+    assert_eq!(
+        root["outputs"].as_array().unwrap().len(),
+        record["blobs"].as_array().unwrap().len()
+    );
 }
 
 #[test]
@@ -864,24 +945,13 @@ fn remote_cache_accepts_a_queued_root_but_never_replaces_a_running_build_script(
             .bytes
             .retain(|path, _| !path.contains("/actions/") || path == &root || path == &script);
         state.gated.insert(root.clone());
+        state.gated.insert(script.clone());
         state.marker_root = Some(store.join("outdirs"));
     }
     server.reset_requests();
     remote_run(&workspace, &store, &["build"]);
-    assert_eq!(
-        server.objects.lock().unwrap().gates_released,
-        1,
-        "the root response arrived after the script started"
-    );
-    assert_eq!(
-        server
-            .requests()
-            .into_iter()
-            .filter(|(method, path)| method == "GET" && path.contains("/actions/"))
-            .collect::<Vec<_>>(),
-        vec![("GET".into(), root)],
-        "finish the root before considering its producers, including the running script"
-    );
+    assert!(server.objects.lock().unwrap().gates_released >= 1);
+    assert!(server.requests().contains(&("GET".into(), root)));
     let report = report_for_workspace(&store, &workspace);
     assert_unit_cache(
         &report,
@@ -982,7 +1052,7 @@ fn check_intermediate_hit_with_local_consumer(shared_remote_dependency: bool) {
     server.reset_requests();
     remote_run(&workspace, &store, &["build"]);
     assert_eq!(server.objects.lock().unwrap().gates_released, 1);
-    let artifact_requests: Vec<_> = server
+    let mut artifact_requests: Vec<_> = server
         .requests()
         .into_iter()
         .filter(|(method, path)| {
@@ -992,10 +1062,13 @@ fn check_intermediate_hit_with_local_consumer(shared_remote_dependency: bool) {
         })
         .map(|(_, path)| path)
         .collect();
+    // Workers may reach the server in a different order from queue dispatch.
+    artifact_requests.sort();
+    let mut expected = vec![root, intermediate, dependency];
+    expected.sort();
     assert_eq!(
-        artifact_requests,
-        vec![root, intermediate, dependency],
-        "after a root miss, visit consumers before shared producers; an intermediate hit cannot prune a producer needed locally"
+        artifact_requests, expected,
+        "an intermediate hit cannot prune a producer needed locally"
     );
     let report = report_for_workspace(&store, &workspace);
     assert_unit_cache(
@@ -1042,6 +1115,104 @@ fn check_intermediate_hit_with_local_consumer(shared_remote_dependency: bool) {
             b"42\n"
         }
     );
+}
+
+#[test]
+fn remote_cache_upload_configuration_is_required_only_for_publication() {
+    let directory = TestDirectory::new("remote-upload-config");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    let variables = [
+        "CORGI_R2_WRITE_URL",
+        "CORGI_R2_ACCESS_KEY_ID",
+        "CORGI_R2_SECRET_ACCESS_KEY",
+    ];
+    let mut build = remote_command(&workspace, &store, &["build"]);
+    for variable in variables {
+        build.env_remove(variable);
+    }
+    assert_success(
+        &build.output().unwrap(),
+        "ordinary build without upload configuration",
+    );
+    assert!(server.requests().iter().any(|(method, _)| method == "GET"));
+    assert!(server.requests().iter().all(|(method, _)| method == "GET"));
+
+    let output = remote_command(&workspace, &store, &["build"])
+        .env("CORGI_R2_WRITE_URL", "invalid")
+        .env("CORGI_R2_ACCESS_KEY_ID", "")
+        .env("CORGI_R2_SECRET_ACCESS_KEY", "")
+        .output()
+        .unwrap();
+    assert_success(
+        &output,
+        "ordinary build ignores malformed upload configuration",
+    );
+
+    for variable in variables {
+        server.reset_requests();
+        let output = remote_command(&workspace, &store, &["cache", "build"])
+            .env_remove(variable)
+            .output()
+            .unwrap();
+        assert_failure(&output, "publication requires upload configuration");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(variable),
+            "{variable}"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "invalid configuration must fail before remote requests"
+        );
+    }
+    let output = remote_command(&workspace, &store, &["cache", "build"])
+        .env("CORGI_R2_WRITE_URL", "https://private-secret@host/bucket")
+        .output()
+        .unwrap();
+    assert_failure(&output, "reject credentials embedded in upload URL");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("CORGI_R2_WRITE_URL"));
+    assert!(!stderr.contains("private-secret"));
+
+    let output = remote_command(&workspace, &store, &["cache", "build"])
+        .env(
+            "CORGI_R2_WRITE_URL",
+            format!("http://{}/bucket/", server.address),
+        )
+        .output()
+        .unwrap();
+    assert_success(&output, "publish to an explicitly configured bucket URL");
+    assert!(server.requests().iter().any(|(method, _)| method == "PUT"));
+}
+
+#[test]
+fn remote_cache_publication_reports_malformed_records_without_replacing_them() {
+    let directory = TestDirectory::new("remote-invalid-publication");
+    let server = HttpCache::new();
+    let workspace = remote_fixture(&directory, &server, false);
+    let store = directory.path.join("store");
+    remote_run(&workspace, &store, &["cache", "build"]);
+    let (path, record) = root_record(&server, &directory.package_name);
+    server
+        .objects
+        .lock()
+        .unwrap()
+        .bytes
+        .insert(path.clone(), b"bad json".to_vec());
+    server.reset_requests();
+    let output = remote_command(&workspace, &store, &["cache", "build"])
+        .output()
+        .unwrap();
+    assert_failure(&output, "malformed existing remote record must be reported");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid remote record"));
+    assert!(stderr.contains(record["remote_key"].as_str().unwrap()));
+    assert!(server.requests().iter().all(|(method, _)| method != "PUT"));
+    assert_eq!(server.objects.lock().unwrap().bytes[&path], b"bad json");
+    let report = report_for_workspace(&store, &workspace);
+    assert_eq!(report["run"]["outcome"]["status"], "failed");
+    assert_eq!(report["run"]["outcome"]["stage"], "publish");
 }
 
 #[test]
@@ -1146,15 +1317,17 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
         pass["remote_key"]
     );
     assert_eq!(report["test_harnesses"][0]["cache"]["result"], "hit");
-    assert_eq!(report["remote_downloads"][0]["kind"], "test_pass");
-    assert_eq!(report["remote_downloads"][0]["outcome"], "used");
-    assert_eq!(
-        report["remote_downloads"][0]["remote_key"],
-        pass["remote_key"]
-    );
-    assert!(report["remote_downloads"][0]["record_ns"].is_u64());
-    assert!(report["remote_downloads"][0]["downloaded_ns"].is_u64());
-    assert!(report["remote_downloads"][0]["blobs_start_ns"].is_null());
+    let download = report["remote_downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|download| download["remote_key"] == pass["remote_key"])
+        .unwrap();
+    assert_eq!(download["kind"], "test_pass");
+    assert_eq!(download["outcome"], "used");
+    assert!(download["record_ns"].is_u64());
+    assert!(download["downloaded_ns"].is_u64());
+    assert!(download["blobs_start_ns"].is_null());
     assert_unit_cache(
         &report,
         "remote_dependency",
@@ -1178,10 +1351,13 @@ fn remote_cache_test_pass_is_uploaded_and_restored_without_running_the_test() {
     assert!(server
         .requests()
         .contains(&("GET".into(), pass_path.clone())));
-    assert!(!server
-        .requests()
-        .contains(&("GET".into(), harness_path.clone())));
-    assert_eq!(server.requests(), vec![("GET".into(), pass_path.clone())]);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|(method, path)| method == "GET" && path.contains("/actions/")),
+        "a pass-only cache should not download any blobs"
+    );
     let alias = local_action_path(&store, pass["remote_key"].as_str().unwrap());
     let imported: serde_json::Value = serde_json::from_slice(&fs::read(&alias).unwrap()).unwrap();
     assert_eq!(
@@ -1354,7 +1530,12 @@ fn remote_cache_invalid_test_pass_records_are_misses() {
         assert!(marker.exists(), "invalid {field} must run tests");
         assert!(server.requests().contains(&("GET".into(), path.clone())));
         let report = report_for_workspace(&store, &workspace);
-        let download = &report["remote_downloads"][0];
+        let download = report["remote_downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|download| download["kind"] == "test_pass")
+            .unwrap();
         assert_eq!(download["kind"], "test_pass");
         assert_eq!(download["outcome"], "failed");
         assert_eq!(download["detail"], "invalid test pass");

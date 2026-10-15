@@ -30,6 +30,7 @@ macro_rules! status {
 }
 
 mod compiler_race;
+mod downloads;
 mod remote_cache;
 
 // Profiles come per unit from cargo's unit graph — inheritance,
@@ -1400,6 +1401,16 @@ struct ResolvedAction {
 }
 
 impl ActionSpec {
+    fn local_read_set(&self) -> Option<&HashedReadSet> {
+        match self {
+            Self::Compile(spec) => match &spec.source_inputs {
+                CompileSourceInputs::Local { read_set, .. } => Some(read_set),
+                CompileSourceInputs::Static { .. } => None,
+            },
+            Self::BuildScriptRun(_) => None,
+        }
+    }
+
     fn local_read_set_mut(&mut self) -> Option<&mut HashedReadSet> {
         match self {
             Self::Compile(spec) => match &mut spec.source_inputs {
@@ -8486,35 +8497,7 @@ fn schedule(
             }
         }
     }
-    let remote_enabled = !requests.is_empty();
-    let (pass_requests, artifact_requests): (VecDeque<_>, VecDeque<_>) =
-        requests.into_iter().partition(|(_, pass)| *pass);
-    let requests = [Mutex::new(pass_requests), Mutex::new(artifact_requests)];
     use crate::report::{RemoteDownload, RemoteDownloadKind, RemoteDownloadOutcome};
-    let start_download = |index: usize, pass: bool| -> Result<RemoteDownload> {
-        Ok(RemoteDownload {
-            unit: ctx.report_unit_keys[index].clone(),
-            kind: if pass {
-                RemoteDownloadKind::TestPass
-            } else {
-                RemoteDownloadKind::Artifact
-            },
-            remote_key: if pass {
-                test_pass_key(&ctx.remote_keys[index])?
-            } else {
-                ctx.remote_keys[index].clone()
-            },
-            start_ns: ctx.report.elapsed_ns(),
-            record_ns: None,
-            blobs_start_ns: None,
-            downloaded_ns: None,
-            end_ns: 0,
-            blob_count: 0,
-            superseded_local_ns: None,
-            outcome: RemoteDownloadOutcome::Miss,
-            detail: None,
-        })
-    };
     let finish_download = |index: usize, mut download: RemoteDownload, result: Result<bool>| {
         download.end_ns = ctx.report.elapsed_ns();
         download.outcome = match result {
@@ -8552,149 +8535,108 @@ fn schedule(
             .update(|report| report.remote_downloads.push(download));
     };
     std::thread::scope(|scope| {
-        if remote_enabled {
+        if !requests.is_empty() {
             scope.spawn(|| {
-                // Resolve small final test results before spending bandwidth
-                // on artifacts they may make unnecessary. Only download workers
-                // wait between these phases; local compilers keep running.
-                for (phase, requests) in requests.iter().enumerate() {
-                    // Pass records use independent GETs. Artifact actions are
-                    // visited in graph order, each owning the whole GET budget
-                    // for its connection-reusing, parallel blob batch.
-                    let limit = if phase == 0 {
-                        crate::remote::GET_CONCURRENCY
-                    } else {
-                        1
-                    };
-                    let remote_workers = requests.lock().unwrap().len().min(limit);
-                    std::thread::scope(|downloads| {
-                        for _ in 0..remote_workers {
-                            downloads.spawn(|| {
-                                while !cancel.load(Relaxed) {
-                                    let Some((index, pass)) = requests.lock().unwrap().pop_front()
-                                    else {
-                                        break;
-                                    };
-                                    if pass {
-                                        let mut download = start_download(index, true)
-                                            .expect("test pass key serialization");
-                                        let fetched = remote_cache::fetch_pass(
-                                            ctx,
-                                            index,
-                                            &cancel,
-                                            &mut download,
-                                        );
-                                        let outcome = fetched.map(|pass| {
-                                            if let Some(pass) = pass {
-                                                let mut st = state.lock().unwrap();
-                                                let _ = test_passes[index].set(pass);
-                                                refresh_artifact_demand(
-                                                    ctx,
-                                                    &mut st,
-                                                    results,
-                                                    test_passes,
-                                                    &cancel_downloads,
-                                                );
-                                                drop(st);
-                                                cv.notify_all();
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        });
-                                        finish_download(index, download, outcome);
-                                        continue;
-                                    }
-                                    {
-                                        let st = state.lock().unwrap();
-                                        if (st.started[index] && compiler_races[index].is_none())
-                                            || !st.wanted[index]
-                                            || results[index].get().is_some()
-                                        {
-                                            continue;
-                                        }
-                                    }
-                                    let mut download = start_download(index, false)
-                                        .expect("artifact key is already computed");
-                                    let record = match remote_cache::fetch(
-                                        ctx,
-                                        index,
-                                        &cancel_downloads[index],
-                                        &mut download,
-                                    ) {
-                                        Ok(Some(record)) => record,
-                                        Ok(None) => {
-                                            finish_download(index, download, Ok(false));
-                                            continue;
-                                        }
-                                        Err(error) => {
-                                            finish_download(index, download, Err(error));
-                                            continue;
-                                        }
-                                    };
-                                    // Claim only after every blob has been downloaded and verified.
-                                    {
-                                        let mut st = state.lock().unwrap();
-                                        if cancel.load(Relaxed)
-                                            || (st.started[index]
-                                                && compiler_races[index].is_none())
-                                            || !st.wanted[index]
-                                            || results[index].get().is_some()
-                                        {
-                                            drop(st);
-                                            finish_download(
-                                                index,
-                                                download,
-                                                Err(crate::remote::ReadCancelled.into()),
-                                            );
-                                            continue;
-                                        }
-                                        if st.started[index] {
-                                            let race = compiler_races[index].as_ref().unwrap();
-                                            let offered = race.offer(record, download);
-                                            drop(st);
-                                            if let Err((_, download)) = offered {
-                                                finish_download(
-                                                    index,
-                                                    download,
-                                                    Err(crate::remote::ReadCancelled.into()),
-                                                );
-                                            }
-                                            // The compiler worker reaps its process, installs
-                                            // the winner, and completes this unit exactly once.
-                                            continue;
-                                        }
-                                        st.started[index] = true;
-                                        st.in_flight += 1;
-                                    }
-                                    t_start[index]
-                                        .store(t_sched.elapsed().as_nanos() as u64, Relaxed);
-                                    match remote_cache::install(ctx, index, record) {
-                                        Ok(result) => {
-                                            complete(index, Ok(result), true);
-                                            finish_download(index, download, Ok(true));
-                                        }
-                                        Err(error) => {
-                                            let mut st = state.lock().unwrap();
-                                            st.started[index] = false;
-                                            st.in_flight -= 1;
-                                            if st.indeg[index] == 0 {
-                                                st.ready.push(index);
-                                            }
-                                            drop(st);
-                                            finish_download(
-                                                index,
-                                                download,
-                                                Err(error.context("installing remote result")),
-                                            );
-                                        }
-                                    }
-                                    cv.notify_all();
-                                }
-                            });
+                downloads::run(
+                    ctx,
+                    requests,
+                    &cancel,
+                    &cancel_downloads,
+                    |index, pass| {
+                        if pass {
+                            return test_passes[index].get().is_none();
                         }
-                    });
-                }
+                        let st = state.lock().unwrap();
+                        st.wanted[index]
+                            && results[index].get().is_none()
+                            && (!st.started[index] || compiler_races[index].is_some())
+                    },
+                    |index, fetched, download| {
+                        let record = match fetched {
+                            Ok(Some(downloads::Downloaded::Pass(pass))) => {
+                                let mut st = state.lock().unwrap();
+                                let _ = test_passes[index].set(pass);
+                                refresh_artifact_demand(
+                                    ctx,
+                                    &mut st,
+                                    results,
+                                    test_passes,
+                                    &cancel_downloads,
+                                );
+                                drop(st);
+                                cv.notify_all();
+                                finish_download(index, download, Ok(true));
+                                return;
+                            }
+                            Ok(Some(downloads::Downloaded::Artifact(record))) => record,
+                            Ok(None) => {
+                                finish_download(index, download, Ok(false));
+                                return;
+                            }
+                            Err(error) => {
+                                finish_download(index, download, Err(error));
+                                return;
+                            }
+                        };
+                        // Installation cannot overlap local publication. A running
+                        // compiler owns cleanup and installation of its replacement.
+                        {
+                            let mut st = state.lock().unwrap();
+                            if cancel.load(Relaxed)
+                                || !st.wanted[index]
+                                || results[index].get().is_some()
+                                || (st.started[index] && compiler_races[index].is_none())
+                            {
+                                drop(st);
+                                finish_download(
+                                    index,
+                                    download,
+                                    Err(crate::remote::ReadCancelled.into()),
+                                );
+                                return;
+                            }
+                            if st.started[index] {
+                                let offered = compiler_races[index]
+                                    .as_ref()
+                                    .unwrap()
+                                    .offer(record, download);
+                                drop(st);
+                                if let Err((_, download)) = offered {
+                                    finish_download(
+                                        index,
+                                        download,
+                                        Err(crate::remote::ReadCancelled.into()),
+                                    );
+                                }
+                                return;
+                            }
+                            st.started[index] = true;
+                            st.in_flight += 1;
+                        }
+                        t_start[index].store(t_sched.elapsed().as_nanos() as u64, Relaxed);
+                        match remote_cache::install(ctx, index, record) {
+                            Ok(result) => {
+                                complete(index, Ok(result), true);
+                                finish_download(index, download, Ok(true));
+                            }
+                            Err(error) => {
+                                let mut st = state.lock().unwrap();
+                                st.started[index] = false;
+                                st.in_flight -= 1;
+                                if st.indeg[index] == 0 {
+                                    st.ready.push(index);
+                                }
+                                drop(st);
+                                finish_download(
+                                    index,
+                                    download,
+                                    Err(error.context("installing remote result")),
+                                );
+                            }
+                        }
+                        cv.notify_all();
+                    },
+                );
             });
         }
         let mut compilers = Vec::new();

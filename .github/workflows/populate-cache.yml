@@ -40,6 +40,7 @@ jobs:
 
       - name: Populate build results
         env:
+          CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
           CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
           CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
         run: |
@@ -51,6 +52,7 @@ jobs:
 
       - name: Populate successful test results
         env:
+          CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
           CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
           CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
         run: |

@@ -4,7 +4,6 @@ use crate::store::{sha256_file, Store};
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -23,8 +22,6 @@ const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     pub read_url: String,
-    pub endpoint: Option<String>,
-    pub bucket: Option<String>,
 }
 
 #[derive(Clone)]
@@ -58,24 +55,7 @@ fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
 
 impl Cache {
     pub fn new(config: Config) -> Result<Self> {
-        for url in std::iter::once(&config.read_url).chain(config.endpoint.iter()) {
-            ensure!(
-                (url.starts_with("https://") || url.starts_with("http://"))
-                    && !url.contains(['?', '#', '@', '\r', '\n'])
-                    && !url.chars().any(char::is_whitespace),
-                "R2 URLs must be HTTP(S) base URLs without credentials, query or fragment"
-            );
-        }
-        ensure!(
-            config
-                .bucket
-                .as_ref()
-                .is_none_or(|bucket| !bucket.is_empty()
-                    && bucket
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-            "invalid R2 bucket"
-        );
+        validate_base_url(&config.read_url)?;
         Ok(Self {
             config,
             read_timeout: Duration::from_secs(10),
@@ -96,6 +76,7 @@ impl Cache {
             MAX_RECORD,
             cancel,
             self.read_timeout,
+            false,
         )?;
         if status == 404 {
             return Ok(None);
@@ -107,158 +88,42 @@ impl Cache {
         Ok(Some(bytes))
     }
 
-    /// Succeeds only when every requested blob is locally available and verified.
-    ///
-    /// Failures retain their diagnostic cause; callers treat them as cache misses.
-    /// Only verified bytes are atomically renamed into the local CAS.
-    /// Existing local bytes are checked too, so a damaged CAS entry is repaired.
-    pub fn fetch_blobs(&self, store: &Store, hashes: &[String], cancel: &AtomicBool) -> Result<()> {
-        for hash in hashes {
-            validate_hash(hash)?;
-        }
-        let mut seen = HashSet::new();
-        let mut missing = Vec::new();
-        for hash in hashes {
-            check_cancelled(cancel)?;
-            if seen.insert(hash)
-                && sha256_file(&store.cache_path(hash)).ok().as_deref() != Some(hash)
-            {
-                missing.push((hash, Temporary::new(&store.root.join("tmp"))?));
-            }
-        }
-        if missing.is_empty() {
-            check_cancelled(cancel)?;
+    /// Verify a blob, downloading and atomically installing it only if needed.
+    pub fn fetch_blob(&self, store: &Store, hash: &str, cancel: &AtomicBool) -> Result<()> {
+        validate_hash(hash)?;
+        check_cancelled(cancel)?;
+        let destination = store.cache_path(hash);
+        if sha256_file(&destination).ok().as_deref() == Some(hash) {
             return Ok(());
         }
-
-        // File-backed metadata cannot fill a pipe while we wait for curl.
-        // Each transfer emits one indexed status, in completion order.
-        let statuses = Temporary::new(&store.root.join("tmp"))?;
-        let status_limit = (missing.len() * (missing.len().to_string().len() + 9)) as u64;
-        // Large incremental actions can exceed ARG_MAX, especially with
-        // long store paths. Keep per-transfer options out of argv.
-        let config = Temporary::new(&store.root.join("tmp"))?;
-        let mut config_file = OpenOptions::new().write(true).open(&config.0)?;
-        let mut command = crate::curl();
-        command.args([
-            "-q",
-            "--parallel",
-            "--parallel-max",
-            &GET_CONCURRENCY.to_string(),
-        ]);
-        command.arg("--config").arg(&config.0);
-        for (index, (hash, temporary)) in missing.iter().enumerate() {
-            if index > 0 {
-                writeln!(config_file, "next")?;
-            }
-            writeln!(
-                config_file,
-                "silent\ngloboff\nproto = \"=http,https\"\nconnect-timeout = 3"
-            )?;
-            for (option, value) in [
-                ("max-time", self.read_timeout.as_secs_f64().to_string()),
-                ("max-filesize", MAX_BLOB.to_string()),
-                (
-                    "write-out",
-                    format!("{index} %{{http_code}} %{{exitcode}}\n"),
-                ),
-                ("url", self.read_url(&format!("blobs/{hash}"))),
-            ] {
-                write!(config_file, "{option} = \"")?;
-                config_file.write_all(&curl_config_escape(value.as_bytes()))?;
-                writeln!(config_file, "\"")?;
-            }
-            write!(config_file, "output = \"")?;
-            config_file.write_all(&curl_config_escape(
-                temporary.0.as_os_str().as_encoded_bytes(),
-            ))?;
-            writeln!(config_file, "\"")?;
-        }
-        drop(config_file);
-        command
-            .stdin(Stdio::null())
-            .stdout(OpenOptions::new().write(true).open(&statuses.0)?)
-            .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .context("starting parallel R2 curl transport")?;
-        let start = Instant::now();
-        // --max-time applies to individual transfers, not time in the queue.
-        let waves = missing.len().div_ceil(GET_CONCURRENCY);
-        let deadline = self
-            .read_timeout
-            .saturating_mul(u32::try_from(waves).unwrap_or(u32::MAX))
-            .saturating_add(Duration::from_secs(1));
-        let wait = (|| -> Result<()> {
-            loop {
-                check_cancelled(cancel)?;
-                ensure!(
-                    start.elapsed() <= deadline,
-                    "remote batch deadline exceeded"
-                );
-                ensure!(
-                    fs::metadata(&statuses.0)?.len() <= status_limit
-                        && missing.iter().all(|(_, temporary)| {
-                            fs::metadata(&temporary.0).is_ok_and(|m| m.len() <= MAX_BLOB)
-                        }),
-                    "remote batch exceeded response size limits"
-                );
-                if let Some(status) = child.try_wait()? {
-                    ensure!(
-                        status.success(),
-                        "parallel R2 curl transport failed ({status})"
-                    );
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        })();
-        if let Err(error) = wait {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        ensure!(
-            fs::metadata(&statuses.0)?.len() <= status_limit,
-            "oversized curl metadata"
-        );
-        let mut completed = HashSet::new();
-        for line in fs::read_to_string(&statuses.0)?.lines() {
-            let (index, status) = line.split_once(' ').context("invalid curl status")?;
-            let index: usize = index.parse()?;
-            ensure!(
-                index < missing.len() && completed.insert(index),
-                "incomplete remote batch"
-            );
-            ensure!(
-                status == "200 0",
-                "remote blob {} returned HTTP/curl status {status}",
-                missing[index].0
-            );
-        }
-        ensure!(completed.len() == missing.len(), "incomplete remote batch");
-        for (hash, temporary) in &missing {
-            check_cancelled(cancel)?;
-            ensure!(
-                fs::metadata(&temporary.0)?.len() <= MAX_BLOB
-                    && sha256_file(&temporary.0)?.as_str() == hash.as_str(),
-                "remote blob {hash} failed size or SHA-256 verification"
-            );
-            check_cancelled(cancel)?;
-            let destination = store.cache_path(hash);
-            fs::create_dir_all(destination.parent().unwrap())?;
-            fs::rename(&temporary.0, destination)
-                .context("publishing verified remote blob into CAS")?;
-        }
+        let temporary = Temporary::new(&store.root.join("tmp"))?;
+        let status = self.request(
+            "GET",
+            &self.read_url(&format!("blobs/{hash}")),
+            &temporary.0,
+            None,
+            None,
+            MAX_BLOB,
+            cancel,
+            self.read_timeout,
+            false,
+        )?;
+        ensure!(status == 200, "remote blob {hash} returned HTTP {status}");
         check_cancelled(cancel)?;
+        ensure!(
+            sha256_file(&temporary.0)?.as_str() == hash,
+            "remote blob {hash} failed SHA-256 verification"
+        );
+        check_cancelled(cancel)?;
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::rename(&temporary.0, destination)
+            .context("publishing verified remote blob into CAS")?;
         Ok(())
     }
 
     /// Validate explicit write opt-in before the caller schedules any work.
     pub fn validate_write_config(&self) -> Result<()> {
-        ensure!(self.config.endpoint.is_some(), "R2 writes require endpoint");
-        ensure!(self.config.bucket.is_some(), "R2 writes require bucket");
-        Credentials::from_env()?;
+        WriteConfig::from_env()?;
         Ok(())
     }
 
@@ -268,33 +133,33 @@ impl Cache {
     /// error, not permission to replace the record.
     pub fn publish(&self, key: &str, record: &[u8], blobs: &[BlobRef<'_>]) -> Result<()> {
         validate_hash(key)?;
-        self.validate_write_config()?;
         ensure!(
             record.len() as u64 <= MAX_RECORD,
             "remote record exceeds size limit"
         );
         record_hashes(record)?;
-        let credentials = Credentials::from_env()?;
-        self.publish_with_credentials(key, record, blobs, &credentials)
+        let config = WriteConfig::from_env()?;
+        self.publish_with_config(key, record, blobs, &config)
     }
 
-    fn publish_with_credentials(
+    fn publish_with_config(
         &self,
         key: &str,
         record: &[u8],
         blobs: &[BlobRef<'_>],
-        credentials: &Credentials,
+        config: &WriteConfig,
     ) -> Result<()> {
+        let credentials = &config.credentials;
         let cancel = AtomicBool::new(false);
         let output = Temporary::new(&std::env::temp_dir())?;
-        let action = self.write_url(&format!("actions/{key}.json"));
+        let action = config.object_url(&format!("actions/{key}.json"));
         for blob in blobs {
             validate_hash(blob.hash)?;
         }
         // A lost conditional write restarts inspection, including repair of
         // the winner's references. Bound contention rather than waiting forever.
         for _ in 0..3 {
-            let (status, etag) = self.request_with_condition(
+            let status = self.request(
                 "GET",
                 &action,
                 &output.0,
@@ -303,44 +168,25 @@ impl Cache {
                 MAX_RECORD,
                 &cancel,
                 self.read_timeout,
-                None,
+                false,
             )?;
             ensure!(
                 status == 200 || status == 404,
                 "R2 record inspection returned HTTP {status}"
             );
-            let existing = if status == 200 {
-                record_hashes(&fs::read(&output.0)?).ok()
-            } else {
-                None
-            };
-            if let Some(hashes) = existing {
-                self.repair_blobs(&hashes, blobs, &output.0, credentials, &cancel)?;
+            if status == 200 {
+                let hashes = record_hashes(&fs::read(&output.0)?).with_context(|| {
+                    format!(
+                        "invalid remote record actions/{key}.json; repair it or wait for expiry"
+                    )
+                })?;
+                self.repair_blobs(&hashes, blobs, &output.0, config, &cancel)?;
                 return Ok(());
             }
-            let condition = if status == 404 {
-                "If-None-Match: *".to_string()
-            } else {
-                let etag = etag
-                    .context("R2 invalid record lacks ETag; refusing unconditional replacement")?;
-                ensure!(
-                    etag.starts_with('"')
-                        && etag.ends_with('"')
-                        && etag.bytes().all(|b| (0x21..=0x7e).contains(&b)),
-                    "R2 record has an unsafe or weak ETag"
-                );
-                format!("If-Match: {etag}")
-            };
-            self.repair_blobs(
-                &record_hashes(record)?,
-                blobs,
-                &output.0,
-                credentials,
-                &cancel,
-            )?;
+            self.repair_blobs(&record_hashes(record)?, blobs, &output.0, config, &cancel)?;
             let input = Temporary::new(&std::env::temp_dir())?;
             fs::write(&input.0, record)?;
-            let (status, _) = self.request_with_condition(
+            let status = self.request(
                 "PUT",
                 &action,
                 &output.0,
@@ -349,7 +195,7 @@ impl Cache {
                 MAX_RECORD,
                 &cancel,
                 Duration::from_secs(30),
-                Some(&condition),
+                true,
             )?;
             if status == 412 {
                 continue;
@@ -368,12 +214,13 @@ impl Cache {
         hashes: &[String],
         blobs: &[BlobRef<'_>],
         output: &Path,
-        credentials: &Credentials,
+        config: &WriteConfig,
         cancel: &AtomicBool,
     ) -> Result<()> {
+        let credentials = &config.credentials;
         let mut missing = Vec::new();
         for hash in hashes {
-            let url = self.write_url(&format!("blobs/{hash}"));
+            let url = config.object_url(&format!("blobs/{hash}"));
             let status = self.request(
                 "HEAD",
                 &url,
@@ -383,6 +230,7 @@ impl Cache {
                 MAX_BLOB,
                 cancel,
                 self.read_timeout,
+                false,
             )?;
             match status {
                 200 => {}
@@ -427,6 +275,7 @@ impl Cache {
             MAX_RECORD,
             cancel,
             Duration::from_secs(30),
+            false,
         )?;
         ensure!(
             (200..300).contains(&status),
@@ -442,18 +291,6 @@ impl Cache {
         )
     }
 
-    fn write_url(&self, object: &str) -> String {
-        format!(
-            "{}/{}/{NAMESPACE}/{object}",
-            self.config
-                .endpoint
-                .as_deref()
-                .unwrap_or_default()
-                .trim_end_matches('/'),
-            self.config.bucket.as_deref().unwrap_or_default()
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn request(
         &self,
@@ -465,36 +302,9 @@ impl Cache {
         limit: u64,
         cancel: &AtomicBool,
         timeout: Duration,
+        create_only: bool,
     ) -> Result<u16> {
-        self.request_with_condition(
-            method,
-            url,
-            output,
-            input,
-            credentials,
-            limit,
-            cancel,
-            timeout,
-            None,
-        )
-        .map(|(status, _)| status)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn request_with_condition(
-        &self,
-        method: &str,
-        url: &str,
-        output: &Path,
-        input: Option<&Path>,
-        credentials: Option<&Credentials>,
-        limit: u64,
-        cancel: &AtomicBool,
-        timeout: Duration,
-        condition: Option<&str>,
-    ) -> Result<(u16, Option<String>)> {
         check_cancelled(cancel)?;
-        let headers = Temporary::new(&std::env::temp_dir())?;
         // -q must be first: never inherit ~/.curlrc credentials or redirects.
         // Do not follow redirects; public reads must stay unauthenticated and
         // signed writes must never send credentials to another endpoint.
@@ -515,11 +325,9 @@ impl Cache {
                 "--output",
             ])
             .arg(output)
-            .arg("--dump-header")
-            .arg(&headers.0)
             .args(["--write-out", "%{http_code}", "--url", url]);
-        if let Some(condition) = condition {
-            command.arg("--header").arg(condition);
+        if create_only {
+            command.args(["--header", "If-None-Match: *"]);
         }
         if method == "HEAD" {
             command.arg("--head");
@@ -552,9 +360,7 @@ impl Cache {
                     start.elapsed() <= timeout,
                     "remote request deadline exceeded"
                 );
-                if fs::metadata(output).is_ok_and(|m| m.len() > limit)
-                    || fs::metadata(&headers.0).is_ok_and(|m| m.len() > 64 * 1024)
-                {
+                if fs::metadata(output).is_ok_and(|m| m.len() > limit) {
                     bail!("remote request exceeded response size limits");
                 }
                 if child.try_wait()?.is_some() {
@@ -567,7 +373,7 @@ impl Cache {
         if result.is_err() {
             let _ = child.kill();
             let _ = child.wait();
-            return result.map(|_| (0, None));
+            return result.map(|_| 0);
         }
         let response = child.wait_with_output()?;
         ensure!(
@@ -575,19 +381,7 @@ impl Cache {
             "R2 curl transport failed ({})",
             response.status
         );
-        let mut etag = None;
-        // Ignore interim/proxy response headers; only the final response's
-        // validator may authorize replacement of the downloaded record.
-        for line in fs::read_to_string(&headers.0)?.lines() {
-            if line.starts_with("HTTP/") {
-                etag = None;
-            } else if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("etag") {
-                    etag = Some(value.trim().to_owned());
-                }
-            }
-        }
-        Ok((std::str::from_utf8(&response.stdout)?.parse()?, etag))
+        Ok(std::str::from_utf8(&response.stdout)?.parse()?)
     }
 }
 
@@ -613,6 +407,57 @@ fn record_hashes(bytes: &[u8]) -> Result<Vec<String>> {
         validate_hash(hash)?;
     }
     Ok(record.blobs)
+}
+
+fn validate_base_url(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    ensure!(
+        rest.is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+            && !url.contains(['?', '#', '@', '\r', '\n'])
+            && !url.chars().any(char::is_whitespace),
+        "R2 URLs must be HTTP(S) base URLs without credentials, query or fragment"
+    );
+    Ok(())
+}
+
+fn validate_write_url(url: &str) -> Result<()> {
+    validate_base_url(url)?;
+    let (_, address) = url.split_once("://").context("missing URL scheme")?;
+    let (_, bucket) = address
+        .trim_end_matches('/')
+        .split_once('/')
+        .context("expected an R2 account URL followed by /<bucket>")?;
+    ensure!(
+        !bucket.is_empty()
+            && bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "expected a single R2 bucket name, without an object path"
+    );
+    Ok(())
+}
+
+/// Publisher-only settings; ordinary cache reads never inspect this environment.
+struct WriteConfig {
+    url: String,
+    credentials: Credentials,
+}
+
+impl WriteConfig {
+    fn from_env() -> Result<Self> {
+        let url = std::env::var("CORGI_R2_WRITE_URL").context("missing CORGI_R2_WRITE_URL")?;
+        validate_write_url(&url).context("invalid CORGI_R2_WRITE_URL")?;
+        Ok(Self {
+            url,
+            credentials: Credentials::from_env()?,
+        })
+    }
+
+    fn object_url(&self, object: &str) -> String {
+        format!("{}/{NAMESPACE}/{object}", self.url.trim_end_matches('/'))
+    }
 }
 
 struct Credentials {
@@ -712,9 +557,7 @@ mod tests {
         competing_record: Option<Vec<u8>>,
         always_conflict: bool,
         precondition_failures: usize,
-        connections: usize,
         active_gets: usize,
-        peak_gets: usize,
         read_status: Option<u16>,
         read_length: Option<u64>,
     }
@@ -739,7 +582,6 @@ mod tests {
                 while !done.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            s.lock().unwrap().connections += 1;
                             let s = s.clone();
                             thread::spawn(move || {
                                 // Reset/broken-pipe is expected when testing
@@ -765,10 +607,15 @@ mod tests {
         fn cache(&self) -> Cache {
             Cache::new(Config {
                 read_url: format!("{}/bucket", self.base),
-                endpoint: Some(self.base.clone()),
-                bucket: Some("bucket".into()),
             })
             .unwrap()
+        }
+
+        fn write_config(&self) -> WriteConfig {
+            WriteConfig {
+                url: format!("{}/bucket", self.base),
+                credentials: credentials(),
+            }
         }
 
         fn set(&self, name: &str, bytes: &[u8]) {
@@ -800,7 +647,6 @@ mod tests {
             let (method, path) = (words[0].to_string(), words[1].to_string());
             let mut length = 0;
             let mut auth = false;
-            let mut if_match = None;
             let mut if_none_match = None;
             loop {
                 line.clear();
@@ -816,9 +662,6 @@ mod tests {
                     auth = true;
                     assert!(line.contains("/auto/s3/aws4_request"));
                 }
-                if lower.starts_with("if-match:") {
-                    if_match = Some(line.split_once(':').unwrap().1.trim().to_owned());
-                }
                 if lower.starts_with("if-none-match:") {
                     if_none_match = Some(line.split_once(':').unwrap().1.trim().to_owned());
                 }
@@ -830,31 +673,24 @@ mod tests {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body)?;
-            let (status, response, delay, etag, barrier, length) = {
+            let (status, response, delay, barrier, length) = {
                 let mut state = state.lock().unwrap();
                 state.requests.push((method.clone(), auth));
                 if method == "GET" {
                     state.active_gets += 1;
-                    state.peak_gets = state.peak_gets.max(state.active_gets);
                 }
                 let (status, bytes) = if method == "PUT" {
                     assert!(auth);
                     let is_record = path.contains("/actions/");
                     if is_record {
-                        assert!(if_match.is_some() || if_none_match.is_some());
+                        assert_eq!(if_none_match.as_deref(), Some("*"));
                         if let Some(winner) = state.competing_record.take() {
                             state.objects.insert(path.clone(), winner);
                         }
                     }
-                    let current_etag = state
-                        .objects
-                        .get(&path)
-                        .map(|b| format!("\"{}\"", sha256_hex(b)));
                     let conflict = (is_record && state.always_conflict)
-                        || (if_none_match.as_deref() == Some("*") && current_etag.is_some())
-                        || if_match
-                            .as_ref()
-                            .is_some_and(|tag| current_etag.as_ref() != Some(tag));
+                        || (if_none_match.as_deref() == Some("*")
+                            && state.objects.contains_key(&path));
                     if conflict {
                         state.precondition_failures += 1;
                         (412, Vec::new())
@@ -871,11 +707,6 @@ mod tests {
                         None => (404, Vec::new()),
                     }
                 };
-                let etag = state
-                    .objects
-                    .get(&path)
-                    .map(|b| format!("ETag: \"{}\"\r\n", sha256_hex(b)))
-                    .unwrap_or_default();
                 let barrier =
                     if method == "GET" && path.contains("/actions/") && state.gated_gets < 2 {
                         state.gated_gets += 1;
@@ -884,7 +715,7 @@ mod tests {
                         None
                     };
                 let length = state.read_length.unwrap_or(bytes.len() as u64);
-                (status, bytes, state.delay, etag, barrier, length)
+                (status, bytes, state.delay, barrier, length)
             };
             if let Some(barrier) = barrier {
                 barrier.wait();
@@ -893,7 +724,7 @@ mod tests {
             let result = (|| {
                 write!(
             reader.get_mut(),
-            "HTTP/1.1 {status} Response\r\n{etag}Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             length
         )?;
                 if method != "HEAD" {
@@ -976,78 +807,28 @@ mod tests {
         let hash = sha256_hex(b"correct bytes");
         let name = format!("blobs/{hash}");
         assert!(cache
-            .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
+            .fetch_blob(&local.0, &hash, &cancel())
             .unwrap_err()
             .to_string()
             .contains("404"));
         server.set(&name, b"wrong bytes");
         assert!(cache
-            .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
+            .fetch_blob(&local.0, &hash, &cancel())
             .unwrap_err()
             .to_string()
             .contains("SHA-256"));
         assert!(!local.0.cache_path(&hash).exists());
         server.set(&name, b"correct bytes");
-        cache
-            .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap();
+        cache.fetch_blob(&local.0, &hash, &cancel()).unwrap();
         let path = local.0.cache_path(&hash);
         fs::write(&path, b"damaged").unwrap();
-        cache
-            .fetch_blobs(&local.0, std::slice::from_ref(&hash), &cancel())
-            .unwrap();
+        cache.fetch_blob(&local.0, &hash, &cancel()).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"correct bytes");
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
     }
 
     #[test]
-    fn batch_downloads_overlap_with_bounded_concurrency_and_reuse_connections() {
-        let server = Server::new();
-        server.state.lock().unwrap().delay = Duration::from_millis(120);
-        let cache = server.cache();
-        let local = Local::new();
-        let mut hashes = Vec::new();
-        for index in 0..GET_CONCURRENCY * 3 + 1 {
-            let bytes = format!("blob {index}");
-            let hash = sha256_hex(bytes.as_bytes());
-            server.set(&format!("blobs/{hash}"), bytes.as_bytes());
-            hashes.push(hash);
-        }
-        let count = hashes.len();
-        hashes.extend(hashes.clone());
-        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
-        for hash in &hashes {
-            assert_eq!(sha256_file(&local.0.cache_path(hash)).unwrap(), *hash);
-        }
-        {
-            let state = server.state.lock().unwrap();
-            assert_eq!(
-                state.requests.len(),
-                count,
-                "duplicate hashes must be deduplicated"
-            );
-            assert!(state.peak_gets > 1, "GETs should overlap");
-            assert!(state.peak_gets <= GET_CONCURRENCY);
-            assert!(
-                state.connections < count,
-                "curl should reuse keepalive connections"
-            );
-            assert!(state
-                .requests
-                .iter()
-                .all(|(method, auth)| method == "GET" && !auth));
-        }
-        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
-        assert_eq!(
-            server.state.lock().unwrap().requests.len(),
-            count,
-            "verified local blobs should not be requested"
-        );
-        assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn large_batch_uses_config_with_long_quoted_paths() {
+    fn blob_downloads_support_long_quoted_paths_and_reuse_verified_local_bytes() {
         let server = Server::new();
         let local = Local::new();
         let component = format!(
@@ -1063,77 +844,47 @@ mod tests {
                 .join(&component),
         )
         .unwrap();
-        let hashes: Vec<_> = (0..512)
-            .map(|index| {
-                let bytes = format!("large batch {index}");
-                let hash = sha256_hex(bytes.as_bytes());
-                server.set(&format!("blobs/{hash}"), bytes.as_bytes());
-                hash
-            })
-            .collect();
-        // Output paths alone would exceed macOS's 256 KiB argv limit.
-        assert!(store.root.as_os_str().len() * hashes.len() > 256 * 1024);
-        server
-            .cache()
-            .fetch_blobs(&store, &hashes, &cancel())
-            .unwrap();
-        for hash in &hashes {
-            assert_eq!(sha256_file(&store.cache_path(hash)).unwrap(), *hash);
+        let hash = sha256_hex(b"blob");
+        server.set(&format!("blobs/{hash}"), b"blob");
+        for _ in 0..2 {
+            server.cache().fetch_blob(&store, &hash, &cancel()).unwrap();
+            assert_eq!(sha256_file(&store.cache_path(&hash)).unwrap(), hash);
         }
-        assert_eq!(server.state.lock().unwrap().requests.len(), hashes.len());
+        assert_eq!(server.state.lock().unwrap().requests.len(), 1);
         assert_eq!(fs::read_dir(store.root.join("tmp")).unwrap().count(), 0);
     }
 
     #[test]
-    fn batch_deadline_allows_queued_waves_and_transfer_timeout_cleans_up() {
+    fn blob_transfer_timeout_cleans_up() {
         let server = Server::new();
         let local = Local::new();
         let mut cache = server.cache();
-        cache.read_timeout = Duration::from_millis(500);
-        server.state.lock().unwrap().delay = Duration::from_millis(180);
-        let hashes: Vec<_> = (0..GET_CONCURRENCY * 4)
-            .map(|index| {
-                let bytes = format!("wave {index}");
-                let hash = sha256_hex(bytes.as_bytes());
-                server.set(&format!("blobs/{hash}"), bytes.as_bytes());
-                hash
-            })
-            .collect();
-        let start = Instant::now();
-        cache.fetch_blobs(&local.0, &hashes, &cancel()).unwrap();
-        assert!(start.elapsed() > cache.read_timeout);
-
-        let other = Local::new();
+        let hash = sha256_hex(b"blob");
+        server.set(&format!("blobs/{hash}"), b"blob");
         server.state.lock().unwrap().delay = Duration::from_secs(2);
         cache.read_timeout = Duration::from_millis(80);
-        assert!(cache.fetch_blobs(&other.0, &hashes, &cancel()).is_err());
-        assert!(hashes.iter().all(|hash| !other.0.cache_path(hash).exists()));
-        assert_eq!(fs::read_dir(other.0.root.join("tmp")).unwrap().count(), 0);
+        assert!(cache.fetch_blob(&local.0, &hash, &cancel()).is_err());
+        assert!(!local.0.cache_path(&hash).exists());
+        assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
     }
 
     #[test]
-    fn batch_missing_corrupt_unavailable_and_cancelled_are_misses() {
+    fn blob_missing_corrupt_unavailable_and_cancelled_are_misses() {
         let server = Server::new();
         let cache = server.cache();
         let local = Local::new();
-        let good = sha256_hex(b"good");
         let bad = sha256_hex(b"bad");
-        let hashes = vec![good.clone(), bad.clone()];
-        server.set(&format!("blobs/{good}"), b"good");
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
+        assert!(cache.fetch_blob(&local.0, &bad, &cancel()).is_err());
         server.set(&format!("blobs/{bad}"), b"corrupt");
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
+        assert!(cache.fetch_blob(&local.0, &bad, &cancel()).is_err());
         assert!(!local.0.cache_path(&bad).exists());
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
-        assert!(cache
-            .fetch_blobs(&local.0, &["../escape".into()], &cancel())
-            .is_err());
-        cache.fetch_blobs(&local.0, &[], &cancel()).unwrap();
+        assert!(cache.fetch_blob(&local.0, "../escape", &cancel()).is_err());
 
         server.state.lock().unwrap().delay = Duration::from_secs(2);
         let flag = cancel();
         thread::scope(|scope| {
-            let worker = scope.spawn(|| cache.fetch_blobs(&local.0, &hashes, &flag));
+            let worker = scope.spawn(|| cache.fetch_blob(&local.0, &bad, &flag));
             let deadline = Instant::now() + Duration::from_secs(2);
             while server.state.lock().unwrap().active_gets == 0 {
                 assert!(Instant::now() < deadline, "curl never started");
@@ -1147,26 +898,25 @@ mod tests {
         assert!(!local.0.cache_path(&bad).exists());
         assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
         assert!(cache
-            .fetch_blobs(&local.0, &[], &flag)
+            .fetch_blob(&local.0, &bad, &flag)
             .unwrap_err()
             .is::<ReadCancelled>());
         drop(server);
-        assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
+        assert!(cache.fetch_blob(&local.0, &bad, &cancel()).is_err());
     }
 
     #[test]
-    fn batch_rejects_non_200_oversized_and_incomplete_responses() {
+    fn blob_rejects_non_200_oversized_and_incomplete_responses() {
         let server = Server::new();
         let local = Local::new();
         let mut cache = server.cache();
         cache.read_timeout = Duration::from_millis(100);
         let hash = sha256_hex(b"body");
-        let hashes = vec![hash.clone()];
         server.set(&format!("blobs/{hash}"), b"body");
         for status in [206, 302, 503] {
             server.state.lock().unwrap().read_status = Some(status);
             assert!(cache
-                .fetch_blobs(&local.0, &hashes, &cancel())
+                .fetch_blob(&local.0, &hash, &cancel())
                 .unwrap_err()
                 .to_string()
                 .contains(&status.to_string()));
@@ -1175,7 +925,7 @@ mod tests {
         server.state.lock().unwrap().read_status = None;
         for length in [MAX_BLOB + 1, 5] {
             server.state.lock().unwrap().read_length = Some(length);
-            assert!(cache.fetch_blobs(&local.0, &hashes, &cancel()).is_err());
+            assert!(cache.fetch_blob(&local.0, &hash, &cancel()).is_err());
             assert!(!local.0.cache_path(&hash).exists());
             assert_eq!(fs::read_dir(local.0.root.join("tmp")).unwrap().count(), 0);
         }
@@ -1214,7 +964,7 @@ mod tests {
         }];
         let bytes = record(&[&hash]);
         cache
-            .publish_with_credentials(&key(), &bytes, &refs, &credentials())
+            .publish_with_config(&key(), &bytes, &refs, &server.write_config())
             .unwrap();
         let blob_name = format!("/bucket/{NAMESPACE}/blobs/{hash}");
         let action_name = format!("/bucket/{NAMESPACE}/actions/{}.json", key());
@@ -1226,7 +976,7 @@ mod tests {
         }
         // Even a differing proposed record must repair/preserve the existing one.
         cache
-            .publish_with_credentials(&key(), &record(&[]), &refs, &credentials())
+            .publish_with_config(&key(), &record(&[]), &refs, &server.write_config())
             .unwrap();
         {
             let mut state = server.state.lock().unwrap();
@@ -1235,13 +985,34 @@ mod tests {
             state.puts.clear();
         }
         cache
-            .publish_with_credentials(&key(), &record(&[]), &[], &credentials())
+            .publish_with_config(&key(), &record(&[]), &[], &server.write_config())
             .unwrap();
         assert!(server.state.lock().unwrap().puts.is_empty());
     }
 
     #[test]
-    fn malformed_record_is_replaced_but_upload_errors_do_not_publish_record() {
+    fn malformed_records_are_reported_without_writes() {
+        let server = Server::new();
+        let cache = server.cache();
+        let name = format!("actions/{}.json", key());
+        for bytes in [
+            b"bad json".as_slice(),
+            br#"{"blobs": ["bad hash"]}"#,
+            br#"{}"#,
+        ] {
+            server.set(&name, bytes);
+            let error = cache
+                .publish_with_config(&key(), &record(&[]), &[], &server.write_config())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(&format!("invalid remote record {name}")));
+            let state = server.state.lock().unwrap();
+            assert!(state.puts.is_empty());
+            assert_eq!(state.objects[&format!("/bucket/{NAMESPACE}/{name}")], bytes);
+        }
+    }
+
+    #[test]
+    fn upload_errors_do_not_publish_record() {
         let server = Server::new();
         let cache = server.cache();
         let local = Local::new();
@@ -1251,16 +1022,14 @@ mod tests {
             hash: &hash,
             path: &path,
         }];
-        let name = format!("actions/{}.json", key());
-        server.set(&name, b"bad json");
         server.state.lock().unwrap().fail_put = true;
         assert!(cache
-            .publish_with_credentials(&key(), &record(&[&hash]), &refs, &credentials())
+            .publish_with_config(&key(), &record(&[&hash]), &refs, &server.write_config())
             .is_err());
         assert!(server.state.lock().unwrap().puts.is_empty());
         server.state.lock().unwrap().fail_put = false;
         cache
-            .publish_with_credentials(&key(), &record(&[&hash]), &refs, &credentials())
+            .publish_with_config(&key(), &record(&[&hash]), &refs, &server.write_config())
             .unwrap();
         assert_eq!(server.state.lock().unwrap().puts.len(), 2);
         server
@@ -1270,39 +1039,34 @@ mod tests {
             .objects
             .remove(&format!("/bucket/{NAMESPACE}/blobs/{hash}"));
         assert!(cache
-            .publish_with_credentials(&key(), &record(&[]), &[], &credentials())
+            .publish_with_config(&key(), &record(&[]), &[], &server.write_config())
             .is_err());
     }
 
     #[test]
-    fn concurrent_publishers_preserve_winner_for_absent_and_invalid_records() {
-        for old in [None, Some(b"invalid".as_slice())] {
-            let server = Server::new();
-            let name = format!("actions/{}.json", key());
-            if let Some(old) = old {
-                server.set(&name, old);
-            }
-            server.state.lock().unwrap().record_get_barrier = Some(Arc::new(Barrier::new(2)));
-            let mut workers = Vec::new();
-            for id in 0..2 {
-                let cache = server.cache();
-                workers.push(thread::spawn(move || {
-                    let bytes =
-                        serde_json::to_vec(&serde_json::json!({"blobs": [], "publisher": id}))
-                            .unwrap();
-                    cache
-                        .publish_with_credentials(&key(), &bytes, &[], &credentials())
-                        .unwrap();
-                }));
-            }
-            for worker in workers {
-                worker.join().unwrap();
-            }
-            let state = server.state.lock().unwrap();
-            assert_eq!(state.puts.len(), 1);
-            assert_eq!(state.precondition_failures, 1);
-            assert!(record_hashes(&state.objects[&format!("/bucket/{NAMESPACE}/{name}")]).is_ok());
+    fn concurrent_publishers_preserve_first_record() {
+        let server = Server::new();
+        let name = format!("actions/{}.json", key());
+        server.state.lock().unwrap().record_get_barrier = Some(Arc::new(Barrier::new(2)));
+        let mut workers = Vec::new();
+        for id in 0..2 {
+            let cache = server.cache();
+            let config = server.write_config();
+            workers.push(thread::spawn(move || {
+                let bytes =
+                    serde_json::to_vec(&serde_json::json!({"blobs": [], "publisher": id})).unwrap();
+                cache
+                    .publish_with_config(&key(), &bytes, &[], &config)
+                    .unwrap();
+            }));
         }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.puts.len(), 1);
+        assert_eq!(state.precondition_failures, 1);
+        assert!(record_hashes(&state.objects[&format!("/bucket/{NAMESPACE}/{name}")]).is_ok());
     }
 
     #[test]
@@ -1315,14 +1079,14 @@ mod tests {
         let winner = record(&[&hash]);
         server.state.lock().unwrap().competing_record = Some(winner.clone());
         cache
-            .publish_with_credentials(
+            .publish_with_config(
                 &key(),
                 &record(&[]),
                 &[BlobRef {
                     hash: &hash,
                     path: &path,
                 }],
-                &credentials(),
+                &server.write_config(),
             )
             .unwrap();
         {
@@ -1338,19 +1102,67 @@ mod tests {
         server.state.lock().unwrap().always_conflict = true;
         assert!(server
             .cache()
-            .publish_with_credentials(&key(), &record(&[]), &[], &credentials())
+            .publish_with_config(&key(), &record(&[]), &[], &server.write_config())
             .is_err());
         assert_eq!(server.state.lock().unwrap().precondition_failures, 3);
+    }
+
+    #[test]
+    fn write_url_contains_the_bucket_but_not_the_cache_namespace() {
+        let base = "https://account.r2.cloudflarestorage.com/my-bucket";
+        for url in [base.to_string(), format!("{base}/")] {
+            validate_write_url(&url).unwrap();
+            let config = WriteConfig {
+                url,
+                credentials: credentials(),
+            };
+            assert_eq!(
+                config.object_url("actions/key.json"),
+                format!("{base}/{NAMESPACE}/actions/key.json")
+            );
+        }
+        validate_write_url("http://127.0.0.1:1234/bucket").unwrap();
+        for url in [
+            "",
+            "file:///bucket",
+            "https:///bucket",
+            "https://account.r2.cloudflarestorage.com",
+            "https://account.r2.cloudflarestorage.com/",
+            "https://account.r2.cloudflarestorage.com/bucket/corgi/v1",
+            "https://account.r2.cloudflarestorage.com/bucket?query",
+            "https://account.r2.cloudflarestorage.com/bucket#fragment",
+            "https://secret@account.r2.cloudflarestorage.com/bucket",
+            "https://account.r2.cloudflarestorage.com/bad bucket",
+        ] {
+            assert!(validate_write_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn publication_uses_the_write_url_not_the_public_read_url() {
+        let reader = Server::new();
+        let writer = Server::new();
+        reader
+            .cache()
+            .publish_with_config(&key(), &record(&[]), &[], &writer.write_config())
+            .unwrap();
+        assert!(reader.state.lock().unwrap().requests.is_empty());
+        assert_eq!(
+            writer.state.lock().unwrap().puts,
+            [format!("/bucket/{NAMESPACE}/actions/{}.json", key())]
+        );
     }
 
     #[test]
     fn read_only_config_and_unsafe_keys() {
         let config: Config = toml::from_str("read-url = 'https://cache.example'").unwrap();
         let cache = Cache::new(config).unwrap();
-        assert!(cache.validate_write_config().is_err());
         assert!(cache.fetch_record("../escape", &cancel()).is_err());
-        assert!(
-            toml::from_str::<Config>("read-url = 'https://cache.example'\nsecret = 'no'").is_err()
-        );
+        for field in ["secret", "endpoint", "bucket", "write-url"] {
+            assert!(toml::from_str::<Config>(&format!(
+                "read-url = 'https://cache.example'\n{field} = 'not project config'"
+            ))
+            .is_err());
+        }
     }
 }

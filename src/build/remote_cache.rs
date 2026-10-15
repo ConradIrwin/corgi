@@ -3,17 +3,14 @@
 //! A local copy of that association makes an imported root reusable even when
 //! none of its dependency artifacts or read-set manifests were downloaded.
 use super::*;
-use std::sync::atomic::AtomicBool;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Record {
     remote_key: String,
     action_key: String,
     spec: ActionSpec,
-    /// Remote identities in spec dependency order; graph indices are not portable.
-    producers: Vec<String>,
     result: ActionResult,
-    blobs: Vec<String>,
+    pub(super) blobs: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -65,21 +62,10 @@ fn is_hash(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn dependencies(spec: &ActionSpec) -> &[PlannedActionDependency] {
-    match spec {
-        ActionSpec::Compile(spec) => &spec.dependencies,
-        ActionSpec::BuildScriptRun(spec) => &spec.dependencies,
-    }
-}
-
 fn make_record(ctx: &Ctx, index: usize, action: &ResolvedAction, result: ActionResult) -> Record {
     Record {
         remote_key: ctx.remote_keys[index].clone(),
         action_key: action.key.clone(),
-        producers: dependencies(&action.spec)
-            .iter()
-            .map(|dep| ctx.remote_keys[dep.producer_unit].clone())
-            .collect(),
         spec: action.spec.clone(),
         blobs: blobs(&result),
         result,
@@ -167,7 +153,7 @@ fn alias_path(ctx: &Ctx, index: usize) -> PathBuf {
         .join(format!("{}.json", ctx.remote_keys[index]))
 }
 
-fn validate(ctx: &Ctx, index: usize, record: &mut Record) -> Result<()> {
+fn validate(ctx: &Ctx, index: usize, record: &Record) -> Result<()> {
     anyhow::ensure!(
         record.remote_key == ctx.remote_keys[index],
         "remote key mismatch"
@@ -177,45 +163,9 @@ fn validate(ctx: &Ctx, index: usize, record: &mut Record) -> Result<()> {
         sha256_hex(&serde_json::to_vec(&record.spec)?) == record.action_key,
         "precise action key mismatch"
     );
-    let actual = match &mut record.spec {
-        ActionSpec::Compile(spec) => &mut spec.dependencies,
-        ActionSpec::BuildScriptRun(spec) => &mut spec.dependencies,
-    };
-    anyhow::ensure!(
-        actual.len() == record.producers.len(),
-        "invalid producer list"
-    );
-    for (dependency, remote_key) in actual.iter_mut().zip(&record.producers) {
-        anyhow::ensure!(is_hash(&dependency.producer), "invalid producer key");
-        let planned = dependencies(&ctx.action_plans[index].template)
-            .iter()
-            .find(|planned| {
-                ctx.remote_keys[planned.producer_unit] == *remote_key
-                    && planned.filename == dependency.filename
-                    && planned.extern_name == dependency.extern_name
-            })
-            .context("remote producer mismatch")?;
-        dependency.producer_unit = planned.producer_unit;
-    }
-    // Reconstruct from our own configuration plus the recorded producer
-    // identities. This also verifies embedded CARGO_BIN_EXE paths, rather than
-    // accepting arbitrary paths from an otherwise matching record.
-    let mut expected = action_spec_with_producer_keys(
-        ctx,
-        index,
-        &ctx.action_plans[index].template,
-        |producer| {
-            let dependency = dependencies(&record.spec)
-                .iter()
-                .find(|dep| dep.producer_unit == producer)?;
-            Some((
-                dependency.producer.clone(),
-                ctx.action_plans[producer].main_output.clone(),
-            ))
-        },
-    )?
-    .context("remote producer identity missing")?;
-    if let Some(read_set) = record.spec.local_read_set_mut() {
+    // The remote key already covers configuration and dependency identities.
+    // Validate read sets before making them available to precise local lookups.
+    if let Some(read_set) = record.spec.local_read_set() {
         let root = ctx.meta.packages[ctx.units[index].pkg].root();
         let allowed = ctx
             .package_read_inputs(ctx.units[index].pkg, PackageReadPhase::Compile)?
@@ -233,14 +183,7 @@ fn validate(ctx: &Ctx, index: usize, record: &mut Record) -> Result<()> {
         );
         let current = ctx.store.hash_file_set_cached(&root, &paths)?;
         anyhow::ensure!(&current == read_set, "read-set content mismatch");
-        *expected
-            .local_read_set_mut()
-            .context("unexpected remote read set")? = read_set.clone();
     }
-    anyhow::ensure!(
-        serde_json::to_value(expected)? == serde_json::to_value(&record.spec)?,
-        "remote action configuration mismatch"
-    );
     anyhow::ensure!(
         record.blobs == blobs(&record.result),
         "blob manifest mismatch"
@@ -297,35 +240,34 @@ pub(super) fn lookup_local(ctx: &Ctx, index: usize) -> Result<Option<UnitResult>
     if ctx.remote_keys.is_empty() {
         return Ok(None);
     }
-    let Some(mut record) = fs::read(alias_path(ctx, index))
+    let Some(record) = fs::read(alias_path(ctx, index))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
     else {
         return Ok(None);
     };
-    if validate(ctx, index, &mut record).is_err() {
+    if validate(ctx, index, &record).is_err() {
         return Ok(None);
     }
     let action = resolve_action(record.spec, KeyResolution::VerifiedManifest)?;
     lookup_cached_unit(ctx, index, action, "imported")
 }
 
-pub(super) fn fetch(
+pub(super) fn decode_record(
     ctx: &Ctx,
     index: usize,
-    cancel: &AtomicBool,
+    bytes: &[u8],
     download: &mut crate::report::RemoteDownload,
-) -> Result<Option<Record>> {
-    let cache = ctx.remote.as_ref().context("remote cache disabled")?;
-    let Some(bytes) = cache.fetch_record(&ctx.remote_keys[index], cancel)? else {
-        return Ok(None);
-    };
+) -> Result<Record> {
     download.record_ns = Some(ctx.report.elapsed_ns());
-    let mut record: Record = serde_json::from_slice(&bytes).context("decoding action record")?;
-    validate(ctx, index, &mut record).context("validating action record")?;
+    let record: Record = serde_json::from_slice(bytes).context("decoding action record")?;
+    validate(ctx, index, &record).context("validating action record")?;
     download.blob_count = record.blobs.len();
     download.blobs_start_ns = Some(ctx.report.elapsed_ns());
-    cache.fetch_blobs(&ctx.store, &record.blobs, cancel)?;
+    Ok(record)
+}
+
+pub(super) fn verify_downloaded(ctx: &Ctx, record: &Record) -> Result<()> {
     if let Some(archive) = &record.result.out_dir {
         // Verify archive structure before accepting the action, too: a valid
         // digest alone doesn't make an invalid or unsafe tar installable.
@@ -338,8 +280,7 @@ pub(super) fn fetch(
         fs::remove_dir_all(stage).ok();
         checked.context("validating remote OUT_DIR archive")?;
     }
-    download.downloaded_ns = Some(ctx.report.elapsed_ns());
-    Ok(Some(record))
+    Ok(())
 }
 
 pub(super) fn install(ctx: &Ctx, index: usize, record: Record) -> Result<UnitResult> {
@@ -377,25 +318,21 @@ pub(super) fn local_pass(ctx: &Ctx, index: usize) -> Option<PassRecord> {
     Some(PassRecord::new(remote_key, candidate.key.clone(), count))
 }
 
-pub(super) fn fetch_pass(
+pub(super) fn remember_downloaded_pass(
     ctx: &Ctx,
     index: usize,
-    cancel: &AtomicBool,
+    bytes: &[u8],
     download: &mut crate::report::RemoteDownload,
-) -> Result<Option<PassRecord>> {
+) -> Result<PassRecord> {
     let remote_key = test_pass_key(&ctx.remote_keys[index])?;
-    let cache = ctx.remote.as_ref().context("remote cache disabled")?;
-    let Some(bytes) = cache.fetch_record(&remote_key, cancel)? else {
-        return Ok(None);
-    };
     download.record_ns = Some(ctx.report.elapsed_ns());
-    let record = decode_pass(&remote_key, &bytes)?;
+    let record = decode_pass(&remote_key, bytes)?;
     download.downloaded_ns = Some(ctx.report.elapsed_ns());
     // The requested input key is the authority. Never install a local precise
     // pass under the record's claimed harness identity, which is metadata only.
     ctx.store
         .save_action(&remote_key, &serde_json::to_vec(&record)?)?;
-    Ok(Some(record))
+    Ok(record)
 }
 
 /// Publish the relevant graph, not just actions executed in this invocation.
@@ -422,7 +359,7 @@ pub(super) fn publish(
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
             };
-            if let Some(candidate) = &mut record {
+            if let Some(candidate) = &record {
                 let validation = validate(ctx, index, candidate).and_then(|()| {
                     anyhow::ensure!(
                         candidate
