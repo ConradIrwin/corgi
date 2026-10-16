@@ -166,7 +166,12 @@ pub(super) fn run(
             let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
+                // macOS returns EPERM for a group containing only zombies.
+                // Confirm exit before treating it as an already-stopped group.
+                let already_exited = cfg!(target_os = "macos")
+                    && error.raw_os_error() == Some(libc::EPERM)
+                    && child.try_wait().context(TeardownFailed)?.is_some();
+                if error.raw_os_error() != Some(libc::ESRCH) && !already_exited {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error).context(TeardownFailed);
@@ -247,5 +252,44 @@ time.sleep(60)
             assert!(Instant::now() < deadline, "descendant survived: {state}");
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        // Cancellation can arrive after exit but before the compiler is reaped.
+        let marker = directory.join("exited-pid");
+        let stderr = directory.join("exited-stderr");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"", "exited-compiler"])
+            .arg(&marker);
+        let error = run(
+            &mut command,
+            &jobserver,
+            || {
+                if !stderr.exists() {
+                    return Ok(());
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Ok(pid) = fs::read_to_string(&marker) {
+                        if !pid.trim().is_empty() {
+                            let output = Command::new("ps")
+                                .args(["-p", pid.trim(), "-o", "stat="])
+                                .output()?;
+                            if String::from_utf8_lossy(&output.stdout)
+                                .trim()
+                                .starts_with('Z')
+                            {
+                                return Err(Superseded.into());
+                            }
+                        }
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "compiler did not exit");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+            &stderr,
+        )
+        .unwrap_err();
+        assert!(error.is::<Superseded>(), "{error:#}");
+        assert_eq!(jobserver.available().unwrap(), 3);
     }
 }
