@@ -87,8 +87,89 @@ fn remote_build_cache_lifecycle() {
         );
     }
 
+    let credentials_path = fixture
+        .directory
+        .path
+        .join("home/.config/corgi/credentials");
+    let credentials = format!(
+        "[\"{PRIVATE_URL}\"]\naccess-key-id = \"fixture-read-access\"\nsecret-access-key = \"fixture-read-secret\"\n"
+    );
+    fs::write(&credentials_path, &credentials).unwrap();
+    fixture.write(
+        "corgi.toml",
+        &format!("[cache]\nread-url = \"{PRIVATE_URL}\"\n"),
+    );
+    fixture.clear_results();
+    fixture.run(&["build"]);
+    assert_eq!(
+        report_unit(
+            &fixture.report(),
+            &fixture.directory.package_name,
+            "compile"
+        )["cache"]["probe"],
+        "remote"
+    );
+    fixture.assert_binary_output("42\n");
+    fixture.remote.objects.lock().unwrap().requests.clear();
+    fixture.run(&["build"]);
+    assert!(fixture.remote.objects.lock().unwrap().requests.is_empty());
+
     fixture.release_compiler();
     fixture.remote.objects.lock().unwrap().compiler_gate = None;
+    for contents in [None, Some(credentials.replace("/bucket", "/other-bucket"))] {
+        match contents {
+            Some(contents) => fs::write(&credentials_path, contents).unwrap(),
+            None => fs::remove_file(&credentials_path).unwrap(),
+        }
+        fixture.clear_results();
+        let output = fixture.run(&["build"]);
+        assert_eq!(
+            output
+                .matches("Warning no credentials for remote cache configured")
+                .count(),
+            1,
+            "{output}"
+        );
+        assert!(fixture.remote.objects.lock().unwrap().requests.is_empty());
+        let report = fixture.report();
+        assert!(report["remote_downloads"].as_array().unwrap().is_empty());
+        assert_unit_cache(
+            &report,
+            &fixture.directory.package_name,
+            "compile",
+            "app",
+            "miss",
+        );
+        fixture.assert_binary_output("42\n");
+    }
+
+    for (url, contents, expected) in [
+        (
+            PRIVATE_URL.to_owned(),
+            format!("{credentials}invalid = ["),
+            "invalid R2 credentials file",
+        ),
+        (
+            PRIVATE_URL.replace("https:", "http:"),
+            credentials,
+            "require HTTPS",
+        ),
+    ] {
+        fixture.write("corgi.toml", &format!("[cache]\nread-url = \"{url}\"\n"));
+        fs::write(&credentials_path, contents).unwrap();
+        let output = fixture.command(&["build"]).output().unwrap();
+        assert_failure(&output, "invalid private read configuration");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("fixture-read-secret"), "{error}");
+        assert!(!error.contains("fixture-read-access"), "{error}");
+        assert!(fixture.remote.objects.lock().unwrap().requests.is_empty());
+    }
+    fixture.write(
+        "corgi.toml",
+        &format!("[cache]\nread-url = \"{}/read\"\n", fixture.remote.url),
+    );
+
     let corrupt = fixture.store.join("corrupt");
     fs::write(&corrupt, b"corrupt").unwrap();
     let compressed = Command::new("gzip")
@@ -338,6 +419,9 @@ fn uncached() {
     assert!(fixture.workspace.join("cached-ran").exists());
 }
 
+const PRIVATE_URL: &str =
+    "https://00000000000000000000000000000000.r2.cloudflarestorage.com/bucket";
+
 struct Fixture {
     remote: HttpCache,
     directory: TestDirectory,
@@ -355,6 +439,7 @@ impl Fixture {
             directory,
         };
         fs::create_dir_all(&fixture.store).unwrap();
+        fs::create_dir_all(fixture.directory.path.join("home/.config/corgi")).unwrap();
         fixture.write(
             "Cargo.toml",
             &format!(
@@ -402,13 +487,20 @@ pub fn wait(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         );
         fixture.write(
             "remote-curl.py",
-            r#"#!/usr/bin/env python3
+            &r#"#!/usr/bin/env python3
 import os, sys
+sys.argv = [arg.replace("PRIVATE_CACHE_URL/", "LOCAL_CACHE_URL/", 1)
+            if arg.startswith("PRIVATE_CACHE_URL/") else arg for arg in sys.argv]
 if any(arg.startswith("http://127.0.0.1:") for arg in sys.argv[1:]):
     os.execvp("curl", ["curl", "-q", *sys.argv[1:]])
 tool = os.environ["CORGI_TEST_DOWNLOAD_CURL"]
 os.execvp(tool, [tool, *sys.argv[1:]])
-"#,
+"#
+            .replace("PRIVATE_CACHE_URL", PRIVATE_URL)
+            .replace(
+                "LOCAL_CACHE_URL",
+                &format!("{}/private", fixture.remote.url),
+            ),
         );
         fs::set_permissions(
             fixture.workspace.join("remote-curl.py"),
@@ -447,6 +539,12 @@ os.execvp(tool, [tool, *sys.argv[1:]])
         command
             .current_dir(&self.workspace)
             .args(arguments)
+            .env("HOME", self.directory.path.join("home"))
+            .env(
+                "RUSTUP_HOME",
+                std::env::var_os("RUSTUP_HOME")
+                    .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup").into_os_string()),
+            )
             .env("CORGI_STORE", &self.store)
             .env("CORGI_CURL", self.workspace.join("remote-curl.py"))
             .env("CORGI_TEST_DOWNLOAD_CURL", download_curl)
@@ -620,12 +718,20 @@ fn serve(
     let method = words.next().unwrap().to_owned();
     let url = words.next().unwrap().to_owned();
     let public = url.starts_with("/read/");
+    let private = url.starts_with("/private/");
     let path = url
-        .strip_prefix(if public { "/read/" } else { "/bucket/" })
+        .strip_prefix(if public {
+            "/read/"
+        } else if private {
+            "/private/"
+        } else {
+            "/bucket/"
+        })
         .unwrap()
         .to_owned();
     let mut length = 0;
     let mut authenticated = false;
+    let mut authorization = String::new();
     let mut create_only = false;
     let mut encoding = String::new();
     loop {
@@ -640,7 +746,10 @@ fn serve(
             match name.to_ascii_lowercase().as_str() {
                 "content-length" => length = value.trim().parse().unwrap(),
                 "content-encoding" => encoding = value.trim().to_owned(),
-                "authorization" => authenticated = true,
+                "authorization" => {
+                    authenticated = true;
+                    authorization = value.trim().to_owned();
+                }
                 "if-none-match" => create_only = value.trim() == "*",
                 "expect" => stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?,
                 _ => {}
@@ -653,6 +762,12 @@ fn serve(
     );
     if public {
         assert_eq!(method, "GET");
+    }
+    if private {
+        assert_eq!(method, "GET");
+        assert!(authorization.starts_with("AWS4-HMAC-SHA256 "));
+        assert!(authorization.contains("Credential=fixture-read-access/"));
+        assert!(!authorization.contains("fixture-read-secret"));
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;

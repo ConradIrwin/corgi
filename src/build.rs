@@ -879,6 +879,12 @@ fn archive_out_dir(
 }
 
 impl Ctx {
+    fn remote_reads_enabled(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(crate::remote::Cache::can_read)
+    }
+
     fn check_action_needed(&self, index: usize) -> Result<()> {
         if self.cancelled_actions[index].load(Ordering::Relaxed) {
             return Err(compiler_race::NotNeeded.into());
@@ -2123,7 +2129,7 @@ struct RootDef {
 /// the `toml` crate (the parser cargo itself builds on).
 #[derive(serde::Deserialize, Default)]
 struct CorgiToml {
-    /// Public reads; write credentials are supplied separately by the publisher.
+    /// Public or credential-file-authenticated reads; publication uses separate credentials.
     #[serde(default)]
     cache: Option<crate::remote::Config>,
     #[serde(default)]
@@ -8421,7 +8427,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSumma
     let compiler_races: Vec<Option<compiler_race::Race>> = (0..n)
         .map(|index| {
             (cfg!(unix)
-                && ctx.remote.is_some()
+                && ctx.remote_reads_enabled()
                 && !matches!(ctx.units[index].kind, Kind::Bsr | Kind::TestRun)
                 && !is_pipelined(ctx, index))
             .then(compiler_race::Race::default)
@@ -8570,7 +8576,7 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSumma
     // Prefer requested results: they can cut off the entire build closure.
     // These workers never acquire compiler/jobserver slots.
     let mut requests = VecDeque::new();
-    if ctx.remote.is_some() {
+    if ctx.remote_reads_enabled() {
         let dependencies = ctx
             .units
             .iter()
@@ -9259,7 +9265,7 @@ fn run_rustc_streaming(
         }
         Ok(())
     };
-    let success = if ctx.remote.is_some() {
+    let success = if ctx.remote_reads_enabled() {
         fs::File::create(stderr_path)?;
         let mut reader = std::io::BufReader::new(fs::File::open(stderr_path)?);
         let mut partial = Vec::new();
@@ -10168,7 +10174,7 @@ fn compile(
     // One token per running compiler (its implicit thread); rustc acquires
     // more from the shared pool for extra codegen threads and releases
     // them as codegen units finish.
-    let job_token = if ctx.remote.is_none() {
+    let job_token = if !ctx.remote_reads_enabled() {
         ctx.jobserver.configure(&mut cmd);
         Some(
             ctx.jobserver
@@ -10206,7 +10212,7 @@ fn compile(
             fire_meta,
             &scratch.join("compiler.stderr"),
         )?
-    } else if ctx.remote.is_some() {
+    } else if ctx.remote_reads_enabled() {
         cmd.stdout(Stdio::null());
         let (success, stderr) = compiler_race::run(
             &mut cmd,
@@ -10606,7 +10612,7 @@ fn run_build_script(
         status!("Exec", "{cmd:?}");
     }
     let execution_started = Instant::now();
-    let (success, stdout, stderr) = if ctx.remote.is_some() {
+    let (success, stdout, stderr) = if ctx.remote_reads_enabled() {
         let stdout_path = scratch.join("build-script.stdout");
         cmd.stdout(fs::File::create(&stdout_path)?);
         let (success, stderr) = compiler_race::run(

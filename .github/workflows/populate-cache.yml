@@ -38,6 +38,12 @@ jobs:
           test "$(uname -m)" = arm64
           cargo build --locked --target-dir "$RUNNER_TEMP/corgi-bootstrap"
 
+      - name: Configure private cache reads
+        env:
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: python3 ci/configure-cache-credentials.py
+
       - name: Populate build results
         env:
           CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
@@ -50,7 +56,7 @@ jobs:
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
           "$corgi" cache build --no-incremental
 
-      - name: Verify cold public cache reuse
+      - name: Verify cold authenticated cache reuse
         run: |
           set -euo pipefail
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
@@ -65,7 +71,7 @@ jobs:
           report = json.loads(reports[0].read_text())
           root = next(unit for unit in report["units"] if unit["action"]["is_root"])
           assert root["cache"]["probe"] == "remote", root["cache"]
-          print("Verified final executable reused through the public endpoint")
+          print("Verified final executable reused through the authenticated endpoint")
           PY
 
       - name: Retain cold cache verification

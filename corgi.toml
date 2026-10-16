@@ -1,5 +1,5 @@
 [cache]
-read-url = "https://pub-cf9929c86d0144829e53d5e9f66d3060.r2.dev"
+read-url = "https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache"
 
 [extra-inputs]
 # Integration tests execute these files; edits must invalidate cached test passes.

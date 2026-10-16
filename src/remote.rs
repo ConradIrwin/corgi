@@ -21,12 +21,14 @@ const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
+    /// Public URL, or an HTTPS R2 S3 bucket URL matched in ~/.config/corgi/credentials.
     pub read_url: String,
 }
 
 #[derive(Clone)]
 pub struct Cache {
     config: Config,
+    read_access: ReadAccess,
     read_timeout: Duration,
 }
 
@@ -56,15 +58,32 @@ fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
 impl Cache {
     pub fn new(config: Config) -> Result<Self> {
         validate_base_url(&config.read_url)?;
+        let read_access = ReadAccess::for_url(&config.read_url)?;
+        if matches!(read_access, ReadAccess::Disabled) {
+            eprintln!("Warning no credentials for remote cache configured");
+        }
         Ok(Self {
             config,
+            read_access,
             read_timeout: Duration::from_secs(10),
         })
+    }
+
+    pub fn can_read(&self) -> bool {
+        !matches!(self.read_access, ReadAccess::Disabled)
+    }
+
+    fn read_credentials(&self) -> Option<&Credentials> {
+        match &self.read_access {
+            ReadAccess::Authenticated(credentials) => Some(credentials),
+            ReadAccess::Public | ReadAccess::Disabled => None,
+        }
     }
 
     /// Returns None for HTTP 404; other failures retain their diagnostic cause.
     /// Callers treat errors as cache misses and validate the record's schema.
     pub fn fetch_record(&self, key: &str, cancel: &AtomicBool) -> Result<Option<Vec<u8>>> {
+        ensure!(self.can_read(), "remote cache reads disabled");
         validate_hash(key)?;
         let tmp = Temporary::new(&std::env::temp_dir())?;
         let status = self.request(
@@ -72,7 +91,7 @@ impl Cache {
             &self.read_url(&format!("actions/{key}.json")),
             &tmp.0,
             None,
-            None,
+            self.read_credentials(),
             MAX_RECORD,
             cancel,
             self.read_timeout,
@@ -90,6 +109,7 @@ impl Cache {
 
     /// Verify a blob, downloading and atomically installing it only if needed.
     pub fn fetch_blob(&self, store: &Store, hash: &str, cancel: &AtomicBool) -> Result<()> {
+        ensure!(self.can_read(), "remote cache reads disabled");
         validate_hash(hash)?;
         check_cancelled(cancel)?;
         let destination = store.cache_path(hash);
@@ -102,7 +122,7 @@ impl Cache {
             &self.read_url(&format!("blobs/{hash}")),
             &temporary.0,
             None,
-            None,
+            self.read_credentials(),
             MAX_BLOB,
             cancel,
             self.read_timeout,
@@ -319,7 +339,7 @@ impl Cache {
         check_cancelled(cancel)?;
         // -q must be first: never inherit ~/.curlrc credentials or redirects.
         // Do not follow redirects; public reads must stay unauthenticated and
-        // signed writes must never send credentials to another endpoint.
+        // signed requests must never send credentials to another endpoint.
         let mut command = crate::curl();
         command
             .args([
@@ -481,9 +501,78 @@ impl WriteConfig {
     }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Credentials {
+    #[serde(rename = "access-key-id")]
     access: String,
+    #[serde(rename = "secret-access-key")]
     secret: String,
+}
+
+#[derive(Clone)]
+enum ReadAccess {
+    Public,
+    Authenticated(Credentials),
+    Disabled,
+}
+
+impl ReadAccess {
+    /// Read credentials only for R2's S3 endpoints, never arbitrary public URLs.
+    fn for_url(url: &str) -> Result<Self> {
+        let (_, address) = url.split_once("://").context("missing URL scheme")?;
+        let host = address.split('/').next().unwrap_or_default();
+        if !host.ends_with(".r2.cloudflarestorage.com") {
+            return Ok(Self::Public);
+        }
+        ensure!(
+            url.starts_with("https://"),
+            "authenticated R2 reads require HTTPS"
+        );
+        validate_write_url(url).context("invalid authenticated R2 read URL")?;
+        let path = dirs::home_dir()
+            .context("cannot locate home directory for R2 credentials")?
+            .join(".config/corgi/credentials");
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::Disabled)
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening R2 credentials file {}", path.display()))
+            }
+        };
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= 64 * 1024,
+            "R2 credentials must be a regular file of at most 64 KiB"
+        );
+        use std::io::Read;
+        let mut contents = String::new();
+        file.take(64 * 1024 + 1)
+            .read_to_string(&mut contents)
+            .with_context(|| format!("reading R2 credentials file {}", path.display()))?;
+        ensure!(
+            contents.len() <= 64 * 1024,
+            "R2 credentials file exceeds 64 KiB"
+        );
+        // TOML errors can contain the offending source line, including secrets.
+        let entries: std::collections::BTreeMap<String, Credentials> = toml::from_str(&contents)
+            .map_err(|_| anyhow::anyhow!("invalid R2 credentials file {}; expected bucket URL tables with access-key-id and secret-access-key", path.display()))?;
+        let mut matching = entries
+            .into_iter()
+            .filter(|(endpoint, _)| endpoint.trim_end_matches('/') == url.trim_end_matches('/'));
+        let Some((_, credentials)) = matching.next() else {
+            return Ok(Self::Disabled);
+        };
+        ensure!(
+            matching.next().is_none(),
+            "duplicate R2 credential entries for {url}"
+        );
+        credentials.validate()?;
+        Ok(Self::Authenticated(credentials))
+    }
 }
 
 impl Credentials {
@@ -492,11 +581,19 @@ impl Credentials {
             std::env::var("CORGI_R2_ACCESS_KEY_ID").context("missing CORGI_R2_ACCESS_KEY_ID")?;
         let secret = std::env::var("CORGI_R2_SECRET_ACCESS_KEY")
             .context("missing CORGI_R2_SECRET_ACCESS_KEY")?;
+        let credentials = Self { access, secret };
+        credentials.validate()?;
+        Ok(credentials)
+    }
+
+    fn validate(&self) -> Result<()> {
         ensure!(
-            !access.is_empty() && !secret.is_empty() && access.len() + secret.len() < 4096,
+            !self.access.is_empty()
+                && !self.secret.is_empty()
+                && self.access.len() + self.secret.len() < 4096,
             "invalid R2 credentials"
         );
-        Ok(Self { access, secret })
+        Ok(())
     }
 
     fn config(&self) -> Vec<u8> {
