@@ -7,13 +7,7 @@
 use super::remote_cache::Record;
 use crate::report::RemoteDownload;
 use anyhow::{Context, Result};
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Stdio},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{fs, path::Path, process::Command, sync::Mutex, time::Duration};
 
 #[derive(Default)]
 pub(super) struct Race {
@@ -79,6 +73,17 @@ impl std::fmt::Display for Superseded {
 impl std::error::Error for Superseded {}
 
 #[derive(Debug)]
+pub(super) struct NotNeeded;
+
+impl std::fmt::Display for NotNeeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("action no longer needed")
+    }
+}
+
+impl std::error::Error for NotNeeded {}
+
+#[derive(Debug)]
 pub(super) struct TeardownFailed;
 
 impl std::fmt::Display for TeardownFailed {
@@ -104,7 +109,7 @@ impl Drop for Staging {
 pub(super) fn run(
     command: &mut Command,
     jobserver: &jobserver::Client,
-    check_cancelled: impl Fn() -> Result<()>,
+    mut check_cancelled: impl FnMut() -> Result<()>,
     stderr_path: &Path,
 ) -> Result<(bool, String)> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -142,9 +147,7 @@ pub(super) fn run(
     private.configure(command);
     check_cancelled()?;
     // File-backed stderr avoids a pipe reader keeping cancellation blocked.
-    command
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(stderr_path)?);
+    command.stderr(fs::File::create(stderr_path)?);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

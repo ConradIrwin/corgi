@@ -561,6 +561,7 @@ pub struct Ctx {
     report: Arc<crate::report::Recorder>,
     remote: Option<crate::remote::Cache>,
     remote_keys: Vec<String>,
+    cancelled_actions: Vec<AtomicBool>,
     test_options: TestOptions,
 }
 
@@ -878,6 +879,13 @@ fn archive_out_dir(
 }
 
 impl Ctx {
+    fn check_action_needed(&self, index: usize) -> Result<()> {
+        if self.cancelled_actions[index].load(Ordering::Relaxed) {
+            return Err(compiler_race::NotNeeded.into());
+        }
+        Ok(())
+    }
+
     fn source_files_for(&self, package_index: usize) -> Result<Vec<PathBuf>> {
         if let Some(paths) = self.source_files_memo.lock().unwrap().get(&package_index) {
             return Ok(paths.clone());
@@ -5620,6 +5628,7 @@ fn build_inner(
         host,
         cfg_env,
         meta,
+        cancelled_actions: units.iter().map(|_| AtomicBool::new(false)).collect(),
         units,
         pool,
         cargo,
@@ -5704,7 +5713,7 @@ fn build_inner(
         });
         finish_report_stage(&recorder, "build", report_stage_start);
         summarize_test_actions(&ctx, &results);
-        let (executed, cached) = scheduled?;
+        let summary = scheduled?;
         report_stage_start = begin_report_stage(&recorder, "export");
 
         let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
@@ -5801,7 +5810,7 @@ fn build_inner(
         finish_report_stage(&recorder, "export", report_stage_start);
         status!(
             "Finished",
-            "in {:.2}s — {executed} executed, {cached} cached",
+            "in {:.2}s — {summary}",
             t0.elapsed().as_secs_f64()
         );
         for path in written {
@@ -8263,11 +8272,28 @@ struct SchedState {
     indeg: Vec<usize>,
     started: Vec<bool>,
     wanted: Vec<bool>,
-    done: usize,
     in_flight: usize,
     errors: Vec<String>,
+    summary: ScheduleSummary,
+}
+
+#[derive(Default)]
+struct ScheduleSummary {
     executed: usize,
     cached: usize,
+    downloaded: usize,
+    cancelled: usize,
+    skipped: usize,
+}
+
+impl std::fmt::Display for ScheduleSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} executed, {} downloaded, {} cached, {} cancelled, {} skipped",
+            self.executed, self.downloaded, self.cached, self.cancelled, self.skipped
+        )
+    }
 }
 
 /// Recompute demand after a cached action cuts off its prerequisites.
@@ -8279,9 +8305,10 @@ fn refresh_artifact_demand(
 ) {
     state.wanted = demanded_units(ctx, &mut |index| Ok(results[index].get().is_some()))
         .expect("reading in-memory action results is infallible");
-    for (wanted, cancel) in state.wanted.iter().zip(cancel_downloads) {
+    for (index, (wanted, cancel)) in state.wanted.iter().zip(cancel_downloads).enumerate() {
         if !wanted {
             cancel.store(true, Ordering::Relaxed);
+            ctx.cancelled_actions[index].store(true, Ordering::Relaxed);
         }
     }
 }
@@ -8320,7 +8347,7 @@ fn reverse_dependency_order(dependencies: &[Vec<usize>], needed: &[bool]) -> Res
     Ok(order)
 }
 
-fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize)> {
+fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSummary> {
     let n = ctx.units.len();
     let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
     // Typed dependency events: a pure-rlib compile can start as soon as its
@@ -8411,11 +8438,12 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
         indeg,
         started: vec![false; n],
         wanted: needed.clone(),
-        done: preloaded_cached,
         in_flight: 0,
         errors: Vec::new(),
-        executed: 0,
-        cached: preloaded_cached,
+        summary: ScheduleSummary {
+            cached: preloaded_cached,
+            ..Default::default()
+        },
     });
     let cv = Condvar::new();
     let meta_fired: Vec<std::sync::atomic::AtomicBool> = (0..n)
@@ -8469,9 +8497,13 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                 }
                 if ur.cached {
                     t_cached[idx].store(true, Relaxed);
-                    st.cached += 1;
+                    if prune {
+                        st.summary.downloaded += 1;
+                    } else {
+                        st.summary.cached += 1;
+                    }
                 } else {
-                    st.executed += 1;
+                    st.summary.executed += 1;
                 }
                 // late meta (cache hit, or non-streamed path): fire now
                 if !meta_fired[idx].swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -8494,7 +8526,6 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                     }
                 }
                 let _ = results[idx].set(ur);
-                st.done += 1;
                 for &j in &rdeps_full[idx] {
                     st.indeg[j] -= 1;
                     if st.indeg[j] == 0
@@ -8507,6 +8538,15 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                     }
                 }
             }
+            Err(e) if e.is::<compiler_race::NotNeeded>() => {
+                st.summary.cancelled += 1;
+                ctx.report.update(|report| {
+                    report.units[idx].outcome = crate::report::UnitOutcome {
+                        status: crate::report::UnitStatus::Cancelled,
+                        message: Some(e.to_string()),
+                    };
+                });
+            }
             Err(e) => {
                 status!("Failed", "{} — dependents skipped", describe(ctx, idx));
                 ctx.report.update(|report| {
@@ -8516,7 +8556,6 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                     };
                 });
                 st.errors.push(format!("[{}] {e:#}", describe(ctx, idx)));
-                st.done += 1;
             }
         }
         if prune {
@@ -8758,7 +8797,10 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             cancel.store(true, Relaxed);
         }
     });
-    let st = state.into_inner().unwrap();
+    let mut st = state.into_inner().unwrap();
+    st.summary.skipped = (0..n)
+        .filter(|&index| !st.started[index] && results[index].get().is_none())
+        .count();
     ctx.report.update(|report| {
         for index in 0..n {
             let end = t_end[index].load(Relaxed);
@@ -8854,15 +8896,14 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
             ctx,
             &rows,
             wall,
-            st.executed,
-            st.cached,
+            &st.summary,
             cached_walk_ns,
             report_schedule_start,
         ) {
             eprintln!("corgi warning: could not write timings report: {e:#}");
         }
     }
-    Ok((st.executed, st.cached))
+    Ok(st.summary)
 }
 
 struct TimingRow {
@@ -8882,8 +8923,7 @@ fn write_timings_report(
     ctx: &Ctx,
     rows: &[TimingRow],
     wall: std::time::Duration,
-    executed: usize,
-    cached: usize,
+    summary: &ScheduleSummary,
     cached_walk_ns: u64,
     report_schedule_start: u64,
 ) -> Result<()> {
@@ -8972,14 +9012,12 @@ body{{font:13px system-ui;margin:20px}}h1{{font-size:18px}}\
 .bar.lib{{background:#7cb3e8}}.bar.link{{background:#b07ce8}}.bar.bsr{{background:#e8a67c}}\
 .bar i{{display:block;position:absolute;left:0;top:0;bottom:0;background:#2c6cb0;border-radius:2px 0 0 2px}}\
 table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #ccc;padding:2px 8px;text-align:left;font-size:12px}}\
-</style>\n<h1>corgi timings</h1>\n<p>wall {:.2}s · {} executed · {} cached · cpu {:.1}s · parallelism {:.1}x</p>\n\
+</style>\n<h1>corgi timings</h1>\n<p>wall {:.2}s · {summary} · cpu {:.1}s · parallelism {:.1}x</p>\n\
 <div>{gantt}</div>\n<h2>slowest units</h2><table><tr><th>unit</th><th>total</th><th>rustc</th><th>front-end</th><th>ingest</th><th>key</th><th>cache</th><th>validate</th><th>finish</th><th>other</th></tr>{table}</table>\n\
 <p>phase totals across executed units: rustc {:.1}s · ingest {:.1}s ({:.2} GB hashed) · key {:.1}s · finish {:.1}s · cache-hit walk {:.1}s</p>\n\
 <h2>remote cache downloads</h2><p>Times are relative to scheduling start, like the compiler timeline. A received record is not a usable hit until validated, downloaded and installed. Blob counts include already-local blobs. Only attempted reads are listed.</p>\
 <table><tr><th>unit</th><th>kind</th><th>remote key</th><th>lookup start</th><th>record received</th><th>blobs start</th><th>verified</th><th>end</th><th>blobs referenced</th><th>outcome</th><th>local work replaced</th><th>detail</th></tr>{remote_downloads}</table>\n",
         wall.as_secs_f64(),
-        executed,
-        cached,
         cpu_ns as f64 / 1e9,
         cpu_ns as f64 / wall_ns as f64,
         sum_rustc as f64 / 1e9,
@@ -9018,6 +9056,7 @@ fn run_unit(
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
     race: Option<&compiler_race::Race>,
 ) -> Result<UnitResult> {
+    ctx.check_action_needed(idx)?;
     if let Some(race) = race {
         race.check()?;
     }
@@ -9181,18 +9220,12 @@ fn run_rustc_streaming(
     pkg_name: &str,
     finalize_action: &(dyn Fn() -> Result<Arc<ResolvedAction>> + Sync),
     fire_meta: &(dyn Fn(usize, MetaOut) + Sync),
+    stderr_path: &Path,
 ) -> Result<(bool, String, Option<Arc<ResolvedAction>>)> {
     use std::io::BufRead;
-    let mut child = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning rustc for {pkg_name}"))?;
     let mut rendered = String::new();
     let mut resolved_action = None;
-    let reader = std::io::BufReader::new(child.stderr.take().unwrap());
-    for line in reader.lines() {
-        let line = line?;
+    let mut process_line = |line: String| -> Result<()> {
         match serde_json::from_str::<serde_json::Value>(&line) {
             Ok(v) => {
                 let artifact = v.get("artifact").and_then(|a| a.as_str());
@@ -9224,9 +9257,50 @@ fn run_rustc_streaming(
                 rendered.push('\n');
             }
         }
-    }
-    let status = child.wait()?;
-    Ok((status.success(), rendered, resolved_action))
+        Ok(())
+    };
+    let success = if ctx.remote.is_some() {
+        fs::File::create(stderr_path)?;
+        let mut reader = std::io::BufReader::new(fs::File::open(stderr_path)?);
+        let mut partial = Vec::new();
+        // A regular file may reach EOF partway through a JSON line. Retain the
+        // prefix until the compiler finishes that line on a subsequent poll.
+        let mut poll = || -> Result<()> {
+            while reader.read_until(b'\n', &mut partial)? != 0 {
+                if partial.ends_with(b"\n") {
+                    process_line(String::from_utf8(std::mem::take(&mut partial))?)?;
+                }
+            }
+            Ok(())
+        };
+        cmd.stdout(Stdio::null());
+        let (success, _) = compiler_race::run(
+            cmd,
+            &ctx.jobserver,
+            || {
+                ctx.check_action_needed(uidx)?;
+                poll()
+            },
+            stderr_path,
+        )?;
+        poll()?;
+        if !partial.is_empty() {
+            process_line(String::from_utf8(partial)?)?;
+        }
+        success
+    } else {
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning rustc for {pkg_name}"))?;
+        let reader = std::io::BufReader::new(child.stderr.take().unwrap());
+        for line in reader.lines() {
+            process_line(line?)?;
+        }
+        child.wait()?.success()
+    };
+    Ok((success, rendered, resolved_action))
 }
 
 /// Location-independent package identities. Cargo identifies path packages
@@ -10094,7 +10168,7 @@ fn compile(
     // One token per running compiler (its implicit thread); rustc acquires
     // more from the shared pool for extra codegen threads and releases
     // them as codegen units finish.
-    let job_token = if race.is_none() {
+    let job_token = if ctx.remote.is_none() {
         ctx.jobserver.configure(&mut cmd);
         Some(
             ctx.jobserver
@@ -10123,12 +10197,27 @@ fn compile(
     };
     let t_rustc = Instant::now();
     let (success, stderr, streamed_action) = if self_pipelined {
-        run_rustc_streaming(ctx, &mut cmd, uidx, &pkg.name, &finalize_action, fire_meta)?
-    } else if let Some(race) = race {
+        run_rustc_streaming(
+            ctx,
+            &mut cmd,
+            uidx,
+            &pkg.name,
+            &finalize_action,
+            fire_meta,
+            &scratch.join("compiler.stderr"),
+        )?
+    } else if ctx.remote.is_some() {
+        cmd.stdout(Stdio::null());
         let (success, stderr) = compiler_race::run(
             &mut cmd,
             &ctx.jobserver,
-            || race.check(),
+            || {
+                ctx.check_action_needed(uidx)?;
+                if let Some(race) = race {
+                    race.check()?;
+                }
+                Ok(())
+            },
             &scratch.join("compiler.stderr"),
         )?;
         (success, stderr, None)
@@ -10160,6 +10249,7 @@ fn compile(
     }
 
     let t_val = Instant::now();
+    ctx.check_action_needed(uidx)?;
     let action = match streamed_action {
         Some(action) => action,
         None => finalize_action()?,
@@ -10425,9 +10515,16 @@ fn run_build_script(
     let final_parent = ctx.store.root.join("outdirs").join(&key);
     fs::create_dir_all(ctx.store.root.join("outdirs"))?;
     let lock_file = fs::File::create(ctx.store.root.join("outdirs").join(format!("{key}.lock")))?;
-    lock_file
-        .lock()
-        .with_context(|| format!("locking OUT_DIR for {}", pkg.name))?;
+    loop {
+        ctx.check_action_needed(uidx)?;
+        match lock_file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                return Err(error).with_context(|| format!("locking OUT_DIR for {}", pkg.name))
+            }
+        }
+    }
     // While we waited: a concurrent winner may have finished the work. This
     // lock is also the restoration lock, so restore without trying to acquire
     // it recursively.
@@ -10454,6 +10551,9 @@ fn run_build_script(
         .join(Store::pool_file_name(&script.name, &script_key));
     let scratch = ctx.store.tmp_path("scratch");
     fs::create_dir_all(&scratch)?;
+    let _scratch = compiler_race::Staging(vec![scratch.clone()]);
+    // Drop partial OUT_DIR before releasing its lock, including on cancellation.
+    let mut unfinished = compiler_race::Staging(vec![final_parent.clone()]);
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::BuildScriptRun)?;
     let reads: Vec<&Path> = package_inputs.paths.iter().map(PathBuf::as_path).collect();
     let writes: Vec<&Path> = vec![&final_parent, &scratch];
@@ -10502,23 +10602,42 @@ fn run_build_script(
     // scan before this action commits.
     cmd.env("CARGO_MANIFEST_DIR", &pkg_root);
     cmd.env("CARGO_MANIFEST_PATH", &pkg.manifest_path);
-    ctx.jobserver.configure(&mut cmd);
-    let _job_token = ctx
-        .jobserver
-        .acquire()
-        .context("acquiring jobserver token")?;
     if ctx.verbose {
         status!("Exec", "{cmd:?}");
     }
     let execution_started = Instant::now();
-    let out = cmd
-        .output()
-        .with_context(|| format!("running build script for {}", pkg.name))?;
+    let (success, stdout, stderr) = if ctx.remote.is_some() {
+        let stdout_path = scratch.join("build-script.stdout");
+        cmd.stdout(fs::File::create(&stdout_path)?);
+        let (success, stderr) = compiler_race::run(
+            &mut cmd,
+            &ctx.jobserver,
+            || ctx.check_action_needed(uidx),
+            &scratch.join("build-script.stderr"),
+        )?;
+        (
+            success,
+            String::from_utf8_lossy(&fs::read(stdout_path)?).into_owned(),
+            stderr,
+        )
+    } else {
+        ctx.jobserver.configure(&mut cmd);
+        let _job_token = ctx
+            .jobserver
+            .acquire()
+            .context("acquiring jobserver token")?;
+        let out = cmd
+            .output()
+            .with_context(|| format!("running build script for {}", pkg.name))?;
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
     phases.rustc_ns = execution_started.elapsed().as_nanos() as u64;
     fs::remove_dir_all(&scratch).ok();
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if !out.status.success() {
+    if !success {
         fs::remove_dir_all(&final_parent).ok();
         bail!(
             "build script failed for {} v{}:\n--- stdout\n{}--- stderr\n{}",
@@ -10540,6 +10659,7 @@ fn run_build_script(
     // and compressed bytes are hashed as they stream to the temporary file.
     // CAS installation does not reread them.
     let archive_started = Instant::now();
+    ctx.check_action_needed(uidx)?;
     let allowed_external_roots = ctx.build_script_archive_roots(uidx)?;
     let out_dir = archive_out_dir(
         &ctx.store,
@@ -10560,6 +10680,7 @@ fn run_build_script(
     // record (saved by run_unit). A crash before the record leaves only reclaimable CAS/local
     // state; a missing local directory after commit is restored from tar.
     ctx.store.write_atomic(&final_parent.join(".ok"), b"ok\n")?;
+    unfinished.0.clear();
     Ok(UnitResult {
         action,
         cached: false,

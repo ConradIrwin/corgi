@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -278,6 +278,7 @@ pub struct UnitOutcome {
 pub enum UnitStatus {
     Success,
     Failed,
+    Cancelled,
     Skipped,
 }
 
@@ -694,7 +695,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.counters.files_statted, 28);
         let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 7);
+        assert_eq!(persisted["schema_version"], 8);
         assert_eq!(persisted["units"][0]["id"], "demo:compile:1234");
         fs::remove_dir_all(directory).unwrap();
     }

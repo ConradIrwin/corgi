@@ -140,6 +140,79 @@ fn remote_build_cache_lifecycle() {
         "dependency changes must invalidate the root"
     );
     fixture.assert_binary_output("43\n");
+
+    for build_script in [false, true] {
+        let fixture = Fixture::new("remote-prune");
+        if build_script {
+            fixture.write("build.rs", &format!(r#"
+fn main() {{
+    let scratch = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap());
+    std::fs::write(scratch.join("remote-compiler-running"), "running").unwrap();
+    let start = std::time::Instant::now();
+    while !std::path::Path::new({:?}).exists() {{
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "build script was not cancelled");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }}
+}}
+"#, fixture.release_path()));
+        } else {
+            fixture.write(
+                "dependency/Cargo.toml",
+                "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 [dependencies]\ncompiler_gate = { path = \"../compiler-gate\" }\n",
+            );
+            fixture.write(
+                "dependency/src/lib.rs",
+                &format!(
+                    "compiler_gate::wait!({:?});\npub fn value() -> u32 {{ 42 }}\n",
+                    fixture.release_path()
+                ),
+            );
+        }
+        fixture.run(&["cache", "build"]);
+        let (path, record) = fixture
+            .remote
+            .record(|record| record["spec"]["target"]["name"] == "app");
+        fixture.remote.retain_record(&path, &record);
+        fixture.clear_results();
+        fs::remove_file(fixture.release_path()).unwrap();
+        fixture.remote.objects.lock().unwrap().compiler_gate = Some((path, fixture.store.clone()));
+        let output = fixture.run(&["build", "--timings"]);
+        let report = fixture.report();
+        let unit = report_unit(
+            &report,
+            if build_script {
+                &fixture.directory.package_name
+            } else {
+                "dependency"
+            },
+            if build_script {
+                "run_build_script"
+            } else {
+                "compile"
+            },
+        );
+        assert_eq!(unit["outcome"]["status"], "cancelled", "{report}");
+        assert!(!compiler_running(&fixture.store));
+        let units = report["units"].as_array().unwrap();
+        let cancelled = units
+            .iter()
+            .filter(|unit| unit["outcome"]["status"] == "cancelled")
+            .count();
+        let skipped = units
+            .iter()
+            .filter(|unit| unit["outcome"]["status"] == "skipped")
+            .count();
+        let executed = units
+            .iter()
+            .filter(|unit| {
+                unit["outcome"]["status"] == "success" && unit["cache"]["result"] == "miss"
+            })
+            .count();
+        assert!(output.contains(&format!("{executed} executed, 1 downloaded, 0 cached, {cancelled} cancelled, {skipped} skipped")), "{output}");
+        assert_eq!(executed + 1 + cancelled + skipped, units.len());
+        fixture.assert_binary_output("42\n");
+    }
 }
 
 #[test]
