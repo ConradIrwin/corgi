@@ -2220,13 +2220,22 @@ fn find_corgi_toml(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn cargo_config_root(dir: &Path, manifest: &Path, corgi_toml: Option<&Path>) -> Result<PathBuf> {
+fn cargo_config_root(
+    dir: &Path,
+    manifest: &Path,
+    corgi_toml: Option<&Path>,
+) -> Result<(PathBuf, Option<String>)> {
     let contents =
         fs::read_to_string(manifest).with_context(|| format!("reading {}", manifest.display()))?;
     let parsed: toml::Value =
         toml::from_str(&contents).with_context(|| format!("parsing {}", manifest.display()))?;
+    let package_name = parsed
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
     if parsed.get("workspace").is_some() {
-        return Ok(dir.to_path_buf());
+        return Ok((dir.to_path_buf(), package_name));
     }
     if let Some(workspace) = parsed
         .get("package")
@@ -2234,18 +2243,23 @@ fn cargo_config_root(dir: &Path, manifest: &Path, corgi_toml: Option<&Path>) -> 
         .and_then(toml::Value::as_str)
     {
         return dunce::canonicalize(dir.join(workspace))
+            .map(|root| (root, package_name))
             .with_context(|| format!("resolving package.workspace `{workspace}`"));
     }
-    Ok(corgi_toml
-        .and_then(Path::parent)
-        .unwrap_or(dir)
-        .to_path_buf())
+    Ok((
+        corgi_toml
+            .and_then(Path::parent)
+            .unwrap_or(dir)
+            .to_path_buf(),
+        package_name,
+    ))
 }
 
 /// The Cargo inputs Corgi derives from a project directory. Planning and
 /// `corgi fetch` share this so they always hand Cargo the same configuration.
 struct CargoProject {
     manifest: PathBuf,
+    package_name: Option<String>,
     corgi_toml_path: Option<PathBuf>,
     config_root: PathBuf,
     cargo_config: crate::config::CargoConfig,
@@ -2261,7 +2275,8 @@ impl CargoProject {
             bail!("no Cargo.toml in {}", dir.display());
         }
         let corgi_toml_path = find_corgi_toml(dir);
-        let config_root = cargo_config_root(dir, &manifest, corgi_toml_path.as_deref())?;
+        let (config_root, package_name) =
+            cargo_config_root(dir, &manifest, corgi_toml_path.as_deref())?;
         let (mut cargo_config, root_config_path) = crate::config::discover(&config_root)?;
         let mut cargo_config_paths = root_config_path.into_iter().collect::<Vec<_>>();
         if config_root != dir {
@@ -2271,6 +2286,7 @@ impl CargoProject {
         }
         Ok(Self {
             manifest,
+            package_name,
             corgi_toml_path,
             config_root,
             cargo_config,
@@ -4629,6 +4645,7 @@ fn build_inner(
     let build_std = project.build_std();
     let CargoProject {
         manifest,
+        package_name,
         corgi_toml_path,
         config_root,
         cargo_config,
@@ -4836,7 +4853,16 @@ fn build_inner(
     // content fingerprint. Entry paths are workspace-relative, so a
     // bit-identical checkout in a different directory still hits.
     let root_sets = corgi_toml.root_sets();
-    let resolution_roots = select_resolution_roots(&root_sets, root.as_deref(), &packages)?;
+    let inferred_package = if packages.is_empty() && !workspace && root.is_none() {
+        package_name.as_ref()
+    } else {
+        None
+    };
+    let resolution_packages = inferred_package
+        .map(std::slice::from_ref)
+        .unwrap_or(&packages);
+    let resolution_roots =
+        select_resolution_roots(&root_sets, root.as_deref(), resolution_packages)?;
     let resolution_root_name = root.clone().or_else(|| {
         resolution_roots.as_ref().and_then(|selected_root| {
             root_sets

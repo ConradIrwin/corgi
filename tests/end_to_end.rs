@@ -917,6 +917,18 @@ fn package_selection_infers_its_feature_unification_root() {
 }
 
 #[test]
+fn member_directory_infers_its_feature_unification_root() {
+    let fixture = fixture_path("root-inference");
+    run_corgi(&fixture.join("app"), "build", []);
+
+    let output = Command::new(fixture.join("target/debug").join(executable_name("app")))
+        .output()
+        .unwrap();
+    assert_success(&output, "app");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "app root\n");
+}
+
+#[test]
 fn selected_package_must_be_part_of_the_named_root() {
     let fixture = fixture_path("root-inference");
     let output = invoke_corgi(&fixture, "check", ["--root", "app", "--package", "sibling"]);
