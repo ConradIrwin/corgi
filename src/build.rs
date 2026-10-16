@@ -1,11 +1,12 @@
 use crate::meta::{self, Metadata, Package, Target};
-use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
+use crate::native_toolchain::{SuppliedRust, ToolchainSource};
 use crate::platform::executable_name;
 use crate::report::UnitKeyResolution as KeyResolution;
 use crate::sandbox::linux::setup_linux_sandbox;
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
 use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store};
+use crate::toolchain::{CTools, Identity, PlatformToolchain, Toolchain};
 use anyhow::{bail, Context, Result};
 use path_slash::PathExt as _;
 use regex::RegexSet;
@@ -490,7 +491,6 @@ pub struct Ctx {
     pool: PathBuf,
     cargo: String,
     cargo_home: String,
-    base_env: Vec<(String, String)>,
     workspace_root: String,
     target_dir: PathBuf,
     sysroot: String,
@@ -502,7 +502,7 @@ pub struct Ctx {
     /// target/<dir> layout name from the root units' resolved profile
     /// (cargo maps dev/test to "debug").
     profile_name: String,
-    toolchain: ResolvedToolchain,
+    toolchain: Toolchain,
     toolchain_identity: String,
     /// Pinned tools resolved for injection: env var, store path,
     /// identity hash, shim name/bin, and package scope (empty = all).
@@ -512,7 +512,6 @@ pub struct Ctx {
     target: Option<String>,
     /// Build standard-library units from this toolchain's pinned rust-src.
     build_std: bool,
-    zig: Option<ZigRuntime>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
     /// Dev-loop namespace: local units compile with -Cincremental into
@@ -565,109 +564,6 @@ pub struct Ctx {
     /// [extra-inputs], granted to their actions and hashed as inputs.
     extra_inputs: ExtraInputs,
     report: Arc<crate::report::Recorder>,
-}
-
-enum ResolvedToolchain {
-    Supplied(NativeToolchain),
-    ManagedDarwin(ManagedDarwinToolchain),
-}
-
-impl ResolvedToolchain {
-    fn supplied(&self) -> Option<&NativeToolchain> {
-        match self {
-            Self::Supplied(native) => Some(native),
-            Self::ManagedDarwin(_) => None,
-        }
-    }
-
-    fn darwin_runtime(&self, platform: &str) -> Option<&MacosRuntime> {
-        match self {
-            Self::Supplied(_) => None,
-            Self::ManagedDarwin(managed) => managed
-                .runtimes
-                .iter()
-                .find(|runtime| runtime.platform == platform),
-        }
-    }
-
-    fn identity(
-        &self,
-        channel: &str,
-        zig_identity: &str,
-    ) -> Result<(String, crate::report::ToolchainInput)> {
-        let ((cc, ld, sdk), macos_identity, libclang_identity) = match self {
-            Self::Supplied(native) => (
-                (
-                    native.compiler_version.trim().to_string(),
-                    format!("{} (native Clang link driver)", native.compiler.display()),
-                    format!("supplied toolchain inputs {}", native.identity),
-                ),
-                String::new(),
-                String::new(),
-            ),
-            Self::ManagedDarwin(managed) => {
-                let macos_identity = managed
-                    .runtimes
-                    .iter()
-                    .map(|runtime| runtime.identity.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let libclang_identity = managed
-                    .libclang_path
-                    .as_ref()
-                    .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
-                    .transpose()?
-                    .unwrap_or_default();
-                (
-                    darwin_toolchain_identity(channel),
-                    macos_identity,
-                    libclang_identity,
-                )
-            }
-        };
-        let identity = format!(
-            "cc: {cc}\nld: {ld}\nsdk: {sdk}\nzig: {zig_identity}\nmacos: {macos_identity}\nlibclang: {libclang_identity}"
-        );
-        Ok((identity, crate::report::ToolchainInput { cc, ld, sdk }))
-    }
-}
-
-struct ManagedDarwinToolchain {
-    runtimes: Vec<MacosRuntime>,
-    /// `LIBCLANG_PATH` for Corgi's pinned header parser.
-    /// None when unsupported.
-    libclang_path: Option<String>,
-}
-
-impl ManagedDarwinToolchain {
-    fn build_script_environment(&self, platform: &str, host: &str) -> Vec<(String, String)> {
-        let mut environment = Vec::new();
-        for runtime in &self.runtimes {
-            if runtime.platform == platform {
-                environment.extend(runtime.environment());
-            }
-            for (variable, tool) in [
-                ("CC", "cc"),
-                ("CXX", "c++"),
-                ("AR", "ar"),
-                ("RANLIB", "ranlib"),
-            ] {
-                let path = runtime.directory.join(tool).display().to_string();
-                environment.push((
-                    format!("{variable}_{}", runtime.platform.replace('-', "_")),
-                    path.clone(),
-                ));
-                if runtime.platform == host {
-                    environment.push((format!("HOST_{variable}"), path));
-                }
-            }
-        }
-        // Match bindgen's header parser to the managed Clang, not ambient Xcode/CLT.
-        if let Some(path) = &self.libclang_path {
-            environment.push(("LIBCLANG_PATH".into(), path.clone()));
-        }
-        environment
-    }
 }
 
 #[derive(Clone)]
@@ -785,6 +681,187 @@ fn setup_darwin_runtimes(
         )?);
     }
     Ok(runtimes)
+}
+
+/// The toolchains a build runs, from [`provision_toolchains`].
+struct Toolchains {
+    rust: RustToolchain,
+    c: Toolchain,
+    /// The Rust target to build for, if not the host. A target that Zig
+    /// builds is requested by Zig's name; this is the Rust target it maps to.
+    target: Option<String>,
+}
+
+/// Select the build's Rust and C toolchains and install what's missing.
+/// `corgi fetch` and builds share this, so they agree on what a build needs.
+fn provision_toolchains(
+    store: &Store,
+    host_platform: HostPlatform,
+    dir: &Path,
+    host: &str,
+    requested_target: Option<&str>,
+    build_std: bool,
+    config_env: &[(String, String)],
+) -> Result<Toolchains> {
+    let zig_target = requested_target
+        .map(|target| {
+            crate::zig::target_requires_zig(host, target)
+                .map(|required| required.then(|| target.to_string()))
+        })
+        .transpose()?
+        .flatten();
+    let target = match zig_target.as_deref() {
+        Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
+        None => requested_target.map(str::to_string),
+    };
+    let rust = provision_rust(
+        store,
+        host_platform,
+        dir,
+        host,
+        requested_target,
+        build_std,
+        config_env,
+    )?;
+    // The C toolchain depends on the Rust one: a supplied Clang is checked
+    // against the supplied Rust, and managed macOS links with the pinned
+    // Rust's own LLD.
+    let mut c = match (&rust.supplied_rust, host_platform) {
+        (Some(supplied), _) => crate::native_toolchain::supplied_clang(
+            store,
+            supplied,
+            rust.native_environment.clone(),
+        )?,
+        (None, HostPlatform::Darwin) => {
+            provision_darwin_toolchain(store, host, target.as_deref(), &rust, config_env)?
+        }
+        (None, HostPlatform::Linux) => bail!("managed Linux toolchains are not implemented"),
+    };
+    c.add_user_directory();
+    if let (Some(zig_target), Some(target)) = (&zig_target, &target) {
+        add_zig(&mut c, target, ensure_zig(store, host, zig_target)?);
+    }
+    Ok(Toolchains { rust, c, target })
+}
+
+/// Corgi's macOS toolchain: install the LLVM tools and the Apple runtimes for
+/// the host and an Apple `target`.
+fn provision_darwin_toolchain(
+    store: &Store,
+    host: &str,
+    target: Option<&str>,
+    rust: &RustToolchain,
+    config_env: &[(String, String)],
+) -> Result<Toolchain> {
+    let (llvm_tools, libclang) = setup_darwin_llvm_tools(store, host)?;
+    let runtimes = setup_darwin_runtimes(
+        store,
+        host,
+        target,
+        &rust.rust_toolchain,
+        llvm_tools.as_deref(),
+        config_env,
+    )?;
+    let libclang_identity = libclang
+        .as_ref()
+        .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(apple_toolchain(
+        runtimes,
+        libclang,
+        libclang_identity,
+        &rust.channel,
+    ))
+}
+
+/// Zig compiles and links the cross `target`'s units.
+fn add_zig(toolchain: &mut Toolchain, target: &str, zig: ZigRuntime) {
+    toolchain.uses_zig = true;
+    toolchain.identity.zig = zig.identity;
+    toolchain.platforms.push(PlatformToolchain {
+        platform: target.to_string(),
+        linker: zig.use_zig_as_rust_linker.then(|| zig.cc.clone()),
+        environment: Vec::new(),
+        tools: Some(CTools {
+            cc: zig.cc,
+            cxx: zig.cxx,
+            ar: zig.ar,
+            ranlib: zig.ranlib,
+        }),
+        cmake_toolchain: Some(zig.cmake_toolchain),
+        remaps_debug_paths: false,
+    });
+}
+
+/// Give Zig its caches inside the action's scratch directory.
+fn zig_scratch_environment(cmd: &mut Command, scratch: &Path, rustc_version: &str) -> Result<()> {
+    let zig_global_cache = scratch.join("zig-global-cache");
+    let zig_local_cache = scratch.join("zig-local-cache");
+    fs::create_dir_all(&zig_global_cache)?;
+    fs::create_dir_all(&zig_local_cache)?;
+    if let Some(version) = rustc_version
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+    {
+        cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", version);
+    }
+    cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
+    cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    Ok(())
+}
+
+/// Corgi's pinned macOS toolchain: one runtime per Apple platform.
+fn apple_toolchain(
+    runtimes: Vec<MacosRuntime>,
+    libclang: Option<String>,
+    libclang_identity: String,
+    channel: &str,
+) -> Toolchain {
+    let (cc, ld, sdk) = darwin_toolchain_identity(channel);
+    Toolchain {
+        base_environment: vec![(
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", runtimes[0].directory.display()),
+        )],
+        configured_environment: Vec::new(),
+        read_paths: Vec::new(),
+        // Match bindgen's header parser to the managed Clang, not ambient Xcode/CLT.
+        extra_build_script_environment: libclang
+            .map(|path| vec![("LIBCLANG_PATH".to_string(), path)])
+            .unwrap_or_default(),
+        rustc_identity: None,
+        uses_zig: false,
+        identity: Identity {
+            cc,
+            ld,
+            sdk,
+            zig: String::new(),
+            apple_runtimes: runtimes
+                .iter()
+                .map(|runtime| runtime.identity.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            libclang: libclang_identity,
+        },
+        platforms: runtimes
+            .into_iter()
+            .map(|runtime| PlatformToolchain {
+                linker: Some(runtime.directory.join("rust-linker")),
+                environment: runtime.environment(),
+                tools: Some(CTools {
+                    cc: runtime.directory.join("cc"),
+                    cxx: runtime.directory.join("c++"),
+                    ar: runtime.directory.join("ar"),
+                    ranlib: runtime.directory.join("ranlib"),
+                }),
+                cmake_toolchain: None,
+                // Pinned macOS compilers remap native debug paths into the stable cache.
+                remaps_debug_paths: true,
+                platform: runtime.platform,
+            })
+            .collect(),
+    }
 }
 
 fn darwin_toolchain_identity(channel: &str) -> (String, String, String) {
@@ -3546,8 +3623,7 @@ fn touch_tool_marker(dir: &Path) {
 
 /// The Rust toolchain a build uses: a supplied native one, selected by the
 /// `CORGI_*` toolchain variables, or Corgi's pinned download.
-struct SelectedToolchain {
-    source: ToolchainSource,
+struct RustToolchain {
     /// The project's pinned Rust channel.
     channel: String,
     /// Wrapper environment captured for a supplied toolchain; empty when managed.
@@ -3557,10 +3633,9 @@ struct SelectedToolchain {
     rust_toolchain: PathBuf,
 }
 
-/// Select the build's toolchain, installing the pinned one when Corgi
-/// manages it. `corgi fetch` and builds share this so they agree on what a
-/// build needs.
-fn select_toolchain(
+/// Select the build's Rust toolchain, installing the pinned one when Corgi
+/// manages it.
+fn provision_rust(
     store: &Store,
     host_platform: HostPlatform,
     dir: &Path,
@@ -3568,16 +3643,33 @@ fn select_toolchain(
     target: Option<&str>,
     build_std: bool,
     config_env: &[(String, String)],
-) -> Result<SelectedToolchain> {
+) -> Result<RustToolchain> {
     // Reject invalid toolchain variables before reading the pin: an unpinned
     // project asks the selected toolchain for its channel.
     let source = ToolchainSource::for_build()?;
     host_platform.validate_toolchain_source(source)?;
     let channel = read_toolchain_pin(dir)?;
     if source == ToolchainSource::Managed {
-        return Ok(SelectedToolchain {
-            source,
-            rust_toolchain: provision_rust_toolchain(store, &channel, host, build_std)?,
+        ensure_rust(store, &channel, host, build_std)?;
+        if !build_std {
+            // Debugger convenience, deliberately outside the sysroot (see
+            // ensure_rust_src). Failure is non-fatal: builds don't need sources.
+            if let Err(e) = ensure_rust_src(store, &channel) {
+                eprintln!(
+                    "corgi warning: rust-src install failed ({e}); \
+                     std source display in debuggers unavailable"
+                );
+            }
+        }
+        // This store path leaks into ld's UUID (it hashes the link command
+        // line, including libstd rlib paths) and into build-script keys, so
+        // artifacts are only identical across stores at the same path.
+        let rust_toolchain = store.root.join("tools").join(format!(
+            "rust-{channel}-{host}{}",
+            if build_std { "-build-std" } else { "" }
+        ));
+        return Ok(RustToolchain {
+            rust_toolchain,
             channel,
             native_environment: Vec::new(),
             supplied_rust: None,
@@ -3593,8 +3685,7 @@ fn select_toolchain(
     }
     let native_environment = crate::native_toolchain::wrapper_environment(config_env)?;
     let supplied_rust = SuppliedRust::resolve(&channel, host, &native_environment)?;
-    Ok(SelectedToolchain {
-        source,
+    Ok(RustToolchain {
         channel,
         rust_toolchain: supplied_rust.directory.clone(),
         native_environment,
@@ -3602,41 +3693,9 @@ fn select_toolchain(
     })
 }
 
-/// Install the pinned Rust toolchain and return its path in the store. That
-/// path leaks into ld's UUID (it hashes the link command line, including
-/// libstd rlib paths) and into build-script keys, so artifacts are only
-/// identical across stores at the same path.
-fn provision_rust_toolchain(
-    store: &Store,
-    channel: &str,
-    host: &str,
-    build_std: bool,
-) -> Result<PathBuf> {
-    ensure_toolchain(store, channel, host, build_std)?;
-    if !build_std {
-        // Debugger convenience, deliberately outside the sysroot (see
-        // ensure_rust_src). Failure is non-fatal: builds don't need sources.
-        if let Err(e) = ensure_rust_src(store, channel) {
-            eprintln!(
-                "corgi warning: rust-src install failed ({e}); \
-                 std source display in debuggers unavailable"
-            );
-        }
-    }
-    Ok(store.root.join("tools").join(format!(
-        "rust-{channel}-{host}{}",
-        if build_std { "-build-std" } else { "" }
-    )))
-}
-
 /// Install rustc + rust-std + cargo from static.rust-lang.org into the
 /// store (sha256-verified, unpacked to tmp, atomic rename — lock-free).
-fn ensure_toolchain(
-    store: &Store,
-    channel: &str,
-    triple: &str,
-    build_std: bool,
-) -> Result<PathBuf> {
+fn ensure_rust(store: &Store, channel: &str, triple: &str, build_std: bool) -> Result<PathBuf> {
     let suffix = if build_std { "-build-std" } else { "" };
     let dest = store
         .root
@@ -4392,7 +4451,7 @@ pub fn fmt(
             (bin.clone(), bin)
         } else {
             (
-                ensure_toolchain(&store, &channel, &host, false)?,
+                ensure_rust(&store, &channel, &host, false)?,
                 ensure_rustfmt(&store, &channel, &host)?,
             )
         };
@@ -4446,7 +4505,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
     let host_platform = HostPlatform::current()?;
     let host = host_platform.triple();
     let build_std = project.build_std();
-    let toolchain = select_toolchain(
+    let Toolchains { rust, .. } = provision_toolchains(
         &store,
         host_platform,
         &dir,
@@ -4455,17 +4514,6 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         build_std,
         &project.cargo_config.env,
     )?;
-    if (toolchain.source, host_platform) == (ToolchainSource::Managed, HostPlatform::Darwin) {
-        let (llvm_tools, _) = setup_darwin_llvm_tools(&store, &host)?;
-        setup_darwin_runtimes(
-            &store,
-            &host,
-            None,
-            &toolchain.rust_toolchain,
-            llvm_tools.as_deref(),
-            &project.cargo_config.env,
-        )?;
-    }
     // A build only provisions the tools its graph activates. Without a plan,
     // fetch takes every tool that could be active on this host.
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
@@ -4477,7 +4525,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
 
     status!("Fetching", "dependencies via Cargo");
     fetch_dependencies(
-        &toolchain.rust_toolchain,
+        &rust.rust_toolchain,
         &store_cargo_home(&store),
         &project.cargo_config_paths,
         &project.manifest,
@@ -4648,13 +4696,11 @@ fn build_inner(
     }
 
     let host_guess = host_platform.triple();
-    let SelectedToolchain {
-        source: toolchain_source,
-        channel,
-        native_environment,
-        supplied_rust,
-        rust_toolchain,
-    } = select_toolchain(
+    let Toolchains {
+        rust,
+        c: toolchain,
+        target,
+    } = provision_toolchains(
         &store,
         host_platform,
         &dir,
@@ -4663,22 +4709,12 @@ fn build_inner(
         build_std,
         &cargo_config.env,
     )?;
-    let native_toolchain = supplied_rust
-        .as_ref()
-        .map(|rust| NativeToolchain::resolve(&store, rust, native_environment.clone()))
-        .transpose()?;
-    let zig_target = requested_target
-        .as_deref()
-        .map(|target| {
-            crate::zig::target_requires_zig(&host_guess, target)
-                .map(|required| required.then(|| target.to_string()))
-        })
-        .transpose()?
-        .flatten();
-    let target = match zig_target.as_deref() {
-        Some(target) => Some(crate::zig::rust_target(target)?.to_string()),
-        None => requested_target,
-    };
+    let RustToolchain {
+        channel,
+        native_environment,
+        supplied_rust,
+        rust_toolchain,
+    } = rust;
     let rustc = rust_toolchain
         .join("bin")
         .join(executable_name("rustc"))
@@ -4713,30 +4749,15 @@ fn build_inner(
     } else {
         target_rustflags.clone()
     };
+    // A supplied toolchain's environment is keyed like `[env]` and overrides
+    // its entries.
     let mut config_env = cargo_config.env;
-    if let Some(native) = &native_toolchain {
-        for (name, value) in &native.environment {
-            config_env.retain(|(existing, _)| existing != name);
-            config_env.push((name.clone(), value.clone()));
-        }
-        config_env.sort();
+    for (name, value) in &toolchain.configured_environment {
+        config_env.retain(|(existing, _)| existing != name);
+        config_env.push((name.clone(), value.clone()));
     }
-    // Actions never see the ambient environment. Tool discovery must use this
-    // same base plus configured environment so xcrun selects the same tools.
-    let mut base_env = if let Some(native) = &native_toolchain {
-        native.environment.clone()
-    } else {
-        let mut environment = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
-        if let Ok(value) = std::env::var("HOME") {
-            environment.push(("HOME".to_string(), value));
-        }
-        environment
-    };
+    config_env.sort();
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
-    let (llvm_tools, libclang) = match (toolchain_source, host_platform) {
-        (ToolchainSource::Managed, HostPlatform::Darwin) => setup_darwin_llvm_tools(&store, &host)?,
-        _ => (None, None),
-    };
     recorder.update(|report| {
         report.run.tool.declared_environment = config_env
             .iter()
@@ -4750,11 +4771,7 @@ fn build_inner(
     });
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
-    let mut cfg_probe = if let Some(native) = &native_toolchain {
-        crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
-    } else {
-        Command::new(&rustc)
-    };
+    let mut cfg_probe = toolchain.command(Path::new(&rustc));
     cfg_probe.args(["--print", "cfg"]);
     cfg_probe.args(&host_rustflags);
     let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
@@ -4770,8 +4787,8 @@ fn build_inner(
     // version string so it reaches every action key.
     let rust_src = Path::new(&sysroot).join("lib/rustlib/src/rust").exists();
     let mut rustc_version = format!("{rustc_version}rust-src: {rust_src}\n");
-    if let Some(native) = &native_toolchain {
-        rustc_version.push_str(&format!("native-toolchain: {}\n", native.identity));
+    if let Some(identity) = &toolchain.rustc_identity {
+        rustc_version.push_str(&format!("native-toolchain: {identity}\n"));
     }
     let cfg_env = cargo_cfg_env(&cfg_out);
     let mut target_std_libdir: Option<String> = None;
@@ -4792,11 +4809,7 @@ fn build_inner(
         }
     }
     let cfg_env_target = if let Some(t) = &target {
-        let mut probe = if let Some(native) = &native_toolchain {
-            crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
-        } else {
-            Command::new(&rustc)
-        };
+        let mut probe = toolchain.command(Path::new(&rustc));
         probe.args(["--print", "cfg", "--target", t]);
         probe.args(&target_rustflags);
         let o = capture(&mut probe, "rustc --print cfg --target")?;
@@ -4806,10 +4819,7 @@ fn build_inner(
     };
 
     let cargo_home = store_cargo_home(&store).display().to_string();
-    let runtime_paths = native_toolchain
-        .as_ref()
-        .map(|native| native.runtime_paths.clone())
-        .unwrap_or_default();
+    let runtime_paths = toolchain.read_paths.clone();
     let sandbox = match host_platform {
         HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(&store, runtime_paths)?),
         HostPlatform::Darwin => Sandbox::Darwin(setup_macos_sandbox(
@@ -4922,10 +4932,9 @@ fn build_inner(
                 let mut command =
                     isolated_cargo_command(&cargo_bin, Path::new(&cargo_home), &cargo_config_paths);
                 command.env("RUSTC", &rustc);
-                if native_toolchain.is_some() {
-                    for (name, value) in &native_environment {
-                        command.env(name, value);
-                    }
+                // Empty unless a supplied toolchain captured wrapper variables.
+                for (name, value) in &native_environment {
+                    command.env(name, value);
                 }
                 command
             };
@@ -5275,39 +5284,7 @@ fn build_inner(
     finish_report_stage(&recorder, "plan", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
-    let toolchain = match native_toolchain {
-        Some(native) => ResolvedToolchain::Supplied(native),
-        None => match host_platform {
-            HostPlatform::Darwin => {
-                let runtimes = setup_darwin_runtimes(
-                    &store,
-                    &host,
-                    target.as_deref(),
-                    &rust_toolchain,
-                    llvm_tools.as_deref(),
-                    &config_env,
-                )?;
-                base_env.push((
-                    "PATH".into(),
-                    format!("{}:/usr/bin:/bin", runtimes[0].directory.display()),
-                ));
-                ResolvedToolchain::ManagedDarwin(ManagedDarwinToolchain {
-                    runtimes,
-                    libclang_path: libclang,
-                })
-            }
-            HostPlatform::Linux => bail!("managed Linux toolchains are not implemented"),
-        },
-    };
-    let zig_runtime = zig_target
-        .as_deref()
-        .map(|target| ensure_zig(&store, &host_guess, target))
-        .transpose()?;
-    let zig_identity = zig_runtime
-        .as_ref()
-        .map(|runtime| runtime.identity.as_str())
-        .unwrap_or("");
-    let (toolchain_identity, report_toolchain) = toolchain.identity(&channel, zig_identity)?;
+    let (toolchain_identity, report_toolchain) = toolchain.key();
     recorder.update(|report| report.run.tool.toolchain = report_toolchain.clone());
     let cargo = cargo_bin.display().to_string();
     // Lints are plan-time-resolved inputs (see resolve_lints).
@@ -5326,14 +5303,7 @@ fn build_inner(
             .join(executable_name("clippy-driver"))
             .display()
             .to_string();
-        let mut probe = if let Some(native) = toolchain.supplied() {
-            crate::native_toolchain::controlled_command(
-                Path::new(&clippy_driver),
-                &native.environment,
-            )
-        } else {
-            Command::new(&clippy_driver)
-        };
+        let mut probe = toolchain.command(Path::new(&clippy_driver));
         let version = capture(probe.arg("-V"), "clippy-driver -V")?;
         let mut conf_hash = String::new();
         for name in ["clippy.toml", ".clippy.toml"] {
@@ -5517,7 +5487,6 @@ fn build_inner(
         pool,
         cargo,
         cargo_home,
-        base_env,
         workspace_root,
         target_dir,
         sysroot,
@@ -5533,7 +5502,6 @@ fn build_inner(
         env_probes,
         target,
         build_std,
-        zig: zig_runtime,
         timings,
         incremental: !no_incremental,
         jobserver: jobserver::Client::new(
@@ -8542,14 +8510,7 @@ fn expected_outputs(
             let p = match from_store {
                 Some(p) => p,
                 None => {
-                    let mut cmd = if let Some(native) = ctx.toolchain.supplied() {
-                        crate::native_toolchain::controlled_command(
-                            Path::new(&ctx.rustc),
-                            &native.environment,
-                        )
-                    } else {
-                        Command::new(&ctx.rustc)
-                    };
+                    let mut cmd = ctx.toolchain.command(Path::new(&ctx.rustc));
                     cmd.args([
                         "--print",
                         "file-names",
@@ -9305,9 +9266,7 @@ fn compile(
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
     let mut allowed_inputs: Vec<PathBuf> =
         vec![ctx.store.root.clone(), PathBuf::from(&ctx.sysroot)];
-    if let Some(native) = ctx.toolchain.supplied() {
-        allowed_inputs.extend(native.runtime_paths.iter().cloned());
-    }
+    allowed_inputs.extend(ctx.toolchain.read_paths.iter().cloned());
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             allowed_inputs.push(conf.clone());
@@ -9333,24 +9292,10 @@ fn compile(
     cmd.current_dir(compile_dir);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
-    if ctx.zig.is_some() {
-        let zig_global_cache = scratch.join("zig-global-cache");
-        let zig_local_cache = scratch.join("zig-local-cache");
-        fs::create_dir_all(&zig_global_cache)?;
-        fs::create_dir_all(&zig_local_cache)?;
-        if let Some(version) = ctx
-            .rustc_version
-            .lines()
-            .find_map(|line| line.strip_prefix("release: "))
-        {
-            cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", version);
-        }
-        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
-        cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    if ctx.toolchain.uses_zig {
+        zig_scratch_environment(&mut cmd, &scratch, &ctx.rustc_version)?;
     }
-    for (k, v) in &ctx.base_env {
-        cmd.env(k, v);
-    }
+    cmd.envs(ctx.toolchain.base_environment.iter().cloned());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -9411,27 +9356,20 @@ fn compile(
     if !unit.host {
         if let Some(t) = &ctx.target {
             cmd.arg("--target").arg(t);
-            if let Some(zig) = ctx.zig.as_ref().filter(|zig| zig.use_zig_as_rust_linker) {
-                cmd.arg("-C").arg(format!("linker={}", zig.cc.display()));
-            }
             if let Some(libdir) = &ctx.target_std_libdir {
                 cmd.arg("-L").arg(libdir);
             }
         }
     }
-    if let Some(runtime) = ctx.toolchain.darwin_runtime(unit_platform) {
-        cmd.arg("-C").arg(format!(
-            "linker={}",
-            runtime.directory.join("rust-linker").display()
-        ));
-        cmd.envs(runtime.environment());
+    if let Some(toolchain) = ctx.toolchain.platform(unit_platform) {
+        // Before the unit's rustflags, so a project's own `-C linker` wins.
+        if let Some(linker) = &toolchain.linker {
+            cmd.arg("-C").arg(format!("linker={}", linker.display()));
+        }
+        cmd.envs(toolchain.environment.iter().cloned());
     }
     for f in pflags {
         cmd.arg(f);
-    }
-    if let Some(native) = ctx.toolchain.supplied() {
-        cmd.arg("-C")
-            .arg(format!("linker={}", native.compiler.display()));
     }
     for f in lint_flags {
         cmd.arg(f);
@@ -9705,38 +9643,19 @@ fn build_script_environment<'a>(
             unit.profile.opt_level.clone()
         },
     ));
-    // Pinned macOS compilers remap native debug paths into the stable cache.
-    // Other compilers still suppress debug info to avoid machine-local paths.
-    let native_debug =
-        ctx.toolchain.darwin_runtime(&platform).is_some() && unit.profile.debuginfo_flag() != "0";
+    // Compilers that remap native debug paths into the stable cache may emit
+    // debug info; others suppress it to avoid machine-local paths.
+    let native_debug = ctx
+        .toolchain
+        .platform(&platform)
+        .is_some_and(|toolchain| toolchain.remaps_debug_paths)
+        && unit.profile.debuginfo_flag() != "0";
     env.push(("DEBUG".into(), native_debug.to_string()));
     env.push(("NUM_JOBS".into(), "4".into()));
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    if let ResolvedToolchain::ManagedDarwin(managed) = &ctx.toolchain {
-        env.extend(managed.build_script_environment(&platform, &ctx.host));
-    }
-    if platform != ctx.host {
-        if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
-            let target_environment = target.replace('-', "_");
-            for (name, value) in [
-                (format!("CC_{target_environment}"), &zig.cc),
-                (format!("CXX_{target_environment}"), &zig.cxx),
-                (format!("AR_{target_environment}"), &zig.ar),
-                (format!("RANLIB_{target_environment}"), &zig.ranlib),
-            ] {
-                env.push((name, value.display().to_string()));
-            }
-            for name in [
-                "CMAKE_TOOLCHAIN_FILE",
-                "TARGET_CMAKE_TOOLCHAIN_FILE",
-                &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
-            ] {
-                env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
-            }
-        }
-    }
+    env.extend(ctx.toolchain.build_script_environment(&platform, &ctx.host));
     // Cargo hands build scripts the rustflags of the unit they configure,
     // joined with the 0x1f separator.
     env.push((
@@ -9884,24 +9803,10 @@ fn run_build_script(
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
-    if ctx.zig.is_some() {
-        let zig_global_cache = scratch.join("zig-global-cache");
-        let zig_local_cache = scratch.join("zig-local-cache");
-        fs::create_dir_all(&zig_global_cache)?;
-        fs::create_dir_all(&zig_local_cache)?;
-        if let Some(version) = ctx
-            .rustc_version
-            .lines()
-            .find_map(|line| line.strip_prefix("release: "))
-        {
-            cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", version);
-        }
-        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
-        cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    if ctx.toolchain.uses_zig {
+        zig_scratch_environment(&mut cmd, &scratch, &ctx.rustc_version)?;
     }
-    for (k, v) in &ctx.base_env {
-        cmd.env(k, v);
-    }
+    cmd.envs(ctx.toolchain.base_environment.iter().cloned());
     for (k, v) in &spec.environment {
         cmd.env(k, v);
     }
@@ -10240,9 +10145,10 @@ fn raise_file_descriptor_limit() -> Result<()> {
 #[cfg(test)]
 mod build_platform_tests {
     use super::{
-        configure_darwin_link_output, is_apple_target, HostPlatform, MacosRuntime,
-        ManagedDarwinToolchain, NativeToolchain, ResolvedToolchain, ToolchainSource,
+        add_zig, apple_toolchain, configure_darwin_link_output, is_apple_target, HostPlatform,
+        MacosRuntime, ToolchainSource, ZigRuntime,
     };
+    use std::collections::BTreeMap;
     use std::{path::Path, process::Command};
 
     #[test]
@@ -10327,18 +10233,20 @@ mod build_platform_tests {
     fn managed_darwin_environment_scopes_host_and_target_tools() {
         let host = "aarch64-apple-darwin";
         let target = "x86_64-apple-darwin";
-        let managed = ManagedDarwinToolchain {
-            runtimes: vec![
+        let toolchain = apple_toolchain(
+            vec![
                 darwin_runtime(host, "/host"),
                 darwin_runtime(target, "/target"),
             ],
-            libclang_path: Some("/llvm/lib".into()),
-        };
+            Some("/llvm/lib".into()),
+            String::new(),
+            "1.97.1",
+        );
         for (platform, directory) in [(host, "/host"), (target, "/target")] {
-            let environment = managed
+            let environment = toolchain
                 .build_script_environment(platform, host)
                 .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>();
+                .collect::<BTreeMap<_, _>>();
             assert_eq!(environment["CC"], format!("{directory}/cc"));
             assert_eq!(environment["SDKROOT"], format!("{directory}/sdk"));
             assert_eq!(environment["HOST_CC"], "/host/cc");
@@ -10346,31 +10254,82 @@ mod build_platform_tests {
             assert_eq!(environment["CC_x86_64_apple_darwin"], "/target/cc");
             assert_eq!(environment["LIBCLANG_PATH"], "/llvm/lib");
         }
-        let environment = managed.build_script_environment("x86_64-unknown-linux-gnu", host);
+        let environment = toolchain.build_script_environment("x86_64-unknown-linux-gnu", host);
         assert!(!environment
             .iter()
             .any(|(name, _)| matches!(name.as_str(), "CC" | "SDKROOT" | "PATH")));
-        let toolchain = ResolvedToolchain::ManagedDarwin(managed);
-        assert!(toolchain.supplied().is_none());
+        assert!(toolchain.read_paths.is_empty());
         assert_eq!(
-            toolchain.darwin_runtime(target).unwrap().directory,
-            Path::new("/target")
+            toolchain.base_environment,
+            [("PATH".to_string(), "/host:/usr/bin:/bin".to_string())]
         );
-        assert!(toolchain
-            .darwin_runtime("x86_64-unknown-linux-gnu")
-            .is_none());
+        assert_eq!(
+            toolchain.platform(target).unwrap().linker.as_deref(),
+            Some(Path::new("/target/rust-linker"))
+        );
+        assert!(toolchain.platform(host).unwrap().remaps_debug_paths);
+        assert!(toolchain.platform("x86_64-unknown-linux-gnu").is_none());
+    }
+
+    #[test]
+    fn zig_supplies_only_its_cross_target() {
+        let host = "aarch64-apple-darwin";
+        let target = "x86_64-unknown-linux-musl";
+        let mut toolchain = apple_toolchain(
+            vec![darwin_runtime(host, "/host")],
+            None,
+            String::new(),
+            "1.97.1",
+        );
+        add_zig(
+            &mut toolchain,
+            target,
+            ZigRuntime {
+                cc: "/zig/cc".into(),
+                cxx: "/zig/c++".into(),
+                ar: "/zig/ar".into(),
+                ranlib: "/zig/ranlib".into(),
+                cmake_toolchain: "/zig/toolchain.cmake".into(),
+                use_zig_as_rust_linker: true,
+                identity: "zig-identity".into(),
+            },
+        );
+        let zig = toolchain.platform(target).unwrap();
+        assert_eq!(zig.linker.as_deref(), Some(Path::new("/zig/cc")));
+        assert!(zig.environment.is_empty() && !zig.remaps_debug_paths);
+        let environment = |platform| {
+            toolchain
+                .build_script_environment(platform, host)
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        };
+        let target_script = environment(target);
+        assert_eq!(target_script["CC_x86_64_unknown_linux_musl"], "/zig/cc");
+        assert_eq!(
+            target_script["CMAKE_TOOLCHAIN_FILE"],
+            "/zig/toolchain.cmake"
+        );
+        assert!(!target_script.contains_key("CC"));
+        let host_script = environment(host);
+        assert_eq!(host_script["CC"], "/host/cc");
+        assert!(!host_script.contains_key("CMAKE_TOOLCHAIN_FILE"));
+        assert!(toolchain.uses_zig);
+        assert!(toolchain.key().0.contains("zig: zig-identity\n"));
     }
 
     #[test]
     fn managed_darwin_identity_preserves_the_cache_format() {
-        let toolchain = ResolvedToolchain::ManagedDarwin(ManagedDarwinToolchain {
-            runtimes: vec![
+        let mut toolchain = apple_toolchain(
+            vec![
                 darwin_runtime("aarch64-apple-darwin", "/host"),
                 darwin_runtime("x86_64-apple-darwin", "/target"),
             ],
-            libclang_path: None,
-        });
-        let (identity, report) = toolchain.identity("1.97.1", "cross-tools").unwrap();
+            None,
+            String::new(),
+            "1.97.1",
+        );
+        toolchain.identity.zig = "cross-tools".into();
+        let (identity, report) = toolchain.key();
         assert_eq!(
             identity,
             format!(
@@ -10381,25 +10340,6 @@ mod build_platform_tests {
             )
         );
         assert_eq!(report.ld, "Rust 1.97.1 Mach-O LLD");
-    }
-
-    #[test]
-    fn supplied_toolchains_have_no_managed_darwin_inputs() {
-        let toolchain = ResolvedToolchain::Supplied(NativeToolchain {
-            compiler: "/nix/store/clang/bin/clang".into(),
-            compiler_version: "clang version 21\n".into(),
-            environment: Vec::new(),
-            identity: "closure-hash".into(),
-            runtime_paths: Vec::new(),
-        });
-        assert!(toolchain.supplied().is_some());
-        assert!(toolchain.darwin_runtime("aarch64-apple-darwin").is_none());
-        let (identity, report) = toolchain.identity("1.97.1", "").unwrap();
-        assert_eq!(
-            identity,
-            "cc: clang version 21\nld: /nix/store/clang/bin/clang (native Clang link driver)\nsdk: supplied toolchain inputs closure-hash\nzig: \nmacos: \nlibclang: "
-        );
-        assert_eq!(report.sdk, "supplied toolchain inputs closure-hash");
     }
 
     fn darwin_runtime(platform: &str, directory: &str) -> MacosRuntime {

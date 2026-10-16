@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::store::sha256_hex;
+use crate::toolchain::{Identity, PlatformToolchain, Toolchain};
 
 /// Wrapper inputs are captured before clearing the action environment.
 ///
@@ -101,14 +102,6 @@ impl SuppliedRust {
     }
 }
 
-pub struct NativeToolchain {
-    pub compiler: PathBuf,
-    pub compiler_version: String,
-    pub environment: Vec<(String, String)>,
-    pub identity: String,
-    pub runtime_paths: Vec<PathBuf>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolchainSource {
     Managed,
@@ -140,118 +133,153 @@ impl ToolchainSource {
     }
 }
 
-impl NativeToolchain {
-    pub fn resolve(
-        store: &crate::store::Store,
-        rust: &SuppliedRust,
-        environment: Vec<(String, String)>,
-    ) -> Result<Self> {
-        let compiler = required_path("CORGI_CC")?;
-        ensure!(compiler.is_file(), "CORGI_CC must name a Clang executable");
-        let compiler_version = output(
-            controlled_command(&compiler, &environment).arg("--version"),
-            "supplied Clang --version",
-        )?;
+/// The Clang named by `CORGI_CC`, validated against the supplied Rust.
+pub fn supplied_clang(
+    store: &crate::store::Store,
+    rust: &SuppliedRust,
+    environment: Vec<(String, String)>,
+) -> Result<Toolchain> {
+    let compiler = required_path("CORGI_CC")?;
+    ensure!(compiler.is_file(), "CORGI_CC must name a Clang executable");
+    let compiler_version = output(
+        controlled_command(&compiler, &environment).arg("--version"),
+        "supplied Clang --version",
+    )?;
+    ensure!(
+        compiler_version.contains("clang version"),
+        "CORGI_CC must select Clang, not another compiler"
+    );
+    let compiler_target = output(
+        controlled_command(&compiler, &environment).arg("-dumpmachine"),
+        "supplied Clang -dumpmachine",
+    )?;
+    let host = rust
+        .version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("supplied Rust has no host triple")?;
+    validate_compiler_target(compiler_target.trim(), host)?;
+    // Rust resolves its SDK before invoking Clang, so Clang's embedded
+    // fallback alone would leave rustc looking for an ambient xcrun.
+    if host.ends_with("-apple-darwin") {
         ensure!(
-            compiler_version.contains("clang version"),
-            "CORGI_CC must select Clang, not another compiler"
+            environment
+                .iter()
+                .any(|(name, value)| name == "SDKROOT" && !value.is_empty()),
+            "supplied Apple toolchains require SDKROOT pointing to the selected macOS SDK"
         );
-        let compiler_target = output(
-            controlled_command(&compiler, &environment).arg("-dumpmachine"),
-            "supplied Clang -dumpmachine",
-        )?;
-        let host = rust
-            .version
-            .lines()
-            .find_map(|line| line.strip_prefix("host: "))
-            .context("supplied Rust has no host triple")?;
-        validate_compiler_target(compiler_target.trim(), host)?;
-        // Rust resolves its SDK before invoking Clang, so Clang's embedded
-        // fallback alone would leave rustc looking for an ambient xcrun.
-        if host.ends_with("-apple-darwin") {
-            ensure!(
-                environment
-                    .iter()
-                    .any(|(name, value)| name == "SDKROOT" && !value.is_empty()),
-                "supplied Apple toolchains require SDKROOT pointing to the selected macOS SDK"
-            );
+    }
+    let shell = find_executable("sh")?;
+    let mut roots = vec![
+        rust.directory.clone(),
+        rust.sysroot.clone(),
+        rust.rustc.clone(),
+        rust.cargo.clone(),
+        compiler.clone(),
+        shell.clone(),
+    ];
+    for (name, value) in &environment {
+        if matches!(name.as_str(), "DEVELOPER_DIR" | "SDKROOT") && !value.is_empty() {
+            ensure!(Path::new(value).exists(), "{name} does not exist: {value}");
+            roots.push(PathBuf::from(value));
         }
-        let shell = find_executable("sh")?;
-        let mut roots = vec![
-            rust.directory.clone(),
-            rust.sysroot.clone(),
-            rust.rustc.clone(),
-            rust.cargo.clone(),
-            compiler.clone(),
-            shell.clone(),
-        ];
-        for (name, value) in &environment {
-            if matches!(name.as_str(), "DEVELOPER_DIR" | "SDKROOT") && !value.is_empty() {
-                ensure!(Path::new(value).exists(), "{name} does not exist: {value}");
-                roots.push(PathBuf::from(value));
-            }
+    }
+    roots.extend(
+        runtime_roots(std::env::var_os("CORGI_NATIVE_RUNTIME_ROOTS").as_deref())
+            .context("parsing CORGI_NATIVE_RUNTIME_ROOTS")?,
+    );
+    // Flags can introduce dependencies outside the compiler's own closure,
+    // for example a Nix library supplied through NIX_LDFLAGS.
+    // nix-shell also adds search paths for its unrealized output. They remain
+    // keyed flags, but absent paths cannot supply inputs to a sandbox action.
+    roots.extend(
+        environment_store_roots(&environment)?
+            .into_iter()
+            .filter(|path| path.exists()),
+    );
+    let inputs = inputs::resolve(store, &roots)?;
+    let path = std::env::join_paths([
+        rust.directory.join("bin"),
+        compiler
+            .parent()
+            .context("Clang has no parent directory")?
+            .to_path_buf(),
+        shell
+            .parent()
+            .context("shell has no parent directory")?
+            .to_path_buf(),
+    ])?
+    .into_string()
+    .map_err(|_| anyhow::anyhow!("toolchain PATH is not UTF-8"))?;
+    let mut environment = environment;
+    environment.push(("PATH".into(), path));
+    environment.push(("CC".into(), compiler.display().to_string()));
+    // Nix's wrappers only consume unsuffixed user flags when assigned the
+    // host role. Do not inherit another shell compiler's initialized flags.
+    if compiler.starts_with("/nix/store")
+        || environment.iter().any(|(name, _)| name.starts_with("NIX_"))
+    {
+        for wrapper in ["CC", "BINTOOLS"] {
+            environment.push((
+                format!(
+                    "NIX_{wrapper}_WRAPPER_TARGET_HOST_{}",
+                    host.replace('-', "_")
+                ),
+                "1".into(),
+            ));
         }
-        roots.extend(
-            runtime_roots(std::env::var_os("CORGI_NATIVE_RUNTIME_ROOTS").as_deref())
-                .context("parsing CORGI_NATIVE_RUNTIME_ROOTS")?,
-        );
-        // Flags can introduce dependencies outside the compiler's own closure,
-        // for example a Nix library supplied through NIX_LDFLAGS.
-        // nix-shell also adds search paths for its unrealized output. They remain
-        // keyed flags, but absent paths cannot supply inputs to a sandbox action.
-        roots.extend(
-            environment_store_roots(&environment)?
-                .into_iter()
-                .filter(|path| path.exists()),
-        );
-        let inputs = inputs::resolve(store, &roots)?;
-        let path = std::env::join_paths([
-            rust.directory.join("bin"),
-            compiler
-                .parent()
-                .context("Clang has no parent directory")?
-                .to_path_buf(),
-            shell
-                .parent()
-                .context("shell has no parent directory")?
-                .to_path_buf(),
-        ])?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("toolchain PATH is not UTF-8"))?;
-        let mut environment = environment;
-        environment.push(("PATH".into(), path));
-        environment.push(("CC".into(), compiler.display().to_string()));
-        // Nix's wrappers only consume unsuffixed user flags when assigned the
-        // host role. Do not inherit another shell compiler's initialized flags.
-        if compiler.starts_with("/nix/store")
-            || environment.iter().any(|(name, _)| name.starts_with("NIX_"))
-        {
-            for wrapper in ["CC", "BINTOOLS"] {
-                environment.push((
-                    format!(
-                        "NIX_{wrapper}_WRAPPER_TARGET_HOST_{}",
-                        host.replace('-', "_")
-                    ),
-                    "1".into(),
-                ));
-            }
-        }
-        environment.sort();
-        let identity = sha256_hex(&serde_json::to_vec(&(
-            "native-toolchain/2",
-            &rust.directory,
-            &rust.sysroot,
-            &compiler,
-            &inputs.identity,
-            &environment,
-        ))?);
-        Ok(Self {
-            compiler,
-            compiler_version,
-            environment,
-            identity,
-            runtime_paths: inputs.paths,
-        })
+    }
+    environment.sort();
+    let identity = sha256_hex(&serde_json::to_vec(&(
+        "native-toolchain/2",
+        &rust.directory,
+        &rust.sysroot,
+        &compiler,
+        &inputs.identity,
+        &environment,
+    ))?);
+    Ok(clang_toolchain(
+        host.trim(),
+        compiler,
+        &compiler_version,
+        environment,
+        identity,
+        inputs.paths,
+    ))
+}
+
+/// One Clang for every unit, known before the build. Its environment reaches
+/// every action and probe, and is keyed like `[env]`: a wrapped rustc may read
+/// it (NIX_RUSTFLAGS).
+fn clang_toolchain(
+    host: &str,
+    compiler: PathBuf,
+    version: &str,
+    environment: Vec<(String, String)>,
+    identity: String,
+    read_paths: Vec<PathBuf>,
+) -> Toolchain {
+    Toolchain {
+        base_environment: environment.clone(),
+        configured_environment: environment,
+        read_paths,
+        extra_build_script_environment: Vec::new(),
+        identity: Identity {
+            cc: version.trim().to_string(),
+            ld: format!("{} (native Clang link driver)", compiler.display()),
+            sdk: format!("supplied toolchain inputs {identity}"),
+            ..Identity::default()
+        },
+        rustc_identity: Some(identity),
+        uses_zig: false,
+        platforms: vec![PlatformToolchain {
+            platform: host.to_string(),
+            linker: Some(compiler),
+            environment: Vec::new(),
+            tools: None,
+            cmake_toolchain: None,
+            remaps_debug_paths: false,
+        }],
     }
 }
 
@@ -494,6 +522,41 @@ mod tests {
                 .to_string(),
             "runtime path-list entries must be nonempty absolute paths: relative"
         );
+    }
+
+    #[test]
+    fn supplied_clang_compiles_every_unit_with_its_keyed_environment() {
+        let host = "x86_64-unknown-linux-gnu";
+        let toolchain = clang_toolchain(
+            host,
+            "/nix/store/clang/bin/clang".into(),
+            "clang version 21
+",
+            vec![("CC".into(), "/nix/store/clang/bin/clang".into())],
+            "closure-hash".into(),
+            vec!["/nix/store/clang".into()],
+        );
+        let native = toolchain.platform(host).unwrap();
+        assert_eq!(
+            native.linker.as_deref(),
+            Some(Path::new("/nix/store/clang/bin/clang"))
+        );
+        assert!(!native.remaps_debug_paths);
+        // Its environment reaches every action, not only build scripts.
+        assert!(toolchain.build_script_environment(host, host).is_empty());
+        assert_eq!(toolchain.base_environment, toolchain.configured_environment);
+        assert_eq!(toolchain.rustc_identity.as_deref(), Some("closure-hash"));
+        let (identity, report) = toolchain.key();
+        assert_eq!(
+            identity,
+            "cc: clang version 21
+ld: /nix/store/clang/bin/clang (native Clang link driver)
+sdk: supplied toolchain inputs closure-hash
+zig: 
+macos: 
+libclang: "
+        );
+        assert_eq!(report.sdk, "supplied toolchain inputs closure-hash");
     }
 
     #[test]
