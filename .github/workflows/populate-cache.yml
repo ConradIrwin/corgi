@@ -50,6 +50,32 @@ jobs:
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
           "$corgi" cache build --no-incremental
 
+      - name: Verify cold public cache reuse
+        run: |
+          set -euo pipefail
+          corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
+          "$corgi" clean --cache
+          "$corgi" fetch
+          "$corgi" build
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          reports = list(Path(os.environ["CORGI_STORE"], "reports").glob("*.json"))
+          assert len(reports) == 1, reports
+          report = json.loads(reports[0].read_text())
+          root = next(unit for unit in report["units"] if unit["action"]["is_root"])
+          assert root["cache"]["probe"] == "remote", root["cache"]
+          print("Verified final executable reused through the public endpoint")
+          PY
+
+      - name: Retain cold cache verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corgi-cold-cache-report
+          path: ${{ env.CORGI_STORE }}/reports/*.json
+          if-no-files-found: ignore
+
       - name: Populate successful test results
         env:
           CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache

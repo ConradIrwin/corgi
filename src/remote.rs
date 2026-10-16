@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const NAMESPACE: &str = "corgi/v1";
+pub const NAMESPACE: &str = "corgi/v2";
 pub const GET_CONCURRENCY: usize = 4;
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
 const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
@@ -76,7 +76,7 @@ impl Cache {
             MAX_RECORD,
             cancel,
             self.read_timeout,
-            false,
+            &[],
         )?;
         if status == 404 {
             return Ok(None);
@@ -106,7 +106,7 @@ impl Cache {
             MAX_BLOB,
             cancel,
             self.read_timeout,
-            false,
+            &[],
         )?;
         ensure!(status == 200, "remote blob {hash} returned HTTP {status}");
         check_cancelled(cancel)?;
@@ -168,7 +168,7 @@ impl Cache {
                 MAX_RECORD,
                 &cancel,
                 self.read_timeout,
-                false,
+                &[],
             )?;
             ensure!(
                 status == 200 || status == 404,
@@ -195,7 +195,7 @@ impl Cache {
                 MAX_RECORD,
                 &cancel,
                 Duration::from_secs(30),
-                true,
+                &[("If-None-Match", "*")],
             )?;
             if status == 412 {
                 continue;
@@ -230,7 +230,7 @@ impl Cache {
                 MAX_BLOB,
                 cancel,
                 self.read_timeout,
-                false,
+                &[],
             )?;
             match status {
                 200 => {}
@@ -266,16 +266,28 @@ impl Cache {
         credentials: &Credentials,
         cancel: &AtomicBool,
     ) -> Result<()> {
+        let compressed = Temporary::new(&std::env::temp_dir())?;
+        let status = std::process::Command::new("gzip")
+            .args(["-n", "-c", "--"])
+            .arg(input)
+            .stdout(fs::File::create(&compressed.0)?)
+            .stderr(Stdio::null())
+            .status()
+            .context("compressing remote blob with gzip")?;
+        ensure!(status.success(), "gzip compression failed ({status})");
         let status = self.request(
             "PUT",
             url,
             output,
-            Some(input),
+            Some(&compressed.0),
             Some(credentials),
             MAX_RECORD,
             cancel,
             Duration::from_secs(30),
-            false,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Encoding", "gzip"),
+            ],
         )?;
         ensure!(
             (200..300).contains(&status),
@@ -302,7 +314,7 @@ impl Cache {
         limit: u64,
         cancel: &AtomicBool,
         timeout: Duration,
-        create_only: bool,
+        headers: &[(&str, &str)],
     ) -> Result<u16> {
         check_cancelled(cancel)?;
         // -q must be first: never inherit ~/.curlrc credentials or redirects.
@@ -326,8 +338,11 @@ impl Cache {
             ])
             .arg(output)
             .args(["--write-out", "%{http_code}", "--url", url]);
-        if create_only {
-            command.args(["--header", "If-None-Match: *"]);
+        for (name, value) in headers {
+            command.args(["--header", &format!("{name}: {value}")]);
+        }
+        if method == "GET" {
+            command.arg("--compressed");
         }
         if method == "HEAD" {
             command.arg("--head");
@@ -380,6 +395,12 @@ impl Cache {
             response.status.success(),
             "R2 curl transport failed ({})",
             response.status
+        );
+        // Content-Length describes compressed bytes; bound the decoded file too,
+        // including writes between the last polling check and curl's exit.
+        ensure!(
+            fs::metadata(output)?.len() <= limit,
+            "remote request exceeded response size limits"
         );
         Ok(std::str::from_utf8(&response.stdout)?.parse()?)
     }

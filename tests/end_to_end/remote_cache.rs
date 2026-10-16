@@ -58,7 +58,7 @@ fn remote_build_cache_lifecycle() {
         .unwrap()["hash"]
         .as_str()
         .unwrap();
-    let blob_path = format!("corgi/v1/blobs/{binary_hash}");
+    let blob_path = format!("corgi/v2/blobs/{binary_hash}");
     let original = fixture
         .remote
         .objects
@@ -67,6 +67,7 @@ fn remote_build_cache_lifecycle() {
         .bytes
         .remove(&blob_path)
         .unwrap();
+    assert!(original.starts_with(&[0x1f, 0x8b]), "blob must be gzipped");
     fixture.run(&["cache", "build"]);
     {
         let objects = fixture.remote.objects.lock().unwrap();
@@ -88,13 +89,21 @@ fn remote_build_cache_lifecycle() {
 
     fixture.release_compiler();
     fixture.remote.objects.lock().unwrap().compiler_gate = None;
+    let corrupt = fixture.store.join("corrupt");
+    fs::write(&corrupt, b"corrupt").unwrap();
+    let compressed = Command::new("gzip")
+        .args(["-n", "-c"])
+        .arg(&corrupt)
+        .output()
+        .unwrap();
+    assert_success(&compressed, "gzip corrupt content");
     fixture
         .remote
         .objects
         .lock()
         .unwrap()
         .bytes
-        .insert(blob_path.clone(), b"corrupt".to_vec());
+        .insert(blob_path.clone(), compressed.stdout);
     fixture.clear_results();
     fixture.run(&["build"]);
     let report = fixture.report();
@@ -504,7 +513,7 @@ impl HttpCache {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|hash| format!("corgi/v1/blobs/{}", hash.as_str().unwrap())),
+                .map(|hash| format!("corgi/v2/blobs/{}", hash.as_str().unwrap())),
         );
         self.objects
             .lock()
@@ -545,6 +554,7 @@ fn serve(
     let mut length = 0;
     let mut authenticated = false;
     let mut create_only = false;
+    let mut encoding = String::new();
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -556,6 +566,7 @@ fn serve(
         if let Some((name, value)) = line.split_once(':') {
             match name.to_ascii_lowercase().as_str() {
                 "content-length" => length = value.trim().parse().unwrap(),
+                "content-encoding" => encoding = value.trim().to_owned(),
                 "authorization" => authenticated = true,
                 "if-none-match" => create_only = value.trim() == "*",
                 "expect" => stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?,
@@ -589,6 +600,7 @@ fn serve(
             thread::sleep(Duration::from_millis(5));
         }
     }
+    let blob = path.contains("/blobs/");
     let (status, response) = {
         let mut state = objects.lock().unwrap();
         match method.as_str() {
@@ -598,13 +610,19 @@ fn serve(
                 .map(|bytes| (200, bytes.clone()))
                 .unwrap_or((404, Vec::new())),
             "PUT" => {
+                if blob {
+                    assert_eq!(encoding, "gzip");
+                    assert!(body.starts_with(&[0x1f, 0x8b]));
+                } else {
+                    assert!(encoding.is_empty());
+                }
                 if path.contains("/actions/") {
                     assert!(create_only);
                     let record: Value = serde_json::from_slice(&body).unwrap();
                     for hash in record["blobs"].as_array().unwrap() {
                         assert!(
                             state.bytes.contains_key(&format!(
-                                "corgi/v1/blobs/{}",
+                                "corgi/v2/blobs/{}",
                                 hash.as_str().unwrap()
                             )),
                             "blobs must be published before records"
@@ -623,8 +641,13 @@ fn serve(
     };
     write!(
         stream,
-        "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.len()
+        "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        response.len(),
+        if blob && status == 200 {
+            "Content-Encoding: gzip\r\n"
+        } else {
+            ""
+        }
     )?;
     if method != "HEAD" {
         stream.write_all(&response)?;
