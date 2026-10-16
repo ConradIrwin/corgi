@@ -37,6 +37,8 @@ pub(crate) enum Kind {
 
 pub(crate) struct Stat {
     pub kind: Kind,
+    /// Unix permission bits; always 0 on Windows.
+    pub mode: u32,
     pub key: StatKey,
 }
 
@@ -49,6 +51,11 @@ pub(crate) struct Entry {
 /// Like `fs::metadata`: follows symlinks.
 pub(crate) fn metadata(path: &Path) -> io::Result<Stat> {
     from_metadata(path, &fs::metadata(path)?)
+}
+
+/// Like `fs::symlink_metadata`: describes a symlink itself.
+pub(crate) fn symlink_metadata(path: &Path) -> io::Result<Stat> {
+    from_metadata(path, &fs::symlink_metadata(path)?)
 }
 
 /// The entries of `dir`, sorted by name. Windows reads every entry's metadata
@@ -76,6 +83,7 @@ fn from_metadata(path: &Path, md: &fs::Metadata) -> io::Result<Stat> {
     };
     Ok(Stat {
         kind,
+        mode: sys::mode(md),
         key: StatKey {
             size: md.len(),
             modified_ns,
@@ -99,6 +107,7 @@ mod tests {
         for entry in &entries {
             let direct = metadata(&root.join(&entry.name)).unwrap();
             assert_eq!(entry.stat.kind, direct.kind);
+            assert_eq!(entry.stat.mode, direct.mode);
             assert_eq!(entry.stat.key, direct.key);
         }
         fs::remove_dir_all(root).unwrap();
