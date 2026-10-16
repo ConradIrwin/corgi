@@ -12,7 +12,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,8 +24,37 @@ static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! status {
     ($label:expr, $($arg:tt)*) => {
-        eprintln!("{:>12} {}", $label, format_args!($($arg)*))
+        if stderr_color() {
+            eprintln!("\x1b[1;32m{:>12}\x1b[0m {}", $label, format_args!($($arg)*))
+        } else {
+            eprintln!("{:>12} {}", $label, format_args!($($arg)*))
+        }
     };
+}
+
+fn stderr_color() -> bool {
+    color_enabled(
+        std::env::var("CARGO_TERM_COLOR").ok().as_deref(),
+        io::stderr().is_terminal(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn color_enabled(preference: Option<&str>, terminal: bool, term: Option<&str>) -> bool {
+    match preference {
+        Some("always") => true,
+        Some("never") => false,
+        _ => terminal && term != Some("dumb"),
+    }
+}
+
+#[test]
+fn terminal_color_policy() {
+    assert!(color_enabled(None, true, Some("xterm-256color")));
+    assert!(!color_enabled(None, false, Some("xterm-256color")));
+    assert!(!color_enabled(Some("auto"), true, Some("dumb")));
+    assert!(color_enabled(Some("always"), false, Some("dumb")));
+    assert!(!color_enabled(Some("never"), true, Some("xterm-256color")));
 }
 
 // Profiles come per unit from cargo's unit graph — inheritance,
@@ -9364,6 +9393,17 @@ fn compile(
         cmd.arg("--json=artifacts");
     } else {
         cmd.arg("--emit=link,dep-info");
+    }
+    if self_checked || self_pipelined {
+        if stderr_color() {
+            cmd.arg("--json=diagnostic-rendered-ansi");
+        }
+    } else {
+        cmd.arg(if stderr_color() {
+            "--color=always"
+        } else {
+            "--color=never"
+        });
     }
     if matches!(unit.kind, Kind::Test) && unit.test_harness {
         cmd.arg("--test");
