@@ -8547,7 +8547,19 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
     let finish_download = |index: usize, mut download: RemoteDownload, result: Result<bool>| {
         download.end_ns = ctx.report.elapsed_ns();
         download.outcome = match result {
-            Ok(true) => RemoteDownloadOutcome::Used,
+            Ok(true) => {
+                status!(
+                    "Downloaded",
+                    "{}{}",
+                    describe(ctx, index),
+                    if download.superseded_local_ns.is_some() {
+                        " — replaced local compilation"
+                    } else {
+                        ""
+                    }
+                );
+                RemoteDownloadOutcome::Used
+            }
             Ok(false) => {
                 download.detail = Some("record not found (HTTP 404)".into());
                 RemoteDownloadOutcome::Miss
@@ -8715,11 +8727,6 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<(usize, usize
                     }
                     match remote_cache::install(ctx, idx, record) {
                         Ok(result) => {
-                            status!(
-                                "Downloaded",
-                                "{} — replaced local compilation",
-                                describe(ctx, idx)
-                            );
                             complete(idx, Ok(result), true);
                             finish_download(idx, download, Ok(true));
                         }

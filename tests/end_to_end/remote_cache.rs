@@ -26,7 +26,9 @@ fn remote_build_cache_lifecycle() {
     fixture.remote.objects.lock().unwrap().compiler_gate =
         Some((record_path.clone(), fixture.store.clone()));
 
-    fixture.run(&["build"]);
+    let output = fixture.run(&["build"]);
+    assert!(output.contains("Downloaded"), "{output}");
+    assert!(output.contains("— replaced local compilation"), "{output}");
     let report = fixture.report();
     let root = report_unit(&report, &fixture.directory.package_name, "compile");
     let download = report["remote_downloads"]
@@ -177,7 +179,10 @@ fn uncached() {
     fs::remove_file(fixture.release_path()).unwrap();
     symlink(&result_path, fixture.release_path()).unwrap();
 
-    fixture.run(&["test", "--test", "cached"]);
+    let output = fixture.run(&["test", "--test", "cached"]);
+    assert!(output.contains("Downloaded"), "{output}");
+    assert!(output.contains("(run tests \"cached\")"), "{output}");
+    assert!(!output.contains("— replaced local compilation"), "{output}");
     assert!(!fixture.workspace.join("cached-ran").exists());
     assert!(!fixture.workspace.join("target/debug/app").exists());
     let report = fixture.report();
@@ -381,11 +386,10 @@ os.execvp(tool, [tool, *sys.argv[1:]])
         command
     }
 
-    fn run(&self, arguments: &[&str]) {
-        assert_success(
-            &self.command(arguments).output().unwrap(),
-            &format!("corgi {}", arguments.join(" ")),
-        );
+    fn run(&self, arguments: &[&str]) -> String {
+        let output = self.command(arguments).output().unwrap();
+        assert_success(&output, &format!("corgi {}", arguments.join(" ")));
+        String::from_utf8(output.stderr).unwrap()
     }
 
     fn clear_results(&self) {
