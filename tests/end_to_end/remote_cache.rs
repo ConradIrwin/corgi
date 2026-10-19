@@ -14,7 +14,9 @@ use std::{
 #[test]
 fn remote_build_cache_lifecycle() {
     let fixture = Fixture::new("remote-build");
-    fixture.run(&["cache", "build"]);
+    fixture.remote.objects.lock().unwrap().transient_failures = 1;
+    let output = fixture.run(&["cache", "build"]);
+    assert!(output.contains("retrying cache publication"), "{output}");
     let (record_path, record) = fixture
         .remote
         .record(|record| record["spec"]["target"]["name"] == "app");
@@ -615,6 +617,7 @@ struct Objects {
     bytes: BTreeMap<String, Vec<u8>>,
     requests: Vec<(String, String)>,
     compiler_gate: Option<(String, PathBuf)>,
+    transient_failures: usize,
 }
 
 struct HttpCache {
@@ -792,6 +795,10 @@ fn serve(
     let (status, response) = {
         let mut state = objects.lock().unwrap();
         match method.as_str() {
+            _ if !public && !private && state.transient_failures > 0 => {
+                state.transient_failures -= 1;
+                (503, Vec::new())
+            }
             "GET" | "HEAD" => state
                 .bytes
                 .get(&path)

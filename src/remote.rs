@@ -48,6 +48,17 @@ impl std::fmt::Display for ReadCancelled {
 
 impl std::error::Error for ReadCancelled {}
 
+#[derive(Debug)]
+struct TransientRequestFailure;
+
+impl std::fmt::Display for TransientRequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("temporary R2 request failure")
+    }
+}
+
+impl std::error::Error for TransientRequestFailure {}
+
 fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(ReadCancelled.into());
@@ -159,7 +170,16 @@ impl Cache {
         );
         record_hashes(record)?;
         let config = WriteConfig::from_env()?;
-        self.publish_with_config(key, record, blobs, &config)
+        for attempt in 0..3 {
+            match self.publish_with_config(key, record, blobs, &config) {
+                Err(error) if attempt < 2 && error.is::<TransientRequestFailure>() => {
+                    eprintln!("corgi warning: retrying cache publication: {error:#}");
+                    thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
     }
 
     fn publish_with_config(
@@ -391,10 +411,11 @@ impl Cache {
             drop(child.stdin.take());
             loop {
                 check_cancelled(cancel)?;
-                ensure!(
-                    start.elapsed() <= timeout,
-                    "remote request deadline exceeded"
-                );
+                if start.elapsed() > timeout {
+                    return Err(anyhow::Error::new(TransientRequestFailure)).with_context(|| {
+                        format!("{method} {url}: remote request deadline exceeded")
+                    });
+                }
                 if fs::metadata(output).is_ok_and(|m| m.len() > limit) {
                     bail!("remote request exceeded response size limits");
                 }
@@ -411,9 +432,20 @@ impl Cache {
             return result.map(|_| 0);
         }
         let response = child.wait_with_output()?;
+        if matches!(
+            response.status.code(),
+            Some(5 | 6 | 7 | 18 | 28 | 52 | 55 | 56 | 92)
+        ) {
+            return Err(anyhow::Error::new(TransientRequestFailure)).with_context(|| {
+                format!(
+                    "{method} {url}: R2 curl transport failed ({})",
+                    response.status
+                )
+            });
+        }
         ensure!(
             response.status.success(),
-            "R2 curl transport failed ({})",
+            "{method} {url}: R2 curl transport failed ({})",
             response.status
         );
         // Content-Length describes compressed bytes; bound the decoded file too,
@@ -422,7 +454,12 @@ impl Cache {
             fs::metadata(output)?.len() <= limit,
             "remote request exceeded response size limits"
         );
-        Ok(std::str::from_utf8(&response.stdout)?.parse()?)
+        let status = std::str::from_utf8(&response.stdout)?.parse()?;
+        if status == 429 || (500..600).contains(&status) {
+            return Err(anyhow::Error::new(TransientRequestFailure))
+                .with_context(|| format!("{method} {url}: HTTP {status}"));
+        }
+        Ok(status)
     }
 }
 
