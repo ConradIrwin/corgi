@@ -1186,7 +1186,7 @@ fn cfg_checking_uses_cargo_and_build_script_declarations() {
 }
 
 #[test]
-fn non_incremental_results_satisfy_incremental_actions() {
+fn incremental_mode_separates_action_and_compiler_identities() {
     let directory = TestDirectory::new("incremental-action-identity");
     let workspace = directory.path.join("workspace");
     let store = directory.path.join("store");
@@ -1202,37 +1202,38 @@ fn non_incremental_results_satisfy_incremental_actions() {
     let clean_report = report_for_workspace(&store, &workspace);
 
     let incremental = invoke_corgi_with_store(&workspace, "check", ["--package", "app"], &store);
-    assert_success(&incremental, "cached incremental corgi check");
+    assert_success(&incremental, "incremental corgi check");
     let incremental_report = report_for_workspace(&store, &workspace);
 
     assert_eq!(clean_report["run"]["command"]["incremental"], false);
     assert_eq!(incremental_report["run"]["command"]["incremental"], true);
-    let cache_misses = incremental_report["units"]
-        .as_array()
-        .expect("incremental report units")
-        .iter()
-        .filter(|unit| unit["cache"]["result"] == "miss")
-        .map(|unit| {
-            (
-                unit["package"]["name"].as_str().unwrap_or_default(),
-                unit["action"]["kind"].as_str().unwrap_or_default(),
-                &unit["cache"]["result"],
-            )
-        })
-        .collect::<Vec<_>>();
-    assert!(cache_misses.is_empty(), "{cache_misses:?}");
-
     let incremental_unit = report_unit(&incremental_report, "app", "check");
     let clean_unit = report_unit(&clean_report, "app", "check");
-    assert_eq!(incremental_unit["cache"]["result"], "hit");
-    assert_eq!(incremental_unit["key"]["hash"], clean_unit["key"]["hash"]);
+    assert_eq!(incremental_unit["cache"]["result"], "miss");
+    assert_ne!(incremental_unit["key"]["hash"], clean_unit["key"]["hash"]);
 
     let compiler_identity = incremental_unit["key"]["inputs"]["compiler_identity"]
         .as_str()
         .expect("compiler identity");
     let expected_output = format!("libapp-{compiler_identity}.rmeta");
     assert_eq!(incremental_unit["outputs"][0]["name"], expected_output);
-    assert_eq!(clean_unit["outputs"][0]["name"], expected_output);
+    assert_ne!(clean_unit["outputs"][0]["name"], expected_output);
+
+    let environment_disabled = corgi_command()
+        .current_dir(&workspace)
+        .args(["check", "--package", "app"])
+        .env("CORGI_STORE", &store)
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .unwrap();
+    assert_success(
+        &environment_disabled,
+        "check with incremental disabled by environment",
+    );
+    let environment_report = report_for_workspace(&store, &workspace);
+    let environment_unit = report_unit(&environment_report, "app", "check");
+    assert_eq!(environment_unit["key"]["hash"], clean_unit["key"]["hash"]);
+    assert_eq!(environment_unit["cache"]["result"], "hit");
 
     let source_path = workspace.join("app/src/main.rs");
     let mut source = fs::read_to_string(&source_path).unwrap();
@@ -1245,7 +1246,7 @@ fn non_incremental_results_satisfy_incremental_actions() {
     let edited_unit = report_unit(&edited_report, "app", "check");
     assert_eq!(edited_unit["outcome"]["status"], "success");
     assert_eq!(edited_unit["cache"]["result"], "miss");
-    assert_ne!(edited_unit["key"]["hash"], clean_unit["key"]["hash"]);
+    assert_ne!(edited_unit["key"]["hash"], incremental_unit["key"]["hash"]);
     assert_eq!(edited_unit["outputs"][0]["name"], expected_output);
 }
 

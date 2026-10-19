@@ -54,7 +54,7 @@ jobs:
           : "${CORGI_R2_ACCESS_KEY_ID:?Configure the bucket-scoped R2 access key}"
           : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
-          "$corgi" cache build --no-incremental
+          "$corgi" cache build
 
       - name: Verify cold authenticated cache reuse
         run: |
@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           corgi="$RUNNER_TEMP/corgi-bootstrap/debug/corgi"
-          "$corgi" cache test --no-incremental
+          "$corgi" cache test
 
       - name: Retain build reports
         if: always()

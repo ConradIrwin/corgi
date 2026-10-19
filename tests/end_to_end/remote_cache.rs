@@ -13,6 +13,81 @@ use std::{
 
 #[test]
 fn remote_build_cache_lifecycle() {
+    let mixed = Fixture::new("remote-incremental");
+    let manifest = fs::read_to_string(mixed.workspace.join("Cargo.toml")).unwrap();
+    mixed.write(
+        "Cargo.toml",
+        &format!("{manifest}middle = {{ path = \"middle\" }}\n"),
+    );
+    mixed.write(
+        "middle/Cargo.toml",
+        "[package]\nname = \"middle\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [dependencies]\ndependency = { path = \"../dependency\" }\n",
+    );
+    mixed.write(
+        "middle/src/lib.rs",
+        "pub fn value() -> u32 { dependency::value() }\n",
+    );
+    mixed.write(
+        "dependency/Cargo.toml",
+        "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [dependencies]\ncompiler_gate = { path = \"../compiler-gate\" }\n",
+    );
+    mixed.write(
+        "dependency/src/lib.rs",
+        &format!(
+            "compiler_gate::wait!({:?});\npub fn value() -> u32 {{ 42 }}\n",
+            mixed.release_path()
+        ),
+    );
+    mixed.write(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", middle::value()); }\n",
+    );
+    mixed.run(&["cache", "build", "--no-incremental"]);
+    let (path, non_incremental) = mixed
+        .remote
+        .record(|record| record["spec"]["target"]["name"] == "middle");
+    mixed.remote.retain_record(&path, &non_incremental);
+    mixed.clear_results();
+    mixed.run(&["build"]);
+    assert_unit_cache(&mixed.report(), "middle", "compile", "middle", "miss");
+    mixed.assert_binary_output("42\n");
+    mixed.run(&["cache", "build"]);
+    let (path, incremental) = mixed.remote.record(|record| {
+        record["spec"]["target"]["name"] == "middle" && record["spec"]["incremental"] == true
+    });
+    assert_ne!(incremental["remote_key"], non_incremental["remote_key"]);
+    assert_ne!(incremental["action_key"], non_incremental["action_key"]);
+    mixed.remote.retain_record(&path, &incremental);
+    mixed.clear_results();
+    let key = incremental["action_key"].as_str().unwrap();
+    fs::remove_file(mixed.release_path()).unwrap();
+    symlink(
+        mixed
+            .store
+            .join("cache")
+            .join(&key[..2])
+            .join(format!("{key}.json")),
+        mixed.release_path(),
+    )
+    .unwrap();
+    mixed.run(&["build"]);
+    let report = mixed.report();
+    assert_eq!(
+        report_unit(&report, "middle", "compile")["cache"]["probe"],
+        "remote"
+    );
+    assert_unit_cache(&report, "dependency", "compile", "dependency", "miss");
+    assert_unit_cache(
+        &report,
+        &mixed.directory.package_name,
+        "compile",
+        "app",
+        "miss",
+    );
+    mixed.assert_binary_output("42\n");
+
     let fixture = Fixture::new("remote-build");
     fixture.remote.objects.lock().unwrap().transient_failures = 1;
     let output = fixture.run(&["cache", "build"]);

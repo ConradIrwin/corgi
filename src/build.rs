@@ -42,7 +42,7 @@ mod remote_cache;
 // - darwin linking units always get split-debuginfo=unpacked, whatever
 //   the profile says: their DWARF stays in cached object files exported
 //   alongside the binary under the relative paths its debug map names;
-// - incremental and rpath are ignored.
+// - rpath is ignored.
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -509,9 +509,8 @@ pub struct Ctx {
     zig: Option<ZigRuntime>,
     /// Emit a per-unit timing report (target/corgi-timings/).
     timings: bool,
-    /// Dev-loop namespace: local units compile with -Cincremental into
-    /// store-managed state. Off under --no-incremental (audit, CI).
-    incremental: bool,
+    /// Effective per-unit incremental mode, shared by identity planning and execution.
+    incremental: Vec<bool>,
     /// GNU-make jobserver: caps machine-wide compiler parallelism at
     /// ~NCPU. rustc gates its LLVM codegen threads on it natively, and
     /// build scripts inherit it (cc/cmake/make all cooperate) — without
@@ -1377,6 +1376,7 @@ struct CompileActionSpec {
     // Resolved compiler flags, not the name: dev/test and inherited profiles
     // can compile the same unit identically.
     profile: Vec<String>,
+    incremental: bool,
     compiler_identity: String,
     environment: Vec<(String, String)>,
     rustflags: Vec<String>,
@@ -1859,6 +1859,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 features,
                 dependencies,
                 profile: ctx.profile_flags[index].clone(),
+                incremental: ctx.incremental[index],
                 compiler_identity: ctx.idents[index].clone(),
                 environment,
                 rustflags,
@@ -4964,9 +4965,14 @@ fn build_inner(
         Mode::Bench => "cargo-bench",
         _ => "build",
     };
+    let profile_environment = std::env::vars_os()
+        .filter(|(key, _)| {
+            key == "CARGO_INCREMENTAL" || key.to_string_lossy().starts_with("CARGO_PROFILE_")
+        })
+        .collect::<BTreeMap<_, _>>();
     let plan_ptr = sha256_hex(
         format!(
-            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{rustc_version}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}",
+            "plan-ptr\0{TOOL_VERSION}\0{plan_kind}\0{target_set}\0{channel}\0{rustc_version}\0{host_guess}\0{}\0{requested_profile}\0{}\0{}\0{}\0{profile_environment:?}",
             target.as_deref().unwrap_or(""),
             sha256_hex(&fs::read(&manifest)?),
             roots_id,
@@ -5342,6 +5348,14 @@ fn build_inner(
         .enumerate()
         .map(|(i, unit)| effective_profile_flags(unit, check_mode[i]))
         .collect::<Vec<_>>();
+    let incremental = units
+        .iter()
+        .map(|unit| {
+            !no_incremental
+                && unit.profile.incremental
+                && !matches!(unit.kind, Kind::Bsr | Kind::TestRun)
+        })
+        .collect::<Vec<_>>();
     // Source-free unit identities (memoized DFS over dep edges).
     // Use the same resolved profile flags as the action key and rustc, so
     // settings overridden for metadata-only compiles or tests do not split
@@ -5353,6 +5367,7 @@ fn build_inner(
             units: &[Unit],
             logical_pkg_ids: &[String],
             profile_flags: &[Vec<String>],
+            incremental: &[bool],
             memo: &mut Vec<Option<String>>,
         ) -> String {
             if let Some(v) = &memo[i] {
@@ -5362,13 +5377,22 @@ fn build_inner(
             let mut dep_ids: Vec<String> = u
                 .deps
                 .iter()
-                .map(|d| ident_of(d.unit, units, logical_pkg_ids, profile_flags, memo))
+                .map(|d| {
+                    ident_of(
+                        d.unit,
+                        units,
+                        logical_pkg_ids,
+                        profile_flags,
+                        incremental,
+                        memo,
+                    )
+                })
                 .collect();
             dep_ids.sort();
             let mut features = u.features.clone();
             features.sort();
             let mut ident_input = format!(
-                "ident\0{}\0{}\0{}\0{:?}\0{}\0{:?}\0{:?}\0{:?}",
+                "ident\0{}\0{}\0{}\0{:?}\0{}\0{:?}\0{:?}\0{:?}\0{}",
                 TOOL_VERSION,
                 logical_pkg_ids[u.pkg],
                 u.target.name,
@@ -5376,7 +5400,8 @@ fn build_inner(
                 u.host,
                 profile_flags[i],
                 features,
-                dep_ids
+                dep_ids,
+                incremental[i]
             );
             if matches!(u.kind, Kind::Test) && !u.test_harness {
                 ident_input.push_str("\0harness=false");
@@ -5386,7 +5411,16 @@ fn build_inner(
             ident
         }
         (0..units.len())
-            .map(|i| ident_of(i, &units, &logical_pkg_ids, &profile_flags, &mut memo))
+            .map(|i| {
+                ident_of(
+                    i,
+                    &units,
+                    &logical_pkg_ids,
+                    &profile_flags,
+                    &incremental,
+                    &mut memo,
+                )
+            })
             .collect()
     };
     // One-shot warnings for profile settings we deliberately don't honor.
@@ -5657,7 +5691,7 @@ fn build_inner(
         build_std,
         zig: zig_runtime,
         timings,
-        incremental: !no_incremental,
+        incremental,
         jobserver: jobserver::Client::new(
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -8038,7 +8072,7 @@ fn register_report_units(ctx: &Ctx) {
                 "panic": profile.panic,
                 "lto": profile.lto,
                 "split_debuginfo": profile.split_debuginfo,
-                "incremental": profile.incremental,
+                "incremental": ctx.incremental[id],
                 "strip": profile.strip,
                 "rpath": profile.rpath,
             }),
@@ -9869,10 +9903,9 @@ fn compile(
     } else {
         ctx.target.as_deref().unwrap_or(ctx.host.as_str())
     };
-    // Cargo's resolved profile says which units it would compile
-    // incrementally (local packages under dev); --no-incremental changes
-    // execution without changing the artifact's action identity.
-    let incr_action = ctx.incremental && unit.profile.incremental;
+    // rustc includes additional source-span data in incremental crate hashes.
+    // Execute the same mode that was used to key this action and its consumers.
+    let incr_action = spec.incremental;
     let debug_directory = spec
         .debug_binary
         .as_deref()
