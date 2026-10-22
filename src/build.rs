@@ -644,8 +644,9 @@ impl ResolvedToolchain {
                 let libclang_identity = managed
                     .libclang_path
                     .as_ref()
-                    .map(|path| crate::store::sha256_file(&Path::new(path).join("libclang.dylib")))
-                    .transpose()?
+                    // The provisioned artifact is selected by the pinned Zig
+                    // version; release builds verify its archive on download.
+                    .map(|_| format!("llvm-tools-{}", crate::zig::VERSION))
                     .unwrap_or_default();
                 (
                     darwin_toolchain_identity(channel),
@@ -2964,6 +2965,9 @@ fn ensure_macos(
         .collect::<Vec<_>>()
         .join(" ");
     let contents = serde_json::to_vec(&config)?;
+    // The linker is in the pinned Rust distribution named by config.linker.
+    // Its path is already in contents; hashing its bytes on every build adds
+    // no useful identity.
     let identity = wrapper_identity(
         TOOL_VERSION,
         (
@@ -2972,7 +2976,6 @@ fn ensure_macos(
             asset.sha256,
             crate::macos::SDK_SHA256,
             crate::METAL_XCODE_BUILD,
-            crate::store::sha256_file(&config.linker)?,
         ),
     )?;
     let name = format!("macos-wrappers-{}", &identity[..16]);
@@ -3357,6 +3360,12 @@ fn is_concrete_channel(c: &str) -> bool {
         })
         .unwrap_or(false);
     semver || dated
+}
+
+fn managed_rustc_version(channel: &str, host: &str) -> String {
+    // A managed installation is keyed by its download pin. Keep the release
+    // and host lines for consumers of the version identity.
+    format!("managed rustc {channel}\nrelease: {channel}\nhost: {host}\n")
 }
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
@@ -4832,17 +4841,36 @@ fn build_inner(
         .display()
         .to_string();
     let cargo_bin = rust_toolchain.join("bin").join(executable_name("cargo"));
-    let rustc_version = if let Some(rust) = &supplied_rust {
-        rust.version.clone()
+    let (rustc_version, host) = if let Some(rust) = &supplied_rust {
+        let host = rust
+            .version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("supplied rustc -vV: no host line")?
+            .trim()
+            .to_string();
+        (rust.version.clone(), host)
+    } else if zig_target.is_some()
+        && (channel.starts_with("nightly-") || channel.starts_with("beta-"))
+    {
+        // A dated channel does not tell us the semver release required by
+        // cargo-zigbuild. Only this combination needs the actual release line.
+        let version = capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc -vV: no host line")?
+            .trim()
+            .to_string();
+        (version, host)
     } else {
-        capture(Command::new(&rustc).arg("-vV"), "rustc -vV")?
+        // Managed Rust is installed from the verified channel/host download;
+        // these pins identify it without spawning rustc on every build.
+        (
+            managed_rustc_version(&channel, &host_guess),
+            host_guess.clone(),
+        )
     };
-    let host = rustc_version
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .context("rustc -vV: no host line")?
-        .trim()
-        .to_string();
     recorder.update(|report| {
         report.run.tool.rustc_version = rustc_version.clone();
         report.run.tool.host = host.clone();
@@ -9738,7 +9766,9 @@ mod tool_scope_tests {
 
 #[cfg(test)]
 mod toolchain_pin_tests {
-    use super::{read_toolchain_pin_with, toolchain_channel_from_rustc_version};
+    use super::{
+        managed_rustc_version, read_toolchain_pin_with, toolchain_channel_from_rustc_version,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9781,6 +9811,23 @@ mod toolchain_pin_tests {
             )
             .unwrap(),
             "beta-2026-03-20"
+        );
+    }
+
+    #[test]
+    fn managed_version_identity_comes_from_the_download_pin() {
+        let identity = managed_rustc_version("1.97.1", "aarch64-apple-darwin");
+        assert_eq!(
+            identity,
+            "managed rustc 1.97.1\nrelease: 1.97.1\nhost: aarch64-apple-darwin\n"
+        );
+        assert_ne!(
+            identity,
+            managed_rustc_version("1.97.2", "aarch64-apple-darwin")
+        );
+        assert_ne!(
+            identity,
+            managed_rustc_version("1.97.1", "x86_64-apple-darwin")
         );
     }
 
@@ -11220,6 +11267,16 @@ mod build_platform_tests {
             )
         );
         assert_eq!(report.ld, "Rust 1.97.1 Mach-O LLD");
+    }
+
+    #[test]
+    fn managed_darwin_identity_uses_the_llvm_tools_pin_without_reading_libclang() {
+        let toolchain = ResolvedToolchain::ManagedDarwin(ManagedDarwinToolchain {
+            runtimes: vec![darwin_runtime("aarch64-apple-darwin", "/host")],
+            libclang_path: Some("/nonexistent/llvm/lib".into()),
+        });
+        let (identity, _) = toolchain.identity("1.97.1", "").unwrap();
+        assert!(identity.ends_with(&format!("libclang: llvm-tools-{}", crate::zig::VERSION)));
     }
 
     #[test]
