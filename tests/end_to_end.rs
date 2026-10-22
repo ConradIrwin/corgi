@@ -818,6 +818,57 @@ fn workspace_member_uses_its_selected_project_config() {
 }
 
 #[test]
+fn corgi_target_rustflags_override_cargo_config_and_invalidate_cached_builds() {
+    let directory = TestDirectory::new("target-rustflags");
+    let workspace = directory.path.join("workspace");
+    let store = directory.path.join("store");
+    copy_directory(&fixture_path("root-inference"), &workspace);
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    let rustc = Command::new("rustc").arg("-vV").output().unwrap();
+    assert_success(&rustc, "rustc -vV");
+    let rustc = String::from_utf8(rustc.stdout).unwrap();
+    let host = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        format!("[target.{host}]\nrustflags = ['--cfg', 'from_cargo']\n"),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app/src/main.rs"),
+        "fn main() { println!(\"{} {} {}\", shared::message(), cfg!(from_corgi), cfg!(from_cargo)); }\n",
+    )
+    .unwrap();
+
+    for (rustflags, expected) in [
+        (
+            "['--cfg', 'from_corgi']".to_string(),
+            "app root true false\n",
+        ),
+        ("[]".to_string(), "app root false false\n"),
+        (String::new(), "app root false true\n"),
+    ] {
+        let config = if rustflags.is_empty() {
+            "[roots.app]\npackages = ['app']\n".to_string()
+        } else {
+            format!("[roots.app]\npackages = ['app']\n[rustflags]\n{host} = {rustflags}\n")
+        };
+        fs::write(workspace.join("corgi.toml"), config).unwrap();
+        let output =
+            invoke_corgi_with_store(&workspace, "run", ["-p", "app", "--target", host], &store);
+        assert_success(&output, "run app with selected rustflags");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
 fn ordinary_build_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("ordinary-wasm");
     let workspace = directory.path.join("workspace");

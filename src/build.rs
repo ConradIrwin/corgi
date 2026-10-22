@@ -580,7 +580,7 @@ pub struct Ctx {
     /// entry); handed to rustc as a bare `-L`.
     target_std_libdir: Option<String>,
     cfg_env_target: Vec<(String, String)>,
-    /// Resolved .cargo/config.toml rustflags for target-platform units.
+    /// Resolved rustflags for target-platform units.
     target_rustflags: Vec<String>,
     /// Same for host units (empty when an explicit --target is set).
     host_rustflags: Vec<String>,
@@ -2155,11 +2155,8 @@ struct RootDef {
     packages: Vec<String>,
 }
 
-/// Workspace corgi.toml: sha256-pinned tools, plan-time env probes, and
-/// named resolution roots. Every setting names the packages it applies to, and
-/// only those actions key on it — the file itself is never hashed into
-/// keys, so comment or command-text edits rebuild nothing. Parsed with
-/// the `toml` crate (the parser cargo itself builds on).
+/// Workspace corgi.toml: pinned tools, environment, feature roots, and rustflags.
+/// Effective inputs are hashed into the actions they affect, not the whole file.
 #[derive(serde::Deserialize, Default)]
 struct CorgiToml {
     /// Public or credential-file-authenticated reads; publication uses separate credentials.
@@ -2171,6 +2168,9 @@ struct CorgiToml {
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
     roots: std::collections::BTreeMap<String, RootDef>,
+    /// Target-specific flags replace Cargo configuration for matching triples.
+    #[serde(default)]
+    rustflags: std::collections::BTreeMap<String, Vec<String>>,
     /// Files outside a package's root that its actions may read: package name
     /// -> package-root-relative glob patterns, granted and hashed as inputs.
     /// Lives here rather than in package manifests so dependency packages can
@@ -4850,11 +4850,16 @@ fn build_inner(
     if host != host_guess {
         bail!("host triple mismatch: corgi resolved {host_guess}, pinned rustc reports {host}");
     }
+    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
     // Rustflags resolve against the platform a unit compiles for; host
     // units (build scripts, proc-macros) only get them when no explicit
     // --target splits the platforms — cargo's rule, load-bearing for
     // cfg-gated code in build scripts.
-    let target_rustflags = cargo_config.rustflags_for(target.as_deref().unwrap_or(&host_guess))?;
+    let target_triple = target.as_deref().unwrap_or(&host_guess);
+    let target_rustflags = match corgi_toml.rustflags.get(target_triple) {
+        Some(flags) => flags.clone(),
+        None => cargo_config.rustflags_for(target_triple)?,
+    };
     let host_rustflags: Vec<String> = if target.is_some() {
         Vec::new()
     } else {
@@ -4879,7 +4884,6 @@ fn build_inner(
         }
         environment
     };
-    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
     let (llvm_tools, libclang) = match (toolchain_source, host_platform) {
         (ToolchainSource::Managed, HostPlatform::Darwin) => setup_darwin_llvm_tools(&store, &host)?,
         _ => (None, None),
