@@ -2,8 +2,8 @@ name: Publish Corgi
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -17,10 +17,21 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
+
+      - name: Verify release tag
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v${version}"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Ensure Metal release asset
         env:
@@ -46,33 +57,8 @@ jobs:
           RELEASE_REPO: ${{ github.repository }}
         run: ./ci/build-libclang.sh
 
-      - name: Set per-push version
-        id: version
-        env:
-          RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          version="0.1.${RUN_NUMBER}"
-          python3 - "$version" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          manifest = pathlib.Path("Cargo.toml")
-          contents = manifest.read_text()
-          contents, replacements = re.subn(
-              r'(?m)^(version = ")[^"]+(")$',
-              rf'\g<1>{sys.argv[1]}\g<2>',
-              contents,
-              count=1,
-          )
-          if replacements != 1:
-              raise SystemExit("could not update package version in Cargo.toml")
-          manifest.write_text(contents)
-          PY
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Build Corgi and update lockfile
-        run: cargo build
+      - name: Build Corgi
+        run: cargo build --locked
 
       - name: Configure private cache reads
         env:
@@ -80,13 +66,22 @@ jobs:
           CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
         run: python3 ci/configure-cache-credentials.py
 
-      - name: Run tests
-        run: ./target/debug/corgi test
+      - name: Run tests and populate the cache
+        env:
+          CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CORGI_R2_ACCESS_KEY_ID:?Configure the bucket-scoped R2 access key}"
+          : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
+          ./target/debug/corgi cache test
 
       - name: Build release asset
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
           target="aarch64-apple-darwin"
           host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$host" = "$target"
@@ -107,16 +102,28 @@ jobs:
           tar -xzf "dist/${asset}" -C dist/verify
           test "$(dist/verify/corgi --version)" = "corgi ${VERSION}"
 
-      - name: Create draft GitHub release
+      - name: Recreate draft GitHub release from the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if existing="$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [ "$existing" != true ]; then
+              echo "Refusing to replace the published release $tag" >&2
+              exit 1
+            fi
+            # A previous attempt may have left a draft with assets from another
+            # build. Delete the draft, but keep the immutable release tag.
+            gh release delete "$tag" --yes
+          fi
           asset="corgi-aarch64-apple-darwin.tar.gz"
-          gh release create "v${VERSION}" \
+          gh release create "$tag" \
             "dist/${asset}" \
             "dist/${asset}.sha256" \
             --draft \
+            --verify-tag \
             --target "$GITHUB_SHA" \
             --title "Corgi ${VERSION}" \
             --notes "Automated Corgi release ${VERSION}."
@@ -126,7 +133,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish ${{ steps.version.outputs.version }}
-        run: cargo publish --locked --allow-dirty
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 

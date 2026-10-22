@@ -1,0 +1,39 @@
+name: Prepare Corgi toolchain assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: corgi-toolchain-assets
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref_type == 'branch'
+    runs-on: macos-15
+    steps:
+      # Dispatch this workflow on the reviewed branch containing the new pins.
+      - name: Check out proposed toolchain pins
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Ensure Metal release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          DRY_RUN: "0"
+        run: python3 ci/build-metal.py
+
+      - name: Ensure llvm-tools release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: ./ci/build-libclang.sh
