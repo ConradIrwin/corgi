@@ -74,6 +74,12 @@ jobs:
       - name: Build Corgi and update lockfile
         run: cargo build
 
+      - name: Configure private cache reads
+        env:
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: python3 ci/configure-cache-credentials.py
+
       - name: Run tests
         run: ./target/debug/corgi test
 

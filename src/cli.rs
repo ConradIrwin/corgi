@@ -117,6 +117,12 @@ pub fn invocation_directory(argv: &[OsString]) -> Option<PathBuf> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run normally, then publish successful results (including local hits)
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+
     /// Build the selected package
     #[command(visible_alias = "b")]
     Build(WorkspaceBuildArgs),
@@ -153,6 +159,23 @@ pub enum Command {
 
     /// Record this corgi version in corgi.toml
     Pin,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// Build and publish artifacts
+    Build(WorkspaceBuildArgs),
+    /// Build, run tests, and publish artifacts and successful test results
+    Test(TestArgs),
+}
+
+impl From<CacheCommand> for Command {
+    fn from(command: CacheCommand) -> Self {
+        match command {
+            CacheCommand::Build(args) => Self::Build(args),
+            CacheCommand::Test(args) => Self::Test(args),
+        }
+    }
 }
 
 #[derive(Debug, Args, Default)]
