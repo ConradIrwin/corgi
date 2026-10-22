@@ -9,6 +9,96 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEBUG_MARKER: &str = ".corgi-debug.json";
 
+/// Advisory GC metadata carried by mtime, never by the content hash.
+/// Even whole seconds mean workspace retention, odd seconds mean dependency
+/// retention. Pre-existing timestamps intentionally receive an arbitrary class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetentionClass {
+    Workspace,
+    Dependency,
+}
+
+impl RetentionClass {
+    pub(crate) fn from_modified(modified: std::time::SystemTime) -> Option<Self> {
+        let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(if elapsed.as_secs() & 1 == 0 {
+            Self::Workspace
+        } else {
+            Self::Dependency
+        })
+    }
+
+    fn timestamp(self, now: std::time::SystemTime) -> Option<std::time::SystemTime> {
+        let seconds = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let parity = u64::from(self == Self::Dependency);
+        // Subsecond/one-second rounding is immaterial to day-scale retention.
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new((seconds & !1) | parity, 0))
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn retention_timestamp_round_trips_with_small_rounding_error() {
+        for seconds in 100..104 {
+            for nanos in [0, 500_000_000, 999_999_999] {
+                let now = UNIX_EPOCH + Duration::new(seconds, nanos);
+                for class in [RetentionClass::Workspace, RetentionClass::Dependency] {
+                    let encoded = class.timestamp(now).unwrap();
+                    assert_eq!(RetentionClass::from_modified(encoded), Some(class));
+                    let error = encoded
+                        .duration_since(now)
+                        .or_else(|_| now.duration_since(encoded))
+                        .unwrap();
+                    assert!(error < Duration::from_secs(2));
+                }
+            }
+        }
+        assert_eq!(
+            RetentionClass::from_modified(UNIX_EPOCH),
+            Some(RetentionClass::Workspace)
+        );
+    }
+
+    #[test]
+    fn retention_touch_promotes_and_preserves_class() {
+        let path = std::env::temp_dir().join(format!(
+            "corgi-retention-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"immutable content").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        let class =
+            || RetentionClass::from_modified(fs::metadata(&path).unwrap().modified().unwrap());
+        Store::touch_classified(&path, RetentionClass::Workspace);
+        assert_eq!(class(), Some(RetentionClass::Workspace));
+        // A class change must bypass hourly throttling.
+        Store::touch_classified(&path, RetentionClass::Dependency);
+        assert_eq!(class(), Some(RetentionClass::Dependency));
+        let old = RetentionClass::Dependency
+            .timestamp(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        fs::File::open(&path).unwrap().set_modified(old).unwrap();
+        Store::touch_used(&path);
+        assert_eq!(class(), Some(RetentionClass::Dependency));
+        assert!(fs::metadata(&path).unwrap().modified().unwrap() > old);
+        Store::touch_classified(&path, RetentionClass::Workspace);
+        assert_eq!(class(), Some(RetentionClass::Dependency));
+        assert_eq!(fs::read(&path).unwrap(), b"immutable content");
+        fs::remove_file(path).unwrap();
+    }
+}
+
 #[derive(Deserialize, PartialEq, Serialize)]
 struct DebugManifest {
     destination: String,
@@ -286,10 +376,26 @@ impl Store {
     /// use, at most ~hourly. Purely advisory — a missed touch costs at
     /// worst a premature eviction, which self-heals as a cache miss.
     pub fn touch_used(path: &Path) {
+        Self::touch_retention(path, None);
+    }
+
+    pub(crate) fn touch_classified(path: &Path, class: RetentionClass) {
+        Self::touch_retention(path, Some(class));
+    }
+
+    fn touch_retention(path: &Path, requested: Option<RetentionClass>) {
         let Ok(md) = fs::metadata(path) else { return };
+        let existing = md.modified().ok().and_then(RetentionClass::from_modified);
+        // Promotion is sticky. Concurrent touches can still lose a promotion:
+        // this is advisory cache policy, not a synchronized ownership record.
+        let class = match (existing, requested) {
+            (Some(RetentionClass::Dependency), _) => Some(RetentionClass::Dependency),
+            (_, Some(class)) => Some(class),
+            (class, None) => class,
+        };
         if let Ok(modified) = md.modified() {
             if let Ok(age) = modified.elapsed() {
-                if age < std::time::Duration::from_secs(3600) {
+                if age < std::time::Duration::from_secs(3600) && class == existing {
                     return;
                 }
             }
@@ -301,7 +407,9 @@ impl Store {
             .open(path)
             .or_else(|_| fs::File::open(path));
         if let Ok(f) = opened {
-            let _ = f.set_modified(std::time::SystemTime::now());
+            let now = std::time::SystemTime::now();
+            let modified = class.and_then(|class| class.timestamp(now)).unwrap_or(now);
+            let _ = f.set_modified(modified);
         }
     }
 

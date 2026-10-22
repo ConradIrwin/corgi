@@ -3360,8 +3360,75 @@ fn is_concrete_channel(c: &str) -> bool {
 }
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
+const WORKSPACE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const READ_SET_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::store::RetentionClass;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn workspace_retention_is_shorter_and_overrides_are_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "corgi-clean-retention-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::new(root.clone()).unwrap();
+        let workspace = store.cache_path(&"a".repeat(64));
+        let dependency = store.cache_path(&"b".repeat(64));
+        let legacy = store.cache_path(&"c".repeat(64));
+        let fresh = store.cache_path(&"d".repeat(64));
+        for path in [&workspace, &dependency, &legacy, &fresh] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"output").unwrap();
+            fs::File::open(path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH)
+                .unwrap();
+        }
+        for (path, class) in [
+            (&workspace, RetentionClass::Workspace),
+            (&dependency, RetentionClass::Dependency),
+            (&legacy, RetentionClass::Dependency),
+            (&fresh, RetentionClass::Workspace),
+        ] {
+            Store::touch_classified(path, class);
+        }
+        for path in [&workspace, &dependency, &legacy] {
+            let modified = fs::metadata(path).unwrap().modified().unwrap();
+            fs::File::open(path)
+                .unwrap()
+                .set_modified(modified - Duration::from_secs(2 * 86400))
+                .unwrap();
+        }
+        fs::create_dir_all(store.root.join("pool")).unwrap();
+        let alias = store.root.join("pool/libworkspace.rlib");
+        fs::hard_link(&workspace, &alias).unwrap();
+        clean_trim(&store, Some(Duration::from_secs(3 * 86400))).unwrap();
+        assert!(
+            workspace.exists(),
+            "explicit age overrides workspace policy"
+        );
+        clean_trim(&store, None).unwrap();
+        assert!(!workspace.exists());
+        assert!(!alias.exists(), "pool hardlinks follow artifact retention");
+        assert!(dependency.exists());
+        assert!(legacy.exists());
+        assert!(fresh.exists());
+        clean_trim(&store, Some(Duration::from_secs(86400))).unwrap();
+        assert!(!dependency.exists());
+        assert!(!legacy.exists());
+        assert!(fresh.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
 
 /// Expire unused cache data by mtime, retiring paired pool artifacts together.
 ///
@@ -3410,6 +3477,9 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     let cutoff = now
         .checked_sub(older_than.unwrap_or(CACHE_TTL))
         .context("cleanup duration is too large to calculate a cutoff")?;
+    let workspace_cutoff = now
+        .checked_sub(older_than.unwrap_or(WORKSPACE_CACHE_TTL))
+        .context("workspace ttl too large")?;
     let incremental_cutoff = now
         .checked_sub(older_than.unwrap_or(INCREMENTAL_TTL))
         .context("incremental ttl too large")?;
@@ -3423,6 +3493,21 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
         fs::metadata(p)
             .and_then(|m| m.modified())
             .map(|m| m < cutoff)
+            .unwrap_or(false)
+    };
+    let stale_artifact = |p: &Path| -> bool {
+        fs::metadata(p)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| {
+                let cutoff = if crate::store::RetentionClass::from_modified(modified)
+                    == Some(crate::store::RetentionClass::Workspace)
+                {
+                    workspace_cutoff
+                } else {
+                    cutoff
+                };
+                modified < cutoff
+            })
             .unwrap_or(false)
     };
     let stale_incremental = |p: &Path| -> bool {
@@ -3440,7 +3525,7 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
             continue;
         }
         for f in read_dir_paths(&shard)? {
-            if stale(&f) {
+            if stale_artifact(&f) {
                 bytes += fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
                 if fs::remove_file(&f).is_ok() {
                     files += 1;
@@ -3455,7 +3540,7 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     // Remove the paired metadata alias first: leaving it behind can make rustc
     // select a metadata-only candidate instead of another action's complete pair.
     for f in read_dir_paths(&store.root.join("pool"))? {
-        if !stale(&f) {
+        if !stale_artifact(&f) {
             continue;
         }
         if f.extension().is_some_and(|extension| extension == "rlib") {
@@ -6982,7 +7067,11 @@ impl Ctx {
     /// Load and validate an action record without creating any consumer-visible
     /// paths. Demand evaluation can therefore inspect a cached parent without
     /// materializing anything beneath it.
-    fn lookup_action(&self, key: &str) -> Result<std::result::Result<ActionResult, CacheMiss>> {
+    fn lookup_action(
+        &self,
+        index: usize,
+        key: &str,
+    ) -> Result<std::result::Result<ActionResult, CacheMiss>> {
         let Some(bytes) = self.store.load_action(key) else {
             return Ok(Err(CacheMiss::NotFound));
         };
@@ -6994,16 +7083,39 @@ impl Ctx {
             if !p.exists() {
                 return Ok(Err(CacheMiss::BlobMissing));
             }
-            Store::touch_used(&p);
         }
         if let Some(archive) = &res.out_dir {
             let path = self.store.cache_path(&archive.hash);
             if !path.exists() {
                 return Ok(Err(CacheMiss::BlobMissing));
             }
-            Store::touch_used(&path);
         }
+        self.touch_action_retention(index, key, &res);
         Ok(Ok(res))
+    }
+
+    /// Publish and classify together so local and remote producers cannot
+    /// accidentally omit retention metadata. Cache hits only refresh metadata.
+    fn save_action_result(&self, index: usize, key: &str, result: &ActionResult) -> Result<()> {
+        self.store.save_action(key, &serde_json::to_vec(result)?)?;
+        self.touch_action_retention(index, key, result);
+        Ok(())
+    }
+
+    fn touch_action_retention(&self, index: usize, key: &str, result: &ActionResult) {
+        let package = &self.meta.packages[self.units[index].pkg];
+        let class = if self.meta.workspace_members.contains(&package.id) {
+            crate::store::RetentionClass::Workspace
+        } else {
+            crate::store::RetentionClass::Dependency
+        };
+        Store::touch_classified(&self.store.action_path(key), class);
+        for output in &result.outputs {
+            Store::touch_classified(&self.store.cache_path(&output.hash), class);
+        }
+        if let Some(archive) = &result.out_dir {
+            Store::touch_classified(&self.store.cache_path(&archive.hash), class);
+        }
     }
 
     fn immutable_source_hash(&self, pi: usize) -> Result<String> {
@@ -8212,7 +8324,7 @@ fn lookup_cached_unit(
     }
     let unit = &ctx.units[index];
     let compile = !matches!(unit.kind, Kind::Bsr | Kind::TestRun);
-    let lookup = ctx.lookup_action(&action.key)?.and_then(|result| {
+    let lookup = ctx.lookup_action(index, &action.key)?.and_then(|result| {
         // Additional auxiliary outputs are fine, but every predicted output
         // must be present for a cached action to replace execution.
         let valid = plan.accepts_result(&result);
@@ -9239,8 +9351,7 @@ fn run_unit(
     );
     if plan.cache_policy.writes() {
         let start = Instant::now();
-        ctx.store
-            .save_action(&result.action.key, &serde_json::to_vec(&result.res)?)?;
+        ctx.save_action_result(idx, &result.action.key, &result.res)?;
         result.phases.finish_ns += start.elapsed().as_nanos() as u64;
     }
     Ok(result)

@@ -181,8 +181,7 @@ fn validate(ctx: &Ctx, index: usize, record: &Record) -> Result<()> {
 }
 
 fn remember(ctx: &Ctx, index: usize, record: &Record) -> Result<()> {
-    ctx.store
-        .save_action(&record.action_key, &serde_json::to_vec(&record.result)?)?;
+    ctx.save_action_result(index, &record.action_key, &record.result)?;
     let mut spec = record.spec.clone();
     if let Some(read_set) = spec.local_read_set_mut() {
         let files = std::mem::take(read_set);
@@ -267,7 +266,7 @@ pub(super) fn publish(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<()>
             let mut record = if let Some(result) = results[index].get() {
                 Some(make_record(ctx, index, &result.action, result.res.clone()))
             } else if let Some(action) = &ctx.action_plans[index].candidate {
-                ctx.lookup_action(&action.key)?
+                ctx.lookup_action(index, &action.key)?
                     .ok()
                     .map(|result| make_record(ctx, index, action, result))
             } else {

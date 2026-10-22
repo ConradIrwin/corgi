@@ -2522,6 +2522,7 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     let old_incremental = store.join("incr/old");
     let recent_incremental = store.join("incr/recent");
     let artifact = store.join("cache/aa/artifact");
+    let workspace_artifact = store.join("cache/aa/workspace");
     let expired_artifact = store.join("cache/aa/expired");
     let report = store.join("reports/report.json");
     let old_manifest = store.join("manifests/key/old.json");
@@ -2532,6 +2533,7 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     }
     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     fs::write(&artifact, b"artifact").unwrap();
+    fs::write(&workspace_artifact, b"workspace artifact").unwrap();
     fs::write(&expired_artifact, b"expired").unwrap();
     fs::File::open(&expired_artifact)
         .unwrap()
@@ -2550,6 +2552,21 @@ fn clean_expires_incremental_state_before_other_cached_data() {
             .set_modified(two_days_ago)
             .unwrap();
     }
+    let seconds = two_days_ago
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Whole-second parity is the cache's retention class: odd for external
+    // dependencies, even for workspace outputs.
+    for (path, seconds) in [
+        (&artifact, seconds | 1),
+        (&workspace_artifact, seconds & !1),
+    ] {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
     fs::File::open(&old_manifest)
         .unwrap()
         .set_modified(two_days_ago)
@@ -2565,6 +2582,7 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     assert!(!old_incremental.exists());
     assert!(recent_incremental.exists());
     assert!(artifact.exists());
+    assert!(!workspace_artifact.exists());
     assert!(!expired_artifact.exists());
     assert!(report.exists());
     assert!(!old_manifest.exists());
