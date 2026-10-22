@@ -10,8 +10,6 @@ Unlike bazel or buck2, which go much further along this path, a key tenet of cor
 
 Currently corgi is macOS only, but PRs are welcome to make this cross-platform.
 
-One major missing feature I’d like to add is the ability to share caches between multiple trusted machines. But it requires some thought to do this without slowing builds down - network should be an accelerant never a blocker.
-
 ## Usage
 
 Use as you would cargo, except corgi…
@@ -96,6 +94,40 @@ packages = ["delta_runner"]
 ```
 
 When running a corgi command, you can specify which feature universe to exist in with `--root`.
+
+## Distributed caching
+
+You can accelerate builds using corgi's support for remote caching. Currently this works with Cloudflare R2, but other backends are welcome.
+
+```
+[cache]
+read-url = "https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache"
+```
+
+To authenticate local clients with the cache you can store authentication in `~/.config/corgi/credentials`
+
+```
+["https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache"]
+access-key-id = "..."
+secret-access-key = "..."
+```
+
+To populate the cache, run the following commands in your CI provider:
+
+```
+export CORGI_R2_WRITE_URL=...
+export CORGI_R2_ACCESS_KEY_ID=...
+export CORGI_R2_SECRET_ACCESS_KEY=...
+
+corgi cache build
+corgi cache test
+```
+
+This will run a build, and run all the tests, and upload all the intermediate artifacts and test results to R2.
+
+In most cases it's useful to cache both a build *and* a test run, because any differences in features or dependencies in your `Cargo.toml` dev-dependencies will mean that you will very likely build crates with a different set of features.
+
+Uploading test results allows for future runs of `corgi test` to avoid running tests for unchanged crates.
 
 ## And more..?
 

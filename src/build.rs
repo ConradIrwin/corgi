@@ -8805,7 +8805,8 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSumma
                                     .unwrap()
                                     .offer(record, download);
                                 drop(st);
-                                if let Err((_, download)) = offered {
+                                if let Err(remote) = offered {
+                                    let (_, download) = *remote;
                                     finish_download(
                                         index,
                                         download,

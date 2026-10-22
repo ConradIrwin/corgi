@@ -27,12 +27,13 @@ impl Race {
         &self,
         record: Record,
         download: RemoteDownload,
-    ) -> Result<(), (Record, RemoteDownload)> {
+    ) -> Result<(), Box<(Record, RemoteDownload)>> {
+        let remote = Box::new((record, download));
         let mut state = self.state.lock().unwrap();
         if !matches!(*state, State::Open) {
-            return Err((record, download));
+            return Err(remote);
         }
-        *state = State::Remote(Box::new((record, download)));
+        *state = State::Remote(remote);
         Ok(())
     }
 
