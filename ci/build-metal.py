@@ -143,34 +143,63 @@ def archive_metadata(entry):
 
 
 def existing_release(repository, tag, asset):
-    # Listing distinguishes a missing tag from authentication/network failures.
-    # Direct tag lookup would otherwise make every gh failure look like a miss.
-    releases = json.loads(run(
+    # Tag lookup finds the published release even if the release listing
+    # includes an older draft with the same tag (or omits the published one).
+    lookup = subprocess.run(
+        ["gh", "api", f"repos/{repository}/releases/tags/{tag}"],
+        capture_output=True, text=True,
+    )
+    if lookup.returncode == 0:
+        release = json.loads(lookup.stdout)
+        if not release["draft"]:
+            return release_checksum(release, asset)
+    elif "HTTP 404" not in lookup.stderr:
+        raise ValueError(f"looking up Metal release {tag}: {lookup.stderr.strip()}")
+
+    # A 404 can mean a missing release or an unpublished draft. Only create
+    # a new release if neither exists; never overwrite an incomplete draft.
+    pages = json.loads(run(
         "gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases",
         capture_output=True, text=True,
     ).stdout)
-    for page in releases:
-        for release in page:
-            if release["tag_name"] == tag:
-                assets = {entry["name"]: entry for entry in release["assets"]}
-                required = (asset, f"{asset}.sha256")
-                if release["draft"] or any(
-                    name not in assets or assets[name]["state"] != "uploaded"
-                    or assets[name]["size"] <= 0 for name in required
-                ):
-                    raise ValueError("Metal release is incomplete; inspect it before retrying")
-                checksum = run(
-                    "gh", "api", assets[f"{asset}.sha256"]["url"],
-                    "-H", "Accept: application/octet-stream",
-                    capture_output=True, text=True,
-                ).stdout.split()
-                if (len(checksum) != 2 or checksum[1] != asset
-                        or len(checksum[0]) != 64
-                        or any(c not in "0123456789abcdef" for c in checksum[0])
-                        or assets[asset].get("digest") != f"sha256:{checksum[0]}"):
-                    raise ValueError("Metal release checksum does not match its asset digest")
-                return checksum[0]
+    matches = [release for page in pages for release in page if release["tag_name"] == tag]
+    for release in matches:
+        if not release["draft"]:
+            return release_checksum(release, asset)
+    if matches:
+        raise ValueError("Metal release is incomplete; inspect it before retrying")
+    # GitHub's listing has occasionally missed a published release. A tag
+    # without a visible release must not cause us to upload another draft.
+    ref = subprocess.run(
+        ["gh", "api", f"repos/{repository}/git/ref/tags/{tag}"],
+        capture_output=True, text=True,
+    )
+    if ref.returncode == 0:
+        raise ValueError(f"Metal tag {tag} exists but its release was not found")
+    if "HTTP 404" not in ref.stderr:
+        raise ValueError(f"looking up Metal tag {tag}: {ref.stderr.strip()}")
     return None
+
+
+def release_checksum(release, asset):
+    assets = {entry["name"]: entry for entry in release["assets"]}
+    required = (asset, f"{asset}.sha256")
+    if any(
+        name not in assets or assets[name]["state"] != "uploaded"
+        or assets[name]["size"] <= 0 for name in required
+    ):
+        raise ValueError("Metal release is incomplete; inspect it before retrying")
+    checksum = run(
+        "gh", "api", assets[f"{asset}.sha256"]["url"],
+        "-H", "Accept: application/octet-stream",
+        capture_output=True, text=True,
+    ).stdout.split()
+    if (len(checksum) != 2 or checksum[1] != asset
+            or len(checksum[0]) != 64
+            or any(c not in "0123456789abcdef" for c in checksum[0])
+            or assets[asset].get("digest") != f"sha256:{checksum[0]}"):
+        raise ValueError("Metal release checksum does not match its asset digest")
+    return checksum[0]
 
 
 def export_release_sha256(digest):
