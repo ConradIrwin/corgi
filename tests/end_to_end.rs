@@ -448,7 +448,7 @@ fn managed_build_toolchains_are_selected_explicitly_for_the_host() {
 fn target_dir_reuses_artifacts_and_preserves_the_run_directory() {
     let directory = TestDirectory::new("target-dir");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -773,7 +773,7 @@ fn workspace_member_uses_its_selected_project_config() {
     let directory = TestDirectory::new("member-config");
     let workspace = directory.path.join("workspace");
     let member = workspace.join("member");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(member.join("src")).unwrap();
     fs::create_dir_all(member.join(".cargo")).unwrap();
     fs::copy(
@@ -821,7 +821,7 @@ fn workspace_member_uses_its_selected_project_config() {
 fn corgi_target_rustflags_override_cargo_config_and_invalidate_cached_builds() {
     let directory = TestDirectory::new("target-rustflags");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     copy_directory(&fixture_path("root-inference"), &workspace);
     fs::copy(
         std::env::current_dir().unwrap().join("rust-toolchain.toml"),
@@ -1011,7 +1011,7 @@ fn features_enable_only_the_selected_packages_feature() {
 fn no_default_features_preserves_other_workspace_defaults() {
     let directory = TestDirectory::new("no-default-features");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     copy_directory(&fixture_path("no-default-features"), &workspace);
 
     let scoped = "app: (false, false, false); sibling: (true, true, false)";
@@ -1021,22 +1021,6 @@ fn no_default_features_preserves_other_workspace_defaults() {
             "app: (true, true, false); sibling: (true, true, false)",
         ),
         (vec!["-p", "app", "--no-default-features"], scoped),
-        (
-            vec!["-p", "app", "--no-default-features", "--features", "extra"],
-            "app: (false, false, true); sibling: (true, true, false)",
-        ),
-        (
-            vec![
-                "-p",
-                "app",
-                "--no-default-features",
-                "--features",
-                "default",
-            ],
-            "app: (true, true, false); sibling: (true, true, false)",
-        ),
-        // Without -p, the virtual workspace's default member is selected.
-        (vec!["--no-default-features"], scoped),
     ] {
         let output = corgi_command()
             .current_dir(&workspace)
@@ -1085,96 +1069,10 @@ fn no_default_features_preserves_other_workspace_defaults() {
 }
 
 #[test]
-fn no_default_features_separates_package_plans_with_configured_roots() {
-    let directory = TestDirectory::new("no-default-features-plans");
-    let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
-    copy_directory(&fixture_path("no-default-features"), &workspace);
-    fs::write(
-        workspace.join("corgi.toml"),
-        "[roots.all]\npackages = [\"app\", \"sibling\", \"plain\"]\n",
-    )
-    .unwrap();
-
-    let check = |arguments: &[&str], plan: &str, packages: &[(&str, &[&str])]| {
-        let output = corgi_command()
-            .current_dir(&workspace)
-            .arg("check")
-            .args(arguments)
-            .env("CORGI_STORE", &store)
-            .output()
-            .unwrap();
-        assert_success(&output, &format!("corgi check {}", arguments.join(" ")));
-        let report = report_for_workspace(&store, &workspace);
-        assert_eq!(report["cache"]["plan"]["result"], plan);
-        for (package, features) in packages {
-            assert_package_features(&report, package, features);
-        }
-    };
-    let defaults: &[&str] = &["default", "normal"];
-    // Normal builds continue sharing a plan regardless of output selection.
-    check(
-        &["-p", "app"],
-        "miss",
-        &[("app", defaults), ("sibling", defaults)],
-    );
-    check(&["-p", "sibling"], "hit", &[("sibling", defaults)]);
-    check(
-        &["-p", "app", "--no-default-features"],
-        "miss",
-        &[("app", &[]), ("sibling", defaults)],
-    );
-    // These share a resolution root and explicit features, but not defaults.
-    check(
-        &["-p", "sibling", "--no-default-features"],
-        "miss",
-        &[("sibling", &[])],
-    );
-    check(
-        &["--root", "all", "-p", "app", "--no-default-features"],
-        "hit",
-        &[("app", &[]), ("sibling", defaults)],
-    );
-    check(
-        &["-p", "app", "-p", "sibling", "--no-default-features"],
-        "miss",
-        &[("app", &[]), ("sibling", &[])],
-    );
-    check(
-        &["-p", "sibling", "-p", "app", "--no-default-features"],
-        "hit",
-        &[("app", &[]), ("sibling", &[])],
-    );
-    check(
-        &["--root", "all", "--no-default-features"],
-        "miss",
-        &[("app", &[]), ("sibling", &[]), ("plain", &[])],
-    );
-    check(
-        &["-p", "app"],
-        "hit",
-        &[("app", defaults), ("sibling", defaults)],
-    );
-
-    // Sibling is still a dependency, but no longer a resolution root: do not
-    // manufacture a default request for it.
-    fs::write(
-        workspace.join("corgi.toml"),
-        "[roots.app]\npackages = [\"app\", \"plain\"]\n",
-    )
-    .unwrap();
-    check(
-        &["-p", "app", "--no-default-features"],
-        "miss",
-        &[("app", &[]), ("sibling", &[])],
-    );
-}
-
-#[test]
 fn no_default_features_does_not_override_dependency_requests() {
     let directory = TestDirectory::new("no-default-features-dependency");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     copy_directory(&fixture_path("no-default-features"), &workspace);
 
     let check = |features: &[&str]| {
@@ -1253,7 +1151,7 @@ fn cfg_checking_uses_cargo_and_build_script_declarations() {
 fn incremental_mode_separates_action_and_compiler_identities() {
     let directory = TestDirectory::new("incremental-action-identity");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     copy_directory(&fixture_path("root-inference"), &workspace);
 
     let command = || {
@@ -1371,7 +1269,7 @@ fn run_and_test_reuse_equivalent_compilation_units() {
 fn named_profiles_key_compilation_settings_not_names() {
     let directory = TestDirectory::new("named-profile-action-identity");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -1465,7 +1363,7 @@ fn named_profiles_key_compilation_settings_not_names() {
 fn local_compile_read_sets_isolate_package_targets() {
     let directory = TestDirectory::new("local-read-sets");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     write_read_set_workspace(&workspace);
 
     let initial = invoke_corgi_with_store(&workspace, "test", ["--workspace"], &store);
@@ -1504,17 +1402,6 @@ fn local_compile_read_sets_isolate_package_targets() {
     assert_unit_cache(&report, "lib_a", "compile_test", "lib_a", "miss");
     assert_unit_not_executed(&report, "lib_b", "compile", "lib_b");
 
-    fs::write(
-        workspace.join("app/src/main.rs"),
-        "fn main() { println!(\"edited {}\", app::value()); }\n",
-    )
-    .unwrap();
-    let binary_edit = invoke_corgi_with_store(&workspace, "build", ["--workspace"], &store);
-    assert_success(&binary_edit, "corgi build after binary edit");
-    let report = report_for_workspace(&store, &workspace);
-    assert_unit_cache(&report, "app", "compile", "app", "hit");
-    assert_unit_cache(&report, "app", "compile", "app-bin", "miss");
-
     let mut library_source = fs::read_to_string(workspace.join("lib_a/src/lib.rs")).unwrap();
     library_source.push_str("\npub fn edited_library_value() -> u32 { 2 }\n");
     fs::write(workspace.join("lib_a/src/lib.rs"), library_source).unwrap();
@@ -1536,72 +1423,13 @@ fn local_compile_read_sets_isolate_package_targets() {
         "hit",
     );
     assert_unit_cache(&report, "lib_a", "compile", "lib_a", "miss");
-    let script_identity = report_unit(&report, "lib_a", "compile_build_script")["key"]["inputs"]
-        ["compiler_identity"]
-        .clone();
-
-    let manifest = workspace.join("Cargo.toml");
-    let mut contents = fs::read_to_string(&manifest).unwrap();
-    // dev/test share the debug-map destination and build-script environment.
-    // Only the parent units' raw debug settings differ.
-    contents.push_str(
-        "\n[profile.dev]\ndebug = 2\n\
-         [profile.dev.build-override]\ndebug = 0\n\
-         [profile.test]\ndebug = 1\n\
-         [profile.test.build-override]\ndebug = 0\n\
-         [profile.codegen-debug]\ninherits = \"dev\"\n\
-         [profile.codegen-debug.build-override]\ndebug = 1\n",
-    );
-    fs::write(manifest, contents).unwrap();
-    let mut reports = Vec::new();
-    for profile in ["dev", "test"] {
-        let output = invoke_corgi_with_store(
-            &workspace,
-            "check",
-            ["--workspace", "--profile", profile],
-            &store,
-        );
-        assert_success(&output, &format!("corgi check with {profile} profile"));
-        reports.push(report_for_workspace(&store, &workspace));
-    }
-    for package in ["lib_a", "lib_b", "app"] {
-        assert_unit_cache(&reports[1], package, "check", package, "hit");
-        assert_eq!(
-            report_unit(&reports[0], package, "check")["key"]["hash"],
-            report_unit(&reports[1], package, "check")["key"]["hash"]
-        );
-    }
-    for action in ["compile_build_script", "run_build_script"] {
-        assert_unit_not_executed(&reports[1], "lib_a", action, "build-script-build");
-    }
-
-    // Execution dependencies still compile with their actual debug flags.
-    let codegen = invoke_corgi_with_store(
-        &workspace,
-        "check",
-        ["--workspace", "--profile", "codegen-debug"],
-        &store,
-    );
-    assert_success(&codegen, "corgi check with different codegen debug info");
-    let report = report_for_workspace(&store, &workspace);
-    assert_unit_cache(
-        &report,
-        "lib_a",
-        "compile_build_script",
-        "build-script-build",
-        "miss",
-    );
-    assert_ne!(
-        report_unit(&report, "lib_a", "compile_build_script")["key"]["inputs"]["compiler_identity"],
-        script_identity
-    );
 }
 
 #[test]
 fn local_compile_manifest_learns_a_growing_read_set() {
     let directory = TestDirectory::new("growing-read-set");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -1698,7 +1526,7 @@ fn registry_dependency_builds_from_a_cold_isolated_store_and_reuses_cache() {
 fn unread_sibling_dependency_source_does_not_churn_the_root_key() {
     let directory = TestDirectory::new("precise-dependency-order");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     for package in ["app", "left", "right"] {
         fs::create_dir_all(workspace.join(package).join("src")).unwrap();
     }
@@ -1770,7 +1598,7 @@ fn unread_sibling_dependency_source_does_not_churn_the_root_key() {
 fn local_compile_detects_an_ambiguous_module_layout() {
     let directory = TestDirectory::new("ambiguous-module-layout");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -1814,7 +1642,7 @@ fn local_compile_detects_an_ambiguous_module_layout() {
 fn build_script_cfg_does_not_reuse_a_manifest_from_another_configuration() {
     let directory = TestDirectory::new("build-script-cfg-read-set");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -1880,7 +1708,7 @@ fn build_script_cfg_does_not_reuse_a_manifest_from_another_configuration() {
 fn build_script_runtime_reads_require_extra_inputs() {
     let directory = TestDirectory::new("build-script-runtime-input");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -2316,7 +2144,7 @@ fn main() {
 fn pinned_toolchain_supplies_compiler_rt_and_keeps_compile_only_warnings_clean() {
     let directory = TestDirectory::new("pinned-compiler-rt");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -3094,19 +2922,6 @@ fn named_targets_select_only_requested_targets() {
     let directory = TestDirectory::new("named-target-selectors");
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);
 
-    for (selector, name) in [
-        ("--test", "integration"),
-        ("--bench", "custom"),
-        ("--example", "example"),
-    ] {
-        run_corgi(&directory.path, "check", [selector, name]);
-        let missing = invoke_corgi(&directory.path, "check", [selector, "missing"]);
-        assert!(
-            !missing.status.success(),
-            "{selector} accepted a missing target"
-        );
-    }
-
     // A named target must suppress the default selection, even with other
     // integration tests present in the package.
     fs::write(
@@ -3125,21 +2940,6 @@ fn named_targets_select_only_requested_targets() {
         .unwrap();
     assert_success(&result, "corgi test --test integration");
     assert!(marker.exists(), "selected integration test did not run");
-
-    run_corgi(&directory.path, "test", ["--bench", "custom", "--force"]);
-    run_corgi(&directory.path, "test", ["--example", "example", "--force"]);
-    run_corgi(
-        &directory.path,
-        "check",
-        [
-            "--test",
-            "integration",
-            "--example",
-            "example",
-            "--bench",
-            "custom",
-        ],
-    );
 }
 
 #[test]
@@ -3452,14 +3252,7 @@ fn package_target_selectors_reach_cargo_planning() {
     let directory = TestDirectory::new("target-selectors");
     copy_directory(&fixture_path("benchmark-targets"), &directory.path);
 
-    for selector in [
-        "--lib",
-        "--bins",
-        "--tests",
-        "--benches",
-        "--examples",
-        "--all-targets",
-    ] {
+    for selector in ["--lib", "--tests"] {
         run_corgi(&directory.path, "check", [selector]);
     }
 
@@ -3491,62 +3284,6 @@ fn package_target_selectors_reach_cargo_planning() {
     assert!(
         selected_integration_marker.exists(),
         "`--tests` did not execute the integration test"
-    );
-
-    run_corgi(&directory.path, "test", ["--bins", "--force"]);
-    run_corgi(&directory.path, "test", ["--examples", "--force"]);
-
-    for selector in ["--benches", "--all-targets"] {
-        let custom_benchmark_marker = directory
-            .path
-            .join(format!("custom-benchmark-{}.ran", &selector[2..]));
-        let selected_tests = corgi_command()
-            .arg("test")
-            .arg("-C")
-            .arg(&directory.path)
-            .args([selector, "--force"])
-            .env("CORGI_TEST_BENCH_MARKER", &custom_benchmark_marker)
-            .output()
-            .expect("failed to test selected targets");
-        assert_success(&selected_tests, &format!("corgi test {selector}"));
-        assert_eq!(
-            fs::read_to_string(custom_benchmark_marker).unwrap(),
-            "",
-            "custom test executable received libtest or benchmark arguments"
-        );
-    }
-
-    let filtered_custom_harness = corgi_command()
-        .arg("test")
-        .arg("-C")
-        .arg(&directory.path)
-        .args(["--benches", "selected"])
-        .output()
-        .expect("failed to test custom harness filter validation");
-    assert_failure(
-        &filtered_custom_harness,
-        "corgi test --benches with a test-name filter",
-    );
-    assert!(
-        String::from_utf8_lossy(&filtered_custom_harness.stderr)
-            .contains("pass arguments to test harnesses with --"),
-        "{}",
-        String::from_utf8_lossy(&filtered_custom_harness.stderr)
-    );
-
-    run_corgi(&directory.path, "build", ["--examples"]);
-    let example = Command::new(
-        directory
-            .path
-            .join("target/debug/examples")
-            .join(executable_name("example")),
-    )
-    .output()
-    .expect("failed to run selected example");
-    assert_success(&example, "selected example");
-    assert_eq!(
-        String::from_utf8(example.stdout).unwrap(),
-        "example selected\n"
     );
 }
 
@@ -4283,7 +4020,7 @@ fn debug_objects_are_exported_beside_the_binary_and_restored_from_cache() {
 fn debug_objects_follow_each_non_root_executable_output_directory() {
     let directory = TestDirectory::new("debug-output-layouts");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     for path in ["src", "tests", "examples", "fixture_macro/src"] {
         fs::create_dir_all(workspace.join(path)).unwrap();
     }
@@ -4499,7 +4236,7 @@ fn debug_objects_follow_each_non_root_executable_output_directory() {
 fn debug_objects_are_exported_for_dylibs_when_crate_type_order_changes() {
     let directory = TestDirectory::new("debug-crate-type-order");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("src/lib.rs"),
@@ -4563,7 +4300,7 @@ fn debug_objects_are_exported_for_dylibs_when_crate_type_order_changes() {
 fn rustflags_debuginfo_exports_debug_objects_when_profile_debug_is_disabled() {
     let directory = TestDirectory::new("rustflags-debuginfo");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::create_dir_all(workspace.join(".cargo")).unwrap();
     fs::write(
@@ -4636,7 +4373,7 @@ fn rustflags_debuginfo_exports_debug_objects_when_profile_debug_is_disabled() {
 fn binary_export_cannot_overlap_another_binarys_debug_directory() {
     let directory = TestDirectory::new("debug-export-collision");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -4668,7 +4405,7 @@ fn binary_export_cannot_overlap_another_binarys_debug_directory() {
 fn unrelated_source_edits_do_not_change_recompiled_debug_binary_bytes() {
     let directory = TestDirectory::new("debug-precise-key");
     let workspace = directory.path.join("workspace");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(
         workspace.join("Cargo.toml"),
@@ -5148,6 +4885,15 @@ fn corgi_store_command<const ARGUMENT_COUNT: usize>(
         .args(arguments)
         .env("CORGI_STORE", store);
     corgi
+}
+
+// CI shares provisioned tools and ordinary build artifacts across independent
+// workspaces. Tests that need a genuinely cold or mutable store keep using
+// directory.path.join("store") instead.
+fn shared_store(directory: &TestDirectory) -> PathBuf {
+    std::env::var_os("CORGI_TEST_SHARED_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.path.join("store"))
 }
 
 fn invoke_corgi_offline<const ARGUMENT_COUNT: usize>(

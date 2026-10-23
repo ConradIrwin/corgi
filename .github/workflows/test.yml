@@ -9,47 +9,39 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  unit:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
-
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-
       - name: Build Corgi
         run: cargo build --locked
+      - name: Run unit tests
+        run: ./target/debug/corgi test --bin corgi
 
+  integration:
+    runs-on: macos-15
+    env:
+      CORGI_STORE: ${{ runner.temp }}/corgi-integration
+      CORGI_TEST_SHARED_STORE: ${{ runner.temp }}/corgi-integration
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Build Corgi
+        run: cargo build --locked
       - name: Configure private cache reads
         env:
           CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
           CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
         run: python3 ci/configure-cache-credentials.py
-
-      - name: Populate debug build cache
-        env:
-          CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
-          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
-          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          : "${CORGI_R2_ACCESS_KEY_ID:?Configure the bucket-scoped R2 access key}"
-          : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
-          ./target/debug/corgi cache build
-
-      - name: Run tests and populate the cache
-        env:
-          CORGI_R2_WRITE_URL: https://9a5426ad4c05881db7cff829de5f13e4.r2.cloudflarestorage.com/corgi-build-cache
-          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
-          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          : "${CORGI_R2_ACCESS_KEY_ID:?Configure the bucket-scoped R2 access key}"
-          : "${CORGI_R2_SECRET_ACCESS_KEY:?Configure the bucket-scoped R2 secret key}"
-          ./target/debug/corgi cache test
+      - name: Run end-to-end tests
+        run: ./target/debug/corgi test --test end_to_end
