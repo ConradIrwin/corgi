@@ -4906,7 +4906,7 @@ fn build_inner(
     )?;
     let native_toolchain = supplied_rust
         .as_ref()
-        .map(|rust| NativeToolchain::resolve(rust, native_environment.clone()))
+        .map(|rust| NativeToolchain::resolve(&store, rust, native_environment.clone()))
         .transpose()?;
     let zig_target = requested_target
         .as_deref()

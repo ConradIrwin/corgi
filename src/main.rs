@@ -2,6 +2,7 @@ mod audit;
 mod build;
 mod cli;
 mod config;
+mod file_stat;
 mod libclang;
 mod macos;
 mod meta;
