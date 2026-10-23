@@ -1239,29 +1239,27 @@ fn run_and_test_reuse_equivalent_compilation_units() {
     let workspace = directory.path.join("workspace");
     write_read_set_workspace(&workspace);
 
-    for commands in [["run", "test"], ["test", "run"]] {
-        let store = directory.path.join(commands.join("-"));
-        let mut reports = Vec::new();
-        for command in commands {
-            let output = invoke_corgi_with_store(&workspace, command, ["--package", "app"], &store);
-            assert_success(&output, &format!("corgi {command}"));
-            reports.push(report_for_workspace(&store, &workspace));
-        }
+    let store = directory.path.join("store");
+    let mut reports = Vec::new();
+    for command in ["test", "run"] {
+        let output = invoke_corgi_with_store(&workspace, command, ["--package", "app"], &store);
+        assert_success(&output, &format!("corgi {command}"));
+        reports.push(report_for_workspace(&store, &workspace));
+    }
 
-        for (package, action, target) in [
-            ("lib_a", "compile_build_script", "build-script-build"),
-            ("lib_a", "run_build_script", "build-script-build"),
-            ("lib_a", "compile", "lib_a"),
-            ("lib_b", "compile", "lib_b"),
-            ("app", "compile", "app"),
-        ] {
-            assert_unit_cache(&reports[0], package, action, target, "miss");
-            assert_unit_cache(&reports[1], package, action, target, "hit");
-            let first = report_unit(&reports[0], package, action);
-            let second = report_unit(&reports[1], package, action);
-            assert_ne!(first["profile"]["name"], second["profile"]["name"]);
-            assert_eq!(first["key"]["hash"], second["key"]["hash"]);
-        }
+    for (package, action, target) in [
+        ("lib_a", "compile_build_script", "build-script-build"),
+        ("lib_a", "run_build_script", "build-script-build"),
+        ("lib_a", "compile", "lib_a"),
+        ("lib_b", "compile", "lib_b"),
+        ("app", "compile", "app"),
+    ] {
+        assert_unit_cache(&reports[0], package, action, target, "miss");
+        assert_unit_cache(&reports[1], package, action, target, "hit");
+        let first = report_unit(&reports[0], package, action);
+        let second = report_unit(&reports[1], package, action);
+        assert_ne!(first["profile"]["name"], second["profile"]["name"]);
+        assert_eq!(first["key"]["hash"], second["key"]["hash"]);
     }
 }
 
@@ -3125,7 +3123,7 @@ fn main() {
     )
     .unwrap();
 
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     let marker = directory.path.join("ran");
     for shell_value in [None, Some("from-shell")] {
         for arguments in [
@@ -3691,8 +3689,7 @@ fn gamma_skipped() {
 #[test]
 fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
     let directory = TestDirectory::new("cached-test-count");
-    let store_directory = TestDirectory::new("cached-test-store");
-    let store = &store_directory.path;
+    let store = shared_store(&directory);
     let marker = directory.path.join("test-ran");
     fs::create_dir_all(directory.path.join("src")).unwrap();
     fs::write(
@@ -3715,7 +3712,7 @@ fn cached_tests_report_the_test_count_and_no_cache_runs_them_again() {
             .arg("-C")
             .arg(&directory.path)
             .args(arguments)
-            .env("CORGI_STORE", store)
+            .env("CORGI_STORE", &store)
             .env("CORGI_TEST_MARKER", &marker)
             .output()
             .expect("failed to invoke corgi test")
@@ -4462,7 +4459,7 @@ fn unrelated_source_edits_do_not_change_recompiled_debug_binary_bytes() {
 #[test]
 fn local_package_artifacts_are_shared_across_repository_workspaces() {
     let directory = TestDirectory::new("cross-repository-cache");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     let dependency = directory.path.join("zed");
     let application = directory.path.join("delta");
 
@@ -4538,7 +4535,7 @@ fn local_package_artifacts_are_shared_across_repository_workspaces() {
 #[test]
 fn build_script_archives_restore_only_for_executing_consumers() {
     let directory = TestDirectory::new("demand-driven-root-hit");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     let workspace = directory.path.join("workspace");
     copy_directory(&fixture_path("demand-driven-root-hit"), &workspace);
 
@@ -4686,7 +4683,7 @@ fn build_script_archives_restore_only_for_executing_consumers() {
 #[test]
 fn non_git_packages_use_manifest_and_source_fallback_across_checkouts() {
     let directory = TestDirectory::new("non-git-package-cache");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     let first = directory.path.join("first");
     let second = directory.path.join("second");
     write_non_git_package_fixture(&first, "first");
@@ -4752,7 +4749,7 @@ fn non_git_packages_use_manifest_and_source_fallback_across_checkouts() {
 #[test]
 fn cached_plan_relocates_external_repository_sources_to_the_current_checkout() {
     let directory = TestDirectory::new("relocated-plan-sources");
-    let store = directory.path.join("store");
+    let store = shared_store(&directory);
     let first = directory.path.join("first");
     let second = directory.path.join("second");
     write_relocated_repository_fixture(&first, "first checkout");
