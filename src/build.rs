@@ -10600,6 +10600,8 @@ location-free — resolve paths at runtime instead of baking them in at build ti
     }
     phases.ingest_ns = t_ingest.elapsed().as_nanos() as u64;
     fs::remove_dir_all(&stage_root).context("removing compiler staging directory")?;
+    // Cleanup must finish before another compiler can reuse the shared incremental scratch.
+    drop(_staging);
     // rustc is done with the session state, so another action of this unit
     // may take it over.
     incr_lock.take();
