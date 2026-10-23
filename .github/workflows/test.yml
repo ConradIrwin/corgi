@@ -44,28 +44,4 @@ jobs:
         env:
           CORGI_STORE: ${{ runner.temp }}/corgi-integration
           CORGI_TEST_SHARED_STORE: ${{ runner.temp }}/corgi-integration
-        run: |
-          set -euo pipefail
-          (
-            while true; do
-              printf 'CPU sample %s ' "$(date -u +%H:%M:%S)"
-              ps -A -o comm= -o %cpu= | awk '
-                {
-                  cpu = $NF
-                  if ($0 ~ /rustc/) rustc += cpu
-                  else if ($0 ~ /corgi/) corgi += cpu
-                  else if ($0 ~ /curl/) curl += cpu
-                  else if ($0 ~ /tar/) tar += cpu
-                  else if ($0 ~ /python/) python += cpu
-                  total += cpu
-                }
-                END {
-                  printf "total=%.0f%% rustc=%.0f%% corgi=%.0f%% curl=%.0f%% tar=%.0f%% python=%.0f%%\n",
-                    total, rustc, corgi, curl, tar, python
-                }'
-              sleep 30
-            done
-          ) &
-          sampler=$!
-          trap 'kill "$sampler" 2>/dev/null || true' EXIT
-          ./target/debug/corgi --verbose test --test end_to_end
+        run: ./target/debug/corgi test --test end_to_end
