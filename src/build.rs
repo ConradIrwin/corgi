@@ -2,7 +2,7 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
 use crate::platform::executable_name;
 use crate::report::UnitKeyResolution as KeyResolution;
-use crate::sandbox::linux::setup_linux_sandbox;
+use crate::sandbox::linux::{host_runtime_paths, setup_linux_sandbox};
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
 use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store};
@@ -599,23 +599,34 @@ pub struct Ctx {
 enum ResolvedToolchain {
     Supplied(NativeToolchain),
     ManagedDarwin(ManagedDarwinToolchain),
+    ManagedLinux {
+        runtime: ZigRuntime,
+        host_dependencies: String,
+    },
 }
 
 impl ResolvedToolchain {
     fn supplied(&self) -> Option<&NativeToolchain> {
         match self {
             Self::Supplied(native) => Some(native),
-            Self::ManagedDarwin(_) => None,
+            Self::ManagedDarwin(_) | Self::ManagedLinux { .. } => None,
         }
     }
 
     fn darwin_runtime(&self, platform: &str) -> Option<&MacosRuntime> {
         match self {
-            Self::Supplied(_) => None,
+            Self::Supplied(_) | Self::ManagedLinux { .. } => None,
             Self::ManagedDarwin(managed) => managed
                 .runtimes
                 .iter()
                 .find(|runtime| runtime.platform == platform),
+        }
+    }
+
+    fn linux_runtime(&self) -> Option<&ZigRuntime> {
+        match self {
+            Self::ManagedLinux { runtime, .. } => Some(runtime),
+            _ => None,
         }
     }
 
@@ -654,6 +665,21 @@ impl ResolvedToolchain {
                     libclang_identity,
                 )
             }
+            Self::ManagedLinux {
+                runtime,
+                host_dependencies,
+            } => (
+                (
+                    format!("zig clang {}", crate::zig::VERSION),
+                    format!("zig {}", crate::zig::VERSION),
+                    format!(
+                        "zig glibc {}; host tools {host_dependencies}",
+                        runtime.identity
+                    ),
+                ),
+                String::new(),
+                String::new(),
+            ),
         };
         let identity = format!(
             "cc: {cc}\nld: {ld}\nsdk: {sdk}\nzig: {zig_identity}\nmacos: {macos_identity}\nlibclang: {libclang_identity}"
@@ -3238,15 +3264,6 @@ impl HostPlatform {
         };
         format!("{arch}-{os}")
     }
-
-    fn validate_toolchain_source(self, source: ToolchainSource) -> Result<()> {
-        match (self, source) {
-            (_, ToolchainSource::Supplied) | (Self::Darwin, ToolchainSource::Managed) => Ok(()),
-            (Self::Linux, ToolchainSource::Managed) => {
-                bail!("managed Linux toolchains are not implemented; set CORGI_RUST_TOOLCHAIN and CORGI_CC")
-            }
-        }
-    }
 }
 
 fn read_toolchain_pin(dir: &Path) -> Result<String> {
@@ -3803,7 +3820,11 @@ fn select_toolchain(
     // Reject invalid toolchain variables before reading the pin: an unpinned
     // project asks the selected toolchain for its channel.
     let source = ToolchainSource::for_build()?;
-    host_platform.validate_toolchain_source(source)?;
+    if source == ToolchainSource::Managed && host_platform == HostPlatform::Linux {
+        if let Some(target) = target.filter(|target| *target != host) {
+            bail!("managed Linux toolchains currently support native builds only (requested {target}, host {host})");
+        }
+    }
     let channel = read_toolchain_pin(dir)?;
     if source == ToolchainSource::Managed {
         return Ok(SelectedToolchain {
@@ -4702,6 +4723,9 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
             &project.cargo_config.env,
         )?;
     }
+    if (toolchain.source, host_platform) == (ToolchainSource::Managed, HostPlatform::Linux) {
+        ensure_zig(&store, &host, &host)?;
+    }
     // A build only provisions the tools its graph activates. Without a plan,
     // fetch takes every tool that could be active on this host.
     let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
@@ -5070,10 +5094,18 @@ fn build_inner(
     };
 
     let cargo_home = store_cargo_home(&store).display().to_string();
-    let runtime_paths = native_toolchain
+    let mut runtime_paths = native_toolchain
         .as_ref()
         .map(|native| native.runtime_paths.clone())
         .unwrap_or_default();
+    let host_dependencies =
+        if host_platform == HostPlatform::Linux && toolchain_source == ToolchainSource::Managed {
+            let (paths, identity) = host_runtime_paths(&store, Path::new(&rustc))?;
+            runtime_paths.extend(paths);
+            identity
+        } else {
+            String::new()
+        };
     let sandbox = match host_platform {
         HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(&store, runtime_paths)?),
         HostPlatform::Darwin => Sandbox::Darwin(setup_macos_sandbox(
@@ -5619,6 +5651,14 @@ fn build_inner(
     finish_report_stage(&recorder, "plan", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
+    let zig_runtime = zig_target
+        .as_deref()
+        .or_else(|| {
+            (host_platform == HostPlatform::Linux && toolchain_source == ToolchainSource::Managed)
+                .then_some(host_guess.as_str())
+        })
+        .map(|target| ensure_zig(&store, &host_guess, target))
+        .transpose()?;
     let toolchain = match native_toolchain {
         Some(native) => ResolvedToolchain::Supplied(native),
         None => match host_platform {
@@ -5640,13 +5680,15 @@ fn build_inner(
                     libclang_path: libclang,
                 })
             }
-            HostPlatform::Linux => bail!("managed Linux toolchains are not implemented"),
+            HostPlatform::Linux => ResolvedToolchain::ManagedLinux {
+                runtime: zig_runtime
+                    .as_ref()
+                    .context("managed Linux builds require Zig")?
+                    .clone(),
+                host_dependencies,
+            },
         },
     };
-    let zig_runtime = zig_target
-        .as_deref()
-        .map(|target| ensure_zig(&store, &host_guess, target))
-        .transpose()?;
     let zig_identity = zig_runtime
         .as_ref()
         .map(|runtime| runtime.identity.as_str())
@@ -10360,6 +10402,10 @@ fn compile(
         ));
         cmd.envs(runtime.environment());
     }
+    if let Some(runtime) = ctx.toolchain.linux_runtime() {
+        cmd.arg("-C")
+            .arg(format!("linker={}", runtime.cc.display()));
+    }
     for f in pflags {
         cmd.arg(f);
     }
@@ -10682,6 +10728,20 @@ fn build_script_environment<'a>(
     env.push(("CARGO".into(), ctx.cargo.clone()));
     if let ResolvedToolchain::ManagedDarwin(managed) = &ctx.toolchain {
         env.extend(managed.build_script_environment(&platform, &ctx.host));
+    }
+    if let Some(runtime) = ctx.toolchain.linux_runtime() {
+        for (name, path) in [
+            ("CC", &runtime.cc),
+            ("CXX", &runtime.cxx),
+            ("AR", &runtime.ar),
+            ("RANLIB", &runtime.ranlib),
+        ] {
+            env.push((name.into(), path.display().to_string()));
+        }
+        env.push((
+            "CMAKE_TOOLCHAIN_FILE".into(),
+            runtime.cmake_toolchain.display().to_string(),
+        ));
     }
     if platform != ctx.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
@@ -11238,7 +11298,7 @@ fn raise_file_descriptor_limit() -> Result<()> {
 mod build_platform_tests {
     use super::{
         configure_darwin_link_output, is_apple_target, HostPlatform, MacosRuntime,
-        ManagedDarwinToolchain, NativeToolchain, ResolvedToolchain, ToolchainSource,
+        ManagedDarwinToolchain, NativeToolchain, ResolvedToolchain,
     };
     use std::{path::Path, process::Command};
 
@@ -11302,22 +11362,6 @@ mod build_platform_tests {
             HostPlatform::Darwin
         );
         assert!(HostPlatform::from_os("windows").is_err());
-    }
-
-    #[test]
-    fn supplied_toolchains_are_supported_on_every_host() {
-        for host in [HostPlatform::Linux, HostPlatform::Darwin] {
-            assert!(host
-                .validate_toolchain_source(ToolchainSource::Supplied)
-                .is_ok());
-        }
-        assert!(HostPlatform::Darwin
-            .validate_toolchain_source(ToolchainSource::Managed)
-            .is_ok());
-        let error = HostPlatform::Linux
-            .validate_toolchain_source(ToolchainSource::Managed)
-            .unwrap_err();
-        assert!(error.to_string().contains("managed Linux toolchains"));
     }
 
     #[test]

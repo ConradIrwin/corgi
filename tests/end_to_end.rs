@@ -430,18 +430,10 @@ fn managed_build_toolchains_are_selected_explicitly_for_the_host() {
         .unwrap();
     assert_failure(&output, "exercise managed setup without downloading tools");
     let error = String::from_utf8_lossy(&output.stderr);
-    if cfg!(target_os = "linux") {
-        assert!(
-            error.contains("managed Linux toolchains are not implemented"),
-            "{error}"
-        );
-        assert!(!store.join("tools").exists());
-    } else {
-        assert!(
-            error.contains("download failed: https://static.rust-lang.org/"),
-            "{error}"
-        );
-    }
+    assert!(
+        error.contains("download failed: https://static.rust-lang.org/"),
+        "{error}"
+    );
 }
 
 #[test]

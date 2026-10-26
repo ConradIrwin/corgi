@@ -5,7 +5,7 @@
 //! namespaces and a syscall filter also exclude host Unix sockets and VM sockets.
 
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
@@ -17,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use crate::store::Store;
+use crate::store::{sha256_file, sha256_hex, Store};
 
 pub struct LinuxSandbox {
     pub executable: PathBuf,
@@ -36,6 +36,105 @@ pub fn setup_linux_sandbox(store: &Store, mut runtime_paths: Vec<PathBuf>) -> Re
         executable,
         runtime_paths,
     })
+}
+
+/// Grant host libraries needed to run managed build tools inside the sandbox.
+///
+/// Only inspect Corgi, the verified compiler, and the shell. Never run `ldd`
+/// on source-controlled or generated executables.
+pub fn host_runtime_paths(store: &Store, rustc: &Path) -> Result<(Vec<PathBuf>, String)> {
+    let shell = crate::native_toolchain::find_executable("sh")?;
+    let mut paths = BTreeSet::from([shell.clone()]);
+    // find_executable canonicalizes the selected path, but bare "sh" spawns
+    // still need the name that PATH resolves inside the sandbox.
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let alias = directory.join("sh");
+        if alias.is_absolute()
+            && fs::canonicalize(&alias)
+                .as_ref()
+                .is_ok_and(|resolved| resolved == &shell)
+        {
+            paths.insert(alias);
+        }
+    }
+    for executable in [std::env::current_exe()?, rustc.to_path_buf(), shell] {
+        let output = Command::new("ldd")
+            .arg(&executable)
+            .output()
+            .with_context(|| format!("inspecting runtime libraries of {}", executable.display()))?;
+        ensure!(
+            output.status.success(),
+            "ldd {} failed: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for line in String::from_utf8(output.stdout)?.lines() {
+            let library = line
+                .split_once(" => ")
+                .map_or(line.trim(), |(_, path)| path)
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            ensure!(
+                !line.contains(" => not found"),
+                "missing runtime dependency of {}: {line}",
+                executable.display()
+            );
+            if library.starts_with('/') {
+                let path = PathBuf::from(library);
+                paths.insert(
+                    if path.components().any(|part| part == Component::ParentDir) {
+                        fs::canonicalize(path)?
+                    } else {
+                        path
+                    },
+                );
+            }
+        }
+    }
+    // The host supplies glibc and the compiler's ubiquitous zlib and GCC
+    // unwind runtimes. Key other host dependencies, including the shell.
+    let mut dependencies = BTreeMap::new();
+    for path in &paths {
+        let requested_name = path
+            .file_name()
+            .context("host runtime library has no filename")?
+            .to_string_lossy();
+        // Match the SONAME that ldd resolved, not the canonical file name:
+        // libz.so.1 commonly points at a patch-versioned libz.so.1.2.x.
+        if matches!(requested_name.as_ref(), "libz.so.1" | "libgcc_s.so.1") {
+            continue;
+        }
+        let resolved = fs::canonicalize(path)?;
+        if resolved.starts_with(&store.root) || dependencies.contains_key(&resolved) {
+            continue;
+        }
+        let name = resolved
+            .file_name()
+            .context("host runtime library has no filename")?
+            .to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "libc.so.6"
+                | "libm.so.6"
+                | "libdl.so.2"
+                | "librt.so.1"
+                | "libpthread.so.0"
+                | "libutil.so.1"
+                | "ld-linux-x86-64.so.2"
+                | "ld-linux-aarch64.so.1"
+        ) {
+            continue;
+        }
+        dependencies.insert(
+            resolved.clone(),
+            (name.into_owned(), sha256_file(&resolved)?),
+        );
+    }
+    let identity = sha256_hex(&serde_json::to_vec(
+        &dependencies.into_values().collect::<Vec<_>>(),
+    )?);
+    Ok((paths.into_iter().collect(), identity))
 }
 
 impl LinuxSandbox {
