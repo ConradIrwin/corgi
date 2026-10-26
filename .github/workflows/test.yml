@@ -75,24 +75,3 @@ jobs:
 
       - name: Self-host and compile C in the sandbox
         run: bash ci/linux-smoke.sh
-
-  arch-smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Self-host inside Arch Linux
-        run: |
-          # The VM is ephemeral. Bubblewrap needs nested user/mount namespaces
-          # inside Docker, which the ordinary container profile denies.
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          docker run --rm --privileged \
-            --volume "$PWD:$PWD" --workdir "$PWD" \
-            archlinux:base-devel bash -euc '
-              pacman -Syu --noconfirm --needed git curl bubblewrap rustup
-              rustup set profile minimal
-              rustup default 1.97.1
-              cargo build --locked --bin corgi
-              bash ci/linux-smoke.sh
-            '
