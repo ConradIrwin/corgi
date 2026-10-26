@@ -45,6 +45,14 @@ pub fn setup_linux_sandbox(store: &Store, mut runtime_paths: Vec<PathBuf>) -> Re
 pub fn host_runtime_paths(store: &Store, rustc: &Path) -> Result<(Vec<PathBuf>, String)> {
     let shell = crate::native_toolchain::find_executable("sh")?;
     let mut paths = BTreeSet::from([shell.clone()]);
+    // `ldd` can report the loader under its canonical /usr/lib name while the
+    // ELF interpreter still names /lib64 (notably on Arch's merged /usr).
+    let interpreter = match std::env::consts::ARCH {
+        "x86_64" => "/lib64/ld-linux-x86-64.so.2",
+        "aarch64" => "/lib/ld-linux-aarch64.so.1",
+        architecture => bail!("managed Linux runtime does not support {architecture}"),
+    };
+    paths.insert(PathBuf::from(interpreter));
     // find_executable canonicalizes the selected path, but bare "sh" spawns
     // still need the name that PATH resolves inside the sandbox.
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
