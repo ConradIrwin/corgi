@@ -3,8 +3,12 @@
 # Ensure the llvm-tools release artifact for Corgi's pinned Zig version exists.
 #
 # The artifact carries the LLVM tools Corgi needs beyond Zig: libclang (which
-# bindgen dlopens) plus dsymutil, both sliced from the one upstream LLVM macOS
-# ARM64 tarball so they match each other and the pinned Zig's Clang.
+# bindgen dlopens), sliced from the upstream LLVM tarball for the platform so it
+# matches the pinned Zig's Clang. macOS also takes dsymutil from the same
+# tarball. Linux takes no dsymutil (debug info stays in the ELF files), but
+# bundles Ubuntu 22.04's libstdc++, which upstream's libclang.so needs and
+# Corgi's sandbox does not provide; libclang finds it through its
+# $ORIGIN/../lib runpath.
 #
 # This is an idempotent "reconcile" job, not a one-shot build:
 #
@@ -25,16 +29,45 @@
 #   RELEASE_REPO   owner/repo hosting the artifact (default ConradIrwin/corgi)
 #   DRY_RUN=1      do everything except publish; leave the archive in ./dist
 #   GH_TOKEN       required to check/create releases unless DRY_RUN=1
+#   PLATFORM       macos-arm64 (default), linux-x64, or linux-arm64
 #
-# macOS ARM64 only for now: upstream LLVM ships a macOS ARM64 tarball but no
-# Intel one, so this slices ARM64. Add a second source here to cover Intel.
+# Intel macOS is not covered: upstream LLVM ships no Intel macOS tarball.
 
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_REPO="${RELEASE_REPO:-ConradIrwin/corgi}"
-PLATFORM="macos-arm64"
+PLATFORM="${PLATFORM:-macos-arm64}"
 ASSET="llvm-tools-${PLATFORM}.tar.zst"
+
+# Upstream asset suffix, and for Linux the pinned Ubuntu 22.04 libstdc++6
+# package. Its GLIBCXX_3.4.30 covers upstream libclang.so's GLIBCXX_3.4.29, and
+# it needs glibc 2.34, the same floor as libclang.so itself.
+case "$PLATFORM" in
+  macos-arm64)
+    upstream_suffix="macOS-ARM64"
+    ;;
+  linux-x64)
+    upstream_suffix="Linux-X64"
+    libstdcxx_url="http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libstdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb"
+    libstdcxx_sha256="29ef3d289b272704b75141906c8f683db0f2bdb0942061366691333bfb289bdc"
+    libstdcxx_multiarch="x86_64-linux-gnu"
+    ;;
+  linux-arm64)
+    upstream_suffix="Linux-ARM64"
+    libstdcxx_url="http://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libstdc++6_12.3.0-1ubuntu1~22.04.3_arm64.deb"
+    libstdcxx_sha256="59d244119e6129c7e9c0897491c0e210e925d15881b2dedcf8965ceb4fbf1aa3"
+    libstdcxx_multiarch="aarch64-linux-gnu"
+    ;;
+  *)
+    printf 'error: unsupported PLATFORM %s\n' "$PLATFORM" >&2
+    exit 1
+    ;;
+esac
+case "$PLATFORM" in
+  macos-*) is_linux=0 ;;
+  *) is_linux=1 ;;
+esac
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
@@ -51,10 +84,17 @@ log "pinned Zig version: ${zig_version} (release tag ${tag})"
 # Release builds of Corgi embed this to hard-pin the llvm-tools download.
 # Exported on every path (fresh build and no-op), since the release build runs
 # after this step and embeds the digest whether or not it was rebuilt.
+# macOS keeps the original variable name; Linux platforms add a suffix such
+# as CORGI_LLVM_TOOLS_SHA256_LINUX_X64 (see src/libclang.rs).
+if [ "$is_linux" = 1 ]; then
+  sha256_variable="CORGI_LLVM_TOOLS_SHA256_$(printf '%s' "$PLATFORM" | tr 'a-z-' 'A-Z_')"
+else
+  sha256_variable="CORGI_LLVM_TOOLS_SHA256"
+fi
 export_release_sha256() {
   local digest="$1"
   if [ -n "${GITHUB_ENV:-}" ]; then
-    printf 'CORGI_LLVM_TOOLS_SHA256=%s\n' "$digest" >> "$GITHUB_ENV"
+    printf '%s=%s\n' "$sha256_variable" "$digest" >> "$GITHUB_ENV"
   fi
 }
 
@@ -94,16 +134,22 @@ fi
 #
 # `zig cc --version` prints e.g. "clang version 21.1.0" — the exact Clang built
 # into the Zig we pin. Zig tracks an LLVM release branch (major.minor), but
-# upstream only publishes a macOS ARM64 binary for *some* patch releases
-# (e.g. 21.1.0 and 21.1.1 have none; 21.1.8 does). Since libclang's C API and
+# upstream only publishes binaries for *some* patch releases (e.g. 21.1.0 and
+# 21.1.1 have no macOS ARM64 asset; 21.1.8 does). Since libclang's C API and
 # resource headers are stable across a major.minor branch, any patch on that
 # branch is a correct match. So we take Zig's major.minor and resolve it to the
-# newest upstream patch that actually ships a macOS ARM64 asset.
+# newest upstream patch that actually ships the platform's asset.
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-zig_host="aarch64-macos"
+# Run the Zig built for this machine, whatever platform the artifact targets.
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) zig_host="aarch64-macos" ;;
+  Linux-x86_64) zig_host="x86_64-linux" ;;
+  Linux-aarch64) zig_host="aarch64-linux" ;;
+  *) die "no Zig download for this machine ($(uname -s) $(uname -m))" ;;
+esac
 zig_tarball="zig-${zig_host}-${zig_version}.tar.xz"
 log "downloading Zig ${zig_version} to read its Clang version"
 curl -sSfL -o "${work}/zig.tar.xz" \
@@ -120,7 +166,7 @@ llvm_minor="$(printf '%s' "$clang_version" | cut -d. -f2)"
 log "Zig ${zig_version} embeds Clang ${clang_version} (LLVM ${llvm_major}.${llvm_minor} branch)"
 
 # Resolve major.minor -> newest upstream llvmorg-<major.minor.patch> that
-# publishes a macOS ARM64 asset. DRY_RUN skips the gh lookup: set LLVM_VERSION
+# publishes the platform's asset. DRY_RUN skips the gh lookup: set LLVM_VERSION
 # to the patch whose tarball you passed via LLVM_TARBALL, else Clang's exact
 # version is assumed.
 if [ -n "${LLVM_VERSION:-}" ]; then
@@ -134,26 +180,26 @@ else
       --jq ".[].tagName | select(startswith(\"llvmorg-${llvm_major}.${llvm_minor}.\")) | ltrimstr(\"llvmorg-\")" \
       | while read -r candidate; do
           if gh release view "llvmorg-${candidate}" -R llvm/llvm-project --json assets \
-               --jq '.assets[].name' 2>/dev/null | grep -qx "LLVM-${candidate}-macOS-ARM64.tar.xz"; then
+               --jq '.assets[].name' 2>/dev/null | grep -qx "LLVM-${candidate}-${upstream_suffix}.tar.xz"; then
             printf '%s\n' "$candidate"
           fi
         done \
       | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1
   )"
   [ -n "$llvm_version" ] \
-    || die "no upstream LLVM ${llvm_major}.${llvm_minor}.x release ships a macOS ARM64 asset"
+    || die "no upstream LLVM ${llvm_major}.${llvm_minor}.x release ships a ${upstream_suffix} asset"
   log "using upstream LLVM ${llvm_version} for Clang ${clang_version} (${llvm_major}.${llvm_minor} branch)"
 fi
 
 # --- 4b. create the artifact ------------------------------------------------
 #
 # Slice libclang + its version-matched resource headers and libc++ headers out
-# of the upstream LLVM macOS ARM64 release. Keeping the library and its headers
-# together is the invariant that prevents silent bindgen breakage.
+# of the upstream LLVM release. Keeping the library and its headers together is
+# the invariant that prevents silent bindgen breakage.
 
-# Upstream's macOS ARM64 asset is named LLVM-<ver>-macOS-ARM64.tar.xz and
-# unpacks to a directory of the same stem (verified against the 20.1.2 release).
-upstream="LLVM-${llvm_version}-macOS-ARM64"
+# Upstream assets are named LLVM-<ver>-<suffix>.tar.xz and unpack to a
+# directory of the same stem (verified against 20.1.2 macOS and 21.1.8 Linux).
+upstream="LLVM-${llvm_version}-${upstream_suffix}"
 upstream_tarball="${upstream}.tar.xz"
 upstream_url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvm_version}/${upstream_tarball}"
 # LLVM_TARBALL lets local runs reuse an already-downloaded 1.4 GB tarball.
@@ -163,7 +209,7 @@ if [ -n "${LLVM_TARBALL:-}" ]; then
 else
   log "downloading upstream ${upstream_tarball}"
   curl -sSfL -o "${work}/llvm.tar.xz" "$upstream_url" \
-    || die "upstream LLVM ${llvm_version} macOS ARM64 tarball not found at ${upstream_url}"
+    || die "upstream LLVM ${llvm_version} ${upstream_suffix} tarball not found at ${upstream_url}"
 fi
 
 # Verify upstream's own artifact attestation when gh supports it; the input
@@ -174,27 +220,62 @@ if [ "${DRY_RUN:-0}" != "1" ]; then
 fi
 
 log "unpacking upstream LLVM"
-tar -xf "${work}/llvm.tar.xz" -C "$work"
+if [ "$is_linux" = 1 ]; then
+  # The Linux tarball unpacks to several GB; take only the slice.
+  tar -xf "${work}/llvm.tar.xz" -C "$work" --wildcards \
+    "${upstream}/lib/libclang.so*" \
+    "${upstream}/lib/clang/${llvm_major}/include/*" \
+    "${upstream}/include/clang-c/*" \
+    "${upstream}/include/c++/v1/*" \
+    "${upstream}/include/llvm/Support/LICENSE.TXT"
+else
+  tar -xf "${work}/llvm.tar.xz" -C "$work"
+fi
 src="${work}/${upstream}"
 [ -d "$src" ] || die "unexpected upstream layout: ${src} missing"
 
 stage="${work}/stage"
 mkdir -p "${stage}/lib"
 
-# The loadable library bindgen dlopens.
-cp -a "${src}/lib/libclang.dylib" "${stage}/lib/libclang.dylib"
+if [ "$is_linux" = 1 ]; then
+  # The loadable library bindgen dlopens, with its versioned symlinks.
+  cp -a "${src}"/lib/libclang.so* "${stage}/lib/"
+  [ -f "${stage}/lib/libclang.so" ] || die "upstream LLVM ${llvm_version} lacks lib/libclang.so"
 
-# dsymutil, the other LLVM tool Corgi needs beyond Zig. Sliced from the same
-# upstream tarball so it matches the pinned Zig's Clang. `cp -a` preserves its
-# executable bit; fail hard if upstream ever drops it.
-[ -f "${src}/bin/dsymutil" ] || die "upstream LLVM ${llvm_version} lacks bin/dsymutil"
-mkdir -p "${stage}/bin"
-cp -a "${src}/bin/dsymutil" "${stage}/bin/dsymutil"
+  # libclang.so links GCC's libstdc++, which Corgi's sandbox does not mount.
+  # Bundle it beside libclang, where the $ORIGIN/../lib runpath finds it.
+  log "downloading pinned libstdc++6 from ${libstdcxx_url}"
+  curl -sSfL -o "${work}/libstdcxx.deb" "$libstdcxx_url" \
+    || die "libstdc++6 package not found at ${libstdcxx_url}"
+  actual="$( (sha256sum "${work}/libstdcxx.deb" 2>/dev/null || shasum -a 256 "${work}/libstdcxx.deb") | cut -d' ' -f1)"
+  [ "$actual" = "$libstdcxx_sha256" ] \
+    || die "libstdc++6 sha256 mismatch: pinned ${libstdcxx_sha256}, got ${actual}"
+  mkdir -p "${work}/libstdcxx"
+  (cd "${work}/libstdcxx" && ar x ../libstdcxx.deb && tar -xf data.tar.*)
+  cp -a "${work}/libstdcxx/usr/lib/${libstdcxx_multiarch}"/libstdc++.so.6* "${stage}/lib/"
+  rm -f "${stage}"/lib/libstdc++.so.6.*-gdb.py
+  [ -e "${stage}/lib/libstdc++.so.6" ] || die "libstdc++6 package lacks libstdc++.so.6"
 
-# Clang's builtin/resource headers (stddef.h, stdarg.h, ...), named by major.
-# libclang finds these relative to itself; they MUST match the library.
-mkdir -p "${stage}/lib/clang"
-cp -a "${src}/lib/clang/${llvm_major}" "${stage}/lib/clang/${llvm_major}"
+  # Only the builtin headers: Zig supplies compiler-rt, and Rust its own
+  # sanitizer runtimes, so the resource tree's lib/ is not needed.
+  mkdir -p "${stage}/lib/clang/${llvm_major}"
+  cp -a "${src}/lib/clang/${llvm_major}/include" "${stage}/lib/clang/${llvm_major}/include"
+else
+  # The loadable library bindgen dlopens.
+  cp -a "${src}/lib/libclang.dylib" "${stage}/lib/libclang.dylib"
+
+  # dsymutil, the other LLVM tool Corgi needs beyond Zig. Sliced from the same
+  # upstream tarball so it matches the pinned Zig's Clang. `cp -a` preserves its
+  # executable bit; fail hard if upstream ever drops it.
+  [ -f "${src}/bin/dsymutil" ] || die "upstream LLVM ${llvm_version} lacks bin/dsymutil"
+  mkdir -p "${stage}/bin"
+  cp -a "${src}/bin/dsymutil" "${stage}/bin/dsymutil"
+
+  # Clang's builtin/resource headers (stddef.h, stdarg.h, ...), named by major.
+  # libclang finds these relative to itself; they MUST match the library.
+  mkdir -p "${stage}/lib/clang"
+  cp -a "${src}/lib/clang/${llvm_major}" "${stage}/lib/clang/${llvm_major}"
+fi
 
 # The libclang C API headers (clang-c/Index.h, ...). Not needed at bindgen
 # runtime, but the verify step compiles a probe against them, and they are
@@ -224,8 +305,15 @@ cat > "${stage}/CORGI_LLVM_TOOLS.txt" <<EOF
 zig_version: ${zig_version}
 llvm_version: ${llvm_version}
 upstream: ${upstream_url}
-tools: lib/libclang.dylib, bin/dsymutil
 EOF
+if [ "$is_linux" = 1 ]; then
+  cat >> "${stage}/CORGI_LLVM_TOOLS.txt" <<EOF
+tools: lib/libclang.so
+libstdc++: ${libstdcxx_url} (GCC Runtime Library Exception)
+EOF
+else
+  echo "tools: lib/libclang.dylib, bin/dsymutil" >> "${stage}/CORGI_LLVM_TOOLS.txt"
+fi
 
 log "repackaging ${ASSET}"
 mkdir -p "${repo_root}/dist"
@@ -237,7 +325,7 @@ tar --no-mac-metadata -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -o "$asset_p
 # exact bytes we just produced.
 (
   cd "${repo_root}/dist"
-  shasum -a 256 "$ASSET" > "${ASSET}.sha256"
+  sha256sum "$ASSET" > "${ASSET}.sha256" 2>/dev/null || shasum -a 256 "$ASSET" > "${ASSET}.sha256"
 )
 log "built dist/${ASSET}"
 log "sidecar: $(cat "${repo_root}/dist/${ASSET}.sha256")"
@@ -249,7 +337,7 @@ export_release_sha256 "$(cut -d' ' -f1 < "${repo_root}/dist/${ASSET}.sha256")"
 # A slice that loads but whose resource headers are wrong produces silently bad
 # bindings, so prove the artifact actually parses a header before it ships.
 if [ -x "${repo_root}/ci/verify-libclang.sh" ]; then
-  LIBCLANG_STAGE="$stage" LLVM_MAJOR="$llvm_major" \
+  LIBCLANG_STAGE="$stage" LLVM_MAJOR="$llvm_major" PLATFORM="$PLATFORM" \
     "${repo_root}/ci/verify-libclang.sh" \
     || die "llvm-tools verification failed; not publishing"
 fi

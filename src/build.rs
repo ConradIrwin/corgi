@@ -28,15 +28,16 @@ static NEXT_PIN_WRITE: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! status {
     ($label:expr, $($arg:tt)*) => {
-        if stderr_color() {
+        if $crate::build::stderr_color() {
             eprintln!("\x1b[1;32m{:>12}\x1b[0m {}", $label, format_args!($($arg)*))
         } else {
             eprintln!("{:>12} {}", $label, format_args!($($arg)*))
         }
     };
 }
+pub(crate) use status;
 
-fn stderr_color() -> bool {
+pub(crate) fn stderr_color() -> bool {
     color_enabled(
         std::env::var("CARGO_TERM_COLOR").ok().as_deref(),
         io::stderr().is_terminal(),
@@ -602,6 +603,9 @@ enum ResolvedToolchain {
     ManagedLinux {
         runtime: ZigRuntime,
         host_dependencies: String,
+        /// `LIBCLANG_PATH` for Corgi's pinned header parser; None when
+        /// unsupported.
+        libclang_path: Option<String>,
     },
 }
 
@@ -668,6 +672,7 @@ impl ResolvedToolchain {
             Self::ManagedLinux {
                 runtime,
                 host_dependencies,
+                libclang_path,
             } => (
                 (
                     format!("zig clang {}", crate::zig::VERSION),
@@ -678,7 +683,10 @@ impl ResolvedToolchain {
                     ),
                 ),
                 String::new(),
-                String::new(),
+                libclang_path
+                    .as_ref()
+                    .map(|_| format!("llvm-tools-{}", crate::zig::VERSION))
+                    .unwrap_or_default(),
             ),
         };
         let identity = format!(
@@ -732,6 +740,10 @@ struct ZigRuntime {
     cxx: PathBuf,
     ar: PathBuf,
     ranlib: PathBuf,
+    pkg_config: PathBuf,
+    /// Header search flags that make bindgen parse the headers Zig compiles
+    /// against; None for targets without them.
+    bindgen_args: Option<String>,
     cmake_toolchain: PathBuf,
     use_zig_as_rust_linker: bool,
     identity: String,
@@ -774,10 +786,13 @@ impl MacosRuntime {
     }
 }
 
-fn setup_darwin_llvm_tools(store: &Store, host: &str) -> Result<(Option<PathBuf>, Option<String>)> {
-    // One pinned artifact supplies both bindgen's libclang and the dsymutil
-    // used by Clang when linking a debug image. Provisioning it unconditionally
-    // is cheaper than detecting bindgen consumers in the package graph.
+/// Provision the pinned llvm-tools for a managed toolchain, returning its root
+/// and the `LIBCLANG_PATH` for bindgen.
+fn setup_llvm_tools(store: &Store, host: &str) -> Result<(Option<PathBuf>, Option<String>)> {
+    // One pinned artifact supplies bindgen's libclang and, on macOS, the
+    // dsymutil used by Clang when linking a debug image. Provisioning it
+    // unconditionally is cheaper than detecting bindgen consumers in the
+    // package graph.
     let llvm_tools = if crate::libclang::is_supported(host) {
         Some(ensure_llvm_tools(store, host)?)
     } else {
@@ -2191,6 +2206,10 @@ struct CorgiToml {
     cache: Option<crate::remote::Config>,
     #[serde(default)]
     tools: std::collections::BTreeMap<String, ToolSpec>,
+    /// Native libraries unpacked into each target's sysroot; see
+    /// [`crate::libraries`].
+    #[serde(default)]
+    libraries: std::collections::BTreeMap<String, crate::libraries::LibrarySpec>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, EnvProbe>,
     #[serde(default)]
@@ -2457,6 +2476,15 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
             bail!(
                 "tool `{}` in {} needs exactly one of `bin` (executable) or `path` (file/dir)",
                 t.name,
+                p.display()
+            );
+        }
+    }
+    for (name, library) in &mut parsed.libraries {
+        library.name.clone_from(name);
+        if library.url.is_empty() || library.sha256.len() != 64 {
+            bail!(
+                "library `{name}` in {} needs a `url` and a 64-character `sha256`",
                 p.display()
             );
         }
@@ -2806,70 +2834,7 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     let unpack = work.join("unpack");
     fs::create_dir_all(&unpack)?;
     let archive = work.join("archive");
-    match t.auth.as_str() {
-        "" => {
-            let st = crate::curl()
-                .args(["-sSfL", "-o"])
-                .arg(&archive)
-                .arg(&t.url)
-                .status()?;
-            if !st.success() {
-                bail!("download failed: {}", t.url);
-            }
-        }
-        "github" => {
-            let (repo, tag, asset) = parse_github_release_url(&t.url).with_context(|| {
-                format!(
-                    "tool {}: auth = \"github\" requires a github.com release-asset url",
-                    t.name
-                )
-            })?;
-            let st = Command::new("gh")
-                .args([
-                    "release",
-                    "download",
-                    &tag,
-                    "-R",
-                    &repo,
-                    "--pattern",
-                    &asset,
-                    "--output",
-                ])
-                .arg(&archive)
-                .status()
-                .with_context(|| {
-                    format!(
-                        "tool {}: running gh (auth = \"github\" needs the GitHub CLI, logged in)",
-                        t.name
-                    )
-                })?;
-            if !st.success() {
-                bail!(
-                    "tool {}: gh release download failed for {} (is `gh auth status` ok?)",
-                    t.name,
-                    t.url
-                );
-            }
-        }
-        other => bail!(
-            "tool {}: unknown auth scheme `{other}` (supported: \"github\")",
-            t.name
-        ),
-    }
-    // An empty pin means "download without verifying": the pinned Metal path
-    // supplies one only in release builds, where the sha is embedded at compile
-    // time. Every corgi.toml [tools.*] entry sets a non-empty sha256, so their
-    // hard-pin behavior is unchanged.
-    if !t.sha256.is_empty() {
-        let actual = crate::store::sha256_file(&archive)?;
-        if actual != t.sha256 {
-            bail!(
-                "sha256 mismatch for tool {}: manifest pins {}, archive is {actual}",
-                t.name,
-                t.sha256
-            );
-        }
-    }
+    download_pinned("tool", &t.name, &t.url, &t.auth, &t.sha256, &archive)?;
     let st = Command::new("tar")
         .arg("-xf")
         .arg(&archive)
@@ -2891,6 +2856,73 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
+}
+
+/// Download `url` to `archive`, verifying it against `sha256` when non-empty.
+///
+/// `kind` and `name` only label errors ("tool protoc", "library libxcb1").
+/// `auth` selects the transport: empty for a plain download, or "github" for
+/// a release asset fetched with the GitHub CLI's stored credentials.
+pub(crate) fn download_pinned(
+    kind: &str,
+    name: &str,
+    url: &str,
+    auth: &str,
+    sha256: &str,
+    archive: &Path,
+) -> Result<()> {
+    match auth {
+        "" => {
+            let st = crate::curl()
+                .args(["-sSfL", "-o"])
+                .arg(archive)
+                .arg(url)
+                .status()?;
+            if !st.success() {
+                bail!("download failed: {url}");
+            }
+        }
+        "github" => {
+            let (repo, tag, asset) = parse_github_release_url(url).with_context(|| {
+                format!("{kind} {name}: auth = \"github\" requires a github.com release-asset url")
+            })?;
+            let st = Command::new("gh")
+                .args([
+                    "release",
+                    "download",
+                    &tag,
+                    "-R",
+                    &repo,
+                    "--pattern",
+                    &asset,
+                    "--output",
+                ])
+                .arg(archive)
+                .status()
+                .with_context(|| {
+                    format!(
+                        "{kind} {name}: running gh (auth = \"github\" needs the GitHub CLI, logged in)"
+                    )
+                })?;
+            if !st.success() {
+                bail!(
+                    "{kind} {name}: gh release download failed for {url} (is `gh auth status` ok?)"
+                );
+            }
+        }
+        other => bail!("{kind} {name}: unknown auth scheme `{other}` (supported: \"github\")"),
+    }
+    // An empty pin means "download without verifying": the pinned Metal path
+    // supplies one only in release builds, where the sha is embedded at compile
+    // time. Every corgi.toml [tools.*] entry sets a non-empty sha256, so their
+    // hard-pin behavior is unchanged.
+    if !sha256.is_empty() {
+        let actual = crate::store::sha256_file(archive)?;
+        if actual != sha256 {
+            bail!("sha256 mismatch for {kind} {name}: manifest pins {sha256}, archive is {actual}");
+        }
+    }
+    Ok(())
 }
 
 /// Provision a pinned macOS artifact, keying its store directory on the source
@@ -3056,7 +3088,23 @@ fn ensure_zig_executable(store: &Store, host: &str) -> Result<PathBuf> {
         .join(&spec.bin))
 }
 
-fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
+/// Provision Zig wrappers for `target`, including the target's declared
+/// `[libraries]` sysroot when it has one.
+///
+/// The wrappers are the target's native toolchain: `cc`/`c++` link against the
+/// sysroot and `pkg-config` answers from it. Its identity therefore folds into
+/// the wrapper identity, which build scripts and links already key on.
+fn ensure_zig(
+    store: &Store,
+    host: &str,
+    target: &str,
+    libraries: &std::collections::BTreeMap<String, crate::libraries::LibrarySpec>,
+) -> Result<ZigRuntime> {
+    let sysroot = crate::libraries::ensure_sysroot(
+        store,
+        libraries.values(),
+        crate::zig::rust_target(target)?,
+    )?;
     let target = crate::zig::target(target)?
         .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
     let asset = crate::zig::asset(host)?;
@@ -3069,6 +3117,8 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
             asset.platform,
             asset.sha256,
             &target.zig,
+            crate::pkg_config::EXECUTABLE,
+            sysroot.as_ref().map(|sysroot| &sysroot.identity),
         ),
     )?;
     let wrapper_dir = store
@@ -3090,6 +3140,7 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
             "c++",
             "ar",
             "ranlib",
+            crate::pkg_config::EXECUTABLE,
             "target",
             "zig-path",
             "toolchain.cmake",
@@ -3102,8 +3153,14 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         fs::create_dir_all(&staging_dir)?;
         let driver_source = std::env::current_exe()?.canonicalize()?;
         fs::copy(&driver_source, staging_dir.join("driver"))?;
-        for name in ["cc", "c++", "ar", "ranlib"] {
+        for name in ["cc", "c++", "ar", "ranlib", crate::pkg_config::EXECUTABLE] {
             crate::platform::symlink("driver", staging_dir.join(name))?;
+        }
+        if let Some(sysroot) = &sysroot {
+            fs::write(
+                staging_dir.join(crate::pkg_config::SYSROOT_FILE),
+                sysroot.root.as_os_str().as_encoded_bytes(),
+            )?;
         }
         fs::write(staging_dir.join("target"), &target.zig)?;
         fs::write(
@@ -3120,11 +3177,36 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
         }
     }
     touch_tool_marker(&wrapper_dir);
+    // bindgen parses headers with libclang rather than through these wrappers,
+    // so it needs the same libc headers spelled out, plus the sysroot's.
+    let bindgen_args =
+        crate::zig::glibc_header_arguments(&zig_executable, &target.zig).map(|mut arguments| {
+            if let Some(sysroot) = &sysroot {
+                let multiarch = crate::libraries::multiarch(&target.zig);
+                for directory in [
+                    format!("usr/include/{multiarch}"),
+                    "usr/include".to_string(),
+                ] {
+                    let directory = sysroot.root.join(directory);
+                    if directory.is_dir() {
+                        arguments.push("-idirafter".to_string());
+                        arguments.push(directory.display().to_string());
+                    }
+                }
+            }
+            arguments
+                .iter()
+                .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
     Ok(ZigRuntime {
         cc: wrapper_dir.join("cc"),
         cxx: wrapper_dir.join("c++"),
         ar: wrapper_dir.join("ar"),
         ranlib: wrapper_dir.join("ranlib"),
+        pkg_config: wrapper_dir.join(crate::pkg_config::EXECUTABLE),
+        bindgen_args,
         cmake_toolchain: wrapper_dir.join("toolchain.cmake"),
         use_zig_as_rust_linker: target.use_zig_as_rust_linker,
         identity: wrapper_identity,
@@ -3132,8 +3214,8 @@ fn ensure_zig(store: &Store, host: &str, target: &str) -> Result<ZigRuntime> {
 }
 
 /// Fetch and unpack the pinned llvm-tools artifact for `host`, and return the
-/// root of its unpacked tree (containing `lib/libclang.dylib` and
-/// `bin/dsymutil`).
+/// root of its unpacked tree (containing libclang and, on macOS,
+/// `bin/dsymutil`; see [`crate::libclang::required_files`]).
 ///
 /// The artifact is keyed on the pinned Zig version and downloaded from Corgi's
 /// own release repo (see [`crate::libclang`]). Release builds embed the expected
@@ -3144,15 +3226,15 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
         .root
         .join("tools")
         .join(format!("llvm-tools-{}", crate::zig::VERSION));
-    let dylib = dest.join(crate::libclang::DYLIB_RELATIVE);
-    let dsymutil = dest.join(crate::libclang::DSYMUTIL_RELATIVE);
-    if dylib.exists() && dsymutil.exists() {
+    let required = crate::libclang::required_files(host);
+    let complete = |root: &Path| required.iter().all(|relative| root.join(relative).exists());
+    if complete(&dest) {
         touch_tool_marker(&dest);
         return Ok(llvm_tools_dir(store));
     }
     status!(
         "Installing",
-        "llvm-tools (libclang, dsymutil) for Zig {}",
+        "llvm-tools (libclang) for Zig {}",
         crate::zig::VERSION
     );
     let work = store.tmp_path("llvm-tools");
@@ -3169,7 +3251,7 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     if !st.success() {
         bail!("downloading llvm-tools archive failed: {archive_url}");
     }
-    if let Some(expected) = crate::libclang::expected_sha256() {
+    if let Some(expected) = crate::libclang::expected_sha256(host) {
         let actual = crate::store::sha256_file(&archive)?;
         if actual != expected {
             bail!(
@@ -3188,10 +3270,7 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     if !st.success() {
         bail!("unpack failed for llvm-tools archive {archive_url}");
     }
-    for relative in [
-        crate::libclang::DYLIB_RELATIVE,
-        crate::libclang::DSYMUTIL_RELATIVE,
-    ] {
+    for relative in required {
         if !unpack.join(relative).exists() {
             bail!("llvm-tools archive is missing `{relative}` (from {archive_url})");
         }
@@ -3199,7 +3278,7 @@ fn ensure_llvm_tools(store: &Store, host: &str) -> Result<PathBuf> {
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&unpack, &dest) {
         Ok(()) => {}
-        Err(_) if dylib.exists() && dsymutil.exists() => {}
+        Err(_) if complete(&dest) => {}
         Err(e) => return Err(e).context("publishing llvm-tools"),
     }
     touch_tool_marker(&dest);
@@ -4713,7 +4792,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         &project.cargo_config.env,
     )?;
     if (toolchain.source, host_platform) == (ToolchainSource::Managed, HostPlatform::Darwin) {
-        let (llvm_tools, _) = setup_darwin_llvm_tools(&store, &host)?;
+        let (llvm_tools, _) = setup_llvm_tools(&store, &host)?;
         setup_darwin_runtimes(
             &store,
             &host,
@@ -4723,12 +4802,13 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
             &project.cargo_config.env,
         )?;
     }
+    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
     if (toolchain.source, host_platform) == (ToolchainSource::Managed, HostPlatform::Linux) {
-        ensure_zig(&store, &host, &host)?;
+        setup_llvm_tools(&store, &host)?;
+        ensure_zig(&store, &host, &host, &corgi_toml.libraries)?;
     }
     // A build only provisions the tools its graph activates. Without a plan,
     // fetch takes every tool that could be active on this host.
-    let corgi_toml = read_corgi_toml(&dir)?.unwrap_or_default();
     for tool in corgi_toml.tools.values() {
         if tool.serves_platform(&host) {
             ensure_tool(&store, tool)?;
@@ -5021,8 +5101,10 @@ fn build_inner(
         }
         environment
     };
+    // Linux provisions llvm-tools later, once the unit graph shows a bindgen
+    // consumer: unlike macOS, nothing else in the artifact is always needed.
     let (llvm_tools, libclang) = match (toolchain_source, host_platform) {
-        (ToolchainSource::Managed, HostPlatform::Darwin) => setup_darwin_llvm_tools(&store, &host)?,
+        (ToolchainSource::Managed, HostPlatform::Darwin) => setup_llvm_tools(&store, &host)?,
         _ => (None, None),
     };
     recorder.update(|report| {
@@ -5657,7 +5739,7 @@ fn build_inner(
             (host_platform == HostPlatform::Linux && toolchain_source == ToolchainSource::Managed)
                 .then_some(host_guess.as_str())
         })
-        .map(|target| ensure_zig(&store, &host_guess, target))
+        .map(|target| ensure_zig(&store, &host_guess, target, &corgi_toml.libraries))
         .transpose()?;
     let toolchain = match native_toolchain {
         Some(native) => ResolvedToolchain::Supplied(native),
@@ -5680,13 +5762,35 @@ fn build_inner(
                     libclang_path: libclang,
                 })
             }
-            HostPlatform::Linux => ResolvedToolchain::ManagedLinux {
-                runtime: zig_runtime
+            HostPlatform::Linux => {
+                let mut runtime = zig_runtime
                     .as_ref()
                     .context("managed Linux builds require Zig")?
-                    .clone(),
-                host_dependencies,
-            },
+                    .clone();
+                let uses_libclang = units
+                    .iter()
+                    .any(|unit| meta.packages[unit.pkg].name == "clang-sys");
+                let (llvm_tools, libclang) = if uses_libclang {
+                    setup_llvm_tools(&store, &host)?
+                } else {
+                    (None, None)
+                };
+                // The pinned libclang does not find its builtin headers itself.
+                if let (Some(llvm_tools), Some(arguments)) =
+                    (llvm_tools.as_deref(), runtime.bindgen_args.as_mut())
+                {
+                    let resource_dir = crate::libclang::resource_dir(llvm_tools)?;
+                    *arguments = format!(
+                        "'-resource-dir' '{}' {arguments}",
+                        resource_dir.display().to_string().replace('\'', "'\\''")
+                    );
+                }
+                ResolvedToolchain::ManagedLinux {
+                    runtime,
+                    host_dependencies,
+                    libclang_path: libclang,
+                }
+            }
         },
     };
     let zig_identity = zig_runtime
@@ -10737,8 +10841,19 @@ fn build_script_environment<'a>(
             ("CXX", &runtime.cxx),
             ("AR", &runtime.ar),
             ("RANLIB", &runtime.ranlib),
+            ("PKG_CONFIG", &runtime.pkg_config),
         ] {
             env.push((name.into(), path.display().to_string()));
+        }
+        if let ResolvedToolchain::ManagedLinux {
+            libclang_path: Some(path),
+            ..
+        } = &ctx.toolchain
+        {
+            env.push(("LIBCLANG_PATH".into(), path.clone()));
+        }
+        if let Some(arguments) = &runtime.bindgen_args {
+            env.push(("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone()));
         }
         env.push((
             "CMAKE_TOOLCHAIN_FILE".into(),

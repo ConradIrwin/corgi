@@ -103,6 +103,49 @@ pub fn target(target: &str) -> Result<Option<Target<'_>>> {
     }))
 }
 
+/// The glibc minor version Zig targets when a triple has no `.2.N` suffix.
+///
+/// Zig's own default (`lib/std/Target.zig`) for 64-bit Linux; the C compiler
+/// receives it as `__GLIBC_MINOR__` through `zig cc`.
+pub const DEFAULT_GLIBC_MINOR: &str = "31";
+
+/// Clang flags that make a separate header parser (bindgen's libclang) see the
+/// libc headers `zig cc` compiles against for a glibc `zig_target`.
+///
+/// `zig cc` passes these itself: `-nostdlibinc` hides the host's
+/// `/usr/include`, and the libc directories follow Clang's builtin headers.
+/// Returns None for targets other than Linux glibc.
+pub fn glibc_header_arguments(zig_executable: &Path, zig_target: &str) -> Option<Vec<String>> {
+    let (triple, version) = match zig_target.split_once('.') {
+        Some((triple, version)) => (triple, Some(version)),
+        None => (zig_target, None),
+    };
+    let architecture = triple.strip_suffix("-linux-gnu")?;
+    let family = match architecture {
+        "x86_64" => "x86",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    let minor = version
+        .and_then(|version| version.split('.').nth(1))
+        .unwrap_or(DEFAULT_GLIBC_MINOR);
+    let include = zig_executable.parent()?.join("lib/libc/include");
+    let mut arguments = vec![
+        "-nostdlibinc".to_string(),
+        format!("-D__GLIBC_MINOR__={minor}"),
+    ];
+    for directory in [
+        format!("{family}-linux-gnu"),
+        "generic-glibc".to_string(),
+        format!("{family}-linux-any"),
+        "any-linux-any".to_string(),
+    ] {
+        arguments.push("-idirafter".to_string());
+        arguments.push(include.join(directory).display().to_string());
+    }
+    Some(arguments)
+}
+
 pub fn rust_target(target_name: &str) -> Result<&str> {
     Ok(target(target_name)?
         .map(|target| target.rust)
@@ -176,6 +219,7 @@ pub fn run_linker_invocation(arguments: &[std::ffi::OsString]) -> Result<()> {
         )
     };
     let mut args = Vec::new();
+    let mut library_directories = Vec::new();
     let has_pinned_target = direct_wrapper_directory.is_some();
     if let Some(wrapper_directory) = direct_wrapper_directory {
         let zig_path = std::fs::read_to_string(wrapper_directory.join("zig-path"))
@@ -196,13 +240,24 @@ pub fn run_linker_invocation(arguments: &[std::ffi::OsString]) -> Result<()> {
                 format!("-fdebug-prefix-map={manifest_directory}=."),
                 "-fdebug-compilation-dir=.".to_string(),
                 "-target".to_string(),
-                target,
+                target.clone(),
             ]);
-            if !arguments[argument_start..]
+            let links = !arguments[argument_start..]
                 .iter()
-                .any(|argument| argument == "-c")
-            {
+                .any(|argument| matches!(argument.to_str(), Some("-c" | "-S" | "-E")));
+            if links {
                 std::env::set_current_dir("/").context("changing Zig linker working directory")?;
+                // Declared libraries resolve `-l` from the pinned sysroot.
+                // They follow the caller's own search paths, so a library a
+                // build script compiled into OUT_DIR still wins.
+                if let Ok(sysroot) =
+                    std::fs::read_to_string(wrapper_directory.join(crate::pkg_config::SYSROOT_FILE))
+                {
+                    library_directories = crate::libraries::library_directories(
+                        Path::new(&sysroot),
+                        crate::libraries::multiarch(&target),
+                    );
+                }
             }
         }
     }
@@ -221,6 +276,9 @@ pub fn run_linker_invocation(arguments: &[std::ffi::OsString]) -> Result<()> {
             continue;
         }
         args.push(argument.to_string());
+    }
+    for directory in library_directories {
+        args.push(format!("-L{}", directory.display()));
     }
     let zig = match command {
         "cc" => Zig::Cc { args },
