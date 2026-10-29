@@ -103,14 +103,41 @@ fn real_main() -> Result<()> {
         cli::Cli::command().print_help()?;
         return Ok(());
     };
+    let configured_cache = remote::configured_cache(&dir)?;
     let (command, publish_cache) = match command {
-        cli::Command::Cache { command } => (command.into(), true),
+        cli::Command::Cache {
+            command: cli::CacheCommand::Setup,
+        } => {
+            return remote::setup_cache(configured_cache.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("`corgi cache setup` requires [cache] in corgi.toml")
+            })?);
+        }
+        cli::Command::Cache {
+            command: cli::CacheCommand::Build(args),
+        } => (cli::Command::Build(args), true),
+        cli::Command::Cache {
+            command: cli::CacheCommand::Test(args),
+        } => (cli::Command::Test(args), true),
         command => (command, false),
     };
     // Default: the store lives at the machine-wide path, so embedded
     // OUT_DIR paths match on every machine. CORGI_STORE relocates it; a
     // relocated store embeds its own path instead.
-    let store_root = store::default_root()?;
+    let store_root = if std::env::var_os("CORGI_STORE").is_some() {
+        store::default_root()?
+    } else if let Some(cache) = configured_cache.as_ref() {
+        match cache.ready_macos_cache_path()? {
+            Some(path) => path,
+            None => {
+                if cfg!(target_os = "macos") && cache.macos_cache_path.is_some() {
+                    eprintln!("Remote caching available: run `corgi cache setup`");
+                }
+                store::default_root()?
+            }
+        }
+    } else {
+        store::default_root()?
+    };
 
     match command {
         cli::Command::Audit(args) => audit::audit(

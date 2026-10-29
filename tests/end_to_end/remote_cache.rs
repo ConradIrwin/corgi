@@ -12,6 +12,104 @@ use std::{
     time::Instant,
 };
 
+#[cfg(target_os = "macos")]
+#[test]
+fn cache_setup_uses_one_password_and_selects_the_project_store() {
+    let fixture = Fixture::new("remote-cache-setup");
+    let store = fixture.directory.path.join("configured-store");
+    let store = store
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("configured-store");
+    let original = format!(
+        "[\"{PRIVATE_URL}\"]\naccess-key-id = \"old\"\nsecret-access-key = \"old\"\n\
+         [\"https://other.example.com/bucket\"]\naccess-key-id = \"keep\"\nsecret-access-key = \"keep\"\n"
+    );
+    let credentials = fixture
+        .directory
+        .path
+        .join("home/.config/corgi/credentials");
+    fs::write(&credentials, original).unwrap();
+    fixture.write(
+        "corgi.toml",
+        &format!(
+            "[cache]\nread-url = \"{PRIVATE_URL}\"\nmacos-cache-path = {:?}\n\
+             op-access-key-id = \"op://vault/item/access\"\n\
+             op-secret-access-key = \"op://vault/item/secret\"\n",
+            store.to_str().unwrap(),
+        ),
+    );
+    fixture.write(
+        "op",
+        "#!/bin/sh\ncase \"$3\" in\n  op://vault/item/access) printf 'fixture-read-access' ;;\n  op://vault/item/secret) printf 'fixture-read-secret' ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    fs::set_permissions(
+        fixture.workspace.join("op"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(std::iter::once(fixture.workspace.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let before = fixture
+        .command(&["pin"])
+        .env_remove("CORGI_STORE")
+        .output()
+        .unwrap();
+    assert_success(&before, "pin without remote cache setup");
+    assert!(String::from_utf8_lossy(&before.stderr)
+        .contains("Remote caching available: run `corgi cache setup`"));
+
+    let setup = fixture
+        .command(&["cache", "setup"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_success(&setup, "configure remote cache");
+    assert!(store.is_dir());
+    let saved = fs::read_to_string(&credentials).unwrap();
+    assert!(saved.contains("fixture-read-access"));
+    assert!(saved.contains("fixture-read-secret"));
+    assert!(saved.contains("https://other.example.com/bucket"));
+    assert_eq!(
+        fs::metadata(&credentials).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!String::from_utf8_lossy(&setup.stderr).contains("fixture-read-secret"));
+
+    let output = fixture
+        .command(&["build"])
+        .env_remove("CORGI_STORE")
+        .output()
+        .unwrap();
+    assert_success(&output, "build with configured store");
+    assert!(store.join("cache").is_dir());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Remote caching available"),
+        "setup must suppress the hint"
+    );
+
+    fixture.write(
+        "op",
+        "#!/bin/sh\nprintf 'sensitive diagnostic' >&2\nexit 1\n",
+    );
+    let failed = fixture
+        .command(&["cache", "setup"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_failure(&failed, "1Password failure must stop setup");
+    assert!(
+        !String::from_utf8_lossy(&failed.stderr).contains("sensitive diagnostic"),
+        "do not forward 1Password output into the build log"
+    );
+    assert_eq!(fs::read_to_string(credentials).unwrap(), saved);
+}
+
 #[test]
 fn cache_publishes_dependencies_while_build_or_test_is_running() {
     for command in ["build", "test"] {

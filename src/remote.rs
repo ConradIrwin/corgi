@@ -23,6 +23,28 @@ const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
 pub struct Config {
     /// Public URL, or an HTTPS R2 S3 bucket URL matched in ~/.config/corgi/credentials.
     pub read_url: String,
+    #[serde(default)]
+    pub macos_cache_path: Option<PathBuf>,
+    #[serde(default)]
+    pub op_access_key_id: Option<String>,
+    #[serde(default)]
+    pub op_secret_access_key: Option<String>,
+}
+
+pub fn configured_cache(dir: &Path) -> Result<Option<Config>> {
+    #[derive(Deserialize)]
+    struct CacheOnly {
+        cache: Option<Config>,
+    }
+
+    let Some(path) = crate::build::find_corgi_toml(dir) else {
+        return Ok(None);
+    };
+    let source =
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: CacheOnly =
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed.cache)
 }
 
 #[derive(Clone)]
@@ -57,6 +79,26 @@ impl std::fmt::Display for TransientRequestFailure {
 }
 
 impl std::error::Error for TransientRequestFailure {}
+
+impl Config {
+    pub fn ready_macos_cache_path(&self) -> Result<Option<PathBuf>> {
+        if !cfg!(target_os = "macos") {
+            return Ok(None);
+        }
+        let Some(path) = &self.macos_cache_path else {
+            return Ok(None);
+        };
+        ensure!(path.is_absolute(), "macos-cache-path must be absolute");
+        if !path.is_dir() || fs::canonicalize(path)? != *path {
+            return Ok(None);
+        }
+        validate_base_url(&self.read_url)?;
+        if matches!(ReadAccess::for_url(&self.read_url)?, ReadAccess::Disabled) {
+            return Ok(None);
+        }
+        Ok(Some(path.clone()))
+    }
+}
 
 fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
@@ -630,6 +672,128 @@ impl Credentials {
         ]
         .concat()
     }
+}
+
+/// Set up an authenticated remote cache without changing a project file.
+pub fn setup_cache(config: &Config) -> Result<()> {
+    validate_base_url(&config.read_url)?;
+    ensure!(
+        config.read_url.starts_with("https://")
+            && config.read_url.contains(".r2.cloudflarestorage.com/"),
+        "cache setup requires a private HTTPS R2 read-url"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let path = config
+            .macos_cache_path
+            .as_ref()
+            .context("cache setup requires macos-cache-path in corgi.toml")?;
+        ensure!(path.is_absolute(), "macos-cache-path must be absolute");
+        ensure_macos_cache_path(path)?;
+    }
+    let access = read_one_password_field(
+        config
+            .op_access_key_id
+            .as_deref()
+            .context("cache setup requires op-access-key-id in corgi.toml")?,
+    )?;
+    let secret = read_one_password_field(
+        config
+            .op_secret_access_key
+            .as_deref()
+            .context("cache setup requires op-secret-access-key in corgi.toml")?,
+    )?;
+    let credentials = Credentials { access, secret };
+    credentials.validate()?;
+    let home = dirs::home_dir().context("cannot locate home directory for R2 credentials")?;
+    save_credentials(
+        &home.join(".config/corgi/credentials"),
+        &config.read_url,
+        &credentials,
+    )?;
+    eprintln!("Configured remote cache credentials");
+    Ok(())
+}
+
+fn read_one_password_field(reference: &str) -> Result<String> {
+    ensure!(
+        reference.starts_with("op://"),
+        "1Password fields must use op:// secret references"
+    );
+    let output = std::process::Command::new("op")
+        .args(["read", "--no-newline", reference])
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::null())
+        .output()
+        .context("starting 1Password CLI; install `op` and sign in")?;
+    ensure!(
+        output.status.success(),
+        "1Password could not read a cache credential; sign in to `op` and check access to the configured item"
+    );
+    String::from_utf8(output.stdout).context("1Password returned a non-UTF-8 cache credential")
+}
+
+fn save_credentials(path: &Path, url: &str, credentials: &Credentials) -> Result<()> {
+    fs::create_dir_all(path.parent().context("credentials file has no parent")?)?;
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("reading existing Corgi credentials"),
+    };
+    let mut document: toml_edit::DocumentMut = source
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid existing Corgi credentials file"))?;
+    let table = document
+        .as_table_mut()
+        .entry(url)
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    table["access-key-id"] = toml_edit::value(&credentials.access);
+    table["secret-access-key"] = toml_edit::value(&credentials.secret);
+    let temporary = Temporary::new(path.parent().unwrap())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary.0, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::write(&temporary.0, document.to_string())?;
+    fs::rename(&temporary.0, path).context("installing private Corgi credentials")
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_cache_path(path: &Path) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if let Err(error) = fs::create_dir_all(path) {
+        if error.kind() != std::io::ErrorKind::PermissionDenied || !std::io::stdin().is_terminal() {
+            return Err(error).with_context(|| format!("creating {}; run `corgi cache setup` in an interactive terminal to authorize sudo", path.display()));
+        }
+        eprintln!("Creating {} requires administrator access", path.display());
+        let status = std::process::Command::new("sudo")
+            .args(["mkdir", "-p", "--"])
+            .arg(path)
+            .status()
+            .context("starting sudo to create the Corgi store")?;
+        ensure!(status.success(), "sudo could not create {}", path.display());
+        // SAFETY: getuid and getgid have no preconditions.
+        let owner = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+        let status = std::process::Command::new("sudo")
+            .args(["chown", &owner, "--"])
+            .arg(path)
+            .status()
+            .context("starting sudo to own the Corgi store")?;
+        ensure!(
+            status.success(),
+            "sudo could not set ownership of {}",
+            path.display()
+        );
+    }
+    ensure!(
+        fs::canonicalize(path)? == path,
+        "macos-cache-path must be a real path, not a symlink: {}",
+        path.display()
+    );
+    Temporary::new(path).with_context(|| format!("{} must be writable", path.display()))?;
+    Ok(())
 }
 
 fn curl_config_escape(value: &[u8]) -> Vec<u8> {

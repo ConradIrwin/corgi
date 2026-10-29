@@ -167,15 +167,8 @@ pub enum CacheCommand {
     Build(WorkspaceBuildArgs),
     /// Build, run tests, and publish artifacts and successful test results
     Test(TestArgs),
-}
-
-impl From<CacheCommand> for Command {
-    fn from(command: CacheCommand) -> Self {
-        match command {
-            CacheCommand::Build(args) => Self::Build(args),
-            CacheCommand::Test(args) => Self::Test(args),
-        }
-    }
+    /// Set up the project's private cache and local store
+    Setup,
 }
 
 #[derive(Debug, Args, Default)]
