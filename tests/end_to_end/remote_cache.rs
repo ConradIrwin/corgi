@@ -6,10 +6,94 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     os::unix::fs::{symlink, PermissionsExt},
+    process::Stdio,
     sync::{atomic::AtomicBool, Arc, Mutex},
     thread::{self, JoinHandle},
     time::Instant,
 };
+
+#[test]
+fn cache_publishes_dependencies_while_build_or_test_is_running() {
+    for command in ["build", "test"] {
+        let fixture = Fixture::new(&format!("remote-stream-{command}"));
+        if command == "test" {
+            fixture.write(
+                "tests/smoke.rs",
+                "#[test]\nfn smoke() { assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file()); }\n",
+            );
+        }
+        fs::remove_file(fixture.release_path()).unwrap();
+        let mut child = fixture
+            .command(&["cache", command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Toolchain setup can take longer than the compiler's own gate.
+        // Start the publication deadline only once the gated compiler runs.
+        let startup_deadline = Instant::now() + Duration::from_secs(120);
+        while !compiler_running(&fixture.store) && Instant::now() < startup_deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut published_early = false;
+        while Instant::now() < deadline {
+            let objects = fixture.remote.objects.lock().unwrap();
+            published_early = compiler_running(&fixture.store)
+                && objects
+                    .bytes
+                    .iter()
+                    .filter(|(path, _)| path.contains("/actions/"))
+                    .any(|(_, bytes)| {
+                        serde_json::from_slice::<Value>(bytes).unwrap()["spec"]["target"]["name"]
+                            == "dependency"
+                    });
+            drop(objects);
+            if published_early || child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        fixture.release_compiler();
+        let output = child.wait_with_output().unwrap();
+        assert_success(&output, &format!("cache {command}"));
+        assert!(
+            published_early,
+            "cache {command}: dependency must publish before root finishes; requests: {:?}",
+            fixture.remote.objects.lock().unwrap().requests
+        );
+    }
+}
+
+#[test]
+fn cache_publication_bounds_parallel_uploads() {
+    let fixture = Fixture::new("remote-parallel");
+    let manifest = fs::read_to_string(fixture.workspace.join("Cargo.toml")).unwrap();
+    let mut manifest = manifest;
+    for index in 0..5 {
+        let name = format!("extra_{index}");
+        manifest.push_str(&format!("{name} = {{ path = \"{name}\" }}\n"));
+        fixture.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        );
+        fixture.write(
+            &format!("{name}/src/lib.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        );
+    }
+    fixture.write("Cargo.toml", &manifest);
+    fixture.remote.objects.lock().unwrap().slow_put = true;
+    fixture.run(&["cache", "build"]);
+    let peak = fixture.remote.objects.lock().unwrap().peak_puts;
+    assert!(
+        (2..=4).contains(&peak),
+        "expected 2–4 concurrent PUTs, got {peak}"
+    );
+}
 
 #[test]
 fn remote_build_cache_lifecycle() {
@@ -696,6 +780,9 @@ struct Objects {
     compiler_gate: Option<(String, PathBuf)>,
     slow_blob: Option<String>,
     transient_failures: usize,
+    slow_put: bool,
+    active_puts: usize,
+    peak_puts: usize,
 }
 
 struct HttpCache {
@@ -852,18 +939,28 @@ fn serve(
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    let (gate, slow_blob) = {
+    let (gate, slow_blob, slow_put) = {
         let mut state = objects.lock().unwrap();
         state.requests.push((method.clone(), path.clone()));
         let gate = state
             .compiler_gate
             .clone()
             .filter(|(key, _)| public && key == &path);
+        let slow_put = method == "PUT" && state.slow_put;
+        if slow_put {
+            state.active_puts += 1;
+            state.peak_puts = state.peak_puts.max(state.active_puts);
+        }
         (
             gate,
             method == "GET" && state.slow_blob.as_ref() == Some(&path),
+            slow_put,
         )
     };
+    if slow_put {
+        thread::sleep(Duration::from_millis(100));
+        objects.lock().unwrap().active_puts -= 1;
+    }
     if let Some((_, store)) = gate {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !compiler_running(&store) {
