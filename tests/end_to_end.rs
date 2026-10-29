@@ -4877,12 +4877,13 @@ fn corgi_store_command<const ARGUMENT_COUNT: usize>(
 }
 
 // CI shares provisioned tools and ordinary build artifacts across independent
-// workspaces. Tests that need a genuinely cold or mutable store keep using
-// directory.path.join("store") instead.
+// workspaces. Locally, keep the fallback store beside the fixture: a store
+// beneath the workspace can embed the workspace path in compiler artifacts.
+// Tests needing a genuinely cold or mutable store use directory.path.join("store").
 fn shared_store(directory: &TestDirectory) -> PathBuf {
     std::env::var_os("CORGI_TEST_SHARED_STORE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| directory.path.join("store"))
+        .unwrap_or_else(|| directory.fallback_store_path())
 }
 
 fn invoke_corgi_offline<const ARGUMENT_COUNT: usize>(
@@ -5268,10 +5269,20 @@ impl TestDirectory {
         let path = path.canonicalize().unwrap();
         Self { path, package_name }
     }
+
+    fn fallback_store_path(&self) -> PathBuf {
+        let mut name = std::ffi::OsString::from("store-");
+        name.push(self.path.file_name().unwrap());
+        self.path.with_file_name(name)
+    }
 }
 
 impl Drop for TestDirectory {
     fn drop(&mut self) {
+        let store = self.fallback_store_path();
+        if store.exists() {
+            fs::remove_dir_all(store).unwrap();
+        }
         fs::remove_dir_all(&self.path).unwrap();
     }
 }

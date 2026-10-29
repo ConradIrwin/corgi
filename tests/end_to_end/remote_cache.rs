@@ -120,6 +120,10 @@ fn cache_publishes_dependencies_while_build_or_test_is_running() {
                 "#[test]\nfn smoke() { assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file()); }\n",
             );
         }
+        // Provision toolchains before starting the gate. Under a busy full
+        // suite their installation can exceed the compiler's gate timeout.
+        fixture.run(&["build"]);
+        fixture.clear_results();
         fs::remove_file(fixture.release_path()).unwrap();
         let mut child = fixture
             .command(&["cache", command])
@@ -129,7 +133,7 @@ fn cache_publishes_dependencies_while_build_or_test_is_running() {
             .unwrap();
         // Toolchain setup can take longer than the compiler's own gate.
         // Start the publication deadline only once the gated compiler runs.
-        let startup_deadline = Instant::now() + Duration::from_secs(120);
+        let startup_deadline = Instant::now() + Duration::from_secs(300);
         while !compiler_running(&fixture.store) && Instant::now() < startup_deadline {
             if child.try_wait().unwrap().is_some() {
                 break;
@@ -184,6 +188,7 @@ fn cache_publication_bounds_parallel_uploads() {
         );
     }
     fixture.write("Cargo.toml", &manifest);
+    fixture.run(&["build"]);
     fixture.remote.objects.lock().unwrap().slow_put = true;
     fixture.run(&["cache", "build"]);
     let peak = fixture.remote.objects.lock().unwrap().peak_puts;
@@ -1056,6 +1061,12 @@ fn serve(
         )
     };
     if slow_put {
+        // Hold the first upload until another publisher reaches the server.
+        // A fixed sleep would mistake a heavily loaded compiler for serial I/O.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while objects.lock().unwrap().peak_puts < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         thread::sleep(Duration::from_millis(100));
         objects.lock().unwrap().active_puts -= 1;
     }
