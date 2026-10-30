@@ -278,9 +278,9 @@ mod tests {
             ("debian-binary", b"2.0\n\n".to_vec()),
             ("data.tar.gz", fs::read(&data).unwrap()),
         ] {
-            write!(
+            writeln!(
                 writer,
-                "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`",
                 0,
                 0,
                 0,
