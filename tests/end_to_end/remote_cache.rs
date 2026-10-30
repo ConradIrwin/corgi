@@ -6,10 +6,197 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     os::unix::fs::{symlink, PermissionsExt},
+    process::Stdio,
     sync::{atomic::AtomicBool, Arc, Mutex},
     thread::{self, JoinHandle},
     time::Instant,
 };
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cache_setup_uses_one_password_and_selects_the_project_store() {
+    let fixture = Fixture::new("remote-cache-setup");
+    let store = fixture.directory.path.join("configured-store");
+    let store = store
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("configured-store");
+    let original = format!(
+        "[\"{PRIVATE_URL}\"]\naccess-key-id = \"old\"\nsecret-access-key = \"old\"\n\
+         [\"https://other.example.com/bucket\"]\naccess-key-id = \"keep\"\nsecret-access-key = \"keep\"\n"
+    );
+    let credentials = fixture
+        .directory
+        .path
+        .join("home/.config/corgi/credentials");
+    fs::write(&credentials, original).unwrap();
+    fixture.write(
+        "corgi.toml",
+        &format!(
+            "[cache]\nread-url = \"{PRIVATE_URL}\"\nmacos-cache-path = {:?}\n\
+             op-access-key-id = \"op://vault/item/access\"\n\
+             op-secret-access-key = \"op://vault/item/secret\"\n",
+            store.to_str().unwrap(),
+        ),
+    );
+    fixture.write(
+        "op",
+        "#!/bin/sh\ncase \"$3\" in\n  op://vault/item/access) printf 'fixture-read-access' ;;\n  op://vault/item/secret) printf 'fixture-read-secret' ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    fs::set_permissions(
+        fixture.workspace.join("op"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(std::iter::once(fixture.workspace.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let before = fixture
+        .command(&["pin"])
+        .env_remove("CORGI_STORE")
+        .output()
+        .unwrap();
+    assert_success(&before, "pin without remote cache setup");
+    assert!(String::from_utf8_lossy(&before.stderr)
+        .contains("Remote caching available: run `corgi cache setup`"));
+
+    let setup = fixture
+        .command(&["cache", "setup"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_success(&setup, "configure remote cache");
+    assert!(store.is_dir());
+    let saved = fs::read_to_string(&credentials).unwrap();
+    assert!(saved.contains("fixture-read-access"));
+    assert!(saved.contains("fixture-read-secret"));
+    assert!(saved.contains("https://other.example.com/bucket"));
+    assert_eq!(
+        fs::metadata(&credentials).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!String::from_utf8_lossy(&setup.stderr).contains("fixture-read-secret"));
+
+    let output = fixture
+        .command(&["build"])
+        .env_remove("CORGI_STORE")
+        .output()
+        .unwrap();
+    assert_success(&output, "build with configured store");
+    assert!(store.join("cache").is_dir());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Remote caching available"),
+        "setup must suppress the hint"
+    );
+
+    fixture.write(
+        "op",
+        "#!/bin/sh\nprintf 'sensitive diagnostic' >&2\nexit 1\n",
+    );
+    let failed = fixture
+        .command(&["cache", "setup"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_failure(&failed, "1Password failure must stop setup");
+    assert!(
+        !String::from_utf8_lossy(&failed.stderr).contains("sensitive diagnostic"),
+        "do not forward 1Password output into the build log"
+    );
+    assert_eq!(fs::read_to_string(credentials).unwrap(), saved);
+}
+
+#[test]
+fn cache_publishes_dependencies_while_build_or_test_is_running() {
+    for command in ["build", "test"] {
+        let fixture = Fixture::new(&format!("remote-stream-{command}"));
+        if command == "test" {
+            fixture.write(
+                "tests/smoke.rs",
+                "#[test]\nfn smoke() { assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file()); }\n",
+            );
+        }
+        // Provision toolchains before starting the gate. Under a busy full
+        // suite their installation can exceed the compiler's gate timeout.
+        fixture.run(&["build"]);
+        fixture.clear_results();
+        fs::remove_file(fixture.release_path()).unwrap();
+        let mut child = fixture
+            .command(&["cache", command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Toolchain setup can take longer than the compiler's own gate.
+        // Start the publication deadline only once the gated compiler runs.
+        let startup_deadline = Instant::now() + Duration::from_secs(300);
+        while !compiler_running(&fixture.store) && Instant::now() < startup_deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut published_early = false;
+        while Instant::now() < deadline {
+            let objects = fixture.remote.objects.lock().unwrap();
+            published_early = compiler_running(&fixture.store)
+                && objects
+                    .bytes
+                    .iter()
+                    .filter(|(path, _)| path.contains("/actions/"))
+                    .any(|(_, bytes)| {
+                        serde_json::from_slice::<Value>(bytes).unwrap()["spec"]["target"]["name"]
+                            == "dependency"
+                    });
+            drop(objects);
+            if published_early || child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        fixture.release_compiler();
+        let output = child.wait_with_output().unwrap();
+        assert_success(&output, &format!("cache {command}"));
+        assert!(
+            published_early,
+            "cache {command}: dependency must publish before root finishes; requests: {:?}",
+            fixture.remote.objects.lock().unwrap().requests
+        );
+    }
+}
+
+#[test]
+fn cache_publication_bounds_parallel_uploads() {
+    let fixture = Fixture::new("remote-parallel");
+    let manifest = fs::read_to_string(fixture.workspace.join("Cargo.toml")).unwrap();
+    let mut manifest = manifest;
+    for index in 0..5 {
+        let name = format!("extra_{index}");
+        manifest.push_str(&format!("{name} = {{ path = \"{name}\" }}\n"));
+        fixture.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        );
+        fixture.write(
+            &format!("{name}/src/lib.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        );
+    }
+    fixture.write("Cargo.toml", &manifest);
+    fixture.run(&["build"]);
+    fixture.remote.objects.lock().unwrap().slow_put = true;
+    fixture.run(&["cache", "build"]);
+    let peak = fixture.remote.objects.lock().unwrap().peak_puts;
+    assert!(
+        (2..=4).contains(&peak),
+        "expected 2–4 concurrent PUTs, got {peak}"
+    );
+}
 
 #[test]
 fn remote_build_cache_lifecycle() {
@@ -696,6 +883,9 @@ struct Objects {
     compiler_gate: Option<(String, PathBuf)>,
     slow_blob: Option<String>,
     transient_failures: usize,
+    slow_put: bool,
+    active_puts: usize,
+    peak_puts: usize,
 }
 
 struct HttpCache {
@@ -852,18 +1042,34 @@ fn serve(
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    let (gate, slow_blob) = {
+    let (gate, slow_blob, slow_put) = {
         let mut state = objects.lock().unwrap();
         state.requests.push((method.clone(), path.clone()));
         let gate = state
             .compiler_gate
             .clone()
             .filter(|(key, _)| public && key == &path);
+        let slow_put = method == "PUT" && state.slow_put;
+        if slow_put {
+            state.active_puts += 1;
+            state.peak_puts = state.peak_puts.max(state.active_puts);
+        }
         (
             gate,
             method == "GET" && state.slow_blob.as_ref() == Some(&path),
+            slow_put,
         )
     };
+    if slow_put {
+        // Hold the first upload until another publisher reaches the server.
+        // A fixed sleep would mistake a heavily loaded compiler for serial I/O.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while objects.lock().unwrap().peak_puts < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(100));
+        objects.lock().unwrap().active_puts -= 1;
+    }
     if let Some((_, store)) = gate {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !compiler_running(&store) {

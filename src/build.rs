@@ -2372,7 +2372,7 @@ fn select_resolution_roots(
     }
 }
 
-fn find_corgi_toml(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_corgi_toml(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let p = d.join("corgi.toml");
@@ -6081,238 +6081,302 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "build");
     let results: Vec<OnceLock<UnitResult>> =
         (0..ctx.units.len()).map(|_| OnceLock::new()).collect();
-    let build_result = (|| -> Result<()> {
-        let scheduled = schedule(&ctx, &results);
-        recorder.update(|report| {
-            report.counters.source_hash_ns = ctx.src_hash_nanos.load(Ordering::Relaxed)
-        });
-        finish_report_stage(&recorder, "build", report_stage_start);
-        summarize_test_actions(&ctx, &results);
-        let summary = scheduled?;
-        report_stage_start = begin_report_stage(&recorder, "export");
-
-        let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
-            || (matches!(mode, Mode::Build) && targets.includes_harnesses());
-        if exports_harnesses {
-            fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
-        }
-
-        let mut written = Vec::new();
-        let mut opaque_test_executables = Vec::new();
-        let mut benchmark_executables = Vec::new();
-        // Plain Cargo [env] entries are runtime defaults: the caller's environment wins.
-        let runtime_environment: Vec<_> = ctx
-            .config_env
-            .iter()
-            .filter(|(name, _)| std::env::var_os(name).is_none())
-            .cloned()
-            .collect();
-
-        if exports_harnesses {
-            for (i, u) in ctx.units.iter().enumerate() {
-                if !matches!(u.kind, Kind::Test) || !u.is_root {
-                    continue;
-                }
-                let r = results[i].get().context("test harness not built")?;
-                let m = r.main.as_ref().context("test artifact missing")?;
-                // Export the harness before running it, so even a failing test
-                // leaves a debuggable binary behind.
-                let dest = ctx.export_binary(i, m, &r.res)?;
-                if no_run {
-                    written.push(dest);
-                    continue;
-                }
-                let name = u.target.name.clone();
-                let cwd = ctx.meta.packages[u.pkg].root();
-                let ActionSpec::Compile(spec) = &r.action.spec else {
-                    bail!("test harness compile action expected");
-                };
-                let binary_environment = spec
-                    .environment
-                    .iter()
-                    .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
-                    .chain(runtime_environment.iter())
-                    .cloned()
-                    .collect();
-                if matches!(mode, Mode::Test) {
-                    opaque_test_executables.push(BenchmarkExecutable {
-                        name,
-                        path: dest,
-                        cwd,
-                        binary_environment,
-                    });
-                } else if matches!(mode, Mode::Bench) {
-                    benchmark_executables.push(BenchmarkExecutable {
-                        name,
-                        path: dest,
-                        cwd,
-                        binary_environment,
-                    });
-                }
+    let (sender, receiver) = std::sync::mpsc::channel::<usize>();
+    let receiver = Mutex::new(receiver);
+    std::thread::scope(|scope| {
+        let publication_indices = publish_cache.then(|| remote_cache::publication_indices(&ctx));
+        let mut publishers = Vec::new();
+        if publish_cache {
+            for _ in 0..4 {
+                let receiver = &receiver;
+                let results = &results;
+                let ctx = &ctx;
+                publishers.push(scope.spawn(move || {
+                    let mut count = 0;
+                    let mut errors = Vec::new();
+                    loop {
+                        // Drop the receiver lock before doing network I/O.
+                        let next = { receiver.lock().unwrap().recv() };
+                        let Ok(index) = next else { break };
+                        match remote_cache::publish_one(ctx, results, index) {
+                            Ok(true) => count += 1,
+                            Ok(false) => {}
+                            Err(error) => errors.push(format!("{error:#}")),
+                        }
+                    }
+                    (count, errors)
+                }));
             }
         }
-
-        let requested_outputs = requested_units(&ctx);
-        for (i, u) in ctx.units.iter().enumerate() {
-            if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
-                break;
-            }
-            if matches!(u.kind, Kind::Bin)
-                && (!matches!(mode, Mode::Test) || requested_outputs.contains(&i))
+        let enqueue = |index: usize| {
+            if publication_indices
+                .as_ref()
+                .is_some_and(|indices| indices.contains(&index))
             {
-                // Integration tests can demand normal binaries through CARGO_BIN_EXE
-                // even when those binaries were not selected as roots.
-                if let Some(r) = results[i].get() {
-                    let m = r.main.as_ref().context("bin artifact missing")?;
+                sender.send(index).expect("publication workers stopped");
+            }
+        };
+        // Publication overlaps build, export, and test. Record its duration
+        // without replacing the run's current outcome stage.
+        let publication_start = publish_cache.then(|| {
+            let start_ns = recorder.elapsed_ns();
+            recorder.update(|report| {
+                report.stages.insert(
+                    "publish".into(),
+                    crate::report::StageTiming {
+                        start_ns,
+                        end_ns: start_ns,
+                    },
+                );
+            });
+            start_ns
+        });
+        let build_result = (|| -> Result<()> {
+            let scheduled = schedule(&ctx, &results, publish_cache.then_some(&enqueue));
+            recorder.update(|report| {
+                report.counters.source_hash_ns = ctx.src_hash_nanos.load(Ordering::Relaxed)
+            });
+            finish_report_stage(&recorder, "build", report_stage_start);
+            summarize_test_actions(&ctx, &results);
+            let summary = scheduled?;
+            report_stage_start = begin_report_stage(&recorder, "export");
+
+            let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
+                || (matches!(mode, Mode::Build) && targets.includes_harnesses());
+            if exports_harnesses {
+                fs::create_dir_all("/tmp/corgi/target-tmp")
+                    .context("creating CARGO_TARGET_TMPDIR")?;
+            }
+
+            let mut written = Vec::new();
+            let mut opaque_test_executables = Vec::new();
+            let mut benchmark_executables = Vec::new();
+            // Plain Cargo [env] entries are runtime defaults: the caller's environment wins.
+            let runtime_environment: Vec<_> = ctx
+                .config_env
+                .iter()
+                .filter(|(name, _)| std::env::var_os(name).is_none())
+                .cloned()
+                .collect();
+
+            if exports_harnesses {
+                for (i, u) in ctx.units.iter().enumerate() {
+                    if !matches!(u.kind, Kind::Test) || !u.is_root {
+                        continue;
+                    }
+                    let r = results[i].get().context("test harness not built")?;
+                    let m = r.main.as_ref().context("test artifact missing")?;
+                    // Export the harness before running it, so even a failing test
+                    // leaves a debuggable binary behind.
                     let dest = ctx.export_binary(i, m, &r.res)?;
-                    written.push(dest);
+                    if no_run {
+                        written.push(dest);
+                        continue;
+                    }
+                    let name = u.target.name.clone();
+                    let cwd = ctx.meta.packages[u.pkg].root();
+                    let ActionSpec::Compile(spec) = &r.action.spec else {
+                        bail!("test harness compile action expected");
+                    };
+                    let binary_environment = spec
+                        .environment
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
+                        .chain(runtime_environment.iter())
+                        .cloned()
+                        .collect();
+                    if matches!(mode, Mode::Test) {
+                        opaque_test_executables.push(BenchmarkExecutable {
+                            name,
+                            path: dest,
+                            cwd,
+                            binary_environment,
+                        });
+                    } else if matches!(mode, Mode::Bench) {
+                        benchmark_executables.push(BenchmarkExecutable {
+                            name,
+                            path: dest,
+                            cwd,
+                            binary_environment,
+                        });
+                    }
                 }
             }
-            if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
-                if let Some(r) = results[i].get() {
-                    for o in &r.res.outputs {
-                        if o.name.ends_with(".wasm")
-                            || o.name.ends_with(".dylib")
-                            || o.name.ends_with(".so")
-                        {
-                            let dest = ctx.export_binary(i, o, &r.res)?;
-                            written.push(dest);
+
+            let requested_outputs = requested_units(&ctx);
+            for (i, u) in ctx.units.iter().enumerate() {
+                if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
+                    break;
+                }
+                if matches!(u.kind, Kind::Bin)
+                    && (!matches!(mode, Mode::Test) || requested_outputs.contains(&i))
+                {
+                    // Integration tests can demand normal binaries through CARGO_BIN_EXE
+                    // even when those binaries were not selected as roots.
+                    if let Some(r) = results[i].get() {
+                        let m = r.main.as_ref().context("bin artifact missing")?;
+                        let dest = ctx.export_binary(i, m, &r.res)?;
+                        written.push(dest);
+                    }
+                }
+                if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
+                    if let Some(r) = results[i].get() {
+                        for o in &r.res.outputs {
+                            if o.name.ends_with(".wasm")
+                                || o.name.ends_with(".dylib")
+                                || o.name.ends_with(".so")
+                            {
+                                let dest = ctx.export_binary(i, o, &r.res)?;
+                                written.push(dest);
+                            }
                         }
                     }
                 }
             }
-        }
-        finish_report_stage(&recorder, "export", report_stage_start);
-        status!(
-            "Finished",
-            "in {:.2}s — {summary}",
-            t0.elapsed().as_secs_f64()
-        );
-        for path in written {
-            match path.strip_prefix(&ctx.workspace_root) {
-                Ok(relative) => status!("Output", "`{}`", relative.display()),
-                Err(_) => status!("Output", "`{}`", path.display()),
+            finish_report_stage(&recorder, "export", report_stage_start);
+            status!(
+                "Finished",
+                "in {:.2}s — {summary}",
+                t0.elapsed().as_secs_f64()
+            );
+            for path in written {
+                match path.strip_prefix(&ctx.workspace_root) {
+                    Ok(relative) => status!("Output", "`{}`", relative.display()),
+                    Err(_) => status!("Output", "`{}`", path.display()),
+                }
             }
-        }
-        if matches!(mode, Mode::Test) && !no_run {
-            if !ctx
-                .units
-                .iter()
-                .any(|unit| matches!(unit.kind, Kind::TestRun))
-                && opaque_test_executables.is_empty()
-            {
-                bail!("no tests found");
-            }
-            if !opaque_test_executables.is_empty() {
-                let now = recorder.elapsed_ns();
-                let mut test_stage_start = now;
-                recorder.update(|report| {
-                    report.run.outcome.stage = Some("test".into());
-                    test_stage_start = report
-                        .stages
-                        .entry("test".into())
-                        .or_insert(crate::report::StageTiming {
-                            start_ns: now,
-                            end_ns: now,
-                        })
-                        .start_ns;
-                });
-                run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
-                finish_report_stage(&recorder, "test", test_stage_start);
-            }
-        }
-        if matches!(mode, Mode::Bench) && !no_run {
-            let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
-            run_benchmarks(&benchmark_executables, &exec_args)?;
-            finish_report_stage(&recorder, "benchmark", benchmark_stage_start);
-        }
-        let cleanup_stage_start = begin_report_stage(&recorder, "cleanup");
-        maybe_auto_clean(&ctx.store);
-        finish_report_stage(&recorder, "cleanup", cleanup_stage_start);
-        if matches!(mode, Mode::Run) {
-            let root_bins: Vec<usize> = ctx
-                .units
-                .iter()
-                .enumerate()
-                .filter(|(_, u)| matches!(u.kind, Kind::Bin) && u.is_root)
-                .map(|(i, _)| i)
-                .collect();
-            let package = root_bins
-                .first()
-                .map(|&i| &ctx.meta.packages[ctx.units[i].pkg])
-                .context("selected package has no runnable binary target")?;
-            let bin_index = select_run_binary(
-                if targets.is_explicit() {
-                    None
-                } else {
-                    package.default_run.as_deref()
-                },
-                root_bins
+            if matches!(mode, Mode::Test) && !no_run {
+                if !ctx
+                    .units
                     .iter()
-                    .map(|&i| (i, ctx.units[i].target.name.as_str())),
-            )?;
-            let output = results[bin_index]
-                .get()
-                .and_then(|result| result.main.as_ref())
-                .context("selected executable has no binary output")?;
-            let relative = binary_export_path(&ctx, bin_index, &output.name);
-            let dest = ctx.target_dir.join(relative.strip_prefix("target")?);
-            status!("Running", "`{}`", dest.display());
-            let execution_start = begin_report_stage(&recorder, "execute");
-            // Preserve the caller's cwd, ambient environment, and stdio, adding only
-            // configured defaults (no build-only CARGO_* vars). The exit status is
-            // the child's, signals reported the way a shell would (128 + signal).
-            let status = Command::new(&dest)
-                .args(&exec_args)
-                .envs(runtime_environment.iter().cloned())
-                .status()
-                .with_context(|| format!("running {}", dest.display()))?;
-            let execution_end = recorder.elapsed_ns();
-            finish_report_stage(&recorder, "execute", execution_start);
-            #[cfg(unix)]
-            use std::os::unix::process::ExitStatusExt;
-            #[cfg(unix)]
-            let signal = status.signal();
-            #[cfg(not(unix))]
-            let signal = None;
-            let code = signal
-                .map(|signal| 128 + signal)
-                .unwrap_or_else(|| status.code().unwrap_or(1));
-            let execution = crate::report::Execution {
-                unit: ctx.report_unit_keys[bin_index].clone(),
-                program: dest.display().to_string(),
-                args: exec_args.clone(),
-                start_ns: execution_start,
-                end_ns: execution_end,
-                outcome: crate::report::ExecutionOutcome {
-                    exit_code: status.code(),
-                    signal,
-                },
-            };
-            recorder.update(|report| report.execution = Some(execution));
-            if code != 0 {
-                return Err(RunExit { code, signal }.into());
+                    .any(|unit| matches!(unit.kind, Kind::TestRun))
+                    && opaque_test_executables.is_empty()
+                {
+                    bail!("no tests found");
+                }
+                if !opaque_test_executables.is_empty() {
+                    let now = recorder.elapsed_ns();
+                    let mut test_stage_start = now;
+                    recorder.update(|report| {
+                        report.run.outcome.stage = Some("test".into());
+                        test_stage_start = report
+                            .stages
+                            .entry("test".into())
+                            .or_insert(crate::report::StageTiming {
+                                start_ns: now,
+                                end_ns: now,
+                            })
+                            .start_ns;
+                    });
+                    run_opaque_tests(&opaque_test_executables, &exec_args, test_timeout)?;
+                    finish_report_stage(&recorder, "test", test_stage_start);
+                }
+            }
+            if matches!(mode, Mode::Bench) && !no_run {
+                let benchmark_stage_start = begin_report_stage(&recorder, "benchmark");
+                run_benchmarks(&benchmark_executables, &exec_args)?;
+                finish_report_stage(&recorder, "benchmark", benchmark_stage_start);
+            }
+            let cleanup_stage_start = begin_report_stage(&recorder, "cleanup");
+            maybe_auto_clean(&ctx.store);
+            finish_report_stage(&recorder, "cleanup", cleanup_stage_start);
+            if matches!(mode, Mode::Run) {
+                let root_bins: Vec<usize> = ctx
+                    .units
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, u)| matches!(u.kind, Kind::Bin) && u.is_root)
+                    .map(|(i, _)| i)
+                    .collect();
+                let package = root_bins
+                    .first()
+                    .map(|&i| &ctx.meta.packages[ctx.units[i].pkg])
+                    .context("selected package has no runnable binary target")?;
+                let bin_index = select_run_binary(
+                    if targets.is_explicit() {
+                        None
+                    } else {
+                        package.default_run.as_deref()
+                    },
+                    root_bins
+                        .iter()
+                        .map(|&i| (i, ctx.units[i].target.name.as_str())),
+                )?;
+                let output = results[bin_index]
+                    .get()
+                    .and_then(|result| result.main.as_ref())
+                    .context("selected executable has no binary output")?;
+                let relative = binary_export_path(&ctx, bin_index, &output.name);
+                let dest = ctx.target_dir.join(relative.strip_prefix("target")?);
+                status!("Running", "`{}`", dest.display());
+                let execution_start = begin_report_stage(&recorder, "execute");
+                // Preserve the caller's cwd, ambient environment, and stdio, adding only
+                // configured defaults (no build-only CARGO_* vars). The exit status is
+                // the child's, signals reported the way a shell would (128 + signal).
+                let status = Command::new(&dest)
+                    .args(&exec_args)
+                    .envs(runtime_environment.iter().cloned())
+                    .status()
+                    .with_context(|| format!("running {}", dest.display()))?;
+                let execution_end = recorder.elapsed_ns();
+                finish_report_stage(&recorder, "execute", execution_start);
+                #[cfg(unix)]
+                use std::os::unix::process::ExitStatusExt;
+                #[cfg(unix)]
+                let signal = status.signal();
+                #[cfg(not(unix))]
+                let signal = None;
+                let code = signal
+                    .map(|signal| 128 + signal)
+                    .unwrap_or_else(|| status.code().unwrap_or(1));
+                let execution = crate::report::Execution {
+                    unit: ctx.report_unit_keys[bin_index].clone(),
+                    program: dest.display().to_string(),
+                    args: exec_args.clone(),
+                    start_ns: execution_start,
+                    end_ns: execution_end,
+                    outcome: crate::report::ExecutionOutcome {
+                        exit_code: status.code(),
+                        signal,
+                    },
+                };
+                recorder.update(|report| report.execution = Some(execution));
+                if code != 0 {
+                    return Err(RunExit { code, signal }.into());
+                }
+            }
+            Ok(())
+        })();
+        // Pruned dependencies have no scheduled result, but may have a local
+        // candidate or imported alias that still needs publication.
+        if let Some(indices) = &publication_indices {
+            for &index in indices {
+                if results[index].get().is_none() {
+                    enqueue(index);
+                }
             }
         }
-        Ok(())
-    })();
-    if publish_cache {
-        // Publish local hits too, including successful actions from a failed run.
-        let publication_start = build_result
-            .is_ok()
-            .then(|| begin_report_stage(&recorder, "publish"));
-        let published = remote_cache::publish(&ctx, &results);
+        drop(sender);
+        let mut count = 0;
+        let mut errors = Vec::new();
+        for publisher in publishers {
+            let (published, failures) = publisher.join().unwrap();
+            count += published;
+            errors.extend(failures);
+        }
         if let Some(start) = publication_start {
             finish_report_stage(&recorder, "publish", start);
+            status!("Published", "{count} cache results");
         }
-        if let Err(error) = published {
+        if !errors.is_empty() {
+            let error = anyhow::anyhow!(errors.join("\n"));
             return Err(match build_result {
                 Ok(()) => error,
                 Err(build_error) => build_error.context(format!("{error:#}")),
             });
         }
-    }
-    build_result
+        build_result
+    })
 }
 
 /// What the plan cache stores: CAS pointers to the cargo metadata and
@@ -8762,9 +8826,20 @@ fn reverse_dependency_order(dependencies: &[Vec<usize>], needed: &[bool]) -> Res
     Ok(order)
 }
 
-fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSummary> {
+fn schedule(
+    ctx: &Ctx,
+    results: &[OnceLock<UnitResult>],
+    publish: Option<&(dyn Fn(usize) + Sync)>,
+) -> Result<ScheduleSummary> {
     let n = ctx.units.len();
     let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
+    if let Some(publish) = publish {
+        for (index, result) in results.iter().enumerate() {
+            if result.get().is_some() {
+                publish(index);
+            }
+        }
+    }
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
@@ -8941,6 +9016,9 @@ fn schedule(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<ScheduleSumma
                     }
                 }
                 let _ = results[idx].set(ur);
+                if let Some(publish) = publish {
+                    publish(idx);
+                }
                 for &j in &rdeps_full[idx] {
                     st.indeg[j] -= 1;
                     if st.indeg[j] == 0

@@ -252,67 +252,70 @@ pub(super) fn install(ctx: &Ctx, index: usize, record: Record) -> Result<UnitRes
 /// Publish the relevant graph, not just actions executed in this invocation.
 /// Requested local hits prune execution, but must not hide reusable dependency
 /// results from an explicit cache-population command.
-pub(super) fn publish(ctx: &Ctx, results: &[OnceLock<UnitResult>]) -> Result<()> {
+pub(super) fn publication_indices(ctx: &Ctx) -> HashSet<usize> {
+    dependency_closure(ctx, requested_units(ctx))
+        .into_iter()
+        .collect()
+}
+
+pub(super) fn publish_one(
+    ctx: &Ctx,
+    results: &[OnceLock<UnitResult>],
+    index: usize,
+) -> Result<bool> {
     let cache = ctx.remote.as_ref().context("remote cache disabled")?;
-    let mut count = 0;
-    for index in dependency_closure(ctx, requested_units(ctx)) {
+    let publication = (|| -> Result<bool> {
         let plan = &ctx.action_plans[index];
         if !plan.cache_policy.writes()
             || (!plan.cache_policy.reads() && results[index].get().is_none())
         {
-            continue;
+            return Ok(false);
         }
-        let publication = (|| -> Result<()> {
-            let mut record = if let Some(result) = results[index].get() {
-                Some(make_record(ctx, index, &result.action, result.res.clone()))
-            } else if let Some(action) = &ctx.action_plans[index].candidate {
-                ctx.lookup_action(index, &action.key)?
-                    .ok()
-                    .map(|result| make_record(ctx, index, action, result))
-            } else {
-                fs::read(alias_path(ctx, index))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
-            };
-            if let Some(candidate) = &record {
-                let validation = validate(ctx, index, candidate).and_then(|()| {
-                    anyhow::ensure!(
-                        candidate
-                            .blobs
-                            .iter()
-                            .all(|hash| ctx.store.cache_path(hash).is_file()),
-                        "local artifact blobs missing"
-                    );
-                    Ok(())
-                });
-                if let Err(error) = validation {
-                    if results[index].get().is_some() {
-                        return Err(error);
-                    }
-                    // Stale aliases for skipped work are not publication inputs.
-                    record = None;
+        let mut record = if let Some(result) = results[index].get() {
+            Some(make_record(ctx, index, &result.action, result.res.clone()))
+        } else if let Some(action) = &ctx.action_plans[index].candidate {
+            ctx.lookup_action(index, &action.key)?
+                .ok()
+                .map(|result| make_record(ctx, index, action, result))
+        } else {
+            fs::read(alias_path(ctx, index))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+        };
+        if let Some(candidate) = &record {
+            let validation = validate(ctx, index, candidate).and_then(|()| {
+                anyhow::ensure!(
+                    candidate
+                        .blobs
+                        .iter()
+                        .all(|hash| ctx.store.cache_path(hash).is_file()),
+                    "local artifact blobs missing"
+                );
+                Ok(())
+            });
+            if let Err(error) = validation {
+                if results[index].get().is_some() {
+                    return Err(error);
                 }
+                // Stale aliases for skipped work are not publication inputs.
+                record = None;
             }
-            if let Some(record) = &record {
-                let paths = record
-                    .blobs
-                    .iter()
-                    .map(|hash| ctx.store.cache_path(hash))
-                    .collect::<Vec<_>>();
-                let refs = record
-                    .blobs
-                    .iter()
-                    .zip(&paths)
-                    .map(|(hash, path)| crate::remote::BlobRef { hash, path })
-                    .collect::<Vec<_>>();
-                cache.publish(&record.remote_key, &serde_json::to_vec(record)?, &refs)?;
-                count += 1;
-            }
-            Ok(())
-        })();
-        publication
-            .with_context(|| format!("cache publication failed for {}", describe(ctx, index)))?;
-    }
-    status!("Published", "{count} cache results");
-    Ok(())
+        }
+        if let Some(record) = &record {
+            let paths = record
+                .blobs
+                .iter()
+                .map(|hash| ctx.store.cache_path(hash))
+                .collect::<Vec<_>>();
+            let refs = record
+                .blobs
+                .iter()
+                .zip(&paths)
+                .map(|(hash, path)| crate::remote::BlobRef { hash, path })
+                .collect::<Vec<_>>();
+            cache.publish(&record.remote_key, &serde_json::to_vec(record)?, &refs)?;
+        }
+        Ok(record.is_some())
+    })();
+    publication.with_context(|| format!("cache publication failed for {}", describe(ctx, index)))
 }
