@@ -10,8 +10,105 @@ permissions:
   id-token: write
 
 jobs:
+  # Builds the Linux release assets. The macOS job attaches them to the draft
+  # release, so the release, crates.io, and publication steps run once. Each
+  # target builds on a native runner, which also verifies its libclang loads.
+  build-linux:
+    name: Build ${{ matrix.target }} release asset
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            llvm_platform: linux-x64
+            llvm_sha256_variable: CORGI_LLVM_TOOLS_SHA256_LINUX_X64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            llvm_platform: linux-arm64
+            llvm_sha256_variable: CORGI_LLVM_TOOLS_SHA256_LINUX_ARM64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v${version}"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap zstd
+          # Ubuntu 24.04's AppArmor policy blocks unprivileged user namespaces.
+          # This runner is ephemeral; Corgi still requires Bubblewrap's sandbox.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # Corgi provisions these llvm-tools (libclang plus the libstdc++ it
+      # links) when a Linux build uses bindgen. The script is idempotent and
+      # exports CORGI_LLVM_TOOLS_SHA256_LINUX_<ARCH>, which the release build
+      # embeds to pin the download.
+      - name: Ensure llvm-tools release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          PLATFORM: ${{ matrix.llvm_platform }}
+        run: ./ci/build-libclang.sh
+
+      - name: Build Corgi
+        run: |
+          rustup set profile minimal
+          cargo build --locked
+
+      - name: Build release asset
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          SHA256_VARIABLE: ${{ matrix.llvm_sha256_variable }}
+        run: |
+          set -euo pipefail
+          target="$TARGET"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$target"
+          llvm_sha256="${!SHA256_VARIABLE:-}"
+          test -n "$llvm_sha256" || { echo "the llvm-tools step must export $SHA256_VARIABLE" >&2; exit 1; }
+
+          ./target/debug/corgi build --release
+
+          asset="corgi-${target}.tar.gz"
+          mkdir -p dist/archive dist/verify
+          cp target/release/corgi dist/archive/corgi
+          strip dist/archive/corgi
+          tar -czf "dist/${asset}" -C dist/archive corgi
+          (
+            cd dist
+            sha256sum "$asset" > "${asset}.sha256"
+          )
+
+          tar -xzf "dist/${asset}" -C dist/verify
+          test "$(dist/verify/corgi --version)" = "corgi ${VERSION}"
+          # corgi.toml must forward the pin; without it the binary would
+          # download llvm-tools unverified.
+          grep -qF "$llvm_sha256" dist/verify/corgi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corgi-${{ matrix.target }}
+          path: |
+            dist/corgi-${{ matrix.target }}.tar.gz
+            dist/corgi-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
     name: Publish Corgi
+    needs: build-linux
     runs-on: macos-15
 
     steps:
@@ -102,6 +199,12 @@ jobs:
           tar -xzf "dist/${asset}" -C dist/verify
           test "$(dist/verify/corgi --version)" = "corgi ${VERSION}"
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: corgi-*-unknown-linux-gnu
+          path: dist
+          merge-multiple: true
+
       - name: Recreate draft GitHub release from the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,10 +221,12 @@ jobs:
             # build. Delete the draft, but keep the immutable release tag.
             gh release delete "$tag" --yes
           fi
-          asset="corgi-aarch64-apple-darwin.tar.gz"
+          assets=()
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            assets+=("dist/corgi-${target}.tar.gz" "dist/corgi-${target}.tar.gz.sha256")
+          done
           gh release create "$tag" \
-            "dist/${asset}" \
-            "dist/${asset}.sha256" \
+            "${assets[@]}" \
             --draft \
             --verify-tag \
             --target "$GITHUB_SHA" \
