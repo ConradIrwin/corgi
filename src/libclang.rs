@@ -81,9 +81,18 @@ pub fn required_files(host: &str) -> &'static [&'static str] {
     }
 }
 
-/// Release tag hosting the llvm-tools artifact for the pinned Zig version.
-pub fn tag() -> String {
-    format!("llvm-tools-{}", crate::zig::VERSION)
+/// Release tag hosting the llvm-tools artifact for `host` and the pinned Zig
+/// version.
+///
+/// The repository's releases are immutable, so independently built artifacts
+/// cannot share one release: each platform gets its own tag. macOS keeps the
+/// unsuffixed tag it was first published under, which released Corgi
+/// binaries already download from.
+pub fn tag(host: &str) -> Result<String> {
+    Ok(match platform(host)? {
+        "macos-arm64" => format!("llvm-tools-{}", crate::zig::VERSION),
+        platform => format!("llvm-tools-{}-{platform}", crate::zig::VERSION),
+    })
 }
 
 /// Archive file name for `host`.
@@ -95,7 +104,7 @@ pub fn asset_name(host: &str) -> Result<String> {
 pub fn url(host: &str) -> Result<String> {
     Ok(format!(
         "https://github.com/{RELEASE_REPO}/releases/download/{}/{}",
-        tag(),
+        tag(host)?,
         asset_name(host)?
     ))
 }
@@ -193,8 +202,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tag_follows_zig_version() {
-        assert_eq!(tag(), format!("llvm-tools-{}", crate::zig::VERSION));
+    fn tag_follows_zig_version_and_platform() {
+        let version = crate::zig::VERSION;
+        assert_eq!(
+            tag("aarch64-apple-darwin").unwrap(),
+            format!("llvm-tools-{version}")
+        );
+        assert_eq!(
+            tag("aarch64-unknown-linux-gnu").unwrap(),
+            format!("llvm-tools-{version}-linux-arm64")
+        );
     }
 
     #[test]
@@ -215,7 +232,6 @@ mod tests {
     fn artifact_names_the_llvm_tools_family_and_exposes_dsymutil() {
         assert_eq!(DYLIB_RELATIVE, "lib/libclang.dylib");
         assert_eq!(DSYMUTIL_RELATIVE, "bin/dsymutil");
-        assert!(tag().starts_with("llvm-tools-"));
         assert!(url("aarch64-apple-darwin")
             .unwrap()
             .contains("llvm-tools-macos-arm64.tar.zst"));
@@ -231,9 +247,10 @@ mod tests {
     #[test]
     fn linux_artifacts_bundle_libstdcxx_instead_of_dsymutil() {
         let host = "x86_64-unknown-linux-gnu";
-        assert!(url(host)
-            .unwrap()
-            .ends_with("/llvm-tools-linux-x64.tar.zst"));
+        assert!(url(host).unwrap().ends_with(&format!(
+            "/llvm-tools-{}-linux-x64/llvm-tools-linux-x64.tar.zst",
+            crate::zig::VERSION
+        )));
         assert_eq!(
             required_files(host),
             ["lib/libclang.so", "lib/libstdc++.so.6"]

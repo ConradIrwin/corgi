@@ -78,7 +78,13 @@ zig_version="$(
   sed -n 's/^pub const VERSION: &str = "\([^"]*\)";/\1/p' "${repo_root}/src/zig.rs" | head -n1
 )"
 [ -n "$zig_version" ] || die "could not read pinned Zig version from src/zig.rs"
-tag="llvm-tools-${zig_version}"
+# Releases are immutable, so each platform has its own release (matching
+# libclang::tag). macOS keeps the unsuffixed tag it was first published under.
+if [ "$PLATFORM" = "macos-arm64" ]; then
+  tag="llvm-tools-${zig_version}"
+else
+  tag="llvm-tools-${zig_version}-${PLATFORM}"
+fi
 log "pinned Zig version: ${zig_version} (release tag ${tag})"
 
 # Release builds of Corgi embed this to hard-pin the llvm-tools download.
@@ -101,8 +107,9 @@ export_release_sha256() {
 # --- 3. check whether the artifact already exists ---------------------------
 
 if [ "${DRY_RUN:-0}" != "1" ]; then
-  if gh release view "$tag" -R "$RELEASE_REPO" --json assets \
-       --jq '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
+  # A draft left by an interrupted run is not published yet; rebuild into it.
+  if gh release view "$tag" -R "$RELEASE_REPO" --json assets,isDraft \
+       --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
     log "release ${tag} already has ${ASSET}; nothing to do"
     # Read the published sidecar so the pin is available without rebuilding.
     sidecar="$(gh release view "$tag" -R "$RELEASE_REPO" \
@@ -350,15 +357,22 @@ fi
 # --- publish ----------------------------------------------------------------
 
 log "publishing ${ASSET} to ${RELEASE_REPO} release ${tag}"
-if gh release view "$tag" -R "$RELEASE_REPO" >/dev/null 2>&1; then
-  gh release upload "$tag" \
-    "${repo_root}/dist/${ASSET}" "${repo_root}/dist/${ASSET}.sha256" \
-    -R "$RELEASE_REPO" --clobber
-else
+# Published releases are immutable: upload into a draft, then publish it. A
+# draft left by an interrupted run is reused.
+if ! gh release view "$tag" -R "$RELEASE_REPO" >/dev/null 2>&1; then
+  if [ "$is_linux" = 1 ]; then
+    contents="libclang (with the libstdc++ it links)"
+  else
+    contents="libclang and dsymutil"
+  fi
   gh release create "$tag" \
-    "${repo_root}/dist/${ASSET}" "${repo_root}/dist/${ASSET}.sha256" \
     -R "$RELEASE_REPO" \
-    --title "llvm-tools for Zig ${zig_version} (LLVM ${llvm_version})" \
-    --notes "libclang and dsymutil sliced from upstream LLVM ${llvm_version} for use with Corgi's pinned Zig ${zig_version}. Built by ci/build-libclang.sh."
+    --draft \
+    --title "llvm-tools for Zig ${zig_version} on ${PLATFORM} (LLVM ${llvm_version})" \
+    --notes "${contents} sliced from upstream LLVM ${llvm_version} for use with Corgi's pinned Zig ${zig_version}. Built by ci/build-libclang.sh."
 fi
+gh release upload "$tag" \
+  "${repo_root}/dist/${ASSET}" "${repo_root}/dist/${ASSET}.sha256" \
+  -R "$RELEASE_REPO" --clobber
+gh release edit "$tag" -R "$RELEASE_REPO" --draft=false
 log "done"
