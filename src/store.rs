@@ -1,3 +1,4 @@
+use crate::file_stat::{self, Kind, StatKey};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -208,42 +209,49 @@ impl Drop for StreamedInsert {
     }
 }
 
-/// Per-file hint: (size, mtime_ns, inode) -> content hash. Hints only let
+/// Per-file hint: (size, mtime, file id) -> content hash. Hints only let
 /// us skip re-hashing; any metadata mismatch falls back to hashing bytes,
 /// so mtimes never decide correctness.
-type Hints = std::collections::HashMap<String, (u64, i64, u64, String)>;
+type Hints = std::collections::HashMap<String, (StatKey, String)>;
 
-fn stat_key(md: &fs::Metadata) -> (u64, i64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (
-        md.size(),
-        md.mtime() * 1_000_000_000 + md.mtime_nsec(),
-        md.ino(),
-    )
+/// Hints for one set of files, from `Store::with_hints`. The default has no
+/// saved hints, so every file is hashed.
+#[derive(Default)]
+pub(crate) struct HintCache {
+    saved: Hints,
+    fresh: Hints,
+}
+
+impl HintCache {
+    /// The content hash of `path`, recorded under `name`. A saved hash is
+    /// reused only while `key` (from `file_stat`) still matches.
+    pub(crate) fn hash(&mut self, name: &str, path: &Path, key: StatKey) -> Result<String> {
+        STAT_FILES.fetch_add(1, Ordering::Relaxed);
+        let hash = match self.saved.get(name) {
+            Some((saved, hash)) if *saved == key => hash.clone(),
+            _ => {
+                REHASHED_FILES.fetch_add(1, Ordering::Relaxed);
+                sha256_file(path)?
+            }
+        };
+        self.fresh.insert(name.to_owned(), (key, hash.clone()));
+        Ok(hash)
+    }
 }
 
 /// Hash a directory tree by *content only*: relative paths + file bytes.
 /// mtimes, inode numbers, absolute paths never enter the hash.
 pub fn hash_dir(root: &Path) -> Result<String> {
-    hash_dir_hinted(root, &Hints::new(), &mut Hints::new())
+    hash_dir_hinted(root, &mut HintCache::default())
 }
 
-fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<String> {
-    fn walk(
-        h: &mut Sha256,
-        root: &Path,
-        rel: &Path,
-        hints: &Hints,
-        fresh: &mut Hints,
-    ) -> Result<()> {
+fn hash_dir_hinted(root: &Path, hints: &mut HintCache) -> Result<String> {
+    fn walk(h: &mut Sha256, root: &Path, rel: &Path, hints: &mut HintCache) -> Result<()> {
         let dir = root.join(rel);
-        let mut names: Vec<std::ffi::OsString> = Vec::new();
-        for e in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-            names.push(e?.file_name());
-        }
-        names.sort();
-        for name in names {
-            let l = name.to_string_lossy().into_owned();
+        let entries =
+            file_stat::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
+        for entry in entries {
+            let l = entry.name.to_string_lossy().into_owned();
             // Never let build outputs or vcs state into the source hash.
             if rel.as_os_str().is_empty() && matches!(l.as_str(), "target" | "Cargo.lock") {
                 continue;
@@ -251,51 +259,44 @@ fn hash_dir_hinted(root: &Path, hints: &Hints, fresh: &mut Hints) -> Result<Stri
             if l == ".git" {
                 continue;
             }
-            let rel_child = rel.join(&name);
+            let rel_child = rel.join(&entry.name);
             let p = root.join(&rel_child);
-            let md = fs::symlink_metadata(&p)?;
             let rl = rel_child.to_string_lossy().into_owned();
-            if md.file_type().is_symlink() {
-                h.update(b"L");
-                h.update(rl.as_bytes());
-                h.update([0]);
-                h.update(fs::read_link(&p)?.to_string_lossy().as_bytes());
-                h.update([0]);
-            } else if md.is_dir() {
-                h.update(b"D");
-                h.update(rl.as_bytes());
-                h.update([0]);
-                walk(h, root, &rel_child, hints, fresh)?;
-            } else {
-                let key = stat_key(&md);
-                STAT_FILES.fetch_add(1, Ordering::Relaxed);
-                let content = match hints.get(&rl) {
-                    Some((sz, mt, ino, hash)) if (*sz, *mt, *ino) == key => hash.clone(),
-                    _ => {
-                        REHASHED_FILES.fetch_add(1, Ordering::Relaxed);
-                        sha256_file(&p)?
-                    }
-                };
-                fresh.insert(rl.clone(), (key.0, key.1, key.2, content.clone()));
-                h.update(b"F");
-                h.update(rl.as_bytes());
-                h.update([0]);
-                h.update(content.as_bytes());
-                h.update([0]);
+            match entry.stat.kind {
+                Kind::Symlink => {
+                    h.update(b"L");
+                    h.update(rl.as_bytes());
+                    h.update([0]);
+                    h.update(fs::read_link(&p)?.to_string_lossy().as_bytes());
+                    h.update([0]);
+                }
+                Kind::Directory => {
+                    h.update(b"D");
+                    h.update(rl.as_bytes());
+                    h.update([0]);
+                    walk(h, root, &rel_child, hints)?;
+                }
+                Kind::File | Kind::Other => {
+                    let content = hints.hash(&rl, &p, entry.stat.key)?;
+                    h.update(b"F");
+                    h.update(rl.as_bytes());
+                    h.update([0]);
+                    h.update(content.as_bytes());
+                    h.update([0]);
+                }
             }
         }
         Ok(())
     }
     let mut h = Sha256::new();
-    walk(&mut h, root, Path::new(""), hints, fresh)?;
+    walk(&mut h, root, Path::new(""), hints)?;
     Ok(hex(&h.finalize()))
 }
 
 fn file_hashes_hinted(
     root: &Path,
     relative_paths: &[PathBuf],
-    hints: &Hints,
-    fresh: &mut Hints,
+    hints: &mut HintCache,
 ) -> Result<Vec<(String, String)>> {
     let mut relative_paths = relative_paths.to_vec();
     relative_paths.sort();
@@ -316,25 +317,14 @@ fn file_hashes_hinted(
         }
 
         let path = root.join(&relative_path);
-        let metadata =
-            fs::metadata(&path).with_context(|| format!("stat source {}", path.display()))?;
-        if !metadata.is_file() {
+        let stat = file_stat::metadata(&path)
+            .with_context(|| format!("stat source {}", path.display()))?;
+        if stat.kind != Kind::File {
             return Err(anyhow!("source {} is not a file", path.display()));
         }
 
         let relative = relative_path.to_string_lossy().into_owned();
-        let key = stat_key(&metadata);
-        STAT_FILES.fetch_add(1, Ordering::Relaxed);
-        let content = match hints.get(&relative) {
-            Some((size, modified, inode, hash)) if (*size, *modified, *inode) == key => {
-                hash.clone()
-            }
-            _ => {
-                REHASHED_FILES.fetch_add(1, Ordering::Relaxed);
-                sha256_file(&path)?
-            }
-        };
-        fresh.insert(relative.clone(), (key.0, key.1, key.2, content.clone()));
+        let content = hints.hash(&relative, &path, stat.key)?;
         files.push((relative, content));
     }
 
@@ -688,22 +678,9 @@ impl Store {
             self.write_atomic(&p, h.as_bytes())?;
             return Ok(h);
         }
-        let hint_path = self.root.join("hints").join(format!(
-            "{}.json",
-            sha256_hex(root.display().to_string().as_bytes())
-        ));
-        let hints: Hints = fs::read(&hint_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        Store::touch_used(&hint_path);
-        let mut fresh = Hints::new();
-        HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
-        let h = hash_dir_hinted(root, &hints, &mut fresh)?;
-        if fresh != hints {
-            self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
-        }
-        Ok(h)
+        self.with_hints(&root.display().to_string(), |hints| {
+            hash_dir_hinted(root, hints)
+        })
     }
 
     pub fn hash_file_set_cached(
@@ -711,22 +688,37 @@ impl Store {
         root: &Path,
         relative_paths: &[PathBuf],
     ) -> Result<Vec<(String, String)>> {
-        let hint_path = self.root.join("hints").join(format!(
-            "{}.json",
-            sha256_hex(format!("files:{}", root.display()).as_bytes())
-        ));
-        let hints: Hints = fs::read(&hint_path)
+        self.with_hints(&format!("files:{}", root.display()), |hints| {
+            file_hashes_hinted(root, relative_paths, hints)
+        })
+    }
+
+    /// Run `hash` with the saved hints named `name` (any stable string, such
+    /// as a root path), then save the hints of every file it hashed.
+    pub(crate) fn with_hints<T>(
+        &self,
+        name: &str,
+        hash: impl FnOnce(&mut HintCache) -> Result<T>,
+    ) -> Result<T> {
+        let path = self
+            .root
+            .join("hints")
+            .join(format!("{}.json", sha256_hex(name.as_bytes())));
+        let saved: Hints = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Store::touch_used(&hint_path);
-        let mut fresh = Hints::new();
+        Store::touch_used(&path);
         HINTED_DIRS.fetch_add(1, Ordering::Relaxed);
-        let files = file_hashes_hinted(root, relative_paths, &hints, &mut fresh)?;
-        if fresh != hints {
-            self.write_atomic(&hint_path, &serde_json::to_vec(&fresh)?)?;
+        let mut hints = HintCache {
+            saved,
+            fresh: Hints::new(),
+        };
+        let result = hash(&mut hints)?;
+        if hints.fresh != hints.saved {
+            self.write_atomic(&path, &serde_json::to_vec(&hints.fresh)?)?;
         }
-        Ok(files)
+        Ok(result)
     }
 
     /// Copy a CAS blob out to a destination in the worktree.
@@ -739,17 +731,16 @@ impl Store {
             "{}.json",
             sha256_hex(format!("export:{}", dest.display()).as_bytes())
         ));
-        if let Ok(md) = fs::metadata(dest) {
-            let key = stat_key(&md);
-            let hinted: Option<(u64, i64, u64, String)> = fs::read(&hint_path)
+        if let Ok(stat) = file_stat::metadata(dest) {
+            let hinted: Option<(StatKey, String)> = fs::read(&hint_path)
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok());
-            if let Some((size, mtime, inode, hinted_hash)) = hinted {
-                if (size, mtime, inode) == key && hinted_hash == hash {
+            if let Some((key, hinted_hash)) = hinted {
+                if key == stat.key && hinted_hash == hash {
                     return Ok(());
                 }
             }
-            EXPORT_CHECK_BYTES.fetch_add(md.len(), Ordering::Relaxed);
+            EXPORT_CHECK_BYTES.fetch_add(stat.key.size, Ordering::Relaxed);
             if let Ok(existing) = sha256_file(dest) {
                 if existing == hash {
                     self.write_export_hint(&hint_path, dest, hash);
@@ -1070,9 +1061,8 @@ impl Store {
 
     /// Best-effort: record the just-verified/just-written destination stat.
     fn write_export_hint(&self, hint_path: &Path, dest: &Path, hash: &str) {
-        if let Ok(md) = fs::metadata(dest) {
-            let key = stat_key(&md);
-            if let Ok(bytes) = serde_json::to_vec(&(key.0, key.1, key.2, hash)) {
+        if let Ok(stat) = file_stat::metadata(dest) {
+            if let Ok(bytes) = serde_json::to_vec(&(stat.key, hash)) {
                 self.write_atomic(hint_path, &bytes).ok();
             }
         }
@@ -1159,12 +1149,11 @@ fn debug_directory_is_complete(
         return Ok(false);
     }
     for (file_name, expected_hash) in &manifest.objects {
-        let source = fs::metadata(store.cache_path(expected_hash))?;
-        let exported = fs::metadata(directory.join(file_name))?;
-        use std::os::unix::fs::MetadataExt;
-        if (source.dev(), source.ino()) != (exported.dev(), exported.ino())
-            && sha256_file(&directory.join(file_name))? != *expected_hash
-        {
+        let exported = directory.join(file_name);
+        // A hard link to the store's copy is the same file, so it has the same key.
+        let linked = file_stat::metadata(&store.cache_path(expected_hash))?.key
+            == file_stat::metadata(&exported)?.key;
+        if !linked && sha256_file(&exported)? != *expected_hash {
             return Ok(false);
         }
     }
