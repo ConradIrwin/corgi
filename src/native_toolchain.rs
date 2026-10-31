@@ -222,14 +222,14 @@ impl NativeToolchain {
         if compiler.starts_with("/nix/store")
             || environment.iter().any(|(name, _)| name.starts_with("NIX_"))
         {
+            let salts = wrapper_role_salts(host, compiler_target.trim());
             for wrapper in ["CC", "BINTOOLS"] {
-                environment.push((
-                    format!(
-                        "NIX_{wrapper}_WRAPPER_TARGET_HOST_{}",
-                        host.replace('-', "_")
-                    ),
-                    "1".into(),
-                ));
+                for salt in &salts {
+                    environment.push((
+                        format!("NIX_{wrapper}_WRAPPER_TARGET_HOST_{salt}"),
+                        "1".into(),
+                    ));
+                }
             }
         }
         environment.sort();
@@ -341,6 +341,23 @@ fn validate_compiler_target(compiler: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Suffixes naming the host role of Nix's cc and bintools wrappers.
+///
+/// A wrapper's salt follows Nix's spelling of its target (arm64-apple-darwin),
+/// which can differ from Rust's (aarch64-apple-darwin). Darwin compilers may
+/// append a release that the salt omits. Both spellings are assigned; each
+/// wrapper reads only its own.
+fn wrapper_role_salts(host: &str, compiler_target: &str) -> BTreeSet<String> {
+    let compiler_target = compiler_target.split_once("-apple-darwin").map_or_else(
+        || compiler_target.to_string(),
+        |(architecture, _)| format!("{architecture}-apple-darwin"),
+    );
+    [host, compiler_target.as_str()]
+        .into_iter()
+        .map(|target| target.replace('-', "_"))
+        .collect()
+}
+
 fn linux_target(target: &str) -> Option<(&str, &str)> {
     let (architecture_vendor, abi) = target.split_once("-linux-")?;
     let (architecture, vendor) = architecture_vendor
@@ -450,6 +467,29 @@ mod tests {
         ] {
             assert!(validate_compiler_target(compiler, host).is_err());
         }
+    }
+
+    #[test]
+    fn wrapper_roles_cover_both_rust_and_nix_target_spellings() {
+        let salts = |host, compiler| -> Vec<String> {
+            wrapper_role_salts(host, compiler).into_iter().collect()
+        };
+        assert_eq!(
+            salts("aarch64-apple-darwin", "arm64-apple-darwin"),
+            ["aarch64_apple_darwin", "arm64_apple_darwin"]
+        );
+        assert_eq!(
+            salts("aarch64-apple-darwin", "arm64-apple-darwin25.1.0"),
+            ["aarch64_apple_darwin", "arm64_apple_darwin"]
+        );
+        assert_eq!(
+            salts("x86_64-apple-darwin", "x86_64-apple-darwin25.1.0"),
+            ["x86_64_apple_darwin"]
+        );
+        assert_eq!(
+            salts("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            ["x86_64_unknown_linux_gnu"]
+        );
     }
 
     #[test]
