@@ -2,10 +2,12 @@
 //! this module neither touches objects nor performs remote garbage collection.
 use crate::store::{sha256_file, Store};
 use anyhow::{bail, ensure, Context, Result};
+use curl::easy::{Easy, List, ReadError, SslOpt};
 use serde::Deserialize;
 use std::{
+    cell::RefCell,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -51,6 +53,19 @@ pub fn configured_cache(dir: &Path) -> Result<Option<Config>> {
 pub struct Cache {
     config: Config,
     read_access: ReadAccess,
+}
+
+/// Separate handles prevent public reads from inheriting authenticated state.
+struct Connections {
+    public: Easy,
+    authenticated: Easy,
+}
+
+thread_local! {
+    static CONNECTIONS: RefCell<Connections> = RefCell::new(Connections {
+        public: Easy::new(),
+        authenticated: Easy::new(),
+    });
 }
 
 pub struct BlobRef<'a> {
@@ -389,6 +404,42 @@ impl Cache {
         cancel: &AtomicBool,
         headers: &[(&str, &str)],
     ) -> Result<u16> {
+        if std::env::var_os("CORGI_CURL").is_some() {
+            return self.request_via_command(
+                method,
+                url,
+                output,
+                input,
+                credentials,
+                limit,
+                cancel,
+                headers,
+            );
+        }
+        self.request_with_connection(
+            method,
+            url,
+            output,
+            input,
+            credentials,
+            limit,
+            cancel,
+            headers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_via_command(
+        &self,
+        method: &str,
+        url: &str,
+        output: &Path,
+        input: Option<&Path>,
+        credentials: Option<&Credentials>,
+        limit: u64,
+        cancel: &AtomicBool,
+        headers: &[(&str, &str)],
+    ) -> Result<u16> {
         check_cancelled(cancel)?;
         // -q must be first: never inherit ~/.curlrc credentials or redirects.
         // Do not follow redirects; public reads must stay unauthenticated and
@@ -489,6 +540,127 @@ impl Cache {
                 .with_context(|| format!("{method} {url}: HTTP {status}"));
         }
         Ok(status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_with_connection(
+        &self,
+        method: &str,
+        url: &str,
+        output: &Path,
+        input: Option<&Path>,
+        credentials: Option<&Credentials>,
+        limit: u64,
+        cancel: &AtomicBool,
+        headers: &[(&str, &str)],
+    ) -> Result<u16> {
+        check_cancelled(cancel)?;
+        validate_base_url(url)?;
+        CONNECTIONS.with(|connections| {
+            let mut connections = connections.borrow_mut();
+            let easy = if credentials.is_some() {
+                &mut connections.authenticated
+            } else {
+                &mut connections.public
+            };
+            // reset preserves libcurl's connection and DNS caches, but drops
+            // per-request credentials, headers, callbacks, and method options.
+            easy.reset();
+            easy.url(url)?;
+            easy.follow_location(false)?;
+            // The statically linked Rustls backend needs an explicit verifier.
+            easy.ssl_options(SslOpt::new().native_ca(true))?;
+            easy.connect_timeout(Duration::from_secs(5))?;
+            easy.low_speed_limit(1024)?;
+            easy.low_speed_time(Duration::from_secs(30))?;
+            easy.max_filesize(limit)?;
+            easy.progress(true)?;
+            if let Some(credentials) = credentials {
+                easy.username(&credentials.access)?;
+                easy.password(&credentials.secret)?;
+                easy.aws_sigv4("aws:amz:auto:s3")?;
+            }
+            if !headers.is_empty() {
+                let mut list = List::new();
+                for (name, value) in headers {
+                    list.append(&format!("{name}: {value}"))?;
+                }
+                easy.http_headers(list)?;
+            }
+            let mut input_file = input.map(fs::File::open).transpose()?;
+            if method == "HEAD" {
+                easy.nobody(true)?;
+            } else if method == "GET" {
+                easy.get(true)?;
+                easy.accept_encoding("")?;
+            } else if method == "PUT" {
+                easy.upload(true)?;
+                easy.in_filesize(
+                    fs::metadata(input.context("PUT requires an input file")?)?.len(),
+                )?;
+            } else {
+                bail!("unsupported remote request method {method}");
+            }
+            let mut output_file = fs::File::create(output)?;
+            let mut downloaded = 0u64;
+            let mut response_too_large = false;
+            let mut write_error = None;
+            let transfer_result = {
+                let mut transfer = easy.transfer();
+                transfer.header_function(|_| true)?;
+                transfer.progress_function(|_, _, _, _| !cancel.load(Ordering::Relaxed))?;
+                transfer.write_function(|data| {
+                    downloaded += data.len() as u64;
+                    if downloaded > limit {
+                        response_too_large = true;
+                        return Ok(0);
+                    }
+                    if let Err(error) = output_file.write_all(data) {
+                        write_error = Some(error);
+                        return Ok(0);
+                    }
+                    Ok(data.len())
+                })?;
+                if input_file.is_some() {
+                    transfer.read_function(|buffer| {
+                        input_file
+                            .as_mut()
+                            .unwrap()
+                            .read(buffer)
+                            .map_err(|_| ReadError::Abort)
+                    })?;
+                }
+                transfer.perform()
+            };
+            check_cancelled(cancel)?;
+            ensure!(
+                !response_too_large,
+                "remote request exceeded response size limits"
+            );
+            if let Some(error) = write_error {
+                return Err(error).context("writing remote response");
+            }
+            if let Err(error) = transfer_result {
+                let message = format!(
+                    "{method} {url}: R2 libcurl transport failed ({})",
+                    error.description()
+                );
+                if matches!(error.code() as i32, 5 | 6 | 7 | 18 | 28 | 52 | 55 | 56 | 92) {
+                    return Err(anyhow::Error::new(TransientRequestFailure)).context(message);
+                }
+                bail!("{message}");
+            }
+            ensure!(
+                fs::metadata(output)?.len() <= limit,
+                "remote request exceeded response size limits"
+            );
+            let status = u16::try_from(easy.response_code()?)?;
+            if status == 429 || (500..600).contains(&status) {
+                return Err(anyhow::Error::new(TransientRequestFailure))
+                    .with_context(|| format!("{method} {url}: HTTP {status}"));
+            }
+            Ok(status)
+        })
     }
 }
 
@@ -839,3 +1011,6 @@ impl Drop for Temporary {
         let _ = fs::remove_file(&self.0);
     }
 }
+
+#[cfg(test)]
+mod connection_tests;

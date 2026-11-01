@@ -61,6 +61,7 @@ fn real_main() -> Result<()> {
     if zig::is_linker_invocation(&argv) {
         return zig::run_linker_invocation(&argv);
     }
+    curl::init();
     let had_argument_delimiter = argv.iter().any(|arg| arg == "--");
     let invocation_dir = match cli::invocation_directory(&argv) {
         Some(dir) if dir.is_absolute() => dir,

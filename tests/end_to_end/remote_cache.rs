@@ -12,6 +12,31 @@ use std::{
     time::Instant,
 };
 
+#[test]
+fn remote_cache_uses_libcurl_without_a_transport_override() {
+    let fixture = Fixture::new("remote-libcurl");
+    fixture.run(&["build"]);
+    fixture.clear_results();
+    let output = fixture
+        .command(&["cache", "build"])
+        .env_remove("CORGI_CURL")
+        .output()
+        .unwrap();
+    assert_success(&output, "publish through libcurl");
+    fixture
+        .remote
+        .record(|record| record["spec"]["target"]["name"] == "app");
+
+    fixture.clear_results();
+    let output = fixture
+        .command(&["build"])
+        .env_remove("CORGI_CURL")
+        .output()
+        .unwrap();
+    assert_success(&output, "read through libcurl");
+    fixture.assert_binary_output("42\n");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn cache_setup_uses_one_password_and_selects_the_project_store() {
