@@ -1,7 +1,14 @@
 name: Deploy site to GitHub Pages
 
-# Run manually from the Actions tab (or `gh workflow run pages.yml`).
+# Deploys automatically when a push to main changes any site input; can also
+# be run manually from the Actions tab (or `gh workflow run pages.yml`).
 on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - site/**
+      - .github/workflows/pages.yml
   workflow_dispatch:
 
 permissions:
