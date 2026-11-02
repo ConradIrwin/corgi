@@ -44,6 +44,10 @@ toml = "0.8"
 toml_edit = "0.22"
 zstd = { version = "0.13", default-features = false }
 
+# Debug builds of Corgi hash gigabytes of toolchain and source files.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 panic = "abort"

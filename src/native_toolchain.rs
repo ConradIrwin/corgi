@@ -141,7 +141,11 @@ impl ToolchainSource {
 }
 
 impl NativeToolchain {
-    pub fn resolve(rust: &SuppliedRust, environment: Vec<(String, String)>) -> Result<Self> {
+    pub fn resolve(
+        store: &crate::store::Store,
+        rust: &SuppliedRust,
+        environment: Vec<(String, String)>,
+    ) -> Result<Self> {
         let compiler = required_path("CORGI_CC")?;
         ensure!(compiler.is_file(), "CORGI_CC must name a Clang executable");
         let compiler_version = output(
@@ -200,7 +204,7 @@ impl NativeToolchain {
                 .into_iter()
                 .filter(|path| path.exists()),
         );
-        let inputs = inputs::resolve(&roots)?;
+        let inputs = inputs::resolve(store, &roots)?;
         let path = std::env::join_paths([
             rust.directory.join("bin"),
             compiler
