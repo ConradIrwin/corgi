@@ -383,6 +383,7 @@ struct ToolRt {
     version: String,
     env: String,
     value: String,
+    command: String,
     /// Identity of the *setting*: hash of the pin itself. Scoped actions
     /// key on this, nothing else does.
     id: String,
@@ -2153,6 +2154,9 @@ struct ToolSpec {
     sha256: String,
     #[serde(default)]
     bin: String,
+    /// Bare executable name exposed on PATH; defaults to the tool's table name.
+    #[serde(default)]
+    command: Option<String>,
     #[serde(default)]
     path: String,
     env: String,
@@ -2479,6 +2483,15 @@ fn read_corgi_toml(dir: &Path) -> Result<Option<CorgiToml>> {
                 p.display()
             );
         }
+        if let Some(command) = &t.command {
+            if t.bin.is_empty()
+                || command.is_empty()
+                || matches!(command.as_str(), "." | "..")
+                || command.contains(['/', '\\'])
+            {
+                bail!("tool `{name}` command must be a filename and requires `bin`");
+            }
+        }
     }
     for (name, library) in &mut parsed.libraries {
         library.name.clone_from(name);
@@ -2769,30 +2782,45 @@ fn record_target_without_harness(
 
 /// Bare-name spawns (`Command::new("cmake")`) resolve through a shim dir
 /// of symlinks to exactly the tools visible to this action. One dir per
-/// distinct subset, named by the subset's identity hash; contents derive
-/// from keyed tool ids, so PATH itself never needs keying.
-fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>> {
-    let with_bin: Vec<&&ToolRt> = tools.iter().filter(|t| !t.bin.is_empty()).collect();
-    if with_bin.is_empty() {
+/// distinct subset, keyed by tool identities and effective executable paths.
+/// Scoped environment overrides must affect both `$CMAKE` and bare `cmake`.
+fn ensure_tool_shims(
+    store: &Store,
+    tools: &[&ToolRt],
+    environment: &[(String, String)],
+) -> Result<Option<PathBuf>> {
+    let mut commands = BTreeMap::new();
+    for tool in tools.iter().filter(|tool| !tool.bin.is_empty()) {
+        let executable = environment
+            .iter()
+            .rev()
+            .find(|(name, _)| name == &tool.env)
+            .map_or(tool.value.as_str(), |(_, value)| value.as_str());
+        if !Path::new(executable).is_absolute() {
+            bail!("tool `{}` executable must be an absolute path", tool.name);
+        }
+        if commands
+            .insert(tool.command.as_str(), (tool.id.as_str(), executable))
+            .is_some()
+        {
+            bail!("multiple visible tools provide command `{}`", tool.command);
+        }
+    }
+    if commands.is_empty() {
         return Ok(None);
     }
-    let mut ids: Vec<&str> = with_bin.iter().map(|t| t.id.as_str()).collect();
-    ids.sort();
-    let subset = crate::store::sha256_hex(ids.join("\n").as_bytes());
+    let subset = crate::store::sha256_hex(&serde_json::to_vec(&commands)?);
     let dir = store.root.join("toolsets").join(&subset[..16]);
     if dir.exists() {
         Store::touch_used(&dir);
         return Ok(Some(dir));
     }
     let tmp = store.tmp_path("shims");
+    let _staging = compiler_race::Staging(vec![tmp.clone()]);
     fs::create_dir_all(&tmp)?;
-    for t in &with_bin {
-        let target = store
-            .root
-            .join("tools")
-            .join(format!("{}-{}", t.name, t.version))
-            .join(&t.bin);
-        crate::platform::symlink(&target, tmp.join(&t.name)).ok();
+    for (command, (_, executable)) in commands {
+        crate::platform::symlink(Path::new(executable), tmp.join(command))
+            .with_context(|| format!("creating tool command `{command}`"))?;
     }
     fs::create_dir_all(dir.parent().unwrap())?;
     match fs::rename(&tmp, &dir) {
@@ -2948,6 +2976,7 @@ fn pinned_macos_tool(
             url,
             sha256: checksum.unwrap_or("").into(),
             bin: String::new(),
+            command: None,
             path: exported.into(),
             env: String::new(),
             packages: Vec::new(),
@@ -3074,6 +3103,7 @@ fn ensure_zig_executable(store: &Store, host: &str) -> Result<PathBuf> {
         url: crate::zig::url(&asset),
         sha256: asset.sha256.to_string(),
         bin: format!("{archive_root}/zig"),
+        command: None,
         path: String::new(),
         env: String::new(),
         packages: Vec::new(),
@@ -5891,8 +5921,15 @@ fn build_inner(
         // on it, so a pin edit has exactly the declared blast radius.
         let id = sha256_hex(
             format!(
-                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-                t.name, t.version, t.url, t.sha256, t.bin, t.path, t.env
+                "tool\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                t.name,
+                t.version,
+                t.url,
+                t.sha256,
+                t.bin,
+                t.path,
+                t.env,
+                t.command.as_deref().unwrap_or(&t.name)
             )
             .as_bytes(),
         );
@@ -5901,6 +5938,7 @@ fn build_inner(
             version: t.version.clone(),
             env: t.env.clone(),
             value: tool_path.display().to_string(),
+            command: t.command.clone().unwrap_or_else(|| t.name.clone()),
             id,
             bin: t.bin.clone(),
             packages: t.packages.clone(),
@@ -10091,6 +10129,9 @@ mod tool_url_tests {
 }
 
 #[cfg(test)]
+mod tool_shim_tests;
+
+#[cfg(test)]
 mod tool_scope_tests {
     use super::ToolRt;
 
@@ -10101,6 +10142,7 @@ mod tool_scope_tests {
             version: "1".into(),
             env: "GHOSTTY_PREFIX".into(),
             value: "/tools/ghostty".into(),
+            command: "ghostty".into(),
             id: "pin".into(),
             bin: String::new(),
             packages: vec!["terminal".into()],
@@ -11161,7 +11203,7 @@ fn run_build_script(
     for (k, v) in &spec.environment {
         cmd.env(k, v);
     }
-    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
+    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools, &spec.environment)? {
         let path = spec
             .environment
             .iter()

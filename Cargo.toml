@@ -1,6 +1,6 @@
 [package]
 name = "corgi-build"
-version = "0.1.97"
+version = "0.1.98"
 edition = "2021"
 rust-version = "1.90"
 description = "PoC: deterministic, content-addressed, lock-free cargo-compatible build tool"

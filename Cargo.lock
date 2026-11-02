@@ -306,7 +306,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corgi-build"
-version = "0.1.97"
+version = "0.1.98"
 dependencies = [
  "anyhow",
  "cargo-zigbuild",
