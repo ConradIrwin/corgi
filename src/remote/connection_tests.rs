@@ -127,6 +127,7 @@ fn publication_receipts_expire_and_are_scoped_to_the_bucket_and_record() {
     assert!(!receipt.is_recent());
     receipt.remember(&store).unwrap();
     assert!(receipt.is_recent());
+    assert_eq!(fs::metadata(&receipt.path).unwrap().len(), 0);
     assert!(
         !PublicationReceipt::new(&store, "https://example.com/other", &key, record).is_recent()
     );
@@ -136,7 +137,12 @@ fn publication_receipts_expire_and_are_scoped_to_the_bucket_and_record() {
     );
     fs::File::open(&receipt.path)
         .unwrap()
-        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(4 * 86400))
+        .unwrap();
+    assert!(receipt.is_recent());
+    fs::File::open(&receipt.path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(6 * 86400))
         .unwrap();
     assert!(!receipt.is_recent());
     fs::remove_dir_all(root).unwrap();

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEBUG_MARKER: &str = ".corgi-debug.json";
+pub(crate) const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
 
 /// Advisory GC metadata carried by mtime, never by the content hash.
 /// Even whole seconds mean workspace retention, odd seconds mean dependency

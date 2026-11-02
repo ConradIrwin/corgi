@@ -5,7 +5,7 @@ use crate::report::UnitKeyResolution as KeyResolution;
 use crate::sandbox::linux::{host_runtime_paths, setup_linux_sandbox};
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
 use crate::sandbox::Sandbox;
-use crate::store::{sha256_hex, Store};
+use crate::store::{sha256_hex, Store, CACHE_TTL};
 use anyhow::{bail, Context, Result};
 use path_slash::PathExt as _;
 use regex::RegexSet;
@@ -3385,7 +3385,6 @@ fn managed_rustc_version(channel: &str, host: &str) -> String {
     format!("managed rustc {channel}\nrelease: {channel}\nhost: {host}\n")
 }
 
-const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 24 * 3600);
 const WORKSPACE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const INCREMENTAL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const READ_SET_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
@@ -3515,9 +3514,6 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     let read_set_manifest_cutoff = now
         .checked_sub(older_than.unwrap_or(READ_SET_MANIFEST_TTL))
         .context("read-set manifest ttl too large")?;
-    let receipt_cutoff = now
-        .checked_sub(older_than.unwrap_or(crate::remote::PUBLICATION_RECEIPT_TTL * 2))
-        .context("publication receipt ttl too large")?;
     let stale = |p: &Path| -> bool {
         fs::metadata(p)
             .and_then(|m| m.modified())
@@ -3566,7 +3562,7 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
         for marker in read_dir_paths(&bucket.join(crate::remote::NAMESPACE))? {
             if fs::metadata(&marker)
                 .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified < receipt_cutoff)
+                .is_ok_and(|modified| modified < cutoff)
             {
                 bytes += fs::metadata(&marker)
                     .map(|metadata| metadata.len())

@@ -1,6 +1,6 @@
 //! Optional R2 transport. Object expiry (30 days) is a bucket lifecycle policy:
 //! this module neither touches objects nor performs remote garbage collection.
-use crate::store::{sha256_file, sha256_hex, Store};
+use crate::store::{sha256_file, sha256_hex, Store, CACHE_TTL};
 use anyhow::{bail, ensure, Context, Result};
 use curl::easy::{Easy, List, ReadError, SslOpt};
 use serde::Deserialize;
@@ -17,7 +17,6 @@ use std::{
 
 pub const NAMESPACE: &str = "corgi/v2";
 pub const GET_CONCURRENCY: usize = 4;
-pub const PUBLICATION_RECEIPT_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
 const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -76,7 +75,6 @@ pub struct BlobRef<'a> {
 
 struct PublicationReceipt {
     path: PathBuf,
-    record_hash: String,
 }
 
 impl PublicationReceipt {
@@ -87,8 +85,7 @@ impl PublicationReceipt {
                 .join("remote-published")
                 .join(sha256_hex(url.trim_end_matches('/').as_bytes()))
                 .join(NAMESPACE)
-                .join(format!("{key}.json")),
-            record_hash: sha256_hex(record),
+                .join(format!("{key}-{}.receipt", sha256_hex(record))),
         }
     }
 
@@ -100,12 +97,11 @@ impl PublicationReceipt {
             .modified()
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age < PUBLICATION_RECEIPT_TTL)
-            && fs::read(&self.path).ok().as_deref() == Some(self.record_hash.as_bytes())
+            .is_some_and(|age| age < CACHE_TTL)
     }
 
     fn remember(&self, store: &Store) -> Result<()> {
-        store.write_atomic(&self.path, self.record_hash.as_bytes())
+        store.write_atomic(&self.path, b"")
     }
 }
 
