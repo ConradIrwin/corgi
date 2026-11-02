@@ -1859,7 +1859,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                     "/tmp/corgi/target-tmp".to_string(),
                 ));
             }
-            environment.sort();
+            let environment = canonical_environment(environment);
             let mut rustflags = if unit.host {
                 ctx.host_rustflags.clone()
             } else {
@@ -1948,7 +1948,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
                 toolchain: is_linking(ctx, index).then(|| ctx.toolchain_identity.clone()),
                 debug_binary: None,
             }));
-            (spec, declared_environment)
+            (spec, canonical_environment(declared_environment))
         };
         let outputs = match &spec {
             ActionSpec::Compile(spec) => {
@@ -10886,6 +10886,15 @@ location-free — resolve paths at runtime instead of baking them in at build ti
     finish_compile(plan, action, false, res, phases)
 }
 
+/// Preserves override order before sorting environment variables for action identity.
+fn canonical_environment(environment: Vec<(String, String)>) -> Vec<(String, String)> {
+    environment
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
 type BuildScriptEnvironment<'a> = (
     Vec<(String, String)>,
     Vec<(String, String)>,
@@ -11021,9 +11030,11 @@ fn build_script_environment<'a>(
             "1".into(),
         ));
     }
-    env.sort();
-    declared_environment.sort();
-    (env, declared_environment, visible_tools)
+    (
+        canonical_environment(env),
+        canonical_environment(declared_environment),
+        visible_tools,
+    )
 }
 
 fn run_build_script(

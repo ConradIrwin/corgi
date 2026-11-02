@@ -3149,6 +3149,63 @@ fn main() {
 }
 
 #[test]
+fn scoped_environment_overrides_config_for_build_scripts_and_compiles() {
+    let directory = TestDirectory::new("scoped-env-override");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = {:?}\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [[bin]]\nname = \"app\"\npath = \"app.rs\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[env]\nTEST_SCOPED_VALUE = \"m-default\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("corgi.toml"),
+        format!(
+            "[env.TEST_SCOPED_VALUE]\ninherit = true\npackages = [{:?}]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        r#"fn main() {
+    assert_ne!(std::env::var("TEST_SCOPED_VALUE").unwrap(), "m-default");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("app.rs"),
+        "fn main() { println!(\"{}\", env!(\"TEST_SCOPED_VALUE\")); }\n",
+    )
+    .unwrap();
+    let store = shared_store(&directory);
+    for value in ["a-scoped", "z-scoped"] {
+        let output = corgi_command()
+            .current_dir(&workspace)
+            .args(["run", "--bin", "app"])
+            .env("CORGI_STORE", &store)
+            .env("TEST_SCOPED_VALUE", value)
+            .output()
+            .unwrap();
+        assert_success(&output, "run with a scoped environment override");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{value}\n")
+        );
+    }
+}
+
+#[test]
 fn cargo_bin_name_follows_target_identity_including_test_harnesses() {
     let directory = TestDirectory::new("cargo-bin-name");
     fs::write(
