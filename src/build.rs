@@ -3515,6 +3515,9 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
     let read_set_manifest_cutoff = now
         .checked_sub(older_than.unwrap_or(READ_SET_MANIFEST_TTL))
         .context("read-set manifest ttl too large")?;
+    let receipt_cutoff = now
+        .checked_sub(older_than.unwrap_or(crate::remote::PUBLICATION_RECEIPT_TTL * 2))
+        .context("publication receipt ttl too large")?;
     let stale = |p: &Path| -> bool {
         fs::metadata(p)
             .and_then(|m| m.modified())
@@ -3554,6 +3557,21 @@ fn clean_trim(store: &Store, older_than: Option<std::time::Duration>) -> Result<
             if stale_artifact(&f) {
                 bytes += fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
                 if fs::remove_file(&f).is_ok() {
+                    files += 1;
+                }
+            }
+        }
+    }
+    for bucket in read_dir_paths(&store.root.join("remote-published"))? {
+        for marker in read_dir_paths(&bucket.join(crate::remote::NAMESPACE))? {
+            if fs::metadata(&marker)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified < receipt_cutoff)
+            {
+                bytes += fs::metadata(&marker)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if fs::remove_file(&marker).is_ok() {
                     files += 1;
                 }
             }

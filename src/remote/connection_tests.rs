@@ -1,5 +1,7 @@
-use super::{Cache, Config, Credentials, Temporary, MAX_RECORD};
+use super::{Cache, Config, Credentials, PublicationReceipt, Temporary, MAX_RECORD};
+use crate::store::Store;
 use std::{
+    fs,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{
@@ -113,6 +115,31 @@ fn cancellation_interrupts_an_unresponsive_connection() {
         "cancellation should not wait for a transport timeout"
     );
     server.join().unwrap();
+}
+
+#[test]
+fn publication_receipts_expire_and_are_scoped_to_the_bucket_and_record() {
+    let root = std::env::temp_dir().join(format!("corgi-receipt-test-{}", std::process::id()));
+    let store = Store::new(root.clone()).unwrap();
+    let key = "a".repeat(64);
+    let record = br#"{"blobs":[]}"#;
+    let receipt = PublicationReceipt::new(&store, "https://example.com/bucket", &key, record);
+    assert!(!receipt.is_recent());
+    receipt.remember(&store).unwrap();
+    assert!(receipt.is_recent());
+    assert!(
+        !PublicationReceipt::new(&store, "https://example.com/other", &key, record).is_recent()
+    );
+    assert!(
+        !PublicationReceipt::new(&store, "https://example.com/bucket", &key, b"changed")
+            .is_recent()
+    );
+    fs::File::open(&receipt.path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    assert!(!receipt.is_recent());
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn serve_two_requests(signed: bool) -> (String, thread::JoinHandle<usize>) {

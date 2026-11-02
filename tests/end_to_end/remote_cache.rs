@@ -27,6 +27,18 @@ fn remote_cache_uses_libcurl_without_a_transport_override() {
         .remote
         .record(|record| record["spec"]["target"]["name"] == "app");
 
+    fixture.remote.objects.lock().unwrap().requests.clear();
+    let repeated = fixture
+        .command(&["cache", "build"])
+        .env_remove("CORGI_CURL")
+        .output()
+        .unwrap();
+    assert_success(&repeated, "reuse verified publication receipts");
+    assert!(
+        fixture.remote.objects.lock().unwrap().requests.is_empty(),
+        "a recent receipt should avoid all R2 requests"
+    );
+
     fixture.clear_results();
     let output = fixture
         .command(&["build"])
@@ -359,6 +371,18 @@ fn remote_build_cache_lifecycle() {
         .remove(&blob_path)
         .unwrap();
     assert!(original.starts_with(&[0x1f, 0x8b]), "blob must be gzipped");
+    fixture.run(&["cache", "build"]);
+    {
+        let objects = fixture.remote.objects.lock().unwrap();
+        assert!(!objects.bytes.contains_key(&blob_path));
+        assert!(
+            !objects
+                .requests
+                .contains(&("HEAD".into(), blob_path.clone())),
+            "a recent publication receipt avoids rechecking its blobs"
+        );
+    }
+    fixture.expire_publication_receipts();
     fixture.run(&["cache", "build"]);
     {
         let objects = fixture.remote.objects.lock().unwrap();
@@ -817,6 +841,17 @@ os.execvp(tool, [tool, *sys.argv[1:]])
             fs::remove_file(self.release_path()).unwrap();
         }
         fs::write(self.release_path(), "ready").unwrap();
+    }
+
+    fn expire_publication_receipts(&self) {
+        for bucket in fs::read_dir(self.store.join("remote-published")).unwrap() {
+            for marker in fs::read_dir(bucket.unwrap().path().join("corgi/v2")).unwrap() {
+                fs::File::open(marker.unwrap().path())
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap();
+            }
+        }
     }
 
     fn command(&self, arguments: &[&str]) -> Command {

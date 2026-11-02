@@ -313,7 +313,12 @@ pub(super) fn publish_one(
                 .zip(&paths)
                 .map(|(hash, path)| crate::remote::BlobRef { hash, path })
                 .collect::<Vec<_>>();
-            cache.publish(&record.remote_key, &serde_json::to_vec(record)?, &refs)?;
+            cache.publish(
+                &ctx.store,
+                &record.remote_key,
+                &serde_json::to_vec(record)?,
+                &refs,
+            )?;
         }
         Ok(record.is_some())
     })();

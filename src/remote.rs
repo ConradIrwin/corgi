@@ -1,6 +1,6 @@
 //! Optional R2 transport. Object expiry (30 days) is a bucket lifecycle policy:
 //! this module neither touches objects nor performs remote garbage collection.
-use crate::store::{sha256_file, Store};
+use crate::store::{sha256_file, sha256_hex, Store};
 use anyhow::{bail, ensure, Context, Result};
 use curl::easy::{Easy, List, ReadError, SslOpt};
 use serde::Deserialize;
@@ -17,6 +17,7 @@ use std::{
 
 pub const NAMESPACE: &str = "corgi/v2";
 pub const GET_CONCURRENCY: usize = 4;
+pub const PUBLICATION_RECEIPT_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
 const MAX_BLOB: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -71,6 +72,41 @@ thread_local! {
 pub struct BlobRef<'a> {
     pub hash: &'a str,
     pub path: &'a Path,
+}
+
+struct PublicationReceipt {
+    path: PathBuf,
+    record_hash: String,
+}
+
+impl PublicationReceipt {
+    fn new(store: &Store, url: &str, key: &str, record: &[u8]) -> Self {
+        Self {
+            path: store
+                .root
+                .join("remote-published")
+                .join(sha256_hex(url.trim_end_matches('/').as_bytes()))
+                .join(NAMESPACE)
+                .join(format!("{key}.json")),
+            record_hash: sha256_hex(record),
+        }
+    }
+
+    fn is_recent(&self) -> bool {
+        let Ok(metadata) = fs::metadata(&self.path) else {
+            return false;
+        };
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < PUBLICATION_RECEIPT_TTL)
+            && fs::read(&self.path).ok().as_deref() == Some(self.record_hash.as_bytes())
+    }
+
+    fn remember(&self, store: &Store) -> Result<()> {
+        store.write_atomic(&self.path, self.record_hash.as_bytes())
+    }
 }
 
 #[derive(Debug)]
@@ -215,7 +251,13 @@ impl Cache {
     /// records are left unchanged, even when their bytes differ. Missing old
     /// blobs are repaired from supplied refs; an unavailable old blob is an
     /// error, not permission to replace the record.
-    pub fn publish(&self, key: &str, record: &[u8], blobs: &[BlobRef<'_>]) -> Result<()> {
+    pub fn publish(
+        &self,
+        store: &Store,
+        key: &str,
+        record: &[u8],
+        blobs: &[BlobRef<'_>],
+    ) -> Result<()> {
         validate_hash(key)?;
         ensure!(
             record.len() as u64 <= MAX_RECORD,
@@ -223,13 +265,26 @@ impl Cache {
         );
         record_hashes(record)?;
         let config = WriteConfig::from_env()?;
+        let receipt = PublicationReceipt::new(store, &config.url, key, record);
+        if receipt.is_recent() {
+            return Ok(());
+        }
         for attempt in 0..3 {
             match self.publish_with_config(key, record, blobs, &config) {
                 Err(error) if attempt < 2 && error.is::<TransientRequestFailure>() => {
                     eprintln!("corgi warning: retrying cache publication: {error:#}");
                     thread::sleep(Duration::from_millis(250 * (attempt + 1)));
                 }
-                result => return result,
+                result => {
+                    if result? {
+                        if let Err(error) = receipt.remember(store) {
+                            eprintln!(
+                                "corgi warning: recording cache publication failed: {error:#}"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
             }
         }
         unreachable!()
@@ -241,7 +296,7 @@ impl Cache {
         record: &[u8],
         blobs: &[BlobRef<'_>],
         config: &WriteConfig,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let credentials = &config.credentials;
         let cancel = AtomicBool::new(false);
         let output = Temporary::new(&std::env::temp_dir())?;
@@ -267,13 +322,14 @@ impl Cache {
                 "R2 record inspection returned HTTP {status}"
             );
             if status == 200 {
-                let hashes = record_hashes(&fs::read(&output.0)?).with_context(|| {
+                let existing = fs::read(&output.0)?;
+                let hashes = record_hashes(&existing).with_context(|| {
                     format!(
                         "invalid remote record actions/{key}.json; repair it or wait for expiry"
                     )
                 })?;
                 self.repair_blobs(&hashes, blobs, &output.0, config, &cancel)?;
-                return Ok(());
+                return Ok(existing == record);
             }
             self.repair_blobs(&record_hashes(record)?, blobs, &output.0, config, &cancel)?;
             let input = Temporary::new(&std::env::temp_dir())?;
@@ -295,7 +351,7 @@ impl Cache {
                 (200..300).contains(&status),
                 "R2 record upload returned HTTP {status}"
             );
-            return Ok(());
+            return Ok(true);
         }
         bail!("R2 record publication exceeded conditional-write retry limit")
     }
