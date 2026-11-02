@@ -9,26 +9,36 @@
 #     found", or — worse — silently wrong bindings. This runs a real translation
 #     unit through the sliced library's C API and checks it finds its own
 #     builtin headers, catching both.
-#   * bin/dsymutil exists and runs: `dsymutil --version` succeeds and prints a
-#     version string.
+#   * macOS: bin/dsymutil exists and runs: `dsymutil --version` succeeds and
+#     prints a version string.
+#   * Linux: libclang.so resolves libstdc++ from the artifact, not the host.
 #
 # Env:
-#   LIBCLANG_STAGE   staged tree containing lib/libclang.dylib and
-#                    bin/dsymutil (required)
+#   LIBCLANG_STAGE   staged tree containing the libclang library and, on
+#                    macOS, bin/dsymutil (required)
 #   LLVM_MAJOR       Clang major version, for the resource dir (required)
+#   PLATFORM         macos-arm64 (default), linux-x64, or linux-arm64
 
 set -euo pipefail
 
 stage="${LIBCLANG_STAGE:?LIBCLANG_STAGE must point at the staged libclang tree}"
 major="${LLVM_MAJOR:?LLVM_MAJOR must be set}"
-dylib="${stage}/lib/libclang.dylib"
+platform="${PLATFORM:-macos-arm64}"
+case "$platform" in
+  macos-*) dylib="${stage}/lib/libclang.dylib" ;;
+  *) dylib="${stage}/lib/libclang.so" ;;
+esac
 dsymutil="${stage}/bin/dsymutil"
 # Clang appends /include to -resource-dir itself, so the resource dir is
 # .../clang/<major> and its builtin headers live under .../clang/<major>/include.
 resource_dir="${stage}/lib/clang/${major}"
 
 [ -f "$dylib" ] || { echo "verify: missing ${dylib}" >&2; exit 1; }
-[ -x "$dsymutil" ] || { echo "verify: missing or non-executable ${dsymutil}" >&2; exit 1; }
+case "$platform" in
+  macos-*)
+    [ -x "$dsymutil" ] || { echo "verify: missing or non-executable ${dsymutil}" >&2; exit 1; }
+    ;;
+esac
 [ -f "${resource_dir}/include/stddef.h" ] || {
   echo "verify: missing builtin header ${resource_dir}/include/stddef.h" >&2
   exit 1
@@ -95,16 +105,45 @@ done
   exit 1
 }
 
+# The probe runs on this machine, so a Linux artifact for another architecture
+# can only be checked structurally here.
+case "${platform}:$(uname -m)" in
+  macos-arm64:arm64 | linux-x64:x86_64 | linux-arm64:aarch64) runnable=1 ;;
+  *) runnable=0 ;;
+esac
+if [ "$runnable" = 0 ]; then
+  echo "verify: ${platform} libclang cannot run on $(uname -m); skipping the parse probe" >&2
+  exit 0
+fi
+
+lib_dir="$(cd "$(dirname "$dylib")" && pwd)"
+case "$platform" in
+  linux-*)
+    # Corgi's sandbox has no host libstdc++, so the bundled copy must win.
+    # The runpath resolves through $ORIGIN/../lib, so compare canonical paths.
+    resolved="$(ldd "$dylib" | sed -n 's/^[[:space:]]*libstdc++\.so\.6 => \([^ ]*\).*/\1/p')"
+    [ -n "$resolved" ] && [ "$(cd "$(dirname "$resolved")" && pwd -P)" = "$(cd "$lib_dir" && pwd -P)" ] || {
+      echo "verify: libclang.so resolves libstdc++ to '${resolved}', not the bundled copy" >&2
+      exit 1
+    }
+    echo "verify: libclang.so uses the bundled libstdc++" >&2
+    ;;
+esac
+
 # libclang's install name is @rpath/libclang.dylib, so the probe needs an
 # rpath pointing at the staged lib dir to resolve it at load time. bindgen's
 # real loader dlopens it by absolute path, which sidesteps this — the rpath is
 # only for this compiled probe.
 cc -o "${work}/probe" "${work}/probe.c" \
   -I"$include_root" "$dylib" \
-  -Wl,-rpath,"$(cd "$(dirname "$dylib")" && pwd)"
+  -Wl,-rpath,"$lib_dir"
 
 "${work}/probe" "${resource_dir}" "${work}/probe.h"
 echo "verify: libclang parsed a builtin-header translation unit cleanly" >&2
+
+case "$platform" in
+  linux-*) exit 0 ;;
+esac
 
 # dsymutil ships in the same artifact; prove it runs and reports a version.
 dsymutil_version="$("$dsymutil" --version)" \

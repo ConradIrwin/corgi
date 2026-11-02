@@ -3,10 +3,12 @@ mod build;
 mod cli;
 mod config;
 mod libclang;
+mod libraries;
 mod macos;
 mod meta;
 mod native_toolchain;
 mod out_dir_archive;
+mod pkg_config;
 mod platform;
 mod remote;
 mod report;
@@ -57,6 +59,9 @@ fn real_main() -> Result<()> {
     let argv: Vec<_> = std::env::args_os().collect();
     if macos::is_driver_invocation(&argv) {
         return macos::run_driver_invocation(&argv);
+    }
+    if pkg_config::is_invocation(&argv) {
+        return pkg_config::run_invocation(&argv);
     }
     if zig::is_linker_invocation(&argv) {
         return zig::run_linker_invocation(&argv);

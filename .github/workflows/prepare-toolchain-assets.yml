@@ -37,3 +37,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REPO: ${{ github.repository }}
         run: ./ci/build-libclang.sh
+
+  # The Linux artifact's verification loads libclang, so it needs a native
+  # runner.
+  prepare-linux:
+    if: github.ref_type == 'branch'
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out proposed toolchain pins
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Ensure Linux llvm-tools release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          PLATFORM: ${{ matrix.platform }}
+        run: ./ci/build-libclang.sh

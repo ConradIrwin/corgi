@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>corgi — {{tagline}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rye&family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono&display=swap">
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0}
+img{max-width:100%;display:block}
+pre{overflow-x:auto;white-space:pre}
+code{font-size:.9em}
+
+body{background:#faf4ea;color:#2d241d;font:17px/1.75 'Inter',system-ui,sans-serif;padding:40px 16px}
+.wrap{max-width:780px;margin:0 auto;border:1px solid #e6d2b2;border-radius:28px;background:#fffcf6;padding:28px 28px 56px;box-shadow:0 1px 0 #fff inset,0 24px 60px -30px rgba(150,90,30,.35)}
+header{position:relative}
+header img{border-radius:20px;width:100%}
+header .plate{position:absolute;left:50%;bottom:-24px;transform:translateX(-50%);white-space:nowrap;background:linear-gradient(#e9c27a,#a8721f);color:#3b2310;padding:10px 28px;border-radius:999px;font:15px 'Rye',serif;letter-spacing:.06em;border:2px solid #6b4416;box-shadow:0 4px 10px rgba(90,50,10,.3),inset 0 1px 0 #fff6d8}
+.head{padding:64px 36px 8px;text-align:center}
+h1{font:400 72px/1 'Rye',serif;margin:0;letter-spacing:.02em}
+h1 b{font-weight:400;color:#b4501f}
+.tag{color:#8a6a4a;font-size:19px;margin:.6em 0 0}
+main{padding:0 36px}
+h2{font:400 30px 'Rye',serif;margin:2.4em 0 .4em;letter-spacing:.02em}
+h3{font:400 19px 'Rye',serif;color:#b4501f;margin:1.8em 0 .2em;letter-spacing:.03em}
+a{color:#b4501f;text-underline-offset:3px}
+code{font-family:'JetBrains Mono',monospace;font-size:.85em;background:#f5ead8;padding:.12em .4em;border-radius:6px}
+pre{background:#f7efe2;border:1px solid #ead8bc;border-radius:14px;padding:18px 20px;font-size:14px}
+pre code{background:none;padding:0}
+@media(max-width:700px){body{padding:0}.wrap{border-radius:0;border:0;padding:0 0 40px}header img{border-radius:0}header .plate{white-space:normal;width:90%;text-align:center;font-size:13px;padding:8px 16px}.head,main{padding-left:20px;padding-right:20px}h1{font-size:54px}}
+
+</style>
+</head>
+<body>
+<div class="wrap"><header><img src="corgi.png" alt="A grinning corgi in leather flying cap, goggles and a red scarf, piloting a riveted green and copper propeller plane through golden sunset clouds"><div class="plate">{{tagline}}</div></header>
+<div class="head"><h1><b>corgi</b></h1></div>
+<main>
+{{content}}
+</main></div>
+</body>
+</html>

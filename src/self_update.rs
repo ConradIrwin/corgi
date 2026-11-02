@@ -74,6 +74,8 @@ fn release_target() -> Result<&'static str> {
 fn release_target_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
         _ => None,
     }
 }
@@ -329,7 +331,15 @@ mod tests {
             Some("aarch64-apple-darwin")
         );
         assert_eq!(release_target_for("macos", "x86_64"), None);
-        assert_eq!(release_target_for("linux", "aarch64"), None);
+        assert_eq!(
+            release_target_for("linux", "x86_64"),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            release_target_for("linux", "aarch64"),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(release_target_for("windows", "x86_64"), None);
     }
 
     #[test]

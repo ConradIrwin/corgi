@@ -16,3 +16,11 @@ packages = ["corgi-build"]
 [env.CORGI_LLVM_TOOLS_SHA256]
 inherit = true
 packages = ["corgi-build"]
+
+[env.CORGI_LLVM_TOOLS_SHA256_LINUX_X64]
+inherit = true
+packages = ["corgi-build"]
+
+[env.CORGI_LLVM_TOOLS_SHA256_LINUX_ARM64]
+inherit = true
+packages = ["corgi-build"]
