@@ -750,6 +750,26 @@ struct ZigRuntime {
     identity: String,
 }
 
+impl ZigRuntime {
+    fn build_script_environment(&self) -> Vec<(String, String)> {
+        let mut environment = Vec::new();
+        for (name, path) in [
+            ("CC", &self.cc),
+            ("CXX", &self.cxx),
+            ("AR", &self.ar),
+            ("RANLIB", &self.ranlib),
+            ("PKG_CONFIG", &self.pkg_config),
+            ("CMAKE_TOOLCHAIN_FILE", &self.cmake_toolchain),
+        ] {
+            environment.push((name.into(), path.display().to_string()));
+        }
+        if let Some(arguments) = &self.bindgen_args {
+            environment.push(("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone()));
+        }
+        environment
+    }
+}
+
 struct MacosRuntime {
     platform: String,
     directory: PathBuf,
@@ -3943,9 +3963,11 @@ fn select_toolchain(
     // Reject invalid toolchain variables before reading the pin: an unpinned
     // project asks the selected toolchain for its channel.
     let source = ToolchainSource::for_build()?;
-    if source == ToolchainSource::Managed && host_platform == HostPlatform::Linux {
+    if source == ToolchainSource::Supplied || host_platform == HostPlatform::Linux {
         if let Some(target) = target.filter(|target| *target != host) {
-            bail!("managed Linux toolchains currently support native builds only (requested {target}, host {host})");
+            if crate::zig::target(target)?.is_none() {
+                bail!("toolchain does not support target {target} from host {host}; select a supported Zig target");
+            }
         }
     }
     let channel = read_toolchain_pin(dir)?;
@@ -3957,11 +3979,6 @@ fn select_toolchain(
             native_environment: Vec::new(),
             supplied_rust: None,
         });
-    }
-    if let Some(target) = target {
-        if target != host {
-            bail!("supplied native toolchains currently support native builds only (requested {target}, host {host})");
-        }
     }
     if build_std {
         bail!("supplied native toolchains currently require a prebuilt standard library; build-std is not supported");
@@ -5191,8 +5208,10 @@ fn build_inner(
     let mut target_std_libdir: Option<String> = None;
     if let Some(t) = &target {
         if t != &host_guess && !build_std {
-            ensure_target_std(&store, &channel, t)?;
-            target_std_libdir = Some(
+            let directory = if let Some(rust) = &supplied_rust {
+                rust.standard_library(t)?
+            } else {
+                ensure_target_std(&store, &channel, t)?;
                 store
                     .root
                     .join("tools")
@@ -5200,9 +5219,8 @@ fn build_inner(
                     .join("lib/rustlib")
                     .join(t)
                     .join("lib")
-                    .display()
-                    .to_string(),
-            );
+            };
+            target_std_libdir = Some(directory.display().to_string());
         }
     }
     let cfg_env_target = if let Some(t) = &target {
@@ -5777,7 +5795,7 @@ fn build_inner(
     finish_report_stage(&recorder, "plan", report_stage_start);
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
-    let zig_runtime = zig_target
+    let mut zig_runtime = zig_target
         .as_deref()
         .or_else(|| {
             (host_platform == HostPlatform::Linux && toolchain_source == ToolchainSource::Managed)
@@ -5807,10 +5825,10 @@ fn build_inner(
                 })
             }
             HostPlatform::Linux => {
-                let mut runtime = zig_runtime
-                    .as_ref()
-                    .context("managed Linux builds require Zig")?
-                    .clone();
+                // Build scripts and proc macros always need host executables,
+                // even when the target has the same triple but a different ABI.
+                let mut runtime =
+                    ensure_zig(&store, &host_guess, &host_guess, &corgi_toml.libraries)?;
                 let uses_libclang = units
                     .iter()
                     .any(|unit| meta.packages[unit.pkg].name == "clang-sys");
@@ -5820,14 +5838,16 @@ fn build_inner(
                     (None, None)
                 };
                 // The pinned libclang does not find its builtin headers itself.
-                if let (Some(llvm_tools), Some(arguments)) =
-                    (llvm_tools.as_deref(), runtime.bindgen_args.as_mut())
-                {
+                if let Some(llvm_tools) = llvm_tools.as_deref() {
                     let resource_dir = crate::libclang::resource_dir(llvm_tools)?;
-                    *arguments = format!(
-                        "'-resource-dir' '{}' {arguments}",
-                        resource_dir.display().to_string().replace('\'', "'\\''")
-                    );
+                    for runtime in std::iter::once(&mut runtime).chain(zig_runtime.iter_mut()) {
+                        if let Some(arguments) = runtime.bindgen_args.as_mut() {
+                            *arguments = format!(
+                                "'-resource-dir' '{}' {arguments}",
+                                resource_dir.display().to_string().replace('\'', "'\\''")
+                            );
+                        }
+                    }
                 }
                 ResolvedToolchain::ManagedLinux {
                     runtime,
@@ -10641,15 +10661,19 @@ fn compile(
         cmd.envs(runtime.environment());
     }
     if let Some(runtime) = ctx.toolchain.linux_runtime() {
-        cmd.arg("-C")
-            .arg(format!("linker={}", runtime.cc.display()));
+        if unit.host || ctx.target.is_none() || ctx.zig.is_none() {
+            cmd.arg("-C")
+                .arg(format!("linker={}", runtime.cc.display()));
+        }
     }
     for f in pflags {
         cmd.arg(f);
     }
     if let Some(native) = ctx.toolchain.supplied() {
-        cmd.arg("-C")
-            .arg(format!("linker={}", native.compiler.display()));
+        if unit.host || ctx.target.is_none() || ctx.zig.is_none() {
+            cmd.arg("-C")
+                .arg(format!("linker={}", native.compiler.display()));
+        }
     }
     for f in lint_flags {
         cmd.arg(f);
@@ -10979,15 +11003,7 @@ fn build_script_environment<'a>(
         env.extend(managed.build_script_environment(&platform, &ctx.host));
     }
     if let Some(runtime) = ctx.toolchain.linux_runtime() {
-        for (name, path) in [
-            ("CC", &runtime.cc),
-            ("CXX", &runtime.cxx),
-            ("AR", &runtime.ar),
-            ("RANLIB", &runtime.ranlib),
-            ("PKG_CONFIG", &runtime.pkg_config),
-        ] {
-            env.push((name.into(), path.display().to_string()));
-        }
+        env.extend(runtime.build_script_environment());
         if let ResolvedToolchain::ManagedLinux {
             libclang_path: Some(path),
             ..
@@ -10995,16 +11011,13 @@ fn build_script_environment<'a>(
         {
             env.push(("LIBCLANG_PATH".into(), path.clone()));
         }
-        if let Some(arguments) = &runtime.bindgen_args {
-            env.push(("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone()));
-        }
-        env.push((
-            "CMAKE_TOOLCHAIN_FILE".into(),
-            runtime.cmake_toolchain.display().to_string(),
-        ));
     }
-    if platform != ctx.host {
+    // A supplied compiler belongs to the host. Target tools must take precedence,
+    // including when only the glibc version differs from the host.
+    env.extend(ctx.config_env.iter().cloned());
+    if !unit.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
+            env.extend(zig.build_script_environment());
             let target_environment = target.replace('-', "_");
             for (name, value) in [
                 (format!("CC_{target_environment}"), &zig.cc),
@@ -11034,7 +11047,6 @@ fn build_script_environment<'a>(
         })
         .join("\x1f"),
     ));
-    env.extend(ctx.config_env.iter().cloned());
     if let Some(links) = &pkg.links {
         env.push(("CARGO_MANIFEST_LINKS".into(), links.clone()));
     }

@@ -70,34 +70,37 @@ impl SuppliedRust {
         )
         .canonicalize()
         .context("resolving the supplied Rust sysroot")?;
-        let libraries = sysroot.join("lib/rustlib").join(host).join("lib");
-        ensure!(
-            fs::read_dir(&libraries)
-                .with_context(|| format!(
-                    "supplied Rust has no standard library at {}",
-                    libraries.display()
-                ))?
-                .any(|entry| entry.is_ok_and(|entry| {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with("libstd-") && name.ends_with(".rlib")
-                })),
-            "supplied Rust has no native libstd in {}",
-            libraries.display()
-        );
         // Validate that Cargo can run now, rather than treating a broken
         // supplied installation as a reason to provision a replacement.
         output(
             controlled_command(&cargo, environment).arg("--version"),
             "supplied cargo --version",
         )?;
-        Ok(Self {
+        let rust = Self {
             directory,
             sysroot,
             rustc,
             cargo,
             version,
-        })
+        };
+        rust.standard_library(host)?;
+        Ok(rust)
+    }
+
+    pub fn standard_library(&self, target: &str) -> Result<PathBuf> {
+        let directory = self.sysroot.join("lib/rustlib").join(target).join("lib");
+        ensure!(
+            fs::read_dir(&directory).is_ok_and(|mut entries| entries.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("libstd-") && name.ends_with(".rlib")
+                })
+            })),
+            "supplied Rust has no standard library for {target} at {}; install that target in CORGI_RUST_TOOLCHAIN (no replacement will be downloaded)",
+            directory.display()
+        );
+        Ok(directory)
     }
 }
 
