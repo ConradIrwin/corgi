@@ -25,7 +25,9 @@ cat > "$fixture/corgi.toml" <<'EOF'
 native-fixture = ["answer.c"]
 EOF
 cat > "$fixture/answer.c" <<'EOF'
+#include <features.h>
 int answer(void) { return 42; }
+int glibc_minor(void) { return __GLIBC_MINOR__; }
 EOF
 cat > "$fixture/build.rs" <<'EOF'
 use std::{env, path::PathBuf, process::Command};
@@ -45,16 +47,38 @@ EOF
 cat > "$fixture/src/main.rs" <<'EOF'
 unsafe extern "C" {
     fn answer() -> i32;
+    fn glibc_minor() -> i32;
 }
 
 fn main() {
-    println!("{}", unsafe { answer() });
+    let value = if std::env::args().any(|arg| arg == "glibc") {
+        unsafe { glibc_minor() }
+    } else {
+        unsafe { answer() }
+    };
+    println!("{value}");
 }
 EOF
 
 cargo generate-lockfile --offline --manifest-path "$fixture/Cargo.toml"
 result="$(cd "$fixture" && "$self_bin" run --target-dir "$temp_root/fixture-target")"
 test "$result" = "42"
+
+# The Rust triple is unchanged, but both native headers and linking must honor
+# the requested glibc version rather than reusing the host's Zig runtime.
+for minor in 31 28 31; do
+  result="$(cd "$fixture" && "$self_bin" run \
+    --target "x86_64-unknown-linux-gnu.2.$minor" \
+    --target-dir "$temp_root/fixture-target" -- glibc)"
+  test "$result" = "$minor"
+done
+
+# Build scripts must remain host executables when the target architecture changes.
+(cd "$fixture" && "$self_bin" build \
+  --target aarch64-unknown-linux-gnu.2.31 \
+  --target-dir "$temp_root/cross-target")
+readelf -h "$temp_root/cross-target/aarch64-unknown-linux-gnu/debug/native-fixture" \
+  | grep -q 'Machine:.*AArch64'
 
 # A declared [libraries] sysroot: the build script finds zlib through Corgi's
 # pkg-config and the link resolves -lz from the sysroot. zlib1g-dev's libz.so

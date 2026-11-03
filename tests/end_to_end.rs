@@ -11,6 +11,10 @@ use std::{
 mod remote_cache;
 
 #[cfg(target_os = "linux")]
+#[path = "end_to_end/linux_zig.rs"]
+mod linux_zig;
+
+#[cfg(target_os = "linux")]
 #[test]
 fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
     let directory = TestDirectory::new("linux-hello");
@@ -2084,7 +2088,7 @@ fn pinned_host_tools_preserve_cross_target_compilation() {
 fn main() {
     let target = env::var("TARGET").unwrap();
     if target.contains("linux") {
-        assert!(env::var("BINDGEN_EXTRA_CLANG_ARGS").is_err());
+        assert!(env::var("BINDGEN_EXTRA_CLANG_ARGS").unwrap().contains("generic-glibc"));
         assert!(env::var("SDKROOT").is_err());
     }
     let suffix = target.replace('-', "_");
