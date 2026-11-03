@@ -6136,7 +6136,6 @@ fn build_inner(
     let (sender, receiver) = std::sync::mpsc::channel::<usize>();
     let receiver = Mutex::new(receiver);
     std::thread::scope(|scope| {
-        let publication_indices = publish_cache.then(|| remote_cache::publication_indices(&ctx));
         let mut publishers = Vec::new();
         if publish_cache {
             for _ in 0..4 {
@@ -6161,12 +6160,7 @@ fn build_inner(
             }
         }
         let enqueue = |index: usize| {
-            if publication_indices
-                .as_ref()
-                .is_some_and(|indices| indices.contains(&index))
-            {
-                sender.send(index).expect("publication workers stopped");
-            }
+            sender.send(index).expect("publication workers stopped");
         };
         // Publication overlaps build, export, and test. Record its duration
         // without replacing the run's current outcome stage.
@@ -6399,15 +6393,6 @@ fn build_inner(
             }
             Ok(())
         })();
-        // Pruned dependencies have no scheduled result, but may have a local
-        // candidate or imported alias that still needs publication.
-        if let Some(indices) = &publication_indices {
-            for &index in indices {
-                if results[index].get().is_none() {
-                    enqueue(index);
-                }
-            }
-        }
         drop(sender);
         let mut count = 0;
         let mut errors = Vec::new();
@@ -8885,13 +8870,6 @@ fn schedule(
 ) -> Result<ScheduleSummary> {
     let n = ctx.units.len();
     let (needed, preloaded_cached) = prepare_demand(ctx, results)?;
-    if let Some(publish) = publish {
-        for (index, result) in results.iter().enumerate() {
-            if result.get().is_some() {
-                publish(index);
-            }
-        }
-    }
     // Typed dependency events: a pure-rlib compile can start as soon as its
     // lib deps have *metadata* (rmeta, published mid-codegen); anything that
     // links waits for full artifacts of its entire transitive closure (the
@@ -9067,9 +9045,12 @@ fn schedule(
                         }
                     }
                 }
+                let executed = !ur.cached;
                 let _ = results[idx].set(ur);
-                if let Some(publish) = publish {
-                    publish(idx);
+                if executed {
+                    if let Some(publish) = publish {
+                        publish(idx);
+                    }
                 }
                 for &j in &rdeps_full[idx] {
                     st.indeg[j] -= 1;
