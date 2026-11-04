@@ -6910,6 +6910,7 @@ fn fetch_dependencies(
 
 fn capture_with_live_stderr(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd
+        .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("running {what}"))?;
@@ -10131,6 +10132,9 @@ mod tool_url_tests {
 
 #[cfg(test)]
 mod tool_shim_tests;
+
+#[cfg(all(test, unix))]
+mod capture_tests;
 
 #[cfg(test)]
 mod tool_scope_tests {
