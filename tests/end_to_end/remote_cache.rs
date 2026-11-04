@@ -16,6 +16,14 @@ use std::{
 fn remote_cache_uses_libcurl_without_a_transport_override() {
     let fixture = Fixture::new("remote-libcurl");
     fixture.run(&["build"]);
+    fixture.remote.objects.lock().unwrap().requests.clear();
+    let cached = fixture
+        .command(&["cache", "build"])
+        .env_remove("CORGI_CURL")
+        .output()
+        .unwrap();
+    assert_success(&cached, "cached results do not publish");
+    assert!(fixture.remote.objects.lock().unwrap().requests.is_empty());
     fixture.clear_results();
     let output = fixture
         .command(&["cache", "build"])
@@ -33,10 +41,10 @@ fn remote_cache_uses_libcurl_without_a_transport_override() {
         .env_remove("CORGI_CURL")
         .output()
         .unwrap();
-    assert_success(&repeated, "reuse verified publication receipts");
+    assert_success(&repeated, "skip publication for cached results");
     assert!(
         fixture.remote.objects.lock().unwrap().requests.is_empty(),
-        "a recent receipt should avoid all R2 requests"
+        "cached results should not make R2 requests"
     );
 
     fixture.clear_results();
@@ -226,6 +234,7 @@ fn cache_publication_bounds_parallel_uploads() {
     }
     fixture.write("Cargo.toml", &manifest);
     fixture.run(&["build"]);
+    fixture.clear_results();
     fixture.remote.objects.lock().unwrap().slow_put = true;
     fixture.run(&["cache", "build"]);
     let peak = fixture.remote.objects.lock().unwrap().peak_puts;
@@ -274,10 +283,9 @@ fn remote_build_cache_lifecycle() {
         .record(|record| record["spec"]["target"]["name"] == "middle");
     mixed.remote.retain_record(&path, &non_incremental);
     mixed.clear_results();
-    mixed.run(&["build"]);
+    mixed.run(&["cache", "build"]);
     assert_unit_cache(&mixed.report(), "middle", "compile", "middle", "miss");
     mixed.assert_binary_output("42\n");
-    mixed.run(&["cache", "build"]);
     let (path, incremental) = mixed.remote.record(|record| {
         record["spec"]["target"]["name"] == "middle" && record["spec"]["incremental"] == true
     });
@@ -379,27 +387,24 @@ fn remote_build_cache_lifecycle() {
             !objects
                 .requests
                 .contains(&("HEAD".into(), blob_path.clone())),
-            "a recent publication receipt avoids rechecking its blobs"
+            "cached actions do not recheck missing remote blobs"
         );
     }
-    fixture.expire_publication_receipts();
+    fixture.release_compiler();
+    fixture.remote.objects.lock().unwrap().compiler_gate = None;
+    fixture.clear_results();
+    fixture.remote.objects.lock().unwrap().requests.clear();
     fixture.run(&["cache", "build"]);
     {
-        let objects = fixture.remote.objects.lock().unwrap();
-        assert_eq!(
-            objects.bytes[&blob_path], original,
-            "publication must repair missing blobs"
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&objects.bytes[&record_path]).unwrap(),
-            record
-        );
+        let mut objects = fixture.remote.objects.lock().unwrap();
+        assert!(!objects.bytes.contains_key(&blob_path));
         assert!(
             !objects
                 .requests
-                .contains(&("PUT".into(), record_path.clone())),
-            "repair must leave the existing record unchanged"
+                .contains(&("HEAD".into(), blob_path.clone())),
+            "an existing record does not recheck its blobs"
         );
+        objects.bytes.insert(blob_path.clone(), original.clone());
     }
 
     let credentials_path = fixture
@@ -841,17 +846,6 @@ os.execvp(tool, [tool, *sys.argv[1:]])
             fs::remove_file(self.release_path()).unwrap();
         }
         fs::write(self.release_path(), "ready").unwrap();
-    }
-
-    fn expire_publication_receipts(&self) {
-        for bucket in fs::read_dir(self.store.join("remote-published")).unwrap() {
-            for marker in fs::read_dir(bucket.unwrap().path().join("corgi/v2")).unwrap() {
-                fs::File::open(marker.unwrap().path())
-                    .unwrap()
-                    .set_modified(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap();
-            }
-        }
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
