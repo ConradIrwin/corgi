@@ -11014,26 +11014,40 @@ fn build_script_environment<'a>(
     }
     // A supplied compiler belongs to the host. Target tools must take precedence,
     // including when only the glibc version differs from the host.
+    let target_zig = ctx
+        .zig
+        .as_ref()
+        .zip(ctx.target.as_deref())
+        .filter(|_| !unit.host);
+    if let Some(native) = ctx.toolchain.supplied() {
+        if let Some(path) = &native.libclang_path {
+            env.push(("LIBCLANG_PATH".into(), path.display().to_string()));
+        }
+        if target_zig.is_none() {
+            if let Some(arguments) = &native.native_bindgen_arguments {
+                env.push(("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone()));
+            }
+        }
+    }
     env.extend(ctx.config_env.iter().cloned());
-    if !unit.host {
-        if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
-            env.extend(zig.build_script_environment());
-            let target_environment = target.replace('-', "_");
-            for (name, value) in [
-                (format!("CC_{target_environment}"), &zig.cc),
-                (format!("CXX_{target_environment}"), &zig.cxx),
-                (format!("AR_{target_environment}"), &zig.ar),
-                (format!("RANLIB_{target_environment}"), &zig.ranlib),
-            ] {
-                env.push((name, value.display().to_string()));
-            }
-            for name in [
-                "CMAKE_TOOLCHAIN_FILE",
-                "TARGET_CMAKE_TOOLCHAIN_FILE",
-                &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
-            ] {
-                env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
-            }
+    if let Some((zig, target)) = target_zig {
+        env.retain(|(name, _)| name != "BINDGEN_EXTRA_CLANG_ARGS");
+        env.extend(zig.build_script_environment());
+        let target_environment = target.replace('-', "_");
+        for (name, value) in [
+            (format!("CC_{target_environment}"), &zig.cc),
+            (format!("CXX_{target_environment}"), &zig.cxx),
+            (format!("AR_{target_environment}"), &zig.ar),
+            (format!("RANLIB_{target_environment}"), &zig.ranlib),
+        ] {
+            env.push((name, value.display().to_string()));
+        }
+        for name in [
+            "CMAKE_TOOLCHAIN_FILE",
+            "TARGET_CMAKE_TOOLCHAIN_FILE",
+            &format!("CMAKE_TOOLCHAIN_FILE_{target_environment}"),
+        ] {
+            env.push((name.to_string(), zig.cmake_toolchain.display().to_string()));
         }
     }
     // Cargo hands build scripts the rustflags of the unit they configure,
@@ -11714,6 +11728,8 @@ mod build_platform_tests {
             compiler: "/nix/store/clang/bin/clang".into(),
             compiler_version: "clang version 21\n".into(),
             environment: Vec::new(),
+            libclang_path: None,
+            native_bindgen_arguments: None,
             identity: "closure-hash".into(),
             runtime_paths: Vec::new(),
         });

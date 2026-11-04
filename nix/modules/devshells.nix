@@ -32,6 +32,7 @@
       devShells.default = (pkgs.mkShell.override { inherit (corgi) stdenv; }) {
         name = "corgi-dev";
         inputsFrom = [ corgi ];
+        nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
         packages = [
           corgi
           corgi.rustToolchain

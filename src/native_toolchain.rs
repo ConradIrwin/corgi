@@ -108,6 +108,10 @@ pub struct NativeToolchain {
     pub compiler: PathBuf,
     pub compiler_version: String,
     pub environment: Vec<(String, String)>,
+    /// Host-side libclang selected by the supplied toolchain.
+    pub libclang_path: Option<PathBuf>,
+    /// Native header arguments, excluded from Zig target units.
+    pub native_bindgen_arguments: Option<String>,
     pub identity: String,
     pub runtime_paths: Vec<PathBuf>,
 }
@@ -175,6 +179,18 @@ impl NativeToolchain {
                 "supplied Apple toolchains require SDKROOT pointing to the selected macOS SDK"
             );
         }
+        let libclang_path = std::env::var_os("LIBCLANG_PATH")
+            .filter(|value| !value.is_empty())
+            .map(|_| required_path("LIBCLANG_PATH"))
+            .transpose()?;
+        let native_bindgen_arguments = std::env::var_os("BINDGEN_EXTRA_CLANG_ARGS")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("BINDGEN_EXTRA_CLANG_ARGS is not UTF-8"))
+            })
+            .transpose()?;
         let shell = find_executable("sh")?;
         let mut roots = vec![
             rust.directory.clone(),
@@ -189,6 +205,17 @@ impl NativeToolchain {
                 ensure!(Path::new(value).exists(), "{name} does not exist: {value}");
                 roots.push(PathBuf::from(value));
             }
+        }
+        if let Some(path) = &libclang_path {
+            ensure!(path.to_str().is_some(), "LIBCLANG_PATH is not UTF-8");
+            roots.push(path.clone());
+        }
+        if let Some(arguments) = &native_bindgen_arguments {
+            roots.extend(
+                environment_store_roots(&[("BINDGEN_EXTRA_CLANG_ARGS".into(), arguments.clone())])?
+                    .into_iter()
+                    .filter(|path| path.exists()),
+            );
         }
         roots.extend(
             runtime_roots(std::env::var_os("CORGI_NATIVE_RUNTIME_ROOTS").as_deref())
@@ -237,17 +264,21 @@ impl NativeToolchain {
         }
         environment.sort();
         let identity = sha256_hex(&serde_json::to_vec(&(
-            "native-toolchain/2",
+            "native-toolchain/3",
             &rust.directory,
             &rust.sysroot,
             &compiler,
             &inputs.identity,
             &environment,
+            &libclang_path,
+            &native_bindgen_arguments,
         ))?);
         Ok(Self {
             compiler,
             compiler_version,
             environment,
+            libclang_path,
+            native_bindgen_arguments,
             identity,
             runtime_paths: inputs.paths,
         })

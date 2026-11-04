@@ -15,6 +15,10 @@ mod remote_cache;
 mod linux_zig;
 
 #[cfg(target_os = "linux")]
+#[path = "end_to_end/supplied_bindgen.rs"]
+mod supplied_bindgen;
+
+#[cfg(target_os = "linux")]
 #[test]
 fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
     let directory = TestDirectory::new("linux-hello");
@@ -2248,6 +2252,8 @@ unsafe extern "C" {
 fn main() {
     let libclang_path = std::env::var("LIBCLANG_PATH")
         .expect("corgi did not set LIBCLANG_PATH for the build script");
+    assert!(!std::env::var("BINDGEN_EXTRA_CLANG_ARGS")
+        .unwrap_or_default().contains("must-not-inherit"));
     let dylib = std::path::Path::new(&libclang_path).join("libclang.dylib");
     assert!(dylib.exists(), "libclang.dylib missing at {}", dylib.display());
 
@@ -2299,7 +2305,14 @@ fn main() {
     )
     .unwrap();
 
-    let output = invoke_corgi_with_store(&workspace, "build", [], &store);
+    let output = corgi_store_command(&workspace, "build", [], &store)
+        .env_remove("CORGI_RUST_TOOLCHAIN")
+        .env_remove("CORGI_CC")
+        .env_remove("CORGI_NATIVE_RUNTIME_ROOTS")
+        .env("LIBCLANG_PATH", directory.path.join("must-not-inherit"))
+        .env("BINDGEN_EXTRA_CLANG_ARGS", "--sysroot=/must-not-inherit")
+        .output()
+        .unwrap();
     assert_success(
         &output,
         "build a bindgen-style consumer with provisioned libclang",
