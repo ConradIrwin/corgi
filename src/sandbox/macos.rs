@@ -152,7 +152,9 @@ impl MacosSandbox {
         }
         profile.push_str(&path_filter("subpath", &self.pool)?);
         profile.push_str(")\n");
-        profile.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n");
+        // /dev/fd only reaches descriptors the process already holds; Nix's
+        // ld wrapper reads response files through bash process substitution.
+        profile.push_str("(allow file-read*\n  (literal \"/\")\n  (literal \"/dev/null\")\n  (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (literal \"/dev/zero\")\n  (subpath \"/dev/fd\")\n");
         // getcwd needs the workspace node, not all of its contents.
         profile.push_str(&path_filter("literal", workspace)?);
         // Host-installed tools and libraries are not keyed inputs.
@@ -479,6 +481,15 @@ mod tests {
                 assert!(reads.contains("(subpath \"/private/var/folders/user/T/xcrun_db\")"));
             }
         }
+    }
+
+    #[test]
+    fn process_substitution_can_read_its_own_descriptors() {
+        let profile = profile(&sandbox(), Path::new("/workspace"), &[], &[]);
+        let reads = rule(&profile, "(allow file-read*\n");
+        let writes = rule(&profile, "(allow file-write*\n");
+        assert!(reads.contains("(subpath \"/dev/fd\")"));
+        assert!(!writes.contains("/dev/fd"));
     }
 
     struct Fixture(PathBuf);
