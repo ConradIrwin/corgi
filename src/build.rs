@@ -7562,6 +7562,26 @@ fn sandboxed_command(
         .command(program, Path::new(&ctx.workspace_root), extra_reads, writes)
 }
 
+/// Starts a freshly materialized binary, retrying while Linux reports it busy.
+///
+/// Linux refuses to exec a file that any process holds open for writing
+/// (ETXTBSY). Our own descriptors are close-on-exec, but a child that another
+/// thread forks while one is open inherits it until that child's exec, so the
+/// window is brief: back off for up to about a second.
+fn retry_busy_executable<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut delay = Duration::from_millis(5);
+    for _ in 0..8 {
+        match start() {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+    start()
+}
+
 fn configure_test_command(harness: &TestHarness) -> Command {
     let mut command = Command::new(&harness.path);
     command.current_dir(&harness.cwd);
@@ -7575,12 +7595,13 @@ fn run_benchmarks(benchmarks: &[BenchmarkExecutable], exec_args: &[String]) -> R
     }
     for benchmark in benchmarks {
         status!("Running", "benchmark {}", benchmark.name);
-        let status = Command::new(&benchmark.path)
+        let mut command = Command::new(&benchmark.path);
+        command
             .current_dir(&benchmark.cwd)
             .envs(benchmark.binary_environment.iter().cloned())
             .args(exec_args)
-            .arg("--bench")
-            .status()
+            .arg("--bench");
+        let status = retry_busy_executable(|| command.status())
             .with_context(|| format!("running benchmark {}", benchmark.name))?;
         if !status.success() {
             bail!("benchmark {} failed with {status}", benchmark.name);
@@ -7600,9 +7621,8 @@ fn run_opaque_tests(
         command
             .current_dir(&executable.cwd)
             .envs(executable.binary_environment.iter().cloned());
-        let mut child = command
-            .args(exec_args)
-            .spawn()
+        command.args(exec_args);
+        let mut child = retry_busy_executable(|| command.spawn())
             .with_context(|| format!("running test {}", executable.name))?;
         let (status, killed) = wait_for_test(&mut child, timeout)?;
         if killed {
@@ -7646,8 +7666,7 @@ fn list_tests(harness: &TestHarness, ignored: bool) -> Result<Vec<String>> {
     if ignored {
         command.arg("--ignored");
     }
-    let output = command
-        .output()
+    let output = retry_busy_executable(|| command.output())
         .with_context(|| format!("listing tests in {}", harness.name))?;
     if !output.status.success() {
         io::Write::write_all(&mut io::stderr(), &output.stdout).ok();
@@ -7698,8 +7717,7 @@ fn run_test_case(
     let (stderr_capture, stderr_file) = TestCaptureFile::create(capture_directory, "stderr")?;
     command.stdout(Stdio::from(stdout_file));
     command.stderr(Stdio::from(stderr_file));
-    let mut child = command
-        .spawn()
+    let mut child = retry_busy_executable(|| command.spawn())
         .with_context(|| format!("running {} {name}", harness.name))?;
     let (status, killed) = wait_for_test(&mut child, timeout)?;
     Ok(TestOutcome {
@@ -12257,5 +12275,43 @@ mod unit_graph_tests {
             units[0].deps[0].role,
             DependencyRole::Extern("priv,noprelude,nounused:core".to_string())
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod busy_executable_tests {
+    use super::retry_busy_executable;
+    use std::fs::{self, OpenOptions};
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn starts_an_executable_once_its_writer_closes() {
+        let dir = std::env::temp_dir().join(format!("corgi-busy-exec-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool");
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+
+        // While the writer is open, Linux refuses to exec the file.
+        let busy = Command::new(&path).status().unwrap_err();
+        assert_eq!(busy.kind(), ErrorKind::ExecutableFileBusy);
+
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let status = retry_busy_executable(|| Command::new(&path).status()).unwrap();
+        closer.join().unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
