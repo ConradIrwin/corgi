@@ -3989,7 +3989,12 @@ fn select_toolchain(
         });
     }
     let native_environment = crate::native_toolchain::wrapper_environment(config_env)?;
-    let supplied_rust = SuppliedRust::resolve(&channel, host, &native_environment)?;
+    let supplied_rust = SuppliedRust::resolve(
+        &channel,
+        distributed_rustc_commit(store, &channel)?.as_deref(),
+        host,
+        &native_environment,
+    )?;
     let standard_library_manifest = build_std
         .then(|| find_standard_library_manifest(&supplied_rust.sysroot))
         .transpose()?;
@@ -4025,6 +4030,64 @@ fn find_standard_library_manifest(sysroot: &Path) -> Result<PathBuf> {
         lockfile.display()
     );
     Ok(manifest)
+}
+
+/// Read the rustc commit Rust distributed for a dated `nightly-` or `beta-` pin.
+///
+/// Only the commit hash from the channel manifest is kept in the store, so
+/// `corgi fetch` prepares later offline builds. Numbered releases return `None`.
+///
+/// # Errors
+///
+/// Fails when the manifest is not cached and cannot be downloaded, or when it
+/// does not describe the pinned distribution.
+fn distributed_rustc_commit(store: &Store, channel: &str) -> Result<Option<String>> {
+    let Some((name, date)) = ["nightly", "beta"].into_iter().find_map(|name| {
+        let date = channel.strip_prefix(name)?.strip_prefix('-')?;
+        Some((name, date))
+    }) else {
+        return Ok(None);
+    };
+    let directory = store
+        .root
+        .join("tools")
+        .join(format!("rust-manifest-{channel}"));
+    let cached = directory.join("rustc-commit-hash");
+    if let Ok(commit) = fs::read_to_string(&cached) {
+        touch_tool_marker(&directory);
+        return Ok(Some(commit));
+    }
+    let url = format!("https://static.rust-lang.org/dist/{date}/channel-rust-{name}.toml");
+    let manifest = capture(crate::curl().args(["-sSfL", &url]), &format!("curl {url}"))
+        .with_context(|| {
+            format!("downloading the {channel} channel manifest to verify supplied Rust; run `corgi fetch` with network access")
+        })?;
+    let commit = rustc_commit_from_channel_manifest(&manifest, date)?;
+    fs::create_dir_all(&directory)?;
+    store.write_atomic(&cached, commit.as_bytes())?;
+    touch_tool_marker(&directory);
+    Ok(Some(commit))
+}
+
+fn rustc_commit_from_channel_manifest(manifest: &str, date: &str) -> Result<String> {
+    let manifest: toml::Table =
+        toml::from_str(manifest).context("parsing the Rust channel manifest")?;
+    let actual_date = manifest.get("date").and_then(|date| date.as_str());
+    ensure!(
+        actual_date == Some(date),
+        "Rust channel manifest is dated {actual_date:?}, not {date}"
+    );
+    let commit = manifest
+        .get("pkg")
+        .and_then(|packages| packages.get("rustc"))
+        .and_then(|rustc| rustc.get("git_commit_hash"))
+        .and_then(|commit| commit.as_str())
+        .context("Rust channel manifest has no rustc commit")?;
+    ensure!(
+        commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Rust channel manifest has an invalid rustc commit {commit:?}"
+    );
+    Ok(commit.to_string())
 }
 
 /// Install the pinned Rust toolchain and return its path in the store. That
@@ -4815,7 +4878,12 @@ pub fn fmt(
     let (toolchain_bin, rustfmt_bin) =
         if ToolchainSource::for_formatting() == ToolchainSource::Supplied {
             let environment = crate::native_toolchain::wrapper_environment(&[])?;
-            let rust = SuppliedRust::resolve(&channel, &host, &environment)?;
+            let rust = SuppliedRust::resolve(
+                &channel,
+                distributed_rustc_commit(&store, &channel)?.as_deref(),
+                &host,
+                &environment,
+            )?;
             crate::native_toolchain::required_component(&rust.directory, "rustfmt")?;
             crate::native_toolchain::required_component(&rust.directory, "cargo-fmt")?;
             let bin = rust.directory.join("bin");
@@ -10193,7 +10261,8 @@ mod tool_scope_tests {
 #[cfg(test)]
 mod toolchain_pin_tests {
     use super::{
-        managed_rustc_version, read_toolchain_pin_with, toolchain_channel_from_rustc_version,
+        managed_rustc_version, read_toolchain_pin_with, rustc_commit_from_channel_manifest,
+        toolchain_channel_from_rustc_version,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -10237,6 +10306,25 @@ mod toolchain_pin_tests {
             )
             .unwrap(),
             "beta-2026-03-20"
+        );
+    }
+
+    #[test]
+    fn channel_manifest_yields_the_distributed_rustc_commit() {
+        let commit = "f46ec5218fe7829ac18323b5ee0b409a63169f27";
+        let manifest = format!(
+            "date = \"2026-07-01\"\n[pkg.rustc]\n\
+             version = \"1.98.0-nightly (f46ec5218 2026-06-30)\"\n\
+             git_commit_hash = \"{commit}\"\n"
+        );
+
+        assert_eq!(
+            rustc_commit_from_channel_manifest(&manifest, "2026-07-01").unwrap(),
+            commit
+        );
+        assert!(rustc_commit_from_channel_manifest(&manifest, "2026-06-30").is_err());
+        assert!(
+            rustc_commit_from_channel_manifest("date = \"2026-07-01\"\n", "2026-07-01").is_err()
         );
     }
 

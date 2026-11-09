@@ -52,7 +52,21 @@ pub struct SuppliedRust {
 }
 
 impl SuppliedRust {
-    pub fn resolve(channel: &str, host: &str, environment: &[(String, String)]) -> Result<Self> {
+    /// Validate the supplied Rust installation against the project's pin.
+    ///
+    /// `distributed_commit` is the rustc commit Rust distributed for a dated
+    /// `nightly-` or `beta-` pin; numbered release pins pass `None`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the compiler does not match the pin or host, or when a
+    /// required component or host standard library is missing.
+    pub fn resolve(
+        channel: &str,
+        distributed_commit: Option<&str>,
+        host: &str,
+        environment: &[(String, String)],
+    ) -> Result<Self> {
         let directory = required_path("CORGI_RUST_TOOLCHAIN")?;
         let rustc = required_component(&directory, "rustc")?;
         let cargo = required_component(&directory, "cargo")?;
@@ -60,7 +74,7 @@ impl SuppliedRust {
             controlled_command(&rustc, environment).arg("-vV"),
             "supplied rustc -vV",
         )?;
-        validate_rust_version(channel, host, &version)?;
+        validate_rust_version(channel, distributed_commit, host, &version)?;
         let sysroot = PathBuf::from(
             output(
                 controlled_command(&rustc, environment).args(["--print", "sysroot"]),
@@ -386,20 +400,38 @@ fn linux_target(target: &str) -> Option<(&str, &str)> {
     Some((architecture, abi))
 }
 
-fn validate_rust_version(channel: &str, host: &str, version: &str) -> Result<()> {
-    let release = version
-        .lines()
-        .find_map(|line| line.strip_prefix("release: "));
-    let actual_host = version.lines().find_map(|line| line.strip_prefix("host: "));
-    ensure!(
-        !channel.starts_with("nightly-") && !channel.starts_with("beta-"),
-        "supplied Rust currently requires a numbered release pin; rustc's commit date cannot verify a nightly or beta distribution date"
-    );
-    ensure!(
-        release == Some(channel),
-        "supplied Rust release {:?} does not match project pin {channel}",
-        release
-    );
+/// A dated pin names a distribution date, which rustc's commit date cannot
+/// establish, so it is verified by the commit Rust distributed on that date.
+fn validate_rust_version(
+    channel: &str,
+    distributed_commit: Option<&str>,
+    host: &str,
+    version: &str,
+) -> Result<()> {
+    let field = |name: &str| {
+        version
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+    };
+    let release = field("release");
+    let actual_host = field("host");
+    if let Some(expected) = distributed_commit {
+        let commit = field("commit-hash").context("supplied rustc -vV: no commit-hash line")?;
+        ensure!(
+            commit == expected,
+            "supplied rustc {commit} is not the {channel} distribution's rustc {expected}"
+        );
+    } else {
+        ensure!(
+            !channel.starts_with("nightly-") && !channel.starts_with("beta-"),
+            "verifying supplied Rust against {channel} requires its distributed rustc commit"
+        );
+        ensure!(
+            release == Some(channel),
+            "supplied Rust release {:?} does not match project pin {channel}",
+            release
+        );
+    }
     ensure!(
         actual_host == Some(host),
         "supplied Rust host {:?} does not match native host {host}",
@@ -490,14 +522,30 @@ mod tests {
     fn supplied_rust_must_match_both_release_and_host() {
         for host in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
             let version = format!("release: 1.97.1\nhost: {host}\n");
-            assert!(validate_rust_version("1.97.1", host, &version).is_ok());
+            assert!(validate_rust_version("1.97.1", None, host, &version).is_ok());
         }
         let version = "release: 1.97.1\nhost: x86_64-unknown-linux-gnu\n";
-        assert!(validate_rust_version("1.96.0", "x86_64-unknown-linux-gnu", version).is_err());
-        assert!(validate_rust_version("1.97.1", "aarch64-unknown-linux-gnu", version).is_err());
         assert!(
-            validate_rust_version("nightly-2026-01-01", "x86_64-unknown-linux-gnu", version)
-                .is_err()
+            validate_rust_version("1.96.0", None, "x86_64-unknown-linux-gnu", version).is_err()
+        );
+        assert!(
+            validate_rust_version("1.97.1", None, "aarch64-unknown-linux-gnu", version).is_err()
+        );
+    }
+
+    #[test]
+    fn supplied_dated_rust_must_match_the_distributed_commit_and_host() {
+        let host = "x86_64-unknown-linux-gnu";
+        let version = format!(
+            "release: 1.98.0-nightly\ncommit-hash: {COMMIT}\ncommit-date: 2026-06-30\nhost: {host}\n"
+        );
+        let channel = "nightly-2026-07-01";
+        assert!(validate_rust_version(channel, Some(COMMIT), host, &version).is_ok());
+        let other = "0".repeat(40);
+        assert!(validate_rust_version(channel, Some(&other), host, &version).is_err());
+        assert!(validate_rust_version(channel, None, host, &version).is_err());
+        assert!(
+            validate_rust_version(channel, Some(COMMIT), "aarch64-apple-darwin", &version).is_err()
         );
     }
 
@@ -547,4 +595,6 @@ mod tests {
             BTreeSet::from([PathBuf::from(root), PathBuf::from(sdk)])
         );
     }
+
+    const COMMIT: &str = "f46ec5218fe7829ac18323b5ee0b409a63169f27";
 }
