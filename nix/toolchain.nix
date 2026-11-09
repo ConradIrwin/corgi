@@ -6,6 +6,8 @@ let
     extensions = [
       "clippy"
       "rustfmt"
+      # build-std tests compile std from the supplied sysroot's sources.
+      "rust-src"
     ];
   };
 in

@@ -6,7 +6,7 @@ use crate::sandbox::linux::{host_runtime_paths, setup_linux_sandbox};
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
 use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store, CACHE_TTL};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use path_slash::PathExt as _;
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
@@ -3946,6 +3946,8 @@ struct SelectedToolchain {
     supplied_rust: Option<SuppliedRust>,
     /// The toolchain's root, with `bin/rustc` and `bin/cargo`.
     rust_toolchain: PathBuf,
+    /// The sysroot's standard-library workspace, present only under build-std.
+    standard_library_manifest: Option<PathBuf>,
 }
 
 /// Select the build's toolchain, installing the pinned one when Corgi
@@ -3972,26 +3974,57 @@ fn select_toolchain(
     }
     let channel = read_toolchain_pin(dir)?;
     if source == ToolchainSource::Managed {
+        let rust_toolchain = provision_rust_toolchain(store, &channel, host, build_std)?;
+        // A managed toolchain directory is its sysroot.
+        let standard_library_manifest = build_std
+            .then(|| find_standard_library_manifest(&rust_toolchain))
+            .transpose()?;
         return Ok(SelectedToolchain {
             source,
-            rust_toolchain: provision_rust_toolchain(store, &channel, host, build_std)?,
+            rust_toolchain,
             channel,
             native_environment: Vec::new(),
             supplied_rust: None,
+            standard_library_manifest,
         });
-    }
-    if build_std {
-        bail!("supplied native toolchains currently require a prebuilt standard library; build-std is not supported");
     }
     let native_environment = crate::native_toolchain::wrapper_environment(config_env)?;
     let supplied_rust = SuppliedRust::resolve(&channel, host, &native_environment)?;
+    let standard_library_manifest = build_std
+        .then(|| find_standard_library_manifest(&supplied_rust.sysroot))
+        .transpose()?;
     Ok(SelectedToolchain {
         source,
         channel,
         rust_toolchain: supplied_rust.directory.clone(),
         native_environment,
         supplied_rust: Some(supplied_rust),
+        standard_library_manifest,
     })
+}
+
+/// Locate the standard-library workspace that build-std compiles.
+///
+/// The sources are read in place and never replaced by a download, so a
+/// supplied toolchain must ship its own rust-src component.
+///
+/// # Errors
+///
+/// Fails when `sysroot` lacks the workspace manifest or its lockfile.
+fn find_standard_library_manifest(sysroot: &Path) -> Result<PathBuf> {
+    let manifest = sysroot.join("lib/rustlib/src/rust/library/Cargo.toml");
+    ensure!(
+        manifest.is_file(),
+        "build-std requires the rust-src component in the Rust sysroot at {} (no replacement will be downloaded)",
+        sysroot.display()
+    );
+    let lockfile = manifest.with_file_name("Cargo.lock");
+    ensure!(
+        lockfile.is_file(),
+        "build-std requires the standard library's lockfile at {}",
+        lockfile.display()
+    );
+    Ok(manifest)
 }
 
 /// Install the pinned Rust toolchain and return its path in the store. That
@@ -4882,7 +4915,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         &store_cargo_home(&store),
         &project.cargo_config_paths,
         &project.manifest,
-        build_std,
+        toolchain.standard_library_manifest.as_deref(),
     )
 }
 
@@ -5060,6 +5093,7 @@ fn build_inner(
         native_environment,
         supplied_rust,
         rust_toolchain,
+        standard_library_manifest,
     } = select_toolchain(
         &store,
         host_platform,
@@ -5395,7 +5429,7 @@ fn build_inner(
                 Path::new(&cargo_home),
                 &cargo_config_paths,
                 &manifest,
-                build_std,
+                standard_library_manifest.as_deref(),
             )?;
             // The plan fingerprint hashes Cargo.lock after Cargo can update it.
             // metadata for package details only (paths, links, metadata tables);
@@ -5407,12 +5441,12 @@ fn build_inner(
                 meta_cmd.env("RUSTC_BOOTSTRAP", "1");
             }
             let mut meta_json = capture_with_live_stderr(&mut meta_cmd, "cargo metadata")?;
-            if build_std {
+            if let Some(standard_library_manifest) = &standard_library_manifest {
                 let mut standard_library_metadata = cargo_command();
                 standard_library_metadata
                     .args(["metadata", "--format-version", "1", "--locked"])
                     .arg("--manifest-path")
-                    .arg(standard_library_manifest(&rust_toolchain))
+                    .arg(standard_library_manifest)
                     .env("RUSTC_BOOTSTRAP", "1");
                 let standard_library_json = capture_with_live_stderr(
                     &mut standard_library_metadata,
@@ -6852,20 +6886,16 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The standard library workspace shipped with a build-std toolchain.
-fn standard_library_manifest(toolchain: &Path) -> PathBuf {
-    toolchain.join("lib/rustlib/src/rust/library/Cargo.toml")
-}
-
 /// Download every source planning needs into `cargo_home`: the project's
-/// dependencies and, under build-std, the standard library's.
+/// dependencies and, under build-std, those of `standard_library_manifest`.
 fn fetch_dependencies(
     toolchain: &Path,
     cargo_home: &Path,
     cargo_config_paths: &[PathBuf],
     manifest: &Path,
-    build_std: bool,
+    standard_library_manifest: Option<&Path>,
 ) -> Result<()> {
+    let build_std = standard_library_manifest.is_some();
     let environment = std::env::vars_os().collect();
     let cargo_command = || {
         let mut command = isolated_cargo_command(
@@ -6895,13 +6925,13 @@ fn fetch_dependencies(
         }
         capture_with_live_stderr(&mut fetch, "cargo fetch")?;
     }
-    if build_std {
+    if let Some(standard_library_manifest) = standard_library_manifest {
         // Cargo resolves -Zbuild-std against the toolchain's own lockfile,
         // which is part of the pinned toolchain and must never be rewritten.
         let mut standard_library = cargo_command();
         standard_library
             .args(["fetch", "--locked", "--manifest-path"])
-            .arg(standard_library_manifest(toolchain))
+            .arg(standard_library_manifest)
             .env("RUSTC_BOOTSTRAP", "1");
         capture_with_live_stderr(&mut standard_library, "cargo fetch for build-std")?;
     }
