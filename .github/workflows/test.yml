@@ -46,6 +46,32 @@ jobs:
           CORGI_TEST_SHARED_STORE: ${{ runner.temp }}/corgi-integration
         run: ./target/debug/corgi test --test end_to_end
 
+  linux-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - uses: cachix/install-nix-action@v31
+      - name: Allow Bubblewrap's user namespaces
+        # Ubuntu 24.04's AppArmor policy blocks unprivileged user namespaces.
+        # This runner is ephemeral; Corgi still requires Bubblewrap's sandbox.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Build Corgi
+        # Linux end-to-end tests use the dev shell's supplied Rust and Clang.
+        run: nix develop --command cargo build --locked
+      - name: Configure private cache reads
+        env:
+          CORGI_R2_ACCESS_KEY_ID: ${{ secrets.CORGI_R2_ACCESS_KEY_ID }}
+          CORGI_R2_SECRET_ACCESS_KEY: ${{ secrets.CORGI_R2_SECRET_ACCESS_KEY }}
+        run: python3 ci/configure-cache-credentials.py
+      - name: Run end-to-end tests
+        # Linux does not support a store shared between tests yet, so each
+        # test uses its own.
+        run: nix develop --command ./target/debug/corgi test --test end_to_end
+
   linux-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

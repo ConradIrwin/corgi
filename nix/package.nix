@@ -11,6 +11,8 @@
   git,
   gnutar,
   nix,
+  procps,
+  python3,
   stdenv,
 }:
 let
@@ -53,6 +55,11 @@ craneLib.buildPackage (
 
     # --bin above keeps namespace-dependent integration tests outside Nix's sandbox.
     doCheck = true;
+    # The compiler-cancellation test spawns a Python child and inspects it with ps.
+    nativeCheckInputs = [
+      procps
+      python3
+    ];
 
     postInstall = ''
       wrapProgram "$out/bin/corgi" \
