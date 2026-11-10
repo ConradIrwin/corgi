@@ -9,6 +9,8 @@ let
       # build-std tests compile std from the supplied sysroot's sources.
       "rust-src"
     ];
+    # Wasm tests link against a prebuilt standard library when not using build-std.
+    targets = [ "wasm32-unknown-unknown" ];
   };
 in
 pkgs.callPackage ./package.nix {
