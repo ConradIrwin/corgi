@@ -4969,6 +4969,11 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         setup_llvm_tools(&store, &host)?;
         ensure_zig(&store, &host, &host, &corgi_toml.libraries)?;
     }
+    if toolchain.source == ToolchainSource::Supplied {
+        // Supplied toolchains build only for the host natively; other
+        // targets use Zig, whose wrappers are generated without network.
+        ensure_zig_executable(&store, &host)?;
+    }
     // A build only provisions the tools its graph activates. Without a plan,
     // fetch takes every tool that could be active on this host.
     for tool in corgi_toml.tools.values() {
