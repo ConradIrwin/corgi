@@ -310,6 +310,7 @@ version = "0.1.103"
 dependencies = [
  "anyhow",
  "cargo-zigbuild",
+ "cargo_metadata",
  "clap",
  "curl",
  "dirs",

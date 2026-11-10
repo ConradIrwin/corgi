@@ -62,6 +62,7 @@ fn terminal_color_policy() {
     assert!(!color_enabled(Some("never"), true, Some("xterm-256color")));
 }
 
+mod cargo_messages;
 mod compiler_race;
 mod downloads;
 mod remote_cache;
@@ -332,6 +333,8 @@ fn binary_export_path(ctx: &Ctx, index: usize, output_name: &str) -> PathBuf {
             }
             directory.push(if output_name.ends_with(".exe") {
                 format!("{}.exe", unit.target.name)
+            } else if output_name.ends_with(".wasm") {
+                format!("{}.wasm", unit.target.name)
             } else {
                 unit.target.name.clone()
             });
@@ -4672,6 +4675,10 @@ pub struct BuildOpts {
     pub clippy_args: Vec<String>,
     pub timings: bool,
     pub no_incremental: bool,
+    /// Reject dependency resolution that would update the project's lockfile.
+    pub locked: bool,
+    /// Report exported artifacts using Cargo's JSON message format.
+    pub json: bool,
     pub no_run: bool,
     /// Ignore cached successful test results while retaining build cache hits.
     pub force_tests: bool,
@@ -4989,6 +4996,7 @@ pub fn fetch(store: Store, dir: &Path) -> Result<()> {
         &project.cargo_config_paths,
         &project.manifest,
         toolchain.standard_library_manifest.as_deref(),
+        false,
     )
 }
 
@@ -5021,7 +5029,19 @@ pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
     let path = store_root.join("reports").join(format!("{}.json", run.id));
     let recorder = Arc::new(crate::report::Recorder::new_at(run, monotonic_started_at));
     recorder.update(|report| report.run.outcome.stage = Some("setup".to_string()));
-    let result = build_inner(store, dir, opts, host_platform, Arc::clone(&recorder));
+    let json = opts.json;
+    let mut result = build_inner(store, dir, opts, host_platform, Arc::clone(&recorder));
+    if json {
+        // Keep the build's own error, and still record the run, if stdout is gone.
+        if let Err(error) = cargo_messages::finished(result.is_ok()) {
+            match result {
+                Ok(()) => result = Err(error),
+                Err(_) => {
+                    eprintln!("corgi warning: could not write build-finished message: {error:#}")
+                }
+            }
+        }
+    }
     if result.is_err() {
         let end_ns = recorder.elapsed_ns();
         recorder.update(|report| {
@@ -5118,6 +5138,8 @@ fn build_inner(
         clippy_args,
         timings,
         no_incremental,
+        locked,
+        json,
         no_run,
         force_tests,
         test_timeout,
@@ -5503,6 +5525,7 @@ fn build_inner(
                 &cargo_config_paths,
                 &manifest,
                 standard_library_manifest.as_deref(),
+                locked,
             )?;
             // The plan fingerprint hashes Cargo.lock after Cargo can update it.
             // metadata for package details only (paths, links, metadata tables);
@@ -6342,6 +6365,9 @@ fn build_inner(
                     // Export the harness before running it, so even a failing test
                     // leaves a debuggable binary behind.
                     let dest = ctx.export_binary(i, m, &r.res)?;
+                    if json {
+                        cargo_messages::artifact(&ctx, i, r, std::slice::from_ref(&dest))?;
+                    }
                     if no_run {
                         written.push(dest);
                         continue;
@@ -6378,6 +6404,7 @@ fn build_inner(
 
             let requested_outputs = requested_units(&ctx);
             for (i, u) in ctx.units.iter().enumerate() {
+                let mut filenames = Vec::new();
                 if !matches!(mode, Mode::Build | Mode::Run | Mode::Test | Mode::Bench) {
                     break;
                 }
@@ -6389,6 +6416,7 @@ fn build_inner(
                     if let Some(r) = results[i].get() {
                         let m = r.main.as_ref().context("bin artifact missing")?;
                         let dest = ctx.export_binary(i, m, &r.res)?;
+                        filenames.push(dest.clone());
                         written.push(dest);
                     }
                 }
@@ -6400,10 +6428,19 @@ fn build_inner(
                                 || o.name.ends_with(".so")
                             {
                                 let dest = ctx.export_binary(i, o, &r.res)?;
+                                filenames.push(dest.clone());
                                 written.push(dest);
                             }
                         }
                     }
+                }
+                if json && u.is_root && !filenames.is_empty() {
+                    cargo_messages::artifact(
+                        &ctx,
+                        i,
+                        results[i].get().context("exported artifact missing")?,
+                        &filenames,
+                    )?;
                 }
             }
             finish_report_stage(&recorder, "export", report_stage_start);
@@ -6967,6 +7004,7 @@ fn fetch_dependencies(
     cargo_config_paths: &[PathBuf],
     manifest: &Path,
     standard_library_manifest: Option<&Path>,
+    locked: bool,
 ) -> Result<()> {
     let build_std = standard_library_manifest.is_some();
     let environment = std::env::vars_os().collect();
@@ -6980,8 +7018,8 @@ fn fetch_dependencies(
         command.env("RUSTC", toolchain.join("bin/rustc"));
         command
     };
-    // Try --locked first because it never writes. If the lockfile is stale,
-    // let Cargo update it, as a normal `cargo fetch` invocation does.
+    // Try --locked first because it never writes. Only an unlocked invocation
+    // may retry with the normal Cargo lockfile-update behavior.
     let mut fetch_locked = cargo_command();
     fetch_locked
         .args(["fetch", "--locked", "--manifest-path"])
@@ -6989,7 +7027,10 @@ fn fetch_dependencies(
     if build_std {
         fetch_locked.env("RUSTC_BOOTSTRAP", "1");
     }
-    if capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked").is_err() {
+    if let Err(error) = capture_with_live_stderr(&mut fetch_locked, "cargo fetch --locked") {
+        if locked {
+            return Err(error);
+        }
         status!("Updating", "Cargo.lock");
         let mut fetch = cargo_command();
         fetch.args(["fetch", "--manifest-path"]).arg(manifest);

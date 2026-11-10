@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -171,6 +171,14 @@ pub enum CacheCommand {
     Setup,
 }
 
+/// Output format for build results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum MessageFormat {
+    #[default]
+    Human,
+    Json,
+}
+
 #[derive(Debug, Args, Default)]
 pub struct BuildArgs {
     /// Use the release profile
@@ -220,6 +228,14 @@ pub struct BuildArgs {
     /// Disable incremental compilation
     #[arg(long)]
     pub no_incremental: bool,
+
+    /// Require an up-to-date Cargo.lock without allowing Cargo to update it
+    #[arg(long)]
+    pub locked: bool,
+
+    /// Emit Cargo-compatible JSON for exported artifacts (build only)
+    #[arg(long, value_enum, default_value = "human")]
+    pub message_format: MessageFormat,
 }
 
 #[derive(Debug, Args, Default)]

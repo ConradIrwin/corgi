@@ -915,6 +915,154 @@ fn ordinary_build_compiles_and_exports_a_wasm_library() {
 }
 
 #[test]
+fn wasm_binary_json_reports_real_outputs_and_respects_locked_builds() {
+    let directory = TestDirectory::new("wasm-binary-json");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(workspace.join("corgi.toml"), "").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = {:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [features]\nselected = []\n\
+             [profile.web]\ninherits = \"release\"\nopt-level = \"s\"\ndebug = 1\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    // Keep the root action cold without redownloading the shared toolchains.
+    fs::write(
+        workspace.join("src/main.rs"),
+        format!(
+            "fn main() {{ println!(\"{{}}\", {:?}); }}\n",
+            directory.path
+        ),
+    )
+    .unwrap();
+    let arguments = [
+        "--target",
+        "wasm32-unknown-unknown",
+        "--profile",
+        "web",
+        "--features",
+        "selected",
+        "--message-format=json",
+    ];
+    for fresh in [false, true] {
+        let mut command = corgi_command();
+        command
+            .arg("build")
+            .arg("-C")
+            .arg(&workspace)
+            .args(arguments);
+        if fresh {
+            command.arg("--locked");
+        }
+        let output = command.output().unwrap();
+        assert_success(&output, "build a Wasm binary with Cargo artifact messages");
+        let messages = cargo_metadata::Message::parse_stream(output.stdout.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let [cargo_metadata::Message::CompilerArtifact(artifact), cargo_metadata::Message::BuildFinished(finished)] =
+            messages.as_slice()
+        else {
+            panic!("unexpected build messages: {messages:?}");
+        };
+        let wasm = workspace
+            .join("target/wasm32-unknown-unknown/web")
+            .join(format!("{}.wasm", directory.package_name));
+        assert_eq!(artifact.filenames, [wasm.to_str().unwrap()]);
+        assert_eq!(
+            artifact.executable.as_ref().map(|path| path.as_str()),
+            wasm.to_str()
+        );
+        assert_eq!(artifact.target.name.as_str(), directory.package_name);
+        assert_eq!(artifact.features, ["selected"]);
+        assert_eq!(artifact.profile.opt_level, "s");
+        assert_eq!(
+            artifact.profile.debuginfo,
+            cargo_metadata::ArtifactDebuginfo::Limited
+        );
+        assert!(!artifact.profile.debug_assertions);
+        assert!(!artifact.profile.overflow_checks);
+        assert!(!artifact.profile.test);
+        assert_eq!(artifact.fresh, fresh);
+        assert!(finished.success);
+        assert!(fs::read(wasm).unwrap().starts_with(b"\0asm"));
+    }
+
+    // A warm plan must not conceal a missing lockfile or recreate it.
+    let lockfile = workspace.join("Cargo.lock");
+    fs::remove_file(&lockfile).unwrap();
+    let output = corgi_command()
+        .arg("build")
+        .arg("-C")
+        .arg(&workspace)
+        .args(arguments)
+        .arg("--locked")
+        .output()
+        .unwrap();
+    assert_failure(&output, "reject a missing lockfile under --locked");
+    let messages = cargo_metadata::Message::parse_stream(output.stdout.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(matches!(
+        messages.as_slice(),
+        [cargo_metadata::Message::BuildFinished(finished)] if !finished.success
+    ));
+    assert!(!lockfile.exists());
+}
+
+#[test]
+fn build_tests_json_reports_exported_harness() {
+    let directory = TestDirectory::new("harness-json");
+    fs::create_dir_all(directory.path.join("src")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        directory.path.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(directory.path.join("corgi.toml"), "").unwrap();
+    fs::write(
+        directory.path.join("Cargo.toml"),
+        format!(
+            "[package]\nname = {:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.path.join("src/lib.rs"),
+        "#[test]\nfn must_not_run() { panic!(\"build must not run tests\"); }\n",
+    )
+    .unwrap();
+
+    let output = run_corgi(
+        &directory.path,
+        "build",
+        ["--tests", "--message-format=json"],
+    );
+    let messages = cargo_metadata::Message::parse_stream(output.stdout.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let [cargo_metadata::Message::CompilerArtifact(artifact), cargo_metadata::Message::BuildFinished(finished)] =
+        messages.as_slice()
+    else {
+        panic!("unexpected harness build messages: {messages:?}");
+    };
+    assert!(finished.success);
+    assert!(artifact.profile.test);
+    let executable = artifact.executable.as_ref().expect("harness executable");
+    assert_eq!(artifact.filenames, std::slice::from_ref(executable));
+    assert!(executable.is_file());
+}
+
+#[test]
 fn build_std_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("build-std");
     let workspace = directory.path.join("workspace");

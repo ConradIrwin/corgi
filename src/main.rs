@@ -181,6 +181,11 @@ fn real_main() -> Result<()> {
                         "--all-features is not supported. Use corgi roots and explicitly test the feature combinations you care about."
                     );
                 }
+                anyhow::ensure!(
+                    args.message_format == cli::MessageFormat::Human
+                        || matches!(mode, build::Mode::Build),
+                    "--message-format=json is supported by `corgi build` only"
+                );
                 build::build(
                     store,
                     &dir,
@@ -201,6 +206,8 @@ fn real_main() -> Result<()> {
                         clippy_args,
                         timings: args.timings,
                         no_incremental: args.no_incremental,
+                        locked: args.locked,
+                        json: args.message_format == cli::MessageFormat::Json,
                         no_run,
                         force_tests,
                         test_timeout,
