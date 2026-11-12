@@ -144,6 +144,16 @@ fn real_main() -> Result<()> {
     } else {
         store::default_root()?
     };
+    // TODO: remove this notice (and `store::legacy_linux_root`) in a future
+    // release, once Linux users have moved off ~/.local/share/corgi (added
+    // after 0.1.104).
+    if let Some(legacy) = store::legacy_linux_root() {
+        eprintln!(
+            "note: corgi now keeps its store in {}; the old store at {} is no longer used and can be deleted",
+            store_root.display(),
+            legacy.display()
+        );
+    }
 
     match command {
         cli::Command::Audit(args) => audit::audit(

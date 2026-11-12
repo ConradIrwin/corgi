@@ -24,8 +24,8 @@ fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
     let directory = TestDirectory::new("linux-hello");
     let workspace = directory.path.join("workspace with spaces");
     write_linux_package(&workspace, &directory.package_name);
-    let data = directory.path.join("xdg data");
-    let store = data.join("corgi");
+    let cache = directory.path.join("xdg cache");
+    let store = cache.join("corgi");
     let binary = workspace.join("target/debug").join(&directory.package_name);
     for (message, expected_cache) in [("hello", "miss"), ("hello", "hit"), ("changed", "miss")] {
         fs::write(
@@ -37,10 +37,11 @@ fn linux_supplied_toolchain_builds_runs_and_invalidates_in_an_xdg_store() {
             .current_dir(&workspace)
             .arg("build")
             .env_remove("CORGI_STORE")
-            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", directory.path.join("xdg data"))
             .output()
             .unwrap();
-        assert_success(&output, "build in the default Linux data directory");
+        assert_success(&output, "build in the default Linux cache directory");
         assert_unit_cache(
             &report_for_workspace(&store, &workspace),
             &directory.package_name,

@@ -113,10 +113,22 @@ pub fn default_root() -> Result<PathBuf> {
     if cfg!(target_os = "macos") {
         Ok(PathBuf::from("/Users/Shared/corgi"))
     } else {
-        Ok(dirs::data_local_dir()
-            .context("could not determine the user data directory; set CORGI_STORE")?
+        Ok(dirs::cache_dir()
+            .context("could not determine the user cache directory; set CORGI_STORE")?
             .join("corgi"))
     }
+}
+
+/// Store location used on Linux before it moved to the XDG cache directory.
+/// Its outputs embed their own store path, so it cannot be moved in place;
+/// we only point users at it so they can reclaim the space.
+// TODO: remove together with the notice in `main.rs` in a future release.
+pub fn legacy_linux_root() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") || std::env::var_os("CORGI_STORE").is_some() {
+        return None;
+    }
+    let legacy = dirs::data_local_dir()?.join("corgi");
+    (legacy.is_dir() && Some(&legacy) != default_root().ok().as_ref()).then_some(legacy)
 }
 
 /// Hash-work counters included in performance reports (relaxed: stats only).
