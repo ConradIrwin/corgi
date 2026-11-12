@@ -6,7 +6,9 @@
 //! config the tool cannot faithfully reproduce never builds silently wrong.
 //! Configuration is bounded by the Corgi project: the root config is the
 //! baseline and the selected directory's config is the override. Configs above
-//! that boundary and in CARGO_HOME are machine-local state and stay invisible.
+//! that boundary and in CARGO_HOME are machine-local state and stay invisible,
+//! with one exception: `build.jobs` only sets parallelism, never outputs, so
+//! it is resolved across every config Cargo would read (see [`jobs`]).
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -108,6 +110,87 @@ pub fn discover(start: &Path) -> Result<(CargoConfig, Option<std::path::PathBuf>
     ))
 }
 
+/// Concurrent jobs on a machine with `cpus` logical CPUs, resolved the way
+/// Cargo does from `start`: `CARGO_BUILD_JOBS`, then `build.jobs` from the
+/// nearest `.cargo/config[.toml]` in `start` or an ancestor that sets it, then
+/// `$CARGO_HOME/config[.toml]`, then `cpus`. Other keys in these files are not
+/// read.
+pub fn jobs(start: &Path, cpus: usize) -> Result<usize> {
+    match std::env::var("CARGO_BUILD_JOBS") {
+        Ok(text) if !text.trim().is_empty() => {
+            return jobs_from_env(&text, cpus).context("CARGO_BUILD_JOBS");
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => bail!("CARGO_BUILD_JOBS is not valid UTF-8"),
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")));
+    let mut directories = start
+        .ancestors()
+        .map(|directory| directory.join(".cargo"))
+        .collect::<Vec<_>>();
+    // `~/.cargo` is usually also an ancestor's `.cargo`; read it once.
+    if let Some(home) = cargo_home.filter(|home| !directories.contains(home)) {
+        directories.push(home);
+    }
+    for directory in directories {
+        // Cargo prefers the legacy extensionless name when both exist.
+        let Some(path) = ["config", "config.toml"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if let Some(jobs) =
+            jobs_from_config(&text, cpus).with_context(|| format!("parsing {}", path.display()))?
+        {
+            return Ok(jobs);
+        }
+    }
+    Ok(cpus)
+}
+
+/// `CARGO_BUILD_JOBS` is an integer or `default`.
+fn jobs_from_env(text: &str, cpus: usize) -> Result<usize> {
+    let text = text.trim();
+    if text == "default" {
+        return Ok(cpus);
+    }
+    let count = text
+        .parse()
+        .with_context(|| format!("{text:?} is not an integer or \"default\""))?;
+    jobs_from_count(count, cpus)
+}
+
+/// `build.jobs`, if the config sets it.
+fn jobs_from_config(text: &str, cpus: usize) -> Result<Option<usize>> {
+    let root: toml::Value = toml::from_str(text).context("invalid TOML")?;
+    let Some(value) = root.get("build").and_then(|build| build.get("jobs")) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::Integer(count) => jobs_from_count(*count, cpus)
+            .context("build.jobs")
+            .map(Some),
+        toml::Value::String(text) if text == "default" => Ok(Some(cpus)),
+        _ => bail!("build.jobs must be an integer or \"default\""),
+    }
+}
+
+/// A negative count is that many fewer than `cpus`, floored at 1.
+fn jobs_from_count(count: i64, cpus: usize) -> Result<usize> {
+    match count {
+        0 => bail!("jobs may not be 0"),
+        count if count < 0 => Ok((cpus as i64 + count).max(1) as usize),
+        count => Ok(count as usize),
+    }
+}
+
 fn parse(text: &str) -> Result<CargoConfig> {
     let root: toml::Value = toml::from_str(text).context("invalid TOML")?;
     let table = root.as_table().context("config root is not a table")?;
@@ -124,8 +207,9 @@ fn parse(text: &str) -> Result<CargoConfig> {
                         "rustflags" => {
                             build_rustflags = flag_list(v).context("build.rustflags")?;
                         }
-                        // Parallelism and layout preferences: corgi owns
-                        // both, and rustdoc is not run.
+                        // `jobs` is resolved by `jobs`, which also sees
+                        // machine-local configs. corgi owns the layout, and
+                        // rustdoc is not run.
                         "jobs" | "target-dir" | "incremental" | "rustdocflags" => {}
                         other => bail!("unsupported .cargo/config key build.{other}"),
                     }
@@ -650,6 +734,60 @@ mod tests {
             ]
         );
         assert_eq!(root.build_std, ["std", "panic_unwind"]);
+    }
+
+    #[test]
+    fn jobs_follow_cargo_semantics() {
+        assert_eq!(jobs_from_env("default", 8).unwrap(), 8);
+        assert_eq!(jobs_from_env("3", 8).unwrap(), 3);
+        assert_eq!(jobs_from_env("32", 8).unwrap(), 32);
+        assert_eq!(jobs_from_env("-2", 8).unwrap(), 6);
+        assert_eq!(jobs_from_env("-20", 8).unwrap(), 1);
+        assert!(jobs_from_env("0", 8).is_err());
+        assert!(jobs_from_env("lots", 8).is_err());
+
+        assert_eq!(jobs_from_config("[build]\njobs = 2", 8).unwrap(), Some(2));
+        assert_eq!(jobs_from_config("[build]\njobs = -2", 8).unwrap(), Some(6));
+        assert_eq!(
+            jobs_from_config("[build]\njobs = \"default\"", 8).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            jobs_from_config("[build]\nrustflags = []", 8).unwrap(),
+            None
+        );
+        assert!(jobs_from_config("[build]\njobs = 0", 8).is_err());
+        assert!(jobs_from_config("[build]\njobs = \"4\"", 8).is_err());
+        // Keys corgi would reject in a project config are fine here: this
+        // reader only looks at `build.jobs`.
+        assert_eq!(
+            jobs_from_config("[build]\njobs = 4\nrustc = \"my-rustc\"", 8).unwrap(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn nearest_config_setting_jobs_wins() {
+        // `jobs` reads CARGO_BUILD_JOBS first; skip rather than mutate the
+        // process environment under parallel tests.
+        if std::env::var_os("CARGO_BUILD_JOBS").is_some_and(|value| !value.is_empty()) {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("corgi-config-jobs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(nested.join(".cargo")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::create_dir_all(root.join("a/.cargo")).unwrap();
+        std::fs::write(root.join(".cargo/config.toml"), "[build]\njobs = 2").unwrap();
+        std::fs::write(root.join("a/.cargo/config.toml"), "[build]\njobs = 3").unwrap();
+        // The nearest config exists but does not set jobs.
+        std::fs::write(nested.join(".cargo/config.toml"), "[env]\nX = \"1\"").unwrap();
+
+        assert_eq!(jobs(&nested, 8).unwrap(), 3);
+        assert_eq!(jobs(&root, 8).unwrap(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

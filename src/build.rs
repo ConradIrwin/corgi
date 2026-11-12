@@ -549,10 +549,12 @@ pub struct Ctx {
     /// Effective per-unit incremental mode, shared by identity planning and execution.
     incremental: Vec<bool>,
     /// GNU-make jobserver: caps machine-wide compiler parallelism at
-    /// ~NCPU. rustc gates its LLVM codegen threads on it natively, and
+    /// `jobs`. rustc gates its LLVM codegen threads on it natively, and
     /// build scripts inherit it (cc/cmake/make all cooperate) — without
     /// it, N concurrent rustcs each assume they own every core.
     jobserver: jobserver::Client,
+    /// Token count of `jobserver`; see `config::jobs`.
+    jobs: usize,
     /// Per-unit identity (16 hex chars): pkg, crate, kind, platform,
     /// effective profile flags, features, dep identities — source-free, so
     /// -Cmetadata (symbol hashes) and -Cextra-filename are stable across
@@ -5180,6 +5182,12 @@ fn build_inner(
             bail!("{var} is set; corgi only honors rustflags from .cargo/config.toml");
         }
     }
+    let jobs = crate::config::jobs(
+        &dir,
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(4),
+    )?;
 
     let host_guess = host_platform.triple();
     let SelectedToolchain {
@@ -6229,12 +6237,8 @@ fn build_inner(
         zig: zig_runtime,
         timings,
         incremental,
-        jobserver: jobserver::Client::new(
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4),
-        )
-        .context("creating jobserver")?,
+        jobserver: jobserver::Client::new(jobs).context("creating jobserver")?,
+        jobs,
         idents,
         action_plans: Vec::new(),
         logical_pkg_ids,
@@ -8128,10 +8132,9 @@ fn run_tests_inner(
     let queue = Mutex::new(queue);
     let outcomes = Mutex::new(Vec::<TimedTestOutcome>::new());
     let reporter = Mutex::new(());
-    let worker_count = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(4)
-        .min(uncached_test_count.max(1));
+    // Every worker holds a jobserver token while its test runs, so threads
+    // beyond `jobs` would only block.
+    let worker_count = ctx.jobs.min(uncached_test_count.max(1));
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             scope.spawn(|| loop {
