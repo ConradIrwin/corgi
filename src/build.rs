@@ -3020,6 +3020,30 @@ fn wrapper_identity(tool_version: &str, settings: impl Serialize) -> Result<Stri
     Ok(sha256_hex(&serde_json::to_vec(&(tool_version, settings))?))
 }
 
+/// Locate the wrapper directory for `identity` and the running Corgi binary.
+///
+/// Wrappers run a copy of the Corgi binary that installed them. Builds of the
+/// same release can link different host libraries, so a copy from another
+/// build may need a loader the sandbox does not mount, and cannot start. The
+/// directory name therefore includes the binary's hash. Action keys keep using
+/// `identity` alone, so a new Corgi binary does not invalidate cached outputs.
+fn wrapper_directory(store: &Store, prefix: &str, identity: &str) -> Result<PathBuf> {
+    static DRIVER_HASH: OnceLock<String> = OnceLock::new();
+    let driver_hash = match DRIVER_HASH.get() {
+        Some(hash) => hash,
+        None => {
+            let hash = crate::store::sha256_file(&std::env::current_exe()?.canonicalize()?)
+                .context("hashing the Corgi binary for its wrappers")?;
+            DRIVER_HASH.get_or_init(|| hash)
+        }
+    };
+    let directory_identity = sha256_hex(&serde_json::to_vec(&(identity, driver_hash))?);
+    Ok(store
+        .root
+        .join("tools")
+        .join(format!("{prefix}-{}", &directory_identity[..16])))
+}
+
 fn ensure_macos(
     store: &Store,
     host: &str,
@@ -3090,8 +3114,7 @@ fn ensure_macos(
             crate::METAL_XCODE_BUILD,
         ),
     )?;
-    let name = format!("macos-wrappers-{}", &identity[..16]);
-    let directory = store.root.join("tools").join(&name);
+    let directory = wrapper_directory(store, "macos-wrappers", &identity)?;
     if !directory.join(crate::macos::CONFIG_FILE).exists() {
         let staging = store.tmp_path("macos-wrappers");
         fs::create_dir_all(&staging)?;
@@ -3112,7 +3135,7 @@ fn ensure_macos(
     touch_tool_marker(&directory);
     Ok(MacosRuntime {
         platform: platform.into(),
-        directory: store.root.join("tools").join(name),
+        directory,
         config,
         bindgen_args,
         identity,
@@ -3176,10 +3199,7 @@ fn ensure_zig(
             sysroot.as_ref().map(|sysroot| &sysroot.identity),
         ),
     )?;
-    let wrapper_dir = store
-        .root
-        .join("tools")
-        .join(format!("zig-wrappers-{}", &wrapper_identity[..16]));
+    let wrapper_dir = wrapper_directory(store, "zig-wrappers", &wrapper_identity)?;
     let cmake_contents = format!(
         "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR {})\nset(CMAKE_C_COMPILER \"{}\")\nset(CMAKE_CXX_COMPILER \"{}\")\nset(CMAKE_AR \"{}\")\nset(CMAKE_RANLIB \"{}\")\n",
         target.cmake_processor,
