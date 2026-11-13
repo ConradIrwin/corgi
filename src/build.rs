@@ -5559,7 +5559,13 @@ fn build_inner(
             // metadata for package details only (paths, links, metadata tables);
             // the actual per-unit resolution comes from cargo's unit-graph below
             let mut meta_cmd = cargo_command();
-            meta_cmd.args(["metadata", "--format-version", "1", "--locked"]);
+            meta_cmd.args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--all-features",
+            ]);
             meta_cmd.arg("--manifest-path").arg(&manifest);
             if build_std {
                 meta_cmd.env("RUSTC_BOOTSTRAP", "1");
