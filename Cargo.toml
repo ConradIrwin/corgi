@@ -1,6 +1,6 @@
 [package]
 name = "corgi-build"
-version = "0.1.105"
+version = "0.1.106"
 edition = "2021"
 rust-version = "1.90"
 description = "PoC: deterministic, content-addressed, lock-free cargo-compatible build tool"
@@ -44,6 +44,7 @@ tar = { version = "0.4", default-features = false }
 toml = "0.8"
 toml_edit = "0.22"
 zstd = { version = "0.13", default-features = false }
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 cargo_metadata = "0.23"

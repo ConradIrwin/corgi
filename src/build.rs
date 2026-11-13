@@ -2888,15 +2888,8 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     fs::create_dir_all(&unpack)?;
     let archive = work.join("archive");
     download_pinned("tool", &t.name, &t.url, &t.auth, &t.sha256, &archive)?;
-    let st = Command::new("tar")
-        .arg("-xf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&unpack)
-        .status()?;
-    if !st.success() {
-        bail!("unpack failed for tool {}", t.name);
-    }
+    unpack_tar_or_zip(&archive, &unpack)
+        .with_context(|| format!("unpack failed for tool {}", t.name))?;
     if !unpack.join(exported).exists() {
         bail!("tool {}: `{exported}` not found inside the archive", t.name);
     }
@@ -2975,6 +2968,35 @@ pub(crate) fn download_pinned(
             bail!("sha256 mismatch for {kind} {name}: manifest pins {sha256}, archive is {actual}");
         }
     }
+    Ok(())
+}
+
+/// Unpack a zip archive or a tarball into `destination`.
+///
+/// The format is read from the content because downloads are saved without
+/// their extension and a URL's file name need not reflect the format.
+pub(crate) fn unpack_tar_or_zip(archive: &Path, destination: &Path) -> Result<()> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(archive)
+        .with_context(|| format!("opening archive {}", archive.display()))?;
+    let mut magic = [0u8; 4];
+    let is_zip = file.read_exact(&mut magic).is_ok() && &magic == b"PK\x03\x04";
+    if is_zip {
+        // `extract` rejects entries and symlinks that would land outside
+        // `destination`, and restores Unix modes so executables stay runnable.
+        return zip::ZipArchive::new(file)
+            .and_then(|mut zip| zip.extract(destination))
+            .with_context(|| format!("unzipping {}", archive.display()));
+    }
+    // GNU tar and bsdtar both detect the compression from the content.
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(destination)
+        .status()
+        .context("running tar")?;
+    ensure!(status.success(), "tar failed on {}", archive.display());
     Ok(())
 }
 
@@ -10294,6 +10316,92 @@ mod tool_url_tests {
         assert!(parse_github_release_url("https://example.com/a/b/releases/download/t/x").is_err());
         assert!(parse_github_release_url("https://github.com/o/r/archive/main.tar.gz").is_err());
         assert!(parse_github_release_url("https://github.com/o/r/releases/download/tag").is_err());
+    }
+}
+
+#[cfg(test)]
+mod unpack_tests {
+    use super::unpack_tar_or_zip;
+    use std::fs;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn work_directory(name: &str) -> PathBuf {
+        let work =
+            std::env::temp_dir().join(format!("corgi-unpack-test-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&work).ok();
+        fs::create_dir_all(&work).unwrap();
+        work
+    }
+
+    #[test]
+    fn zip_archives_unpack_with_their_unix_modes() {
+        let work = work_directory("zip");
+        let archive = work.join("archive");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("lib/libwebrtc.a", options.unix_permissions(0o644))
+            .unwrap();
+        writer.write_all(b"archive").unwrap();
+        writer
+            .start_file("bin/tool", options.unix_permissions(0o755))
+            .unwrap();
+        writer.write_all(b"#!/bin/sh\n").unwrap();
+        writer.finish().unwrap();
+
+        let destination = work.join("unpack");
+        fs::create_dir_all(&destination).unwrap();
+        unpack_tar_or_zip(&archive, &destination).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("lib/libwebrtc.a")).unwrap(),
+            b"archive"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &str| {
+                fs::metadata(destination.join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode("bin/tool"), 0o755);
+            assert_eq!(mode("lib/libwebrtc.a"), 0o644);
+        }
+        fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn compressed_tarballs_still_unpack_with_tar() {
+        let work = work_directory("tar");
+        let source = work.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/tool"), "tool").unwrap();
+        let archive = work.join("archive");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .arg("bin")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let destination = work.join("unpack");
+        fs::create_dir_all(&destination).unwrap();
+        unpack_tar_or_zip(&archive, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("bin/tool")).unwrap(),
+            "tool"
+        );
+        fs::remove_dir_all(&work).unwrap();
     }
 }
 

@@ -10,7 +10,7 @@
 //! targets = ["x86_64-unknown-linux-gnu"]
 //! ```
 //!
-//! Each entry is a `.deb` package or a tarball. Every entry serving a target is
+//! Each entry is a `.deb` package, a tarball or a zip archive. Every entry serving a target is
 //! unpacked into one sysroot in the store, because libraries refer to each
 //! other (`fontconfig.pc` requires `freetype2`). The sysroot's identity is the
 //! hash of its pins; the Zig wrappers carry it, so it reaches the toolchain
@@ -22,7 +22,6 @@ use anyhow::{bail, ensure, Context, Result};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use crate::store::{sha256_hex, Store};
 
@@ -157,26 +156,18 @@ pub fn pkg_config_directories(root: &Path, multiarch: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Unpack a `.deb` (its `data.tar.*` member) or a tarball into `destination`.
+/// Unpack a `.deb` (its `data.tar.*` member), a tarball or a zip archive into
+/// `destination`.
 fn unpack_archive(archive: &Path, destination: &Path, work: &Path) -> Result<()> {
     let mut file = File::open(archive)?;
     let mut magic = [0u8; 8];
     let is_deb = file.read_exact(&mut magic).is_ok() && &magic == b"!<arch>\n";
-    let tarball = if is_deb {
+    let unpacked = if is_deb {
         extract_deb_data(&mut file, work)?
     } else {
         archive.to_path_buf()
     };
-    // GNU tar and bsdtar both detect the compression from the content.
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(&tarball)
-        .arg("-C")
-        .arg(destination)
-        .status()
-        .context("running tar")?;
-    ensure!(status.success(), "tar failed on {}", tarball.display());
-    Ok(())
+    crate::build::unpack_tar_or_zip(&unpacked, destination)
 }
 
 /// Copy the `data.tar.*` member out of a `.deb` (an `ar` archive) into `work`.
@@ -245,6 +236,7 @@ fn relativize_symlinks(root: &Path, directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::process::Command;
 
     #[test]
     fn deb_data_unpacks_with_absolute_symlinks_kept_inside_the_root() {
