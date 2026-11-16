@@ -3,11 +3,12 @@
 //! Mutable trees are hashed without source exclusions. Symlinks may refer only
 //! to declared mutable inputs or immutable Nix closures, never ambient host data.
 
+use crate::file_stat::{self, Kind, Stat};
+use crate::store::{HintCache, Store};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -17,12 +18,19 @@ pub(super) struct RuntimeInputs {
     pub identity: String,
 }
 
-/// Resolve stable runtime roots, hashing mutable contents on every invocation.
+/// Resolve stable runtime roots, identifying mutable contents on every
+/// invocation. Unchanged files reuse content hashes saved in the store.
 ///
 /// The caller must keep these inputs unchanged until the build finishes. Root
 /// aliases are projected at both names; relative links must retain their meaning
 /// under that projection. Nix is needed only when a root or interior link uses it.
-pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
+pub(super) fn resolve(store: &Store, roots: &[PathBuf]) -> Result<RuntimeInputs> {
+    store.with_hints(&format!("runtime-inputs:{roots:?}"), |hints| {
+        resolve_hinted(roots, hints)
+    })
+}
+
+fn resolve_hinted(roots: &[PathBuf], hints: &mut HintCache) -> Result<RuntimeInputs> {
     let policy = PathPolicy::new();
     let mut paths = BTreeSet::new();
     let mut declared = BTreeMap::new();
@@ -46,6 +54,7 @@ pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
         paths,
         nix_roots: BTreeSet::new(),
         hash: Sha256::new(),
+        hints,
     };
     field(&mut state.hash, b"corgi-runtime-inputs-v1");
     let mut processed = BTreeSet::new();
@@ -62,7 +71,9 @@ pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
         // An external alias into the store still needs its relative links checked:
         // bind-mounting a directory at a new name can change where ".." leads.
         if nix_root(&path).is_none() {
-            state.walk(&path, Path::new(""), nix_root(&canonical).is_some())?;
+            let root = file_stat::metadata(&path)
+                .with_context(|| format!("reading runtime input {}", path.display()))?;
+            state.walk(&path, Path::new(""), &root, nix_root(&canonical).is_some())?;
         }
         processed.insert(path);
     }
@@ -117,44 +128,41 @@ pub(super) fn resolve(roots: &[PathBuf]) -> Result<RuntimeInputs> {
     })
 }
 
-struct Resolver {
+struct Resolver<'a> {
     policy: PathPolicy,
     declared: BTreeMap<PathBuf, bool>,
     paths: BTreeSet<PathBuf>,
     nix_roots: BTreeSet<PathBuf>,
     hash: Sha256,
+    hints: &'a mut HintCache,
 }
 
-impl Resolver {
-    fn walk(&mut self, root: &Path, relative: &Path, immutable: bool) -> Result<()> {
+impl Resolver<'_> {
+    /// `stat` describes `root/relative`: the root itself follows symlinks,
+    /// and interior entries describe links, not their targets.
+    fn walk(&mut self, root: &Path, relative: &Path, stat: &Stat, immutable: bool) -> Result<()> {
         let path = if relative.as_os_str().is_empty() {
             root.to_path_buf()
         } else {
             root.join(relative)
         };
-        let metadata = if relative.as_os_str().is_empty() {
-            fs::metadata(&path)
-        } else {
-            fs::symlink_metadata(&path)
-        }
-        .with_context(|| format!("reading runtime input {}", path.display()))?;
         field(&mut self.hash, relative.as_os_str().as_encoded_bytes());
-        field(&mut self.hash, &metadata.permissions().mode().to_le_bytes());
-        if metadata.is_dir() {
+        field(&mut self.hash, &stat.mode.to_le_bytes());
+        if stat.kind == Kind::Directory {
             field(&mut self.hash, b"directory");
-            let mut entries = fs::read_dir(&path)?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort();
-            for name in entries {
-                self.walk(root, &relative.join(name), immutable)?;
+            let entries = file_stat::read_dir(&path)
+                .with_context(|| format!("reading runtime input {}", path.display()))?;
+            for child in &entries {
+                self.walk(root, &relative.join(&child.name), &child.stat, immutable)?;
             }
-        } else if metadata.is_file() {
+        } else if stat.kind == Kind::File {
             field(&mut self.hash, b"file");
             if !immutable {
-                field(&mut self.hash, crate::store::sha256_file(&path)?.as_bytes());
+                let name = path.to_string_lossy();
+                let hash = self.hints.hash(&name, &path, stat.key.clone())?;
+                field(&mut self.hash, hash.as_bytes());
             }
-        } else if metadata.file_type().is_symlink() {
+        } else if stat.kind == Kind::Symlink {
             field(&mut self.hash, b"symlink");
             let text = fs::read_link(&path)?;
             field(&mut self.hash, text.as_os_str().as_encoded_bytes());
@@ -223,11 +231,11 @@ impl Resolver {
         let mut prefix = PathBuf::new();
         for component in path.components() {
             prefix.push(component);
-            let metadata = fs::symlink_metadata(&prefix)?;
-            if metadata.file_type().is_symlink() {
+            let stat = file_stat::symlink_metadata(&prefix)?;
+            if stat.kind == Kind::Symlink {
                 field(&mut self.hash, b"alias");
                 field(&mut self.hash, prefix.as_os_str().as_encoded_bytes());
-                field(&mut self.hash, &metadata.permissions().mode().to_le_bytes());
+                field(&mut self.hash, &stat.mode.to_le_bytes());
                 field(
                     &mut self.hash,
                     fs::read_link(&prefix)?.as_os_str().as_encoded_bytes(),
@@ -311,9 +319,15 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
 }
 
 #[cfg(test)]
+fn uncached(roots: &[PathBuf]) -> Result<RuntimeInputs> {
+    resolve_hinted(roots, &mut HintCache::default())
+}
+
+#[cfg(test)]
 mod tests {
+    use super::uncached as resolve;
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]

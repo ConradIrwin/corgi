@@ -49,6 +49,10 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2
 [dev-dependencies]
 cargo_metadata = "0.23"
 
+# Debug builds of Corgi hash gigabytes of toolchain and source files.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 panic = "abort"
