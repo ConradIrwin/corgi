@@ -3200,13 +3200,18 @@ fn ensure_zig(
     target: &str,
     libraries: &std::collections::BTreeMap<String, crate::libraries::LibrarySpec>,
 ) -> Result<ZigRuntime> {
-    let sysroot = crate::libraries::ensure_sysroot(
-        store,
-        libraries.values(),
-        crate::zig::rust_target(target)?,
-    )?;
+    let rust_target = crate::zig::rust_target(target)?;
+    let sysroot = crate::libraries::ensure_sysroot(store, libraries.values(), rust_target)?;
     let target = crate::zig::target(target)?
         .with_context(|| format!("Corgi's Zig linker does not support target `{target}`"))?;
+    // An older glibc target than the runtime supports keeps Zig's libc++.
+    let cxx_runtime_libraries = match crate::zig::glibc_minor(&target.zig) {
+        Some(minor) if minor >= crate::libraries::CXX_RUNTIME_MIN_GLIBC_MINOR => {
+            crate::libraries::cxx_runtime_libraries(rust_target)
+        }
+        _ => Vec::new(),
+    };
+    let cxx_runtime = crate::libraries::ensure_sysroot(store, &cxx_runtime_libraries, rust_target)?;
     let asset = crate::zig::asset(host)?;
     let zig_executable = ensure_zig_executable(store, host)?;
     let wrapper_identity = wrapper_identity(
@@ -3219,6 +3224,7 @@ fn ensure_zig(
             &target.zig,
             crate::pkg_config::EXECUTABLE,
             sysroot.as_ref().map(|sysroot| &sysroot.identity),
+            cxx_runtime.as_ref().map(|runtime| &runtime.identity),
         ),
     )?;
     let wrapper_dir = wrapper_directory(store, "zig-wrappers", &wrapper_identity)?;
@@ -3244,6 +3250,11 @@ fn ensure_zig(
         ]
         .iter()
         .all(|name| directory.join(name).exists())
+            && (cxx_runtime.is_none()
+                || directory
+                    .join(crate::zig::CXX_LINK_DIRECTORY)
+                    .join(crate::zig::LIBGCC_S_LINK_FILE)
+                    .exists())
     };
     if !wrapper_is_complete(&wrapper_dir) {
         let staging_dir = store.tmp_path("zig-wrappers");
@@ -3257,6 +3268,26 @@ fn ensure_zig(
             fs::write(
                 staging_dir.join(crate::pkg_config::SYSROOT_FILE),
                 sysroot.root.as_os_str().as_encoded_bytes(),
+            )?;
+        }
+        if let Some(runtime) = &cxx_runtime {
+            fs::write(
+                staging_dir.join(crate::zig::CXX_RUNTIME_FILE),
+                runtime.root.as_os_str().as_encoded_bytes(),
+            )?;
+            let (libstdcxx, libgcc_s) = crate::libraries::cxx_runtime_shared_libraries(
+                &runtime.root,
+                crate::libraries::multiarch(&target.zig),
+            );
+            let link_directory = staging_dir.join(crate::zig::CXX_LINK_DIRECTORY);
+            fs::create_dir_all(&link_directory)?;
+            crate::platform::symlink(
+                &libstdcxx,
+                link_directory.join(crate::zig::LIBSTDCXX_LINK_FILE),
+            )?;
+            crate::platform::symlink(
+                &libgcc_s,
+                link_directory.join(crate::zig::LIBGCC_S_LINK_FILE),
             )?;
         }
         fs::write(staging_dir.join("target"), &target.zig)?;
@@ -3276,6 +3307,10 @@ fn ensure_zig(
     touch_tool_marker(&wrapper_dir);
     // bindgen parses headers with libclang rather than through these wrappers,
     // so it needs the same libc headers spelled out, plus the sysroot's.
+    // TODO(linux): C++ headers are not covered yet. macOS hands bindgen the
+    // compiler's own SDK flags, libc++ included; Linux should add the pinned
+    // libstdc++ directories from `cxx_runtime`, via `-cxx-isystem` so that C
+    // parsing never picks up libstdc++'s `<math.h>` and friends.
     let bindgen_args =
         crate::zig::glibc_header_arguments(&zig_executable, &target.zig).map(|mut arguments| {
             if let Some(sysroot) = &sysroot {

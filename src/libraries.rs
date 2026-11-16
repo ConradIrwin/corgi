@@ -53,6 +53,100 @@ impl LibrarySpec {
     }
 }
 
+/// GCC's C++ runtime that Linux glibc targets compile and link C++ against.
+///
+/// `zig c++` would substitute Zig's own libc++, but Linux C++ code expects
+/// libstdc++: the `cc` crate links `-lstdc++` there, and prebuilt C++ archives
+/// such as libwebrtc call into its ABI. Ubuntu 22.04's GCC 12 is built against
+/// glibc 2.35, Corgi's default glibc target. GCC 10, the newest for glibc 2.31,
+/// cannot compile common C++20 code such as cxx's slice iterator, and newer
+/// libstdc++ headers probe for glibc 2.32 headers that Zig's 2.31 headers
+/// reject, so older glibc targets keep Zig's libc++.
+///
+/// These are the 22.04 release builds, not later updates: the archive deletes
+/// an update once a newer one supersedes it, but keeps release builds until
+/// 22.04 leaves the archive for old-releases.ubuntu.com.
+const CXX_RUNTIME_PINS: &[(&str, &str, &str, &str)] = &[
+    (
+        "libstdc++-12-dev-amd64",
+        "x86_64-unknown-linux-gnu",
+        "http://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-12/libstdc++-12-dev_12-20220319-1ubuntu1_amd64.deb",
+        "27767620a793cd97f58580e795592aa8f49122116f74b45fa8a5fc9ad62eb07e",
+    ),
+    (
+        "libstdc++6-amd64",
+        "x86_64-unknown-linux-gnu",
+        "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libstdc++6_12-20220319-1ubuntu1_amd64.deb",
+        "035cfe195ddf3a091abbc0c323285772ccbdbb2fb75279e44a0915748b4e5726",
+    ),
+    (
+        "libgcc-s1-amd64",
+        "x86_64-unknown-linux-gnu",
+        "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libgcc-s1_12-20220319-1ubuntu1_amd64.deb",
+        "c9a93721431be07557c810d7e1b24c3b3c51f398334ded104362a68a415b9e61",
+    ),
+    (
+        "libstdc++-12-dev-arm64",
+        "aarch64-unknown-linux-gnu",
+        "http://ports.ubuntu.com/ubuntu-ports/pool/universe/g/gcc-12/libstdc++-12-dev_12-20220319-1ubuntu1_arm64.deb",
+        "7f0617bf8cf0475861c5e59193337026f29b51246d3b0d927c67918a5cd8c05f",
+    ),
+    (
+        "libstdc++6-arm64",
+        "aarch64-unknown-linux-gnu",
+        "http://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libstdc++6_12-20220319-1ubuntu1_arm64.deb",
+        "d9903f1cf4e3c0a74e0bd2f7c65e673c104833cfaaab370d3f2114ffd06728f3",
+    ),
+    (
+        "libgcc-s1-arm64",
+        "aarch64-unknown-linux-gnu",
+        "http://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libgcc-s1_12-20220319-1ubuntu1_arm64.deb",
+        "b6e9a39b0ef3302053734e3a5e52ef12151566bb42d625feab7a502b3071c13b",
+    ),
+];
+
+/// The oldest glibc minor version the pinned C++ runtime supports.
+pub const CXX_RUNTIME_MIN_GLIBC_MINOR: u32 = 35;
+
+/// The libstdc++ version the pinned C++ runtime's headers are filed under.
+pub const CXX_RUNTIME_GCC_VERSION: &str = "12";
+
+/// The pinned C++ runtime packages for `platform`; empty when it has none.
+pub fn cxx_runtime_libraries(platform: &str) -> Vec<LibrarySpec> {
+    CXX_RUNTIME_PINS
+        .iter()
+        .filter(|(_, target, _, _)| *target == platform)
+        .map(|(name, target, url, sha256)| LibrarySpec {
+            name: (*name).to_string(),
+            url: (*url).to_string(),
+            sha256: (*sha256).to_string(),
+            targets: vec![(*target).to_string()],
+            auth: String::new(),
+        })
+        .collect()
+}
+
+/// The pinned C++ runtime's header directories, in search order.
+pub fn cxx_runtime_include_directories(root: &Path, multiarch: &str) -> Vec<PathBuf> {
+    let version = CXX_RUNTIME_GCC_VERSION;
+    [
+        format!("usr/include/c++/{version}"),
+        format!("usr/include/{multiarch}/c++/{version}"),
+        format!("usr/include/c++/{version}/backward"),
+    ]
+    .into_iter()
+    .map(|relative| root.join(relative))
+    .collect()
+}
+
+/// The pinned C++ runtime's shared libraries: libstdc++ and libgcc_s.
+pub fn cxx_runtime_shared_libraries(root: &Path, multiarch: &str) -> (PathBuf, PathBuf) {
+    (
+        root.join(format!("usr/lib/{multiarch}/libstdc++.so.6")),
+        root.join(format!("lib/{multiarch}/libgcc_s.so.1")),
+    )
+}
+
 /// An unpacked library sysroot in the store.
 pub struct Sysroot {
     pub root: PathBuf,
