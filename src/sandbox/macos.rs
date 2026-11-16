@@ -18,6 +18,8 @@ pub struct MacosSandbox {
     pub pool: PathBuf,
     pub runtime_paths: Vec<PathBuf>,
     pub cache_directories: Vec<String>,
+    /// Seatbelt refused a probe profile, so this process is already sandboxed.
+    pub nested: bool,
 }
 
 /// Fail before provisioning tools on a host without Seatbelt.
@@ -54,6 +56,25 @@ pub fn setup_macos_sandbox(
             }
         }
     }
+    // A process already under Seatbelt cannot apply a second, restricting
+    // profile (`sandbox_apply: Operation not permitted`), as inside an
+    // agent's own sandbox; a permissive probe would still apply. Builds then
+    // run without the build sandbox: the outer one still confines them, and
+    // their inputs are still hashed.
+    let nested = !Command::new("/usr/bin/sandbox-exec")
+        .args([
+            "-p",
+            "(version 1)(deny default)(allow process-exec*)(allow file-read*)",
+            "/usr/bin/true",
+        ])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if nested {
+        eprintln!(
+            "corgi warning: Seatbelt is unavailable to this process; building without the build sandbox"
+        );
+    }
     Ok(MacosSandbox {
         sysroot: sysroot.to_owned(),
         rustc: rustc.to_owned(),
@@ -63,6 +84,7 @@ pub fn setup_macos_sandbox(
         pool: store.root.join("pool"),
         runtime_paths,
         cache_directories,
+        nested,
     })
 }
 
@@ -99,6 +121,9 @@ impl MacosSandbox {
         extra_reads: &[&Path],
         writes: &[&Path],
     ) -> Result<Command> {
+        if self.nested {
+            return Ok(Command::new(program));
+        }
         let mut profile = String::from(concat!(
             "(version 1)\n",
             "(deny default)\n",
@@ -517,6 +542,7 @@ mod tests {
                 "/private/var/folders/user/T".into(),
                 "/private/var/folders/user/C".into(),
             ],
+            nested: false,
         }
     }
 
