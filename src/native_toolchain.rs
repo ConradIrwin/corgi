@@ -182,7 +182,8 @@ impl NativeToolchain {
             .lines()
             .find_map(|line| line.strip_prefix("host: "))
             .context("supplied Rust has no host triple")?;
-        validate_compiler_target(compiler_target.trim(), host)?;
+        let compiler_target = compiler_target.trim();
+        validate_compiler_target(compiler_target, host)?;
         // Rust resolves its SDK before invoking Clang, so Clang's embedded
         // fallback alone would leave rustc looking for an ambient xcrun.
         if host.ends_with("-apple-darwin") {
@@ -263,15 +264,16 @@ impl NativeToolchain {
         environment.push(("CC".into(), compiler.display().to_string()));
         // Nix's wrappers only consume unsuffixed user flags when assigned the
         // host role. Do not inherit another shell compiler's initialized flags.
+        // Wrappers key the role on their own target with `-` and `.` replaced,
+        // which is Clang's triple rather than Rust's: Nix spells Apple Silicon
+        // `arm64-apple-darwin` where Rust says `aarch64-apple-darwin`.
         if compiler.starts_with("/nix/store")
             || environment.iter().any(|(name, _)| name.starts_with("NIX_"))
         {
+            let suffix = compiler_target.replace(['-', '.'], "_");
             for wrapper in ["CC", "BINTOOLS"] {
                 environment.push((
-                    format!(
-                        "NIX_{wrapper}_WRAPPER_TARGET_HOST_{}",
-                        host.replace('-', "_")
-                    ),
+                    format!("NIX_{wrapper}_WRAPPER_TARGET_HOST_{suffix}"),
                     "1".into(),
                 ));
             }
